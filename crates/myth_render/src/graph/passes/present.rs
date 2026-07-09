@@ -26,7 +26,7 @@
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, PrepareContext, RenderTargetOps, TextureNodeId,
+    ExecuteContext, PassNode, PrepareContext, RenderTargetOps, TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
@@ -64,11 +64,14 @@ impl PresentFeature {
         }
     }
 
-    /// Pre-RDG resource preparation: create the bind group layout and compile
-    /// the blit pipeline for the active surface format.
-    pub fn extract_and_prepare(
+    /// Post-compile resource preparation for the fallback blit path.
+    ///
+    /// The graph compiler normally folds this pass away. Keeping all GPU work
+    /// here guarantees that the folded path creates neither a layout nor a
+    /// pipeline nor a bind group.
+    fn prepare_resources(
         &mut self,
-        ctx: &mut ExtractContext,
+        ctx: &mut PrepareContext<'_>,
         surface_format: wgpu::TextureFormat,
     ) {
         // ── 1. Lazy-create BindGroupLayout (once) ──────────────────
@@ -150,13 +153,12 @@ impl PresentFeature {
     /// wiring (e.g. UI overlay hooks), which remains valid whether or not the
     /// pass is folded away.
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
         source: TextureNodeId,
         target_surface: TextureNodeId,
     ) -> TextureNodeId {
-        let pipeline_id = self.pipeline_id.expect("PresentFeature not prepared");
-        let layout = self.bind_group_layout.as_ref().unwrap();
+        let surface_format = ctx.frame_config.surface_format;
 
         ctx.graph.add_pass("Present_Pass", |builder| {
             builder.read_texture(source);
@@ -169,10 +171,10 @@ impl PresentFeature {
             builder.mark_pure_forwarding();
 
             let node = PresentPassNode {
+                feature: self,
+                surface_format,
                 source_tex: source,
                 output_tex: output,
-                pipeline_id,
-                layout,
                 transient_bg: None,
             };
             (node, output)
@@ -189,17 +191,23 @@ impl PresentFeature {
 /// Only reached when compile-time folding could not eliminate the pass; in the
 /// folded fast path neither `prepare` nor `execute` runs.
 struct PresentPassNode<'a> {
+    feature: &'a mut PresentFeature,
+    surface_format: wgpu::TextureFormat,
     source_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for PresentPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.prepare_resources(ctx, self.surface_format);
+        let layout = self
+            .feature
+            .bind_group_layout
+            .as_ref()
+            .expect("Present layout must exist after prepare");
         self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.layout, Some("Present BindGroup"), [
+            crate::myth_bind_group!(ctx, layout, Some("Present BindGroup"), [
                 0 => self.source_tex,
                 1 => CommonSampler::LinearClamp,
             ]),
@@ -208,6 +216,11 @@ impl<'a> PassNode<'a> for PresentPassNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut CommandEncoder) {
         let bind_group = self.transient_bg.expect("Present BG not prepared!");
+        let pipeline_id = self
+            .feature
+            .pipeline_id
+            .expect("Present pipeline must exist after prepare");
+        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
 
@@ -220,7 +233,7 @@ impl<'a> PassNode<'a> for PresentPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
+        rpass.set_pipeline(pipeline);
         rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }

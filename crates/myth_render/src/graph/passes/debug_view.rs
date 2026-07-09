@@ -5,8 +5,9 @@
 //!
 //! - **`DebugViewFeature`** (long-lived): owns the pipeline, bind-group
 //!   layouts, and a small uniform buffer for the `view_mode` selector.
-//!   `extract_and_prepare()` compiles the fullscreen pipeline once and
-//!   re-creates it only when the surface format changes.
+//!   `extract()` captures only the per-frame configuration. Pipeline creation,
+//!   buffer upload, and bind-group assembly are deferred until the node
+//!   survives graph compilation.
 //!
 //! - **`DebugViewPassNode`** (ephemeral per-frame): carries the source
 //!   texture ID, target surface ID, and borrowed references to the
@@ -34,14 +35,16 @@ use wgpu::CommandEncoder;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ClusteredScreenBindings, ExecuteContext, ExtractContext, PassNode, PrepareContext,
-    RenderTargetOps, TextureNodeId,
+    ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
+    TextureNodeId,
 };
+use crate::graph::render_state::DebugViewTarget;
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
 };
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::uniforms::clustered_lighting_structs_wgsl;
+use myth_scene::camera::RenderCamera;
 
 // ─── GPU Uniform Layout ─────────────────────────────────────────────────────
 
@@ -53,6 +56,13 @@ pub struct DebugViewUniforms {
     pub custom_scale: f32,
     pub z_near: f32,
     pub z_far: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DebugViewSnapshot {
+    output_format: wgpu::TextureFormat,
+    params: DebugViewUniforms,
+    is_depth: bool,
 }
 
 impl Default for DebugViewUniforms {
@@ -235,15 +245,40 @@ impl DebugViewFeature {
         )));
     }
 
-    /// Pre-RDG preparation: ensure layouts, compile pipeline, upload
-    /// uniforms, and build the static bind group.
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
+    /// Capture the lightweight, topology-independent state needed by the
+    /// debug-view node this frame. This phase performs no GPU interaction.
+    pub fn extract(
+        &self,
+        camera: &RenderCamera,
         output_format: wgpu::TextureFormat,
-        params: DebugViewUniforms,
-        is_depth: bool,
-    ) {
+        target: DebugViewTarget,
+    ) -> Option<DebugViewSnapshot> {
+        let debug_view = camera.debug_view;
+        let view_mode = debug_view.mode.post_process_view_mode()?;
+
+        Some(DebugViewSnapshot {
+            output_format,
+            params: DebugViewUniforms {
+                view_mode,
+                custom_scale: debug_view.custom_scale,
+                z_near: camera.near,
+                z_far: if camera.far.is_infinite() {
+                    10_000.0
+                } else {
+                    camera.far
+                },
+            },
+            is_depth: target.is_depth(),
+        })
+    }
+
+    /// Materialize persistent resources after the node survives DPE.
+    fn prepare_resources(&mut self, ctx: &mut PrepareContext<'_>, snapshot: DebugViewSnapshot) {
+        let DebugViewSnapshot {
+            output_format,
+            params,
+            is_depth,
+        } = snapshot;
         self.ensure_layouts(ctx.device);
 
         // Update the CPU-side uniform and flush to GPU.
@@ -251,14 +286,14 @@ impl DebugViewFeature {
             let mut guard = self.uniforms.write();
             *guard = params;
         }
-        ctx.resource_manager.ensure_buffer(&self.uniforms);
+        ctx.uploads.ensure_buffer(&self.uniforms);
 
         // ── Pipeline (re)creation on format change ─────────────────
         if self.l1_cache_format != Some(output_format) || self.l1_cache_is_depth != Some(is_depth) {
             let mut options = ShaderCompilationOptions::default();
             options.inject_code(
                 "clustered_lighting_structs",
-                &clustered_lighting_structs_wgsl(),
+                clustered_lighting_structs_wgsl(),
             );
 
             if is_depth {
@@ -310,13 +345,10 @@ impl DebugViewFeature {
 
         // ── Static bind group (Group 0) — rebuild on buffer identity change
         if let Some(handle) = self.uniforms.gpu_handle()
-            && let Some(gpu_buf) = ctx.resource_manager.get_gpu_buffer(handle)
+            && let Some(gpu_buf) = ctx.uploads.get_gpu_buffer(handle)
             && (self.static_bg.is_none() || self.last_uniforms_buffer_id != gpu_buf.id)
         {
-            let sampler = ctx
-                .resource_manager
-                .sampler_registry()
-                .get_common(CommonSampler::NearestClamp);
+            let sampler = ctx.sampler_registry.get_common(CommonSampler::NearestClamp);
             let layout = self.static_layout.as_ref().unwrap();
 
             self.static_bg = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -342,24 +374,13 @@ impl DebugViewFeature {
     /// Reads `source_tex`, writes to `target_surface` via SSA relay, and
     /// returns the updated surface handle.
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: DebugViewSnapshot,
         source_tex: TextureNodeId,
         target_surface: TextureNodeId,
-        is_depth: bool,
         clustered: ClusteredScreenBindings,
     ) -> TextureNodeId {
-        let pipeline_id = self.pipeline_id.expect("DebugViewFeature not prepared");
-        let static_bg = self
-            .static_bg
-            .as_ref()
-            .expect("DebugViewFeature: static BG not built");
-        let transient_layout = if is_depth {
-            self.transient_layout_depth.as_ref().unwrap()
-        } else {
-            self.transient_layout_color.as_ref().unwrap()
-        };
-
         ctx.graph.add_pass("DebugView_Pass", |builder| {
             builder.read_texture(source_tex);
             if let Some(params) = clustered.params {
@@ -371,11 +392,10 @@ impl DebugViewFeature {
             let output = builder.replace_texture(target_surface, "DebugView_Output");
 
             let node = DebugViewPassNode {
+                feature: self,
+                snapshot,
                 source_tex,
                 output_tex: output,
-                pipeline_id,
-                static_bg,
-                transient_layout,
                 clustered_params: clustered.params,
                 clustered_records: clustered.records,
                 transient_bg: None,
@@ -390,13 +410,10 @@ impl DebugViewFeature {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 struct DebugViewPassNode<'a> {
+    feature: &'a mut DebugViewFeature,
+    snapshot: DebugViewSnapshot,
     source_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    /// Feature-owned static bind group (Group 0): sampler + uniforms.
-    static_bg: &'a wgpu::BindGroup,
-    /// Layout for transient bind group (Group 1).
-    transient_layout: &'a Tracked<wgpu::BindGroupLayout>,
     clustered_params: Option<crate::graph::core::BufferNodeId>,
     clustered_records: Option<crate::graph::core::BufferNodeId>,
     /// Transient bind group built in `prepare()`.
@@ -405,11 +422,18 @@ struct DebugViewPassNode<'a> {
 
 impl<'a> PassNode<'a> for DebugViewPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.prepare_resources(ctx, self.snapshot);
+
+        let transient_layout = if self.snapshot.is_depth {
+            self.feature.transient_layout_depth.as_ref().unwrap()
+        } else {
+            self.feature.transient_layout_color.as_ref().unwrap()
+        };
         let fallback_params = &ctx.system_textures.clustered_params;
         let fallback_records = &ctx.system_textures.clustered_records;
 
         let mut builder = ctx
-            .build_bind_group(self.transient_layout, Some("DebugView Transient BG (G1)"))
+            .build_bind_group(transient_layout, Some("DebugView Transient BG (G1)"))
             .bind_texture(0, self.source_tex);
 
         builder = if let Some(params) = self.clustered_params {
@@ -431,6 +455,16 @@ impl<'a> PassNode<'a> for DebugViewPassNode<'a> {
         let transient_bg = self
             .transient_bg
             .expect("DebugView transient BG not prepared!");
+        let pipeline_id = self
+            .feature
+            .pipeline_id
+            .expect("DebugView pipeline must exist after prepare");
+        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
+        let static_bg = self
+            .feature
+            .static_bg
+            .as_ref()
+            .expect("DebugView static BG must exist after prepare");
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
 
@@ -443,8 +477,8 @@ impl<'a> PassNode<'a> for DebugViewPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, self.static_bg, &[]);
+        rpass.set_pipeline(pipeline);
+        rpass.set_bind_group(0, static_bg, &[]);
         rpass.set_bind_group(1, transient_bg, &[]);
         rpass.draw(0..3, 0..1);
     }

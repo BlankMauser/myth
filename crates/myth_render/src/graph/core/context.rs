@@ -3,9 +3,13 @@ use std::marker::PhantomData;
 use crate::core::ResourceManager;
 use crate::core::WgpuContext;
 use crate::core::binding::{BindGroupKey, GlobalBindGroupCache};
-use crate::core::gpu::{CommonSampler, MipmapGenerator, SamplerRegistry, SystemTextures, Tracked};
+use crate::core::gpu::{
+    BufferUploadContext, CommonSampler, MipmapGenerator, SamplerRegistry, SystemTextures, Tracked,
+};
 use crate::graph::frame::{BakedRenderLists, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
+use crate::pipeline::ComputePipelineId;
+use crate::pipeline::RenderPipelineId;
 use crate::pipeline::{PipelineCache, ShaderManager};
 use myth_assets::AssetServer;
 use myth_scene::RenderCamera;
@@ -51,17 +55,19 @@ pub struct ExtractContext<'a> {
     pub render_camera: &'a RenderCamera,
 }
 
-// ─── Prepare Context (Transient-Only) ─────────────────────────────────────────
+// ─── Prepare Context (Post-Compile Deferred Preparation) ─────────────────────
 
-/// Minimal context available during the RDG **prepare** phase.
+/// Context available during the RDG **prepare** phase.
 ///
 /// After the render graph has been compiled and transient resources allocated,
-/// each pass's [`PassNode::prepare`] receives this context to assemble
-/// `wgpu::BindGroup`s that reference RDG-managed textures and buffers.
+/// each live pass's [`PassNode::prepare`] receives this context.  This is the
+/// first phase in which feature-specific heavy work is allowed: lazy pipeline
+/// creation, persistent buffer upload, and bind-group assembly all happen here
+/// so dead-pass elimination can suppress them completely.
 ///
-/// This context is deliberately kept **pure**: it provides only the GPU
-/// device, transient view resolver, pipeline cache, sampler registry, and the
-/// global bind group cache. Passes then build bind groups through
+/// Topology, resource descriptors, and dependency edges must already be final;
+/// prepare may materialize an approved plan but must never mutate the graph.
+/// Passes build bind groups through
 /// [`PrepareContext::build_bind_group`], which centralizes cache-key
 /// construction and safe logical-size truncation for RDG buffers.
 pub struct PrepareContext<'a> {
@@ -71,14 +77,20 @@ pub struct PrepareContext<'a> {
     pub device: &'a wgpu::Device,
     /// GPU queue for immediate buffer uploads (rare in prepare).
     pub queue: &'a wgpu::Queue,
-    /// Cached pipelines and their tracked bind-group layouts.
-    pub pipeline_cache: &'a PipelineCache,
+    /// Cached pipelines and their tracked bind-group layouts. Mutable only so
+    /// surviving passes can lazily compile missing variants.
+    pub pipeline_cache: &'a mut PipelineCache,
+    /// Shader-module cache used by lazy pipeline preparation.
+    pub shader_manager: &'a mut ShaderManager,
+    /// Narrow persistent-buffer upload capability. This borrows only the
+    /// ResourceManager's resource-store partition.
+    pub uploads: BufferUploadContext<'a>,
     /// Shared sampler registry (persistent, immutable during prepare).
     pub sampler_registry: &'a SamplerRegistry,
-    /// Mutable cache for transient bind groups with TTL eviction.
-    pub global_bind_group_cache: &'a mut GlobalBindGroupCache,
     /// System fallback textures and Group 3 bind-group infrastructure.
     pub system_textures: &'a SystemTextures,
+    /// Mutable cache for transient bind groups with TTL eviction.
+    pub global_bind_group_cache: &'a mut GlobalBindGroupCache,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -538,11 +550,70 @@ impl<'frame> PrepareContext<'frame> {
         layout: &'ctx Tracked<wgpu::BindGroupLayout>,
         label: Option<&'static str>,
     ) -> BindGroupBuilder<'ctx, 'frame> {
+        let Self {
+            views,
+            device,
+            sampler_registry,
+            global_bind_group_cache,
+            ..
+        } = self;
         BindGroupBuilder::new(
-            Some(&self.views),
-            self.global_bind_group_cache,
-            self.device,
-            self.sampler_registry,
+            Some(views),
+            global_bind_group_cache,
+            device,
+            sampler_registry,
+            layout,
+            label,
+        )
+    }
+
+    pub fn build_render_pipeline_bind_group<'ctx>(
+        &'ctx mut self,
+        pipeline_id: RenderPipelineId,
+        group_index: usize,
+        label: Option<&'static str>,
+    ) -> BindGroupBuilder<'ctx, 'frame> {
+        let layout = self
+            .pipeline_cache
+            .get_tracked_layout(pipeline_id, group_index);
+        let Self {
+            views,
+            device,
+            sampler_registry,
+            global_bind_group_cache,
+            ..
+        } = self;
+        BindGroupBuilder::new(
+            Some(views),
+            global_bind_group_cache,
+            device,
+            sampler_registry,
+            layout,
+            label,
+        )
+    }
+
+    pub fn build_compute_pipeline_bind_group<'ctx>(
+        &'ctx mut self,
+        pipeline_id: ComputePipelineId,
+        group_index: usize,
+        label: Option<&'static str>,
+    ) -> BindGroupBuilder<'ctx, 'frame> {
+        let layout = self
+            .pipeline_cache
+            .get_tracked_compute_layout(pipeline_id, group_index);
+        let Self {
+            views,
+            device,
+            sampler_registry,
+            global_bind_group_cache,
+            ..
+        } = self;
+        BindGroupBuilder::new(
+            Some(views),
+            global_bind_group_cache,
+            device,
+            sampler_registry,
             layout,
             label,
         )

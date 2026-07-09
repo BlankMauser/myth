@@ -568,7 +568,10 @@ impl<'a> FrameComposer<'a> {
         {
             let scene_id = self.ctx.scene.id();
             let scene_gpu_environment = if has_active_environment {
-                self.ctx.resource_manager.gpu_environment(scene_id)
+                self.ctx
+                    .resource_manager
+                    .environments
+                    .scene_environment(scene_id)
             } else {
                 None
             };
@@ -1073,9 +1076,13 @@ impl<'a> FrameComposer<'a> {
                         _ => None,
                     };
 
-                    let is_depth = target.is_depth();
-
-                    if let Some(src) = source {
+                    if let Some(src) = source
+                        && let Some(snapshot) = self.ctx.debug_view_pass.extract(
+                            &self.ctx.camera,
+                            self.frame_config.surface_format,
+                            target,
+                        )
+                    {
                         let clustered = if target == DebugViewTarget::ClusterHeatmap {
                             ClusteredScreenBindings {
                                 light_metadata: None,
@@ -1092,9 +1099,9 @@ impl<'a> FrameComposer<'a> {
 
                         current_target = self.ctx.debug_view_pass.add_to_graph(
                             &mut graph_ctx,
+                            snapshot,
                             src,
                             current_target,
-                            is_depth,
                             clustered,
                         );
                     }
@@ -1211,7 +1218,7 @@ impl<'a> FrameComposer<'a> {
 
             graph.compile(self.ctx.transient_pool, &self.ctx.wgpu_ctx.device);
 
-            // ─── 3a. RDG Prepare: transient-only BindGroup assembly ────────
+            // ─── 3a. RDG Prepare: live-pass deferred preparation ───────────
             //
             // Only the swapchain surface is truly external — all other textures
             // (scene_color, scene_depth, etc.) are RDG transient resources.
@@ -1224,9 +1231,16 @@ impl<'a> FrameComposer<'a> {
                 device: &self.ctx.wgpu_ctx.device,
                 queue: &self.ctx.wgpu_ctx.queue,
                 pipeline_cache: self.ctx.pipeline_cache,
-                sampler_registry: self.ctx.resource_manager.sampler_registry(),
+                shader_manager: self.ctx.shader_manager,
+                uploads: crate::core::gpu::BufferUploadContext::new(
+                    &self.ctx.wgpu_ctx.device,
+                    &self.ctx.wgpu_ctx.queue,
+                    self.ctx.resource_manager.frame_index,
+                    &mut self.ctx.resource_manager.resources,
+                ),
+                sampler_registry: &self.ctx.resource_manager.sampler_registry,
+                system_textures: &self.ctx.resource_manager.system_textures,
                 global_bind_group_cache: self.ctx.global_bind_group_cache,
-                system_textures: self.ctx.resource_manager.system_textures(),
             };
 
             for &pass_idx in &graph.storage.execution_queue {

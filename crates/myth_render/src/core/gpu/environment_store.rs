@@ -33,7 +33,7 @@ impl EnvironmentStore {
 
     #[inline]
     #[must_use]
-    pub(super) fn scene_environment(&self, scene_id: u32) -> Option<&GpuEnvironment> {
+    pub(crate) fn scene_environment(&self, scene_id: u32) -> Option<&GpuEnvironment> {
         self.scene_gpu_environments.get(&scene_id)
     }
 

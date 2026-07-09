@@ -580,13 +580,6 @@ impl Renderer {
                     .extract_and_prepare(&mut extract_ctx, &cloud_entries);
             }
 
-            // Present: unified surface blit, prepared for every render path so
-            // the Composer can always route its final image through a single
-            // surface-writing pass (folded to zero cost when possible).
-            state
-                .present_pass
-                .extract_and_prepare(&mut extract_ctx, view_format);
-
             if is_hf {
                 if let Some(taa_settins) = camera.aa_mode.taa_settings() {
                     state.taa_pass.extract_and_prepare(
@@ -698,35 +691,6 @@ impl Renderer {
                     &scene.tone_mapping.uniforms,
                     scene.tone_mapping.lut_texture,
                 );
-
-                // Debug View — prepare pipeline & uniforms when active
-                #[cfg(feature = "debug_view")]
-                {
-                    use crate::graph::passes::debug_view::DebugViewUniforms;
-                    use crate::graph::render_state::DebugViewTarget;
-
-                    let dv = camera.debug_view;
-                    let target = DebugViewTarget::from_mode(dv.mode);
-                    if let Some(view_mode) = dv.mode.post_process_view_mode() {
-                        let params = DebugViewUniforms {
-                            view_mode,
-                            custom_scale: dv.custom_scale,
-                            z_near: camera.near,
-                            z_far: if camera.far.is_infinite() {
-                                10000.0
-                            } else {
-                                camera.far
-                            },
-                        };
-                        let is_depth = target.is_depth();
-                        state.debug_view_pass.extract_and_prepare(
-                            &mut extract_ctx,
-                            view_format,
-                            params,
-                            is_depth,
-                        );
-                    }
-                }
             }
 
             state.mipmap_pass.extract_and_prepare(&mut extract_ctx);

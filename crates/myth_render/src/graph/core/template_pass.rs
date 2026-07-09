@@ -1507,10 +1507,11 @@ pub struct StandardFullscreenNode<'a> {
 impl<'a> PassNode<'a> for StandardFullscreenNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
         for slot in &mut self.bind_groups[..self.bind_group_count] {
-            let layout = ctx
-                .pipeline_cache
-                .get_tracked_layout(self.pipeline_id, slot.group as usize);
-            let mut bind_group_builder = ctx.build_bind_group(layout, slot.label);
+            let mut bind_group_builder = ctx.build_render_pipeline_bind_group(
+                self.pipeline_id,
+                slot.group as usize,
+                slot.label,
+            );
             for binding in slot.bindings {
                 bind_group_builder =
                     bind_group_builder.bind_graph_binding(binding.binding, binding.resource);
@@ -1554,10 +1555,11 @@ pub struct StandardComputeNode<'a> {
 impl<'a> PassNode<'a> for StandardComputeNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
         for slot in &mut self.bind_groups[..self.bind_group_count] {
-            let layout = ctx
-                .pipeline_cache
-                .get_tracked_compute_layout(self.pipeline_id, slot.group as usize);
-            let mut bind_group_builder = ctx.build_bind_group(layout, slot.label);
+            let mut bind_group_builder = ctx.build_compute_pipeline_bind_group(
+                self.pipeline_id,
+                slot.group as usize,
+                slot.label,
+            );
             for binding in slot.bindings {
                 bind_group_builder =
                     bind_group_builder.bind_graph_binding(binding.binding, binding.resource);

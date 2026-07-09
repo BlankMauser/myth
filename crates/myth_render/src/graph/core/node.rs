@@ -11,15 +11,16 @@ use wgpu::CommandEncoder;
 /// and transient bind-group cache keys.  All persistent GPU resources
 /// (layouts, pipelines, buffers) live in the owning `Feature`.
 ///
-/// # Lifecycle (Eager Setup)
+/// # Lifecycle
 ///
 /// Resource topology and naming are declared **outside** the `PassNode`,
 /// inside the closure passed to [`RenderGraph::add_pass`].  The node
 /// itself participates in three runtime phases:
 ///
 /// 1. **`prepare`** — called after graph compilation and transient memory
-///    allocation.  Assemble `BindGroup`s that reference RDG-managed
-///    transient textures.
+///    allocation, and only for passes that survived dead-pass elimination.
+///    Materialize pipelines, uploads, and bind groups without changing graph
+///    topology or resource descriptors.
 /// 2. **`execute`** — record GPU commands into the shared encoder.
 /// 3. **`after_submit`** — retire pass-owned resources only after the shared
 ///    command buffer has been handed to the queue.
@@ -38,11 +39,10 @@ use wgpu::CommandEncoder;
 /// at frame boundaries, **no `Drop` glue is required** — the arena
 /// reclaims all memory in O(1) without running destructors.
 pub trait PassNode<'a>: Send + Sync {
-    /// Assemble transient `BindGroup`s after physical resource allocation.
+    /// Materialize the execution state after physical resource allocation.
     ///
-    /// Only `BindGroup`s that reference RDG-managed transient textures
-    /// should be created here.  The context deliberately excludes heavy
-    /// infrastructure (shader compiler, asset server, etc.).
+    /// Heavy CPU derivation and GPU interaction should live here when they do
+    /// not affect graph topology, resource descriptors, or dependency edges.
     #[allow(unused_variables)]
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {}
 

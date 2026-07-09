@@ -22,6 +22,77 @@
 use super::{EnsureResult, ResourceManager, generate_gpu_resource_id};
 use myth_resources::buffer::BufferRef;
 
+/// Narrow post-compile capability for persistent CPU→GPU buffer uploads.
+///
+/// This context borrows only the buffer resource store, leaving environment,
+/// texture, sampler, and system-resource partitions available to graph nodes
+/// for the rest of the frame. It is the deferred-prepare counterpart of the
+/// monolithic [`ResourceManager`] buffer API.
+pub struct BufferUploadContext<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    frame_index: u64,
+    resources: &'a mut super::GpuResourceStore,
+}
+
+impl<'a> BufferUploadContext<'a> {
+    pub(crate) fn new(
+        device: &'a wgpu::Device,
+        queue: &'a wgpu::Queue,
+        frame_index: u64,
+        resources: &'a mut super::GpuResourceStore,
+    ) -> Self {
+        Self {
+            device,
+            queue,
+            frame_index,
+            resources,
+        }
+    }
+
+    /// Ensure a persistent buffer exists and contains the latest CPU version.
+    pub fn ensure_buffer<T: super::GpuData>(
+        &mut self,
+        cpu_buffer: &super::CpuBuffer<T>,
+    ) -> (GpuBufferHandle, EnsureResult) {
+        if let Some(handle) = cpu_buffer.gpu_handle() {
+            if let Some(gpu_buf) = self.resources.buffer_mut(handle) {
+                let buffer_ref = cpu_buffer.handle();
+                let mut was_recreated = false;
+
+                if buffer_ref.version > gpu_buf.last_uploaded_version {
+                    let guard = cpu_buffer.read();
+                    let data: &[u8] = bytemuck::cast_slice(guard.as_bytes());
+                    was_recreated = gpu_buf.write_to_gpu(self.device, self.queue, data);
+                    gpu_buf.last_uploaded_version = buffer_ref.version;
+                }
+                gpu_buf.last_used_frame = self.frame_index;
+                return (handle, EnsureResult::new(gpu_buf.id, was_recreated));
+            }
+            cpu_buffer.clear_gpu_handle();
+        }
+
+        let buffer_ref = cpu_buffer.handle();
+        let guard = cpu_buffer.read();
+        let data: &[u8] = bytemuck::cast_slice(guard.as_bytes());
+        let (handle, result) = self.resources.write_buffer(
+            self.device,
+            self.queue,
+            self.frame_index,
+            &buffer_ref,
+            data,
+        );
+        cpu_buffer.set_gpu_handle(handle);
+        (handle, result)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn get_gpu_buffer(&self, handle: GpuBufferHandle) -> Option<&GpuBuffer> {
+        self.resources.buffer(handle)
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Handle — imported from `myth_resources` to ensure CpuBuffer←→SlotMap
 // identity agreement.
