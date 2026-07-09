@@ -386,12 +386,8 @@ impl SsaoFeature {
         let half_w = (fc.width / 2).max(1);
         let half_h = (fc.height / 2).max(1);
 
-        let raw_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.raw_pipeline.expect("SsaoFeature not prepared"));
-        let blur_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.blur_pipeline.expect("SsaoFeature not prepared"));
+        let raw_pipeline_id = self.raw_pipeline.expect("SsaoFeature not prepared");
+        let blur_pipeline_id = self.blur_pipeline.expect("SsaoFeature not prepared");
         let raw_layout = self.raw_layout.as_ref().unwrap();
         let blur_layout = self.blur_layout.as_ref().unwrap();
         let blue_noise_view = self.blue_noise_view.as_ref().unwrap();
@@ -419,7 +415,7 @@ impl SsaoFeature {
                     normal_tex: scene_normals,
                     output_tex: out,
                     uniforms_static_bg,
-                    pipeline: raw_pipeline,
+                    pipeline_id: raw_pipeline_id,
                     raw_layout,
                     blue_noise_view,
                     blue_noise_sampler,
@@ -446,7 +442,7 @@ impl SsaoFeature {
                     depth_tex: scene_depth,
                     normal_tex: scene_normals,
                     output_tex: out,
-                    pipeline: blur_pipeline,
+                    pipeline_id: blur_pipeline_id,
                     blur_layout,
                     transient_bg: None,
                 };
@@ -472,7 +468,7 @@ struct SsaoRawNode<'a> {
     output_tex: TextureNodeId,
 
     uniforms_static_bg: &'a wgpu::BindGroup,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     raw_layout: &'a Tracked<wgpu::BindGroupLayout>,
     blue_noise_view: &'a Tracked<wgpu::TextureView>,
     blue_noise_sampler: &'a Tracked<wgpu::Sampler>,
@@ -509,7 +505,7 @@ impl<'a> PassNode<'a> for SsaoRawNode<'a> {
             multiview_mask: None,
         });
 
-        pass.set_pipeline(self.pipeline);
+        pass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         pass.set_bind_group(0, global_bg, &[]);
         pass.set_bind_group(1, raw_bg, &[]);
         pass.set_bind_group(2, self.uniforms_static_bg, &[]);
@@ -539,7 +535,7 @@ struct SsaoBlurNode<'a> {
     normal_tex: TextureNodeId,
     output_tex: TextureNodeId,
 
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     blur_layout: &'a Tracked<wgpu::BindGroupLayout>,
 
     transient_bg: Option<&'a wgpu::BindGroup>,
@@ -572,7 +568,7 @@ impl<'a> PassNode<'a> for SsaoBlurNode<'a> {
             multiview_mask: None,
         });
 
-        pass.set_pipeline(self.pipeline);
+        pass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         pass.set_bind_group(0, blur_bg, &[]);
         pass.draw(0..3, 0..1);
     }

@@ -350,7 +350,6 @@ impl DebugViewFeature {
         clustered: ClusteredScreenBindings,
     ) -> TextureNodeId {
         let pipeline_id = self.pipeline_id.expect("DebugViewFeature not prepared");
-        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
         let static_bg = self
             .static_bg
             .as_ref()
@@ -374,7 +373,7 @@ impl DebugViewFeature {
             let node = DebugViewPassNode {
                 source_tex,
                 output_tex: output,
-                pipeline,
+                pipeline_id,
                 static_bg,
                 transient_layout,
                 clustered_params: clustered.params,
@@ -393,7 +392,7 @@ impl DebugViewFeature {
 struct DebugViewPassNode<'a> {
     source_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     /// Feature-owned static bind group (Group 0): sampler + uniforms.
     static_bg: &'a wgpu::BindGroup,
     /// Layout for transient bind group (Group 1).
@@ -444,7 +443,7 @@ impl<'a> PassNode<'a> for DebugViewPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.static_bg, &[]);
         rpass.set_bind_group(1, transient_bg, &[]);
         rpass.draw(0..3, 0..1);

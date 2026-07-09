@@ -469,7 +469,6 @@ impl ToneMappingFeature {
         // target_ldr: TextureNodeId,
     ) -> TextureNodeId {
         let pipeline_id = self.current_pipeline.expect("ToneMapFeature not prepared");
-        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
         let static_bg = self
             .static_bg
             .as_ref()
@@ -487,7 +486,7 @@ impl ToneMappingFeature {
             let node = ToneMapPassNode {
                 input_tex: input_hdr,
                 output_tex: output,
-                pipeline,
+                pipeline_id,
                 static_bg,
                 transient_layout,
                 transient_bg: None,
@@ -508,7 +507,7 @@ impl ToneMappingFeature {
 struct ToneMapPassNode<'a> {
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
 
     /// Feature-owned static bind group (Group 1): sampler + uniforms + optional LUT.
     static_bg: &'a wgpu::BindGroup,
@@ -543,7 +542,7 @@ impl<'a> PassNode<'a> for ToneMapPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, global_bind_group, &[]);
         rpass.set_bind_group(1, self.static_bg, &[]);
         rpass.set_bind_group(2, transient_bg, &[]);

@@ -887,9 +887,7 @@ impl SkyboxFeature {
         scene_depth: TextureNodeId,
         dependency_textures: [Option<TextureNodeId>; 2],
     ) -> TextureNodeId {
-        let pipeline = self
-            .current_pipeline
-            .map(|id| ctx.pipeline_cache.get_render_pipeline(id));
+        let pipeline_id = self.current_pipeline;
         let bind_group = self.current_bind_group.as_ref();
         ctx.graph.add_pass("Skybox_Pass", |builder| {
             let out_color = builder.mutate_texture(scene_color, "Scene_Color_Skybox");
@@ -900,7 +898,7 @@ impl SkyboxFeature {
             let node = SkyboxPassNode {
                 out_color,
                 scene_depth,
-                pipeline,
+                pipeline_id,
                 bind_group,
             };
             (node, out_color)
@@ -914,15 +912,16 @@ impl SkyboxFeature {
 pub struct SkyboxPassNode<'a> {
     out_color: TextureNodeId,
     scene_depth: TextureNodeId,
-    pipeline: Option<&'a wgpu::RenderPipeline>,
+    pipeline_id: Option<RenderPipelineId>,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SkyboxPassNode<'a> {
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let (Some(pipeline), Some(bind_group)) = (self.pipeline, self.bind_group) else {
+        let (Some(pipeline_id), Some(bind_group)) = (self.pipeline_id, self.bind_group) else {
             return;
         };
+        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
 
         let gpu_global_bind_group = ctx.baked_lists.global_bind_group;
 

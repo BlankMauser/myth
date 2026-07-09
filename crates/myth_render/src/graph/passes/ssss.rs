@@ -280,12 +280,8 @@ impl SsssFeature {
         feature_id: TextureNodeId,
         specular_tex: TextureNodeId,
     ) -> TextureNodeId {
-        let horizontal_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.horizontal_pipeline.expect("SsssFeature not prepared"));
-        let vertical_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.vertical_pipeline.expect("SsssFeature not prepared"));
+        let horizontal_pipeline_id = self.horizontal_pipeline.expect("SsssFeature not prepared");
+        let vertical_pipeline_id = self.vertical_pipeline.expect("SsssFeature not prepared");
         let bind_group_layout = self.bind_group_layout.as_ref().unwrap();
         let profiles_buffer = self.profiles_buffer.as_ref().unwrap();
 
@@ -314,7 +310,7 @@ impl SsssFeature {
                     normal_in: scene_normals,
                     feature_id,
                     specular_tex,
-                    pipeline: horizontal_pipeline,
+                    pipeline_id: horizontal_pipeline_id,
                     bind_group_layout,
                     profiles_buffer,
                     bind_group: None,
@@ -337,7 +333,7 @@ impl SsssFeature {
                     normal_in: scene_normals,
                     feature_id,
                     specular_tex,
-                    pipeline: vertical_pipeline,
+                    pipeline_id: vertical_pipeline_id,
                     bind_group_layout,
                     profiles_buffer,
                     bind_group: None,
@@ -366,7 +362,7 @@ struct SsssHorizontalNode<'a> {
     feature_id: TextureNodeId,
     specular_tex: TextureNodeId,
 
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     bind_group_layout: &'a Tracked<wgpu::BindGroupLayout>,
     profiles_buffer: &'a Tracked<wgpu::Buffer>,
 
@@ -402,7 +398,7 @@ impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
             ..Default::default()
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.bind_group.unwrap(), &[]);
         rpass.draw(0..3, 0..1);
     }
@@ -425,7 +421,7 @@ struct SsssVerticalNode<'a> {
     feature_id: TextureNodeId,
     specular_tex: TextureNodeId,
 
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     bind_group_layout: &'a Tracked<wgpu::BindGroupLayout>,
     profiles_buffer: &'a Tracked<wgpu::Buffer>,
 
@@ -457,7 +453,7 @@ impl<'a> PassNode<'a> for SsssVerticalNode<'a> {
             ..Default::default()
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.bind_group.unwrap(), &[]);
         rpass.draw(0..3, 0..1);
     }

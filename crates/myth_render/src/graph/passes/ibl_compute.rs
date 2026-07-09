@@ -269,10 +269,7 @@ impl IblComputeFeature {
             .scene_states
             .get(&scene_id)
             .expect("scene IBL state must be prepared before graph build");
-        let pipeline = self
-            .pipeline_ids
-            .get(&state.pipeline_variant)
-            .map(|&id| ctx.pipeline_cache.get_compute_pipeline(id));
+        let pipeline_id = self.pipeline_ids.get(&state.pipeline_variant).copied();
         let source_layout = &self.source_layout;
         let dest_layout = &self.dest_layout;
         let params_desc = BufferDesc::new(
@@ -302,7 +299,7 @@ impl IblComputeFeature {
             let node = IblComputePassNode {
                 base_cube,
                 pmrem,
-                pipeline,
+                pipeline_id,
                 source_layout,
                 dest_layout,
                 mips: mip_states,
@@ -329,7 +326,7 @@ struct IblMipState<'a> {
 struct IblComputePassNode<'a> {
     base_cube: TextureNodeId,
     pmrem: TextureNodeId,
-    pipeline: Option<&'a wgpu::ComputePipeline>,
+    pipeline_id: Option<ComputePipelineId>,
     source_layout: &'a Tracked<wgpu::BindGroupLayout>,
     dest_layout: &'a Tracked<wgpu::BindGroupLayout>,
     mips: &'a mut [IblMipState<'a>],
@@ -356,7 +353,9 @@ impl<'a> PassNode<'a> for IblComputePassNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let pipeline = self.pipeline.expect("IBL pipeline must exist");
+        let pipeline = ctx
+            .pipeline_cache
+            .get_compute_pipeline(self.pipeline_id.expect("IBL pipeline must exist"));
         let mip_levels = ctx.get_texture(self.pmrem).mip_level_count();
 
         for mip in 0..mip_levels as usize {

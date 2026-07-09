@@ -64,13 +64,10 @@ impl HiZFeature {
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
         );
 
-        let init_pipeline = ctx
-            .pipeline_cache
-            .get_compute_pipeline(self.init_pipeline.expect("Hi-Z init pipeline missing"));
-        let downsample_pipeline = ctx.pipeline_cache.get_compute_pipeline(
-            self.downsample_pipeline
-                .expect("Hi-Z downsample pipeline missing"),
-        );
+        let init_pipeline_id = self.init_pipeline.expect("Hi-Z init pipeline missing");
+        let downsample_pipeline_id = self
+            .downsample_pipeline
+            .expect("Hi-Z downsample pipeline missing");
         let init_layout = self.init_layout.as_ref().expect("Hi-Z init layout missing");
         let downsample_layout = self
             .downsample_layout
@@ -98,8 +95,8 @@ impl HiZFeature {
             let node = HiZBuildNode {
                 scene_depth,
                 hiz_texture,
-                init_pipeline,
-                downsample_pipeline,
+                init_pipeline_id,
+                downsample_pipeline_id,
                 init_layout,
                 downsample_layout,
                 init_bg: None,
@@ -234,8 +231,8 @@ struct HiZMipState<'a> {
 struct HiZBuildNode<'a> {
     scene_depth: TextureNodeId,
     hiz_texture: TextureNodeId,
-    init_pipeline: &'a wgpu::ComputePipeline,
-    downsample_pipeline: &'a wgpu::ComputePipeline,
+    init_pipeline_id: ComputePipelineId,
+    downsample_pipeline_id: ComputePipelineId,
     init_layout: &'a Tracked<wgpu::BindGroupLayout>,
     downsample_layout: &'a Tracked<wgpu::BindGroupLayout>,
     init_bg: Option<&'a wgpu::BindGroup>,
@@ -309,7 +306,10 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
             timestamp_writes: None,
         });
 
-        init_pass.set_pipeline(self.init_pipeline);
+        init_pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.init_pipeline_id),
+        );
         init_pass.set_bind_group(0, self.init_bg.expect("Hi-Z init BG missing"), &[]);
         init_pass.dispatch_workgroups(
             full_w.div_ceil(HIZ_WORKGROUP_SIZE),
@@ -323,7 +323,10 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
                 label: Some("Hi-Z Downsample Compute"),
                 timestamp_writes: None,
             });
-            downsample_pass.set_pipeline(self.downsample_pipeline);
+            downsample_pass.set_pipeline(
+                ctx.pipeline_cache
+                    .get_compute_pipeline(self.downsample_pipeline_id),
+            );
             downsample_pass.set_bind_group(0, mip.bind_group.expect("Hi-Z mip BG missing"), &[]);
             downsample_pass.dispatch_workgroups(
                 mip.target_size.0.div_ceil(HIZ_WORKGROUP_SIZE),

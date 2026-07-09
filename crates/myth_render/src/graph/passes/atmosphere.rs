@@ -351,17 +351,14 @@ impl AtmosphereFeature {
             .get(&scene_id)
             .expect("scene atmosphere state must be prepared before graph build");
 
-        let transmittance_pipeline = self
+        let transmittance_pipeline_id = self
             .transmittance_pipeline
-            .map(|id| ctx.pipeline_cache.get_compute_pipeline(id))
             .expect("atmosphere transmittance pipeline must exist");
-        let multi_scatter_pipeline = self
+        let multi_scatter_pipeline_id = self
             .multi_scatter_pipeline
-            .map(|id| ctx.pipeline_cache.get_compute_pipeline(id))
             .expect("atmosphere multi scatter pipeline must exist");
-        let sky_view_pipeline = self
+        let sky_view_pipeline_id = self
             .sky_view_pipeline
-            .map(|id| ctx.pipeline_cache.get_compute_pipeline(id))
             .expect("atmosphere sky view pipeline must exist");
         let sky_to_cube_kind = state
             .starbox
@@ -371,11 +368,10 @@ impl AtmosphereFeature {
             starbox_kind: sky_to_cube_kind,
             moon_texture: state.moon_texture.enabled,
         };
-        let sky_to_cube_pipeline = self
+        let sky_to_cube_pipeline_id = self
             .sky_to_cube_pipelines
             .get(&sky_to_cube_pipeline_key)
             .copied()
-            .map(|id| ctx.pipeline_cache.get_compute_pipeline(id))
             .expect("atmosphere sky-to-cube pipeline must exist");
 
         let gpu_params = GpuAtmosphereParams::from_scene(params);
@@ -448,7 +444,7 @@ impl AtmosphereFeature {
                         gpu_params,
                         bake_params,
                         state,
-                        pipeline: transmittance_pipeline,
+                        pipeline_id: transmittance_pipeline_id,
                         layout: transmittance_layout,
                         bind_group: None,
                     };
@@ -479,7 +475,7 @@ impl AtmosphereFeature {
                         gpu_params,
                         bake_params,
                         state,
-                        pipeline: multi_scatter_pipeline,
+                        pipeline_id: multi_scatter_pipeline_id,
                         layout: multi_scatter_layout,
                         bind_group: None,
                     };
@@ -511,7 +507,7 @@ impl AtmosphereFeature {
                     gpu_params,
                     bake_params,
                     state,
-                    pipeline: sky_view_pipeline,
+                    pipeline_id: sky_view_pipeline_id,
                     layout: sky_view_layout,
                     bind_group: None,
                 };
@@ -533,7 +529,7 @@ impl AtmosphereFeature {
                         gpu_params,
                         bake_params,
                         state,
-                        pipeline: sky_to_cube_pipeline,
+                        pipeline_id: sky_to_cube_pipeline_id,
                         layout: sky_to_cube_layout,
                         base_cube_storage_view,
                         starbox: state.starbox.as_ref(),
@@ -1129,7 +1125,7 @@ struct AtmosphereTransmittanceNode<'a> {
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
-    pipeline: &'a wgpu::ComputePipeline,
+    pipeline_id: ComputePipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
@@ -1157,12 +1153,12 @@ impl<'a> PassNode<'a> for AtmosphereTransmittanceNode<'a> {
         );
     }
 
-    fn execute(&self, _ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Atmosphere Transmittance LUT"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(self.pipeline);
+        cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
         cpass.set_bind_group(
             0,
             self.bind_group.expect("atmo transmittance bg missing"),
@@ -1184,7 +1180,7 @@ struct AtmosphereMultiScatterNode<'a> {
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
-    pipeline: &'a wgpu::ComputePipeline,
+    pipeline_id: ComputePipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
@@ -1214,12 +1210,12 @@ impl<'a> PassNode<'a> for AtmosphereMultiScatterNode<'a> {
         );
     }
 
-    fn execute(&self, _ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Atmosphere Multi-Scatter LUT"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(self.pipeline);
+        cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
         cpass.set_bind_group(
             0,
             self.bind_group.expect("atmo multi-scatter bg missing"),
@@ -1244,7 +1240,7 @@ struct AtmosphereSkyViewNode<'a> {
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
-    pipeline: &'a wgpu::ComputePipeline,
+    pipeline_id: ComputePipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
@@ -1275,12 +1271,12 @@ impl<'a> PassNode<'a> for AtmosphereSkyViewNode<'a> {
         );
     }
 
-    fn execute(&self, _ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Atmosphere Sky-View LUT"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(self.pipeline);
+        cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
         cpass.set_bind_group(0, self.bind_group.expect("atmo sky-view bg missing"), &[]);
         cpass.dispatch_workgroups(SKY_VIEW_WIDTH.div_ceil(8), SKY_VIEW_HEIGHT.div_ceil(8), 1);
     }
@@ -1295,7 +1291,7 @@ struct AtmosphereSkyToCubeNode<'a> {
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
-    pipeline: &'a wgpu::ComputePipeline,
+    pipeline_id: ComputePipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     base_cube_storage_view: &'a Tracked<wgpu::TextureView>,
     starbox: Option<&'a ResolvedAtmosphereStarbox>,
@@ -1350,7 +1346,7 @@ impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
                 label: Some("Atmosphere Sky-to-Cube Bake"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(self.pipeline);
+            cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
             cpass.set_bind_group(
                 0,
                 self.bind_group.expect("atmo sky-to-cube bg missing"),

@@ -219,7 +219,7 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
 
         // 2. Skybox (between opaque and transparent)
         if let Some(skybox) = &self.prepared_skybox {
-            skybox.draw(&mut pass, gpu_global_bind_group);
+            skybox.draw(&mut pass, gpu_global_bind_group, ctx.pipeline_cache);
 
             pass.set_bind_group(0, gpu_global_bind_group, &[]);
             pass.set_bind_group(3, screen_bg, &[]);

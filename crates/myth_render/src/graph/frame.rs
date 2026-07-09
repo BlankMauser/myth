@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use crate::core::gpu::Tracked;
 use crate::core::{BindGroupContext, RenderView, ResourceManager};
 use crate::graph::core::TextureNodeId;
-use crate::pipeline::RenderPipelineId;
+use crate::pipeline::{PipelineCache, RenderPipelineId};
 use crate::renderer::FrameTime;
 use crate::settings::{ClusteredShadingMode, RenderPath};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
@@ -189,8 +189,8 @@ pub struct ShadowLightInstance {
 /// opaque and transparent objects within a single render pass.
 #[derive(Clone, Copy)]
 pub struct PreparedSkyboxDraw<'a> {
-    /// Pre-resolved skybox render pipeline reference.
-    pub pipeline: &'a wgpu::RenderPipeline,
+    /// Stable skybox render pipeline handle, resolved during execution.
+    pub pipeline_id: RenderPipelineId,
     /// The skybox bind group (uniforms + optional texture/sampler).
     pub bind_group: &'a wgpu::BindGroup,
     /// Optional graph dependencies for textures sampled by the skybox.
@@ -198,8 +198,13 @@ pub struct PreparedSkyboxDraw<'a> {
 }
 
 impl<'a> PreparedSkyboxDraw<'a> {
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'a>, global_bind_group: &'a wgpu::BindGroup) {
-        pass.set_pipeline(self.pipeline);
+    pub fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'a>,
+        global_bind_group: &'a wgpu::BindGroup,
+        pipeline_cache: &'a PipelineCache,
+    ) {
+        pass.set_pipeline(pipeline_cache.get_render_pipeline(self.pipeline_id));
         pass.set_bind_group(0, global_bind_group, &[]);
         pass.set_bind_group(1, self.bind_group, &[]);
         pass.draw(0..3, 0..1);

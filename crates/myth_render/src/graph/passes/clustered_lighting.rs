@@ -509,17 +509,13 @@ impl ClusteredLightingFeature {
             .light_view_layout
             .as_ref()
             .expect("Clustered lighting light-view layout must exist");
-        let dispatch_args_pipeline = ctx.pipeline_cache.get_compute_pipeline(
-            self.dispatch_args_pipeline
-                .expect("Cluster dispatch args pipeline missing"),
-        );
-        let light_view_pipeline = ctx.pipeline_cache.get_compute_pipeline(
-            self.light_view_pipeline
-                .expect("Cluster light view pipeline missing"),
-        );
-        let cull_pipeline = ctx
-            .pipeline_cache
-            .get_compute_pipeline(self.cull_pipeline.expect("Clustered cull pipeline missing"));
+        let dispatch_args_pipeline_id = self
+            .dispatch_args_pipeline
+            .expect("Cluster dispatch args pipeline missing");
+        let light_view_pipeline_id = self
+            .light_view_pipeline
+            .expect("Cluster light view pipeline missing");
+        let cull_pipeline_id = self.cull_pipeline.expect("Clustered cull pipeline missing");
 
         let dispatch_args_buffer = final_lights
             .final_indirect_count_buffer
@@ -536,7 +532,7 @@ impl ClusteredLightingFeature {
                             count_buffer,
                             dispatch_args,
                             dispatch_args_layout,
-                            dispatch_args_pipeline,
+                            dispatch_args_pipeline_id,
                             bind_group: None,
                         };
 
@@ -562,7 +558,7 @@ impl ClusteredLightingFeature {
                 light_view_positions,
                 indirect_dispatch_buffer: dispatch_args_buffer,
                 light_view_layout,
-                light_view_pipeline,
+                light_view_pipeline_id,
                 bind_group: None,
                 total_light_slots: light_slots,
             };
@@ -592,7 +588,7 @@ impl ClusteredLightingFeature {
                 light_indices,
                 light_index_allocator,
                 cull_layout,
-                cull_pipeline,
+                cull_pipeline_id,
                 bind_group: None,
                 dispatch_grid_x: self.frame_params.screen_dimensions.z.max(1),
                 dispatch_grid_y: self.frame_params.screen_dimensions.w.max(1),
@@ -656,7 +652,7 @@ struct ClusterDispatchArgsPassNode<'a> {
     count_buffer: BufferNodeId,
     dispatch_args: BufferNodeId,
     dispatch_args_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    dispatch_args_pipeline: &'a wgpu::ComputePipeline,
+    dispatch_args_pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
 
@@ -670,12 +666,15 @@ impl<'a> PassNode<'a> for ClusterDispatchArgsPassNode<'a> {
         );
     }
 
-    fn execute(&self, _ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Cluster Dispatch Args Pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(self.dispatch_args_pipeline);
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.dispatch_args_pipeline_id),
+        );
         pass.set_bind_group(
             0,
             self.bind_group.expect("Cluster dispatch args BG missing"),
@@ -691,7 +690,7 @@ struct ClusterLightViewPassNode<'a> {
     light_view_positions: BufferNodeId,
     indirect_dispatch_buffer: Option<BufferNodeId>,
     light_view_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    light_view_pipeline: &'a wgpu::ComputePipeline,
+    light_view_pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
     total_light_slots: u32,
 }
@@ -712,7 +711,10 @@ impl<'a> PassNode<'a> for ClusterLightViewPassNode<'a> {
             label: Some("Cluster Light View Pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(self.light_view_pipeline);
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.light_view_pipeline_id),
+        );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
         pass.set_bind_group(
             1,
@@ -740,7 +742,7 @@ struct ClusterCullPassNode<'a> {
     light_indices: BufferNodeId,
     light_index_allocator: BufferNodeId,
     cull_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    cull_pipeline: &'a wgpu::ComputePipeline,
+    cull_pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
     dispatch_grid_x: u32,
     dispatch_grid_y: u32,
@@ -775,7 +777,10 @@ impl<'a> PassNode<'a> for ClusterCullPassNode<'a> {
             label: Some("Cluster Cull Pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(self.cull_pipeline);
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.cull_pipeline_id),
+        );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
         pass.set_bind_group(1, self.bind_group.expect("Cluster cull BG missing"), &[]);
         pass.dispatch_workgroups(

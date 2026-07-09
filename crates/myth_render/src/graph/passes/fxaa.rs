@@ -143,7 +143,6 @@ impl FxaaFeature {
         // target_surface: TextureNodeId,
     ) -> TextureNodeId {
         let pipeline_id = self.pipeline_id.expect("FxaaFeature not prepared");
-        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
         let layout = self.bind_group_layout.as_ref().unwrap();
 
         ctx.graph.add_pass("FXAA_Pass", |builder| {
@@ -158,7 +157,7 @@ impl FxaaFeature {
             let node = FxaaPassNode {
                 input_tex: input_ldr,
                 output_tex: output,
-                pipeline,
+                pipeline_id,
                 layout,
                 transient_bg: None,
             };
@@ -174,7 +173,7 @@ impl FxaaFeature {
 struct FxaaPassNode<'a> {
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -203,7 +202,7 @@ impl<'a> PassNode<'a> for FxaaPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }

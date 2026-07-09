@@ -1075,10 +1075,6 @@ mod tests {
         )
     }
 
-    fn dummy_pipeline_cache() -> crate::pipeline::PipelineCache {
-        crate::pipeline::PipelineCache::new()
-    }
-
     // ─── Shared Mock Pass Type ───────────────────────────────────────
 
     struct MockExec;
@@ -1618,12 +1614,11 @@ mod tests {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
-        let pipeline_cache = dummy_pipeline_cache();
         let frame_config = dummy_config();
 
         let backbuffer = graph.register_texture("Backbuffer", dummy_desc(), true);
 
-        let mut ctx = GraphBuilderContext::new(&mut graph, &pipeline_cache, &frame_config, 0);
+        let mut ctx = GraphBuilderContext::new(&mut graph, &frame_config, 0);
 
         let scene_color = ctx.with_group("Scene", |ctx| {
             let opaque_out = ctx.graph.add_pass("Opaque", |builder| {
@@ -1664,12 +1659,11 @@ mod tests {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
-        let pipeline_cache = dummy_pipeline_cache();
         let frame_config = dummy_config();
 
         let backbuffer = graph.register_texture("Backbuffer", dummy_desc(), true);
 
-        let mut ctx = GraphBuilderContext::new(&mut graph, &pipeline_cache, &frame_config, 0);
+        let mut ctx = GraphBuilderContext::new(&mut graph, &frame_config, 0);
 
         let bloom_out = ctx.with_group("Bloom_System", |ctx| {
             let extract_out = ctx.graph.add_pass("Bloom_Extract", |builder| {

@@ -558,18 +558,15 @@ impl BloomFeature {
         let max_possible = ((bloom_w.max(bloom_h) as f32).log2().floor() as u32) + 1;
         let mip_count = max_mip_levels.min(max_possible).max(1) as usize;
 
-        let ds_pipeline = ctx.pipeline_cache.get_render_pipeline(
-            self.downsample_pipeline
-                .expect("BloomFeature: downsample pipeline not initialised"),
-        );
-        let us_pipeline = ctx.pipeline_cache.get_render_pipeline(
-            self.upsample_pipeline
-                .expect("BloomFeature: upsample pipeline not initialised"),
-        );
-        let comp_pipeline = ctx.pipeline_cache.get_render_pipeline(
-            self.composite_pipeline
-                .expect("BloomFeature: composite pipeline not initialised"),
-        );
+        let ds_pipeline_id = self
+            .downsample_pipeline
+            .expect("BloomFeature: downsample pipeline not initialised");
+        let us_pipeline_id = self
+            .upsample_pipeline
+            .expect("BloomFeature: upsample pipeline not initialised");
+        let comp_pipeline_id = self
+            .composite_pipeline
+            .expect("BloomFeature: composite pipeline not initialised");
 
         let karis_on_bg = self
             .karis_on_static_bg
@@ -615,7 +612,7 @@ impl BloomFeature {
                 let node = BloomDownsampleNode {
                     input_tex: input_color,
                     output_tex: out,
-                    pipeline: ds_pipeline,
+                    pipeline_id: ds_pipeline_id,
                     static_bg,
                     transient_layout: ds_transient_layout,
                     transient_bg: None,
@@ -651,7 +648,7 @@ impl BloomFeature {
                     let node = BloomDownsampleNode {
                         input_tex: input,
                         output_tex: out,
-                        pipeline: ds_pipeline,
+                        pipeline_id: ds_pipeline_id,
                         static_bg: karis_off_bg,
                         transient_layout: ds_transient_layout,
                         transient_bg: None,
@@ -676,7 +673,7 @@ impl BloomFeature {
                     let node = BloomUpsampleNode {
                         coarser_tex: coarser,
                         output_tex: out,
-                        pipeline: us_pipeline,
+                        pipeline_id: us_pipeline_id,
                         static_bg: upsample_bg,
                         transient_layout: us_transient_layout,
                         transient_bg: None,
@@ -704,7 +701,7 @@ impl BloomFeature {
                     original_tex: input_color,
                     bloom_tex: bloom_result,
                     output_tex: out,
-                    pipeline: comp_pipeline,
+                    pipeline_id: comp_pipeline_id,
                     static_bg: composite_bg,
                     transient_layout: comp_transient_layout,
                     transient_bg: None,
@@ -816,7 +813,7 @@ static UPSAMPLE_MIP_NAMES: [&str; 16] = [
 struct BloomDownsampleNode<'a> {
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     static_bg: &'a wgpu::BindGroup,
     transient_layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
@@ -846,7 +843,7 @@ impl<'a> PassNode<'a> for BloomDownsampleNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.static_bg, &[]);
         rpass.set_bind_group(1, transient_bg, &[]);
         rpass.draw(0..3, 0..1);
@@ -856,7 +853,7 @@ impl<'a> PassNode<'a> for BloomDownsampleNode<'a> {
 struct BloomUpsampleNode<'a> {
     coarser_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     static_bg: &'a wgpu::BindGroup,
     transient_layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
@@ -886,7 +883,7 @@ impl<'a> PassNode<'a> for BloomUpsampleNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.static_bg, &[]);
         rpass.set_bind_group(1, transient_bg, &[]);
         rpass.draw(0..3, 0..1);
@@ -897,7 +894,7 @@ struct BloomCompositeNode<'a> {
     original_tex: TextureNodeId,
     bloom_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     static_bg: &'a wgpu::BindGroup,
     transient_layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
@@ -928,7 +925,7 @@ impl<'a> PassNode<'a> for BloomCompositeNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.static_bg, &[]);
         rpass.set_bind_group(1, transient_bg, &[]);
         rpass.draw(0..3, 0..1);

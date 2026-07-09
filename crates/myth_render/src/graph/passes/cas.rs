@@ -184,7 +184,6 @@ impl CasFeature {
         input_color: TextureNodeId,
     ) -> TextureNodeId {
         let pipeline_id = self.pipeline_id.expect("CasFeature not prepared");
-        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
         let layout = self.bind_group_layout.as_ref().unwrap();
         let params_buffer = self.params_buffer.as_ref().unwrap();
 
@@ -212,7 +211,7 @@ impl CasFeature {
             let node = CasPassNode {
                 input_tex: input_color,
                 output_tex: output,
-                pipeline,
+                pipeline_id,
                 layout,
                 params_buffer,
                 transient_bg: None,
@@ -229,7 +228,7 @@ impl CasFeature {
 struct CasPassNode<'a> {
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     params_buffer: BufferNodeId,
     transient_bg: Option<&'a wgpu::BindGroup>,
@@ -260,7 +259,7 @@ impl<'a> PassNode<'a> for CasPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }

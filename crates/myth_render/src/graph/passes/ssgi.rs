@@ -825,22 +825,16 @@ impl SsgiFeature {
         pmrem_tex: Option<TextureNodeId>,
         taa_history_view: Option<Tracked<wgpu::TextureView>>,
     ) -> SsgiOutputs {
-        let raw_pipeline = ctx.pipeline_cache.get_render_pipeline(
-            self.raw_pipelines
-                .get(&self.prepared_max_steps)
-                .copied()
-                .expect("SSGI raw pipeline missing"),
-        );
-        let temporal_pipeline = ctx.pipeline_cache.get_render_pipeline(
-            self.temporal_pipeline
-                .expect("SSGI temporal pipeline missing"),
-        );
-        let atrous_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.atrous_pipeline.expect("SSGI A-Trous pipeline missing"));
-        let merge_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.merge_pipeline.expect("SSGI merge pipeline missing"));
+        let raw_pipeline_id = self
+            .raw_pipelines
+            .get(&self.prepared_max_steps)
+            .copied()
+            .expect("SSGI raw pipeline missing");
+        let temporal_pipeline_id = self
+            .temporal_pipeline
+            .expect("SSGI temporal pipeline missing");
+        let atrous_pipeline_id = self.atrous_pipeline.expect("SSGI A-Trous pipeline missing");
+        let merge_pipeline_id = self.merge_pipeline.expect("SSGI merge pipeline missing");
 
         let raw_layout = self.raw_layout.as_ref().unwrap();
         let temporal_layout = self.temporal_layout.as_ref().unwrap();
@@ -949,7 +943,7 @@ impl SsgiFeature {
                     blue_noise_view,
                     blue_noise_sampler,
                     output_tex: out,
-                    pipeline: raw_pipeline,
+                    pipeline_id: raw_pipeline_id,
                     layout: raw_layout,
                     transient_bg: None,
                 };
@@ -1004,7 +998,7 @@ impl SsgiFeature {
                         uniforms,
                         output_indirect: temporal_indirect,
                         output_meta: temporal_meta,
-                        pipeline: temporal_pipeline,
+                        pipeline_id: temporal_pipeline_id,
                         layout: temporal_layout,
                         transient_bg: None,
                     };
@@ -1047,7 +1041,7 @@ impl SsgiFeature {
                         variance_meta: temporal_meta,
                         uniforms,
                         output_tex: out,
-                        pipeline: atrous_pipeline,
+                        pipeline_id: atrous_pipeline_id,
                         layout: atrous_layout,
                         transient_bg: None,
                     };
@@ -1083,7 +1077,7 @@ impl SsgiFeature {
                     scene_normals,
                     uniforms,
                     output_tex: out,
-                    pipeline: merge_pipeline,
+                    pipeline_id: merge_pipeline_id,
                     layout: merge_layout,
                     transient_bg: None,
                 };
@@ -1167,7 +1161,7 @@ struct SsgiRawNode<'a> {
     blue_noise_view: &'a Tracked<wgpu::TextureView>,
     blue_noise_sampler: &'a Tracked<wgpu::Sampler>,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -1203,7 +1197,7 @@ impl<'a> PassNode<'a> for SsgiRawNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, global_bg, &[]);
         rpass.set_bind_group(1, self.transient_bg.expect("SSGI raw BG missing"), &[]);
         rpass.draw(0..3, 0..1);
@@ -1220,7 +1214,7 @@ struct SsgiTemporalNode<'a> {
     uniforms: BufferNodeId,
     output_indirect: TextureNodeId,
     output_meta: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -1257,7 +1251,7 @@ impl<'a> PassNode<'a> for SsgiTemporalNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.transient_bg.expect("SSGI temporal BG missing"), &[]);
         rpass.draw(0..3, 0..1);
     }
@@ -1270,7 +1264,7 @@ struct SsgiAtrousNode<'a> {
     variance_meta: TextureNodeId,
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -1301,7 +1295,7 @@ impl<'a> PassNode<'a> for SsgiAtrousNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.transient_bg.expect("SSGI A-Trous BG missing"), &[]);
         rpass.draw(0..3, 0..1);
     }
@@ -1315,7 +1309,7 @@ struct SsgiMergeNode<'a> {
     scene_normals: TextureNodeId,
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -1347,7 +1341,7 @@ impl<'a> PassNode<'a> for SsgiMergeNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.transient_bg.expect("SSGI merge BG missing"), &[]);
         rpass.draw(0..3, 0..1);
     }

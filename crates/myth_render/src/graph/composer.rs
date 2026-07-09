@@ -161,7 +161,6 @@ pub struct ComposerContext<'a> {
 
 pub struct GraphBuilderContext<'a, 'g> {
     pub graph: &'g mut RenderGraph<'a>,
-    pub pipeline_cache: &'a PipelineCache,
     pub frame_config: &'g FrameConfig,
     scene_local_light_count: u32,
 }
@@ -170,13 +169,11 @@ impl GraphBuilderContext<'_, '_> {
     #[inline]
     pub(crate) fn new<'a, 'g>(
         graph: &'g mut RenderGraph<'a>,
-        pipeline_cache: &'a PipelineCache,
         frame_config: &'g FrameConfig,
         scene_local_light_count: u32,
     ) -> GraphBuilderContext<'a, 'g> {
         GraphBuilderContext {
             graph,
-            pipeline_cache,
             frame_config,
             scene_local_light_count,
         }
@@ -509,7 +506,6 @@ impl<'a> FrameComposer<'a> {
 
         let mut graph_ctx = GraphBuilderContext::new(
             &mut graph,
-            self.ctx.pipeline_cache,
             &self.frame_config,
             self.ctx.extracted_scene.local_light_count() as u32,
         );
@@ -1122,7 +1118,7 @@ impl<'a> FrameComposer<'a> {
 
                     if let (Some(pipeline_id), Some(bg)) = (skybox_pipeline, skybox_bind_group) {
                         Some(PreparedSkyboxDraw {
-                            pipeline: self.ctx.pipeline_cache.get_render_pipeline(pipeline_id),
+                            pipeline_id,
                             bind_group: bg,
                             sampled_textures: procedural_skybox_dependencies,
                         })

@@ -108,9 +108,7 @@ impl BrdfLutFeature {
     }
 
     pub fn add_to_graph<'a>(&'a self, ctx: &mut GraphBuilderContext<'a, '_>) {
-        let pipeline = self
-            .pipeline_id
-            .map(|id| ctx.pipeline_cache.get_compute_pipeline(id));
+        let pipeline_id = self.pipeline_id;
         let bind_group = self.bind_group.as_ref();
         let active = self.active;
 
@@ -118,7 +116,7 @@ impl BrdfLutFeature {
             builder.mark_side_effect();
             (
                 BrdfLutPassNode {
-                    pipeline,
+                    pipeline_id,
                     bind_group,
                     active,
                 },
@@ -129,13 +127,13 @@ impl BrdfLutFeature {
 }
 
 struct BrdfLutPassNode<'a> {
-    pipeline: Option<&'a wgpu::ComputePipeline>,
+    pipeline_id: Option<ComputePipelineId>,
     bind_group: Option<&'a wgpu::BindGroup>,
     active: bool,
 }
 
 impl PassNode<'_> for BrdfLutPassNode<'_> {
-    fn execute(&self, _ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         if !self.active {
             return;
         }
@@ -144,7 +142,9 @@ impl PassNode<'_> for BrdfLutPassNode<'_> {
             return;
         };
 
-        let pipeline = self.pipeline.expect("BRDF LUT pipeline must exist");
+        let pipeline = ctx
+            .pipeline_cache
+            .get_compute_pipeline(self.pipeline_id.expect("BRDF LUT pipeline must exist"));
 
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("BRDF LUT"),

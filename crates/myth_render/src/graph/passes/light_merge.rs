@@ -160,10 +160,9 @@ impl LightMergeFeature {
             .layout
             .as_ref()
             .expect("Light merge layout must exist before graph build");
-        let pipeline = ctx.pipeline_cache.get_compute_pipeline(
-            self.pipeline
-                .expect("Light merge pipeline must exist before graph build"),
-        );
+        let pipeline_id = self
+            .pipeline
+            .expect("Light merge pipeline must exist before graph build");
 
         ctx.with_group("Merge_Local_Lights", |ctx| {
             ctx.graph.add_pass("Merge_Local_Lights", |builder| {
@@ -199,7 +198,7 @@ impl LightMergeFeature {
                         merged_indirect_count,
                         merged_capacity,
                         layout,
-                        pipeline,
+                        pipeline_id,
                         bind_group: None,
                     },
                     LightMergePassOutputs {
@@ -223,7 +222,7 @@ struct LightMergePassNode<'a> {
     merged_indirect_count: BufferNodeId,
     merged_capacity: u32,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
-    pipeline: &'a wgpu::ComputePipeline,
+    pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
 
@@ -242,12 +241,12 @@ impl<'a> PassNode<'a> for LightMergePassNode<'a> {
         );
     }
 
-    fn execute(&self, _ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Light Merge Pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(self.pipeline);
+        pass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
         pass.set_bind_group(0, self.bind_group.expect("Light merge BG missing"), &[]);
         pass.dispatch_workgroups(self.merged_capacity.div_ceil(LIGHT_MERGE_WG_SIZE), 1, 1);
     }

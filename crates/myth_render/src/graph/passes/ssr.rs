@@ -540,22 +540,16 @@ impl SsrFeature {
         specular_mrt: TextureNodeId,
     ) -> SsrOutputs {
         let trace_diagnostics_enabled = self.prepared_trace_diagnostics;
-        let raw_pipeline = ctx.pipeline_cache.get_render_pipeline(
-            self.raw_pipelines
-                .get(&(self.prepared_max_steps, trace_diagnostics_enabled))
-                .copied()
-                .expect("SSR trace pipeline missing"),
-        );
-        let temporal_pipeline = ctx.pipeline_cache.get_render_pipeline(
-            self.temporal_pipeline
-                .expect("SSR temporal pipeline missing"),
-        );
-        let spatial_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.spatial_pipeline.expect("SSR spatial pipeline missing"));
-        let merge_pipeline = ctx
-            .pipeline_cache
-            .get_render_pipeline(self.merge_pipeline.expect("SSR merge pipeline missing"));
+        let raw_pipeline_id = self
+            .raw_pipelines
+            .get(&(self.prepared_max_steps, trace_diagnostics_enabled))
+            .copied()
+            .expect("SSR trace pipeline missing");
+        let temporal_pipeline_id = self
+            .temporal_pipeline
+            .expect("SSR temporal pipeline missing");
+        let spatial_pipeline_id = self.spatial_pipeline.expect("SSR spatial pipeline missing");
+        let merge_pipeline_id = self.merge_pipeline.expect("SSR merge pipeline missing");
 
         let raw_layout = self.raw_layout.as_ref().unwrap();
         let temporal_layout = self.temporal_layout.as_ref().unwrap();
@@ -625,7 +619,7 @@ impl SsrFeature {
                         blue_noise_sampler,
                         output_reflection: out,
                         output_diagnostic: diag_out,
-                        pipeline: raw_pipeline,
+                        pipeline_id: raw_pipeline_id,
                         layout: raw_layout,
                         transient_bg: None,
                     };
@@ -682,7 +676,7 @@ impl SsrFeature {
                         uniforms,
                         output_reflection: temporal_reflection,
                         output_meta: temporal_meta,
-                        pipeline: temporal_pipeline,
+                        pipeline_id: temporal_pipeline_id,
                         layout: temporal_layout,
                         transient_bg: None,
                     };
@@ -716,7 +710,7 @@ impl SsrFeature {
                     material_mrt,
                     uniforms,
                     output_tex: out,
-                    pipeline: spatial_pipeline,
+                    pipeline_id: spatial_pipeline_id,
                     layout: spatial_layout,
                     transient_bg: None,
                 };
@@ -753,7 +747,7 @@ impl SsrFeature {
                     scene_normals,
                     uniforms,
                     output_tex: out,
-                    pipeline: merge_pipeline,
+                    pipeline_id: merge_pipeline_id,
                     layout: merge_layout,
                     transient_bg: None,
                 };
@@ -867,7 +861,7 @@ struct SsrTraceNode<'a> {
     blue_noise_sampler: &'a Tracked<wgpu::Sampler>,
     output_reflection: TextureNodeId,
     output_diagnostic: Option<TextureNodeId>,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -911,7 +905,7 @@ impl<'a> PassNode<'a> for SsrTraceNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, global_bg, &[]);
         rpass.set_bind_group(1, self.transient_bg.expect("SSR trace BG missing"), &[]);
         rpass.draw(0..3, 0..1);
@@ -929,7 +923,7 @@ struct SsrTemporalNode<'a> {
     uniforms: BufferNodeId,
     output_reflection: TextureNodeId,
     output_meta: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -968,7 +962,7 @@ impl<'a> PassNode<'a> for SsrTemporalNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, global_bg, &[]);
         rpass.set_bind_group(1, self.transient_bg.expect("SSR temporal BG missing"), &[]);
         rpass.draw(0..3, 0..1);
@@ -982,7 +976,7 @@ struct SsrSpatialNode<'a> {
     material_mrt: TextureNodeId,
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -1014,7 +1008,7 @@ impl<'a> PassNode<'a> for SsrSpatialNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, self.transient_bg.expect("SSR spatial BG missing"), &[]);
         rpass.draw(0..3, 0..1);
     }
@@ -1029,7 +1023,7 @@ struct SsrMergeNode<'a> {
     scene_normals: TextureNodeId,
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -1064,7 +1058,7 @@ impl<'a> PassNode<'a> for SsrMergeNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, global_bg, &[]);
         rpass.set_bind_group(1, self.transient_bg.expect("SSR merge BG missing"), &[]);
         rpass.draw(0..3, 0..1);

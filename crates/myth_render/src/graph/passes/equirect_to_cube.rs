@@ -313,13 +313,9 @@ impl EquirectToCubeFeature {
             return None;
         }
 
-        let pipeline = match source_type {
-            CubeSourceType::Equirectangular => self
-                .equirect_pipeline_id
-                .map(|id| ctx.pipeline_cache.get_compute_pipeline(id)),
-            CubeSourceType::Cubemap => self
-                .cubemap_pipeline_id
-                .map(|id| ctx.pipeline_cache.get_compute_pipeline(id)),
+        let pipeline_id = match source_type {
+            CubeSourceType::Equirectangular => self.equirect_pipeline_id,
+            CubeSourceType::Cubemap => self.cubemap_pipeline_id,
             CubeSourceType::Procedural => None,
         };
 
@@ -332,7 +328,7 @@ impl EquirectToCubeFeature {
             builder.write_texture(base_cube);
             let node = EquirectToCubePassNode {
                 base_cube,
-                pipeline,
+                pipeline_id,
                 bind_group: &state.bind_group,
             };
             (node, ())
@@ -344,15 +340,16 @@ impl EquirectToCubeFeature {
 
 struct EquirectToCubePassNode<'a> {
     base_cube: TextureNodeId,
-    pipeline: Option<&'a wgpu::ComputePipeline>,
+    pipeline_id: Option<ComputePipelineId>,
     bind_group: &'a wgpu::BindGroup,
 }
 
 impl PassNode<'_> for EquirectToCubePassNode<'_> {
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let pipeline = self
-            .pipeline
-            .expect("environment source pipeline must exist");
+        let pipeline = ctx.pipeline_cache.get_compute_pipeline(
+            self.pipeline_id
+                .expect("environment source pipeline must exist"),
+        );
         let group_count = ctx.get_texture(self.base_cube).width().div_ceil(8);
 
         {

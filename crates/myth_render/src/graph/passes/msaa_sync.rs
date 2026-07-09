@@ -176,13 +176,12 @@ impl MsaaSyncFeature {
             .register_texture("Scene_Color_MSAA", msaa_color_desc, false);
 
         let pipeline_id = self.pipeline_id.expect("MsaaSyncFeature not prepared");
-        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
         let layout = self.bind_group_layout.as_ref().unwrap();
 
         let node = MsaaSyncPassNode {
             src_hdr,
             dst_msaa,
-            pipeline,
+            pipeline_id,
             layout,
             transient_bg: None,
         };
@@ -202,7 +201,7 @@ impl MsaaSyncFeature {
 struct MsaaSyncPassNode<'a> {
     src_hdr: TextureNodeId,
     dst_msaa: TextureNodeId,
-    pipeline: &'a wgpu::RenderPipeline,
+    pipeline_id: RenderPipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
@@ -231,7 +230,7 @@ impl<'a> PassNode<'a> for MsaaSyncPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(self.pipeline);
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
         rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }
