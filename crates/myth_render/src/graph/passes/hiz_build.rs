@@ -6,8 +6,7 @@
 use crate::core::gpu::Tracked;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, PrepareContext, SubViewKey, TextureDesc,
-    TextureNodeId,
+    ExecuteContext, PassNode, PrepareContext, SubViewKey, TextureDesc, TextureNodeId,
 };
 use crate::pipeline::{
     ComputePipelineId, ComputePipelineKey, ShaderCompilationOptions, ShaderSource,
@@ -41,14 +40,9 @@ impl HiZFeature {
         }
     }
 
-    pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext) {
-        self.ensure_layouts(ctx.device);
-        self.ensure_pipelines(ctx);
-    }
-
     #[must_use]
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
         scene_depth: TextureNodeId,
     ) -> TextureNodeId {
@@ -63,16 +57,6 @@ impl HiZFeature {
             HIZ_FORMAT,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
         );
-
-        let init_pipeline_id = self.init_pipeline.expect("Hi-Z init pipeline missing");
-        let downsample_pipeline_id = self
-            .downsample_pipeline
-            .expect("Hi-Z downsample pipeline missing");
-        let init_layout = self.init_layout.as_ref().expect("Hi-Z init layout missing");
-        let downsample_layout = self
-            .downsample_layout
-            .as_ref()
-            .expect("Hi-Z downsample layout missing");
 
         ctx.graph.add_pass("HiZ_Build", |builder| {
             builder.read_texture(scene_depth);
@@ -93,12 +77,9 @@ impl HiZFeature {
             let mip_states = builder.graph.alloc_slice_mut(&mip_states);
 
             let node = HiZBuildNode {
+                feature: self,
                 scene_depth,
                 hiz_texture,
-                init_pipeline_id,
-                downsample_pipeline_id,
-                init_layout,
-                downsample_layout,
                 init_bg: None,
                 mips: mip_states,
             };
@@ -168,7 +149,7 @@ impl HiZFeature {
         self.downsample_layout = Some(Tracked::new(downsample_layout));
     }
 
-    fn ensure_pipelines(&mut self, ctx: &mut ExtractContext) {
+    fn ensure_pipelines(&mut self, ctx: &mut PrepareContext<'_>) {
         if self.init_pipeline.is_none() {
             let (module, shader_hash) = ctx.shader_manager.get_or_compile(
                 ctx.device,
@@ -229,18 +210,28 @@ struct HiZMipState<'a> {
 }
 
 struct HiZBuildNode<'a> {
+    feature: &'a mut HiZFeature,
     scene_depth: TextureNodeId,
     hiz_texture: TextureNodeId,
-    init_pipeline_id: ComputePipelineId,
-    downsample_pipeline_id: ComputePipelineId,
-    init_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    downsample_layout: &'a Tracked<wgpu::BindGroupLayout>,
     init_bg: Option<&'a wgpu::BindGroup>,
     mips: &'a mut [HiZMipState<'a>],
 }
 
 impl<'a> PassNode<'a> for HiZBuildNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.ensure_layouts(ctx.device);
+        self.feature.ensure_pipelines(ctx);
+        let init_layout = self
+            .feature
+            .init_layout
+            .as_ref()
+            .expect("Hi-Z init layout must exist after prepare");
+        let downsample_layout = self
+            .feature
+            .downsample_layout
+            .as_ref()
+            .expect("Hi-Z downsample layout must exist after prepare");
+
         let mip0 = ctx
             .views
             .get_or_create_sub_view(
@@ -255,7 +246,7 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
             .clone();
 
         self.init_bg = Some(
-            ctx.build_bind_group(self.init_layout, Some("Hi-Z Init BG"))
+            ctx.build_bind_group(init_layout, Some("Hi-Z Init BG"))
                 .bind_texture(0, self.scene_depth)
                 .bind_tracked_texture_view(1, &mip0)
                 .build(),
@@ -288,7 +279,7 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
                 .clone();
 
             mip.bind_group = Some(
-                ctx.build_bind_group(self.downsample_layout, Some("Hi-Z Downsample BG"))
+                ctx.build_bind_group(downsample_layout, Some("Hi-Z Downsample BG"))
                     .bind_tracked_texture_view(0, &src_view)
                     .bind_tracked_texture_view(1, &dst_view)
                     .build(),
@@ -297,6 +288,14 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+        let init_pipeline_id = self
+            .feature
+            .init_pipeline
+            .expect("Hi-Z init pipeline must exist after prepare");
+        let downsample_pipeline_id = self
+            .feature
+            .downsample_pipeline
+            .expect("Hi-Z downsample pipeline must exist after prepare");
         let hiz_texture = ctx.get_texture(self.hiz_texture);
         let full_w = hiz_texture.width();
         let full_h = hiz_texture.height();
@@ -306,10 +305,7 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
             timestamp_writes: None,
         });
 
-        init_pass.set_pipeline(
-            ctx.pipeline_cache
-                .get_compute_pipeline(self.init_pipeline_id),
-        );
+        init_pass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(init_pipeline_id));
         init_pass.set_bind_group(0, self.init_bg.expect("Hi-Z init BG missing"), &[]);
         init_pass.dispatch_workgroups(
             full_w.div_ceil(HIZ_WORKGROUP_SIZE),
@@ -325,7 +321,7 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
             });
             downsample_pass.set_pipeline(
                 ctx.pipeline_cache
-                    .get_compute_pipeline(self.downsample_pipeline_id),
+                    .get_compute_pipeline(downsample_pipeline_id),
             );
             downsample_pass.set_bind_group(0, mip.bind_group.expect("Hi-Z mip BG missing"), &[]);
             downsample_pass.dispatch_workgroups(

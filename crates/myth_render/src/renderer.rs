@@ -465,7 +465,6 @@ impl Renderer {
                 .extracted_scene
                 .scene_variants
                 .contains(SceneFeatures::USE_SSR);
-            let needs_scene_hiz = ssgi_enabled || ssr_enabled;
             let needs_feature_id = is_hf && (scene.ssss.enabled || ssr_enabled);
 
             // Sync camera debug settings → RenderState before borrowing it.
@@ -589,21 +588,6 @@ impl Renderer {
                         self.size,
                         HDR_TEXTURE_FORMAT,
                     );
-
-                    if taa_settins.sharpen_intensity > 0.0 {
-                        state.cas_pass.extract_and_prepare(
-                            &mut extract_ctx,
-                            taa_settins.sharpen_intensity,
-                            HDR_TEXTURE_FORMAT,
-                        );
-                    }
-                }
-
-                if let Some(fxaa_settings) = camera.aa_mode.fxaa_settings() {
-                    state.fxaa_pass.target_quality = fxaa_settings.quality();
-                    state
-                        .fxaa_pass
-                        .extract_and_prepare(&mut extract_ctx, view_format);
                 }
 
                 state.prepass.extract_and_prepare(
@@ -612,10 +596,6 @@ impl Renderer {
                     needs_feature_id,
                     needs_velocity,
                 );
-
-                if needs_scene_hiz {
-                    state.hiz_pass.extract_and_prepare(&mut extract_ctx);
-                }
 
                 if ssao_enabled {
                     state
@@ -664,16 +644,6 @@ impl Renderer {
                 }
 
                 state.ssss_pass.extract_and_prepare(&mut extract_ctx);
-
-                // MSAA Sync — needed when SSSS modifies the resolved HDR
-                // buffer and subsequent passes re-enter the MSAA context.
-                let msaa = state.wgpu_ctx.msaa_samples;
-                let needs_specular = scene.ssss.enabled;
-                if msaa > 1 && needs_specular {
-                    state
-                        .msaa_sync_pass
-                        .extract_and_prepare(&mut extract_ctx, msaa);
-                }
 
                 if bloom_enabled {
                     state.bloom_pass.extract_and_prepare(

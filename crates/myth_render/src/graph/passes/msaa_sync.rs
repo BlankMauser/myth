@@ -33,8 +33,7 @@ use crate::HDR_TEXTURE_FORMAT;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc,
-    TextureNodeId,
+    ExecuteContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, MultisampleKey, RenderPipelineId,
@@ -48,6 +47,11 @@ type MsaaSyncCacheKey = u32;
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Feature (long-lived)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[derive(Debug, Clone, Copy)]
+pub struct MsaaSyncSnapshot {
+    msaa_samples: u32,
+}
 
 /// Long-lived MSAA sync feature — owns the blit pipeline and bind group
 /// layout.  Produces an ephemeral [`MsaaSyncPassNode`] each frame via
@@ -74,10 +78,15 @@ impl MsaaSyncFeature {
         }
     }
 
-    /// Pre-RDG resource preparation: create layout, compile MSAA-aware
-    /// blit pipeline.
-    pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext, msaa_samples: u32) {
+    #[must_use]
+    pub fn extract(&self, msaa_samples: u32) -> MsaaSyncSnapshot {
         debug_assert!(msaa_samples > 1, "MsaaSyncFeature requires MSAA");
+        MsaaSyncSnapshot { msaa_samples }
+    }
+
+    /// Materialize the MSAA-aware blit pipeline after the node survives DPE.
+    fn prepare_resources(&mut self, ctx: &mut PrepareContext<'_>, snapshot: MsaaSyncSnapshot) {
+        let msaa_samples = snapshot.msaa_samples;
 
         let device = ctx.device;
 
@@ -156,8 +165,9 @@ impl MsaaSyncFeature {
     /// - `src_hdr`: single-sample `Scene_Color_HDR` (read).
     /// - `dst_msaa`: multi-sampled `Scene_Color_MSAA` (write).
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: MsaaSyncSnapshot,
         src_hdr: TextureNodeId,
     ) -> TextureNodeId {
         let msaa_color_desc = TextureDesc::new(
@@ -165,7 +175,7 @@ impl MsaaSyncFeature {
             ctx.frame_config.height,
             1,
             1,
-            ctx.frame_config.msaa_samples,
+            snapshot.msaa_samples,
             wgpu::TextureDimension::D2,
             HDR_TEXTURE_FORMAT,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -175,14 +185,11 @@ impl MsaaSyncFeature {
             .graph
             .register_texture("Scene_Color_MSAA", msaa_color_desc, false);
 
-        let pipeline_id = self.pipeline_id.expect("MsaaSyncFeature not prepared");
-        let layout = self.bind_group_layout.as_ref().unwrap();
-
         let node = MsaaSyncPassNode {
+            feature: self,
+            snapshot,
             src_hdr,
             dst_msaa,
-            pipeline_id,
-            layout,
             transient_bg: None,
         };
         ctx.graph.add_pass("Msaa_Sync_Pass", |builder| {
@@ -199,17 +206,23 @@ impl MsaaSyncFeature {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 struct MsaaSyncPassNode<'a> {
+    feature: &'a mut MsaaSyncFeature,
+    snapshot: MsaaSyncSnapshot,
     src_hdr: TextureNodeId,
     dst_msaa: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for MsaaSyncPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.prepare_resources(ctx, self.snapshot);
+        let layout = self
+            .feature
+            .bind_group_layout
+            .as_ref()
+            .expect("MSAA sync layout must exist after prepare");
         self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.layout, Some("MSAA Sync BindGroup"), [
+            crate::myth_bind_group!(ctx, layout, Some("MSAA Sync BindGroup"), [
                 0 => self.src_hdr,
                 1 => CommonSampler::LinearClamp,
             ]),
@@ -218,6 +231,10 @@ impl<'a> PassNode<'a> for MsaaSyncPassNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut CommandEncoder) {
         let bind_group = self.transient_bg.expect("MSAA Sync BG not prepared");
+        let pipeline_id = self
+            .feature
+            .pipeline_id
+            .expect("MSAA sync pipeline must exist after prepare");
 
         let rtt = ctx.get_color_attachment(self.dst_msaa, RenderTargetOps::DontCare, None);
 
@@ -230,7 +247,7 @@ impl<'a> PassNode<'a> for MsaaSyncPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(pipeline_id));
         rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }

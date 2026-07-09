@@ -849,8 +849,14 @@ impl<'a> FrameComposer<'a> {
                             if is_msaa {
                                 // If MSAA is enabled, synchronize the SSSS output back to an MSAA texture for downstream passes (Skybox, Transparent) that expect MSAA input.
                                 // This avoids redundant MSAA resolve + re-multisample operations.
+                                let snapshot = self
+                                    .ctx
+                                    .msaa_sync_pass
+                                    .extract(self.frame_config.msaa_samples);
                                 active_color =
-                                    self.ctx.msaa_sync_pass.add_to_graph(c, active_color);
+                                    self.ctx
+                                        .msaa_sync_pass
+                                        .add_to_graph(c, snapshot, active_color);
                             }
                         }
 
@@ -944,7 +950,18 @@ impl<'a> FrameComposer<'a> {
                                 // ── 6b. CAS (Contrast Adaptive Sharpening) ────────────
                                 // Recover fine detail lost to temporal filtering.
                                 if cas_enabled {
-                                    active_color = self.ctx.cas_pass.add_to_graph(c, active_color);
+                                    let taa_settings = self
+                                        .ctx
+                                        .camera
+                                        .aa_mode
+                                        .taa_settings()
+                                        .expect("CAS requires TAA settings");
+                                    let snapshot = self.ctx.cas_pass.extract(
+                                        taa_settings.sharpen_intensity,
+                                        self.frame_config.hdr_format,
+                                    );
+                                    active_color =
+                                        self.ctx.cas_pass.add_to_graph(c, snapshot, active_color);
                                 }
                             });
                         }
@@ -1041,7 +1058,17 @@ impl<'a> FrameComposer<'a> {
                     // FXAA: anti-alias the LDR result into a second transient
                     // target.
                     if fxaa_enabled {
-                        active_color = self.ctx.fxaa_pass.add_to_graph(ctx, active_color);
+                        let fxaa_settings = self
+                            .ctx
+                            .camera
+                            .aa_mode
+                            .fxaa_settings()
+                            .expect("FXAA settings must exist when FXAA is enabled");
+                        let snapshot = self
+                            .ctx
+                            .fxaa_pass
+                            .extract(fxaa_settings.quality(), self.frame_config.surface_format);
+                        active_color = self.ctx.fxaa_pass.add_to_graph(ctx, snapshot, active_color);
                     }
 
                     bb_scene_color = Some(active_color);

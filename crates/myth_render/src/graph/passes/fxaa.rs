@@ -1,14 +1,15 @@
 //! FXAA Feature + Ephemeral PassNode
 //!
-//! - **`FxaaFeature`** (long-lived): owns pipeline cache, bind group layout.
-//!   `extract_and_prepare()` compiles pipelines for the target quality/format.
+//! - **`FxaaFeature`** (long-lived): owns pipeline cache and bind group layout.
+//!   `extract()` returns the quality/format snapshot; pipeline creation is
+//!   deferred until the pass survives graph compilation.
 //! - **`FxaaPassNode`** (ephemeral per-frame): carries lightweight IDs and
 //!   a transient bind-group slot.  Created by `FxaaFeature::add_to_graph()`.
 
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, PrepareContext, RenderTargetOps, TextureNodeId,
+    ExecuteContext, PassNode, PrepareContext, RenderTargetOps, TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
@@ -22,10 +23,13 @@ type FxaaL1CacheKey = (FxaaQuality, wgpu::TextureFormat);
 // Feature (long-lived, stored in RenderFeatures)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-pub struct FxaaFeature {
-    /// Target FXAA quality — set by the caller before extract_and_prepare.
-    pub target_quality: FxaaQuality,
+#[derive(Debug, Clone, Copy)]
+pub struct FxaaSnapshot {
+    quality: FxaaQuality,
+    output_format: wgpu::TextureFormat,
+}
 
+pub struct FxaaFeature {
     // ─── Persistent Cache ──────────────────────────────────────────
     l1_cache_key: Option<FxaaL1CacheKey>,
     pipeline_id: Option<RenderPipelineId>,
@@ -42,19 +46,26 @@ impl FxaaFeature {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            target_quality: FxaaQuality::High,
             l1_cache_key: None,
             pipeline_id: None,
             bind_group_layout: None,
         }
     }
 
-    /// Pre-RDG resource preparation: create layout, compile pipeline.
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
+    #[must_use]
+    pub const fn extract(
+        &self,
+        quality: FxaaQuality,
         output_format: wgpu::TextureFormat,
-    ) {
+    ) -> FxaaSnapshot {
+        FxaaSnapshot {
+            quality,
+            output_format,
+        }
+    }
+
+    /// Materialize persistent resources after the node survives DPE.
+    fn prepare_resources(&mut self, ctx: &mut PrepareContext<'_>, snapshot: FxaaSnapshot) {
         // ── 1. Lazy-create BindGroupLayout (once) ──────────────────
         if self.bind_group_layout.is_none() {
             let layout = ctx
@@ -84,12 +95,12 @@ impl FxaaFeature {
         }
 
         // ── 2. L1 Cache: compile pipeline on quality/format change ─
-        let current_key = (self.target_quality, output_format);
+        let current_key = (snapshot.quality, snapshot.output_format);
 
         if self.l1_cache_key != Some(current_key) {
             let mut options = ShaderCompilationOptions::default();
-            if self.target_quality != FxaaQuality::Medium {
-                options.add_define(self.target_quality.define_key(), "1");
+            if snapshot.quality != FxaaQuality::Medium {
+                options.add_define(snapshot.quality.define_key(), "1");
             }
 
             let (shader_module, shader_hash) = ctx.shader_manager.get_or_compile(
@@ -99,7 +110,7 @@ impl FxaaFeature {
             );
 
             let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: output_format,
+                format: snapshot.output_format,
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             });
@@ -123,7 +134,7 @@ impl FxaaFeature {
                 shader_module,
                 &pipeline_layout,
                 &key,
-                &format!("FXAA Pipeline {:?}", self.target_quality),
+                &format!("FXAA Pipeline {:?}", snapshot.quality),
             );
             self.pipeline_id = Some(id);
             self.l1_cache_key = Some(current_key);
@@ -137,14 +148,12 @@ impl FxaaFeature {
     /// updated surface handle. This enforces a pure dataflow chain where
     /// every Feature explicitly produces a new resource version.
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: FxaaSnapshot,
         input_ldr: TextureNodeId,
         // target_surface: TextureNodeId,
     ) -> TextureNodeId {
-        let pipeline_id = self.pipeline_id.expect("FxaaFeature not prepared");
-        let layout = self.bind_group_layout.as_ref().unwrap();
-
         ctx.graph.add_pass("FXAA_Pass", |builder| {
             builder.read_texture(input_ldr);
             // let output = builder.write_texture(target_surface);
@@ -155,10 +164,10 @@ impl FxaaFeature {
             let output = builder.create_texture("LDR_Antialiased", out_desc);
 
             let node = FxaaPassNode {
+                feature: self,
+                snapshot,
                 input_tex: input_ldr,
                 output_tex: output,
-                pipeline_id,
-                layout,
                 transient_bg: None,
             };
             (node, output)
@@ -171,17 +180,23 @@ impl FxaaFeature {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 struct FxaaPassNode<'a> {
+    feature: &'a mut FxaaFeature,
+    snapshot: FxaaSnapshot,
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for FxaaPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.prepare_resources(ctx, self.snapshot);
+        let layout = self
+            .feature
+            .bind_group_layout
+            .as_ref()
+            .expect("FXAA layout must exist after prepare");
         self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.layout, Some("FXAA BindGroup"), [
+            crate::myth_bind_group!(ctx, layout, Some("FXAA BindGroup"), [
                 0 => self.input_tex,
                 1 => CommonSampler::LinearClamp,
             ]),
@@ -190,6 +205,10 @@ impl<'a> PassNode<'a> for FxaaPassNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut CommandEncoder) {
         let bind_group = self.transient_bg.expect("FXAA BG not prepared!");
+        let pipeline_id = self
+            .feature
+            .pipeline_id
+            .expect("FXAA pipeline must exist after prepare");
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
 
@@ -202,7 +221,7 @@ impl<'a> PassNode<'a> for FxaaPassNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
+        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(pipeline_id));
         rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }
