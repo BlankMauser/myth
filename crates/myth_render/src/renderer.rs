@@ -12,6 +12,7 @@ use crate::graph::core::HistoryRegistry;
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 use crate::graph::core::graph::GraphStorage;
+use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
 use crate::graph::frame::{RenderFrameFeatureConfig, RenderLists};
 #[cfg(feature = "debug_view")]
 use crate::graph::passes::DebugViewFeature;
@@ -40,8 +41,6 @@ use crate::pipeline::{
     ShaderSource,
 };
 use crate::settings::{ClusteredShadingMode, RenderPath, RendererInitConfig, RendererSettings};
-
-const SSGI_HISTORY_FLAG_CAMERA_CUT: u32 = 1 << 2;
 
 fn build_pipeline_layout(
     device: &wgpu::Device,
@@ -588,26 +587,6 @@ impl Renderer {
                     needs_velocity,
                 );
 
-                if ssgi_enabled {
-                    scene.ssgi.update_resolution(self.size.0, self.size.1);
-                    scene.ssgi.set_frame_index(frame_time.frame_count as u32);
-                    scene.ssgi.set_runtime_camera_near(camera.near);
-
-                    let mut ssgi_history_flags = state.ssgi_pass.history_flags();
-                    if camera.camera_cut != 0 {
-                        ssgi_history_flags |= SSGI_HISTORY_FLAG_CAMERA_CUT;
-                    }
-                    scene.ssgi.set_history_flags(ssgi_history_flags);
-                    state.ssgi_pass.extract_and_prepare(
-                        &mut extract_ctx,
-                        &scene.ssgi.uniforms,
-                        self.size,
-                    );
-                } else {
-                    state.ssgi_pass.invalidate_history();
-                    scene.ssgi.set_history_flags(0);
-                }
-
                 state.tone_map_pass.extract_and_prepare(
                     &mut extract_ctx,
                     scene.tone_mapping.mode,
@@ -696,6 +675,37 @@ impl Renderer {
             state.render_frame.maybe_prune(&mut state.resource_manager);
             // Evict stale bind groups that haven't been touched recently.
             state.global_bind_group_cache.garbage_collect();
+
+            // Feature maps own logical history-domain liveness; retiring one
+            // atomically removes its set and both physical banks. RenderState
+            // is touched for every active camera, so with the same TTL it can
+            // never expire while an associated feature history remains live.
+            let current_frame = state.resource_manager.frame_index();
+            let taa_domains = state.taa_pass.garbage_collect(
+                &mut state.history_registry,
+                current_frame,
+                TEMPORAL_DOMAIN_TTL_FRAMES,
+            );
+            let ssr_domains = state.ssr_pass.garbage_collect(
+                &mut state.history_registry,
+                current_frame,
+                TEMPORAL_DOMAIN_TTL_FRAMES,
+            );
+            let ssgi_domains = state.ssgi_pass.garbage_collect(
+                &mut state.history_registry,
+                current_frame,
+                TEMPORAL_DOMAIN_TTL_FRAMES,
+            );
+            let view_domains = state
+                .render_frame
+                .render_state
+                .garbage_collect_temporal_views(current_frame, TEMPORAL_DOMAIN_TTL_FRAMES);
+
+            if taa_domains + ssr_domains + ssgi_domains + view_domains > 0 {
+                log::debug!(
+                    "Temporal GC: retired {taa_domains} TAA, {ssr_domains} SSR, {ssgi_domains} SSGI, and {view_domains} previous-view domains"
+                );
+            }
         }
     }
 

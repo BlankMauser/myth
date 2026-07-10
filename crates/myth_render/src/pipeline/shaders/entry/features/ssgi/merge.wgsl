@@ -11,6 +11,15 @@
 @group(0) @binding(6) var s_point: sampler;
 @group(0) @binding(7) var<uniform> u_ssgi: SsgiUniforms;
 
+struct MergeOutput {
+    @location(0) merged_color: vec4<f32>,
+    @location(1) source_history: vec4<f32>,
+};
+
+fn make_merge_output(color: vec4<f32>) -> MergeOutput {
+    return MergeOutput(color, color);
+}
+
 fn saturate(v: f32) -> f32 {
     return clamp(v, 0.0, 1.0);
 }
@@ -38,7 +47,7 @@ fn resolve_full_uv(half_pixel: vec2<u32>) -> vec2<f32> {
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> MergeOutput {
     let scene_color = textureSampleLevel(t_scene_color, s_point, in.uv, 0.0);
     let material_data = textureSampleLevel(t_material_data, s_point, in.uv, 0.0);
     let albedo = material_data.rgb;
@@ -46,7 +55,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let full_depth = textureSampleLevel(t_depth, s_point, in.uv, 0u);
     let full_normal_packed = textureSampleLevel(t_normal, s_point, in.uv, 0.0);
     if (full_depth <= 0.0 || full_normal_packed.a < 0.5) {
-        return scene_color;
+        return make_merge_output(scene_color);
     }
 
     let full_linear = linearize_depth(full_depth);
@@ -100,14 +109,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         );
         let nearest_indirect = textureLoad(t_clean_indirect, nearest_coord, 0);
         if (nearest_indirect.a <= 0.0) {
-            return scene_color;
+            return make_merge_output(scene_color);
         }
 
         let contribution = nearest_indirect.rgb * albedo * u_ssgi.ray_params.x;
-        return vec4<f32>(scene_color.rgb + contribution, scene_color.a);
+        return make_merge_output(vec4<f32>(scene_color.rgb + contribution, scene_color.a));
     }
 
     let indirect = sum_color / sum_weight;
     let contribution = indirect * albedo * u_ssgi.ray_params.x;
-    return vec4<f32>(scene_color.rgb + contribution, scene_color.a);
+    return make_merge_output(vec4<f32>(scene_color.rgb + contribution, scene_color.a));
 }

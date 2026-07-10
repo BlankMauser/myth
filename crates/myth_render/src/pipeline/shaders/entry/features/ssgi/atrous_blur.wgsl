@@ -2,6 +2,8 @@
 
 {{ struct_definitions }}
 
+override SSGI_ATROUS_STEP_SIZE: u32 = 1u;
+
 @group(0) @binding(0) var t_indirect: texture_2d<f32>;
 @group(0) @binding(1) var t_depth: texture_depth_2d;
 @group(0) @binding(2) var t_normal: texture_2d<f32>;
@@ -69,7 +71,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let spatial_variance = max(textureLoad(t_variance_meta, vec2<i32>(center_pixel), 0).a, 1e-4);
     let variance_sigma = sqrt(spatial_variance);
     let estimated_variance = max(variance_sigma, 1e-3);
-    let step_size = i32(max(u_ssgi.denoise_params.y, 1u));
+    let step_size = i32(max(SSGI_ATROUS_STEP_SIZE, 1u));
     let half_extent = vec2<i32>(i32(u_ssgi.half_resolution.x), i32(u_ssgi.half_resolution.y));
     let depth_sigma = max(u_ssgi.reprojection_params.w * max(center_linear, 1.0), 1e-3);
     let luma_phi = max(u_ssgi.lighting_params.w * estimated_variance, 1e-3);

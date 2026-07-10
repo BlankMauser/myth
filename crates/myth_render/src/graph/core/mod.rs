@@ -22,7 +22,7 @@ pub use graph::{GraphStorage, RenderGraph};
 pub use node::PassNode;
 pub use persistent::{
     HistoryCommitToken, HistoryPlan, HistoryRegistry, HistorySetId, HistoryTextureRef,
-    PersistentTextureId,
+    PersistentTextureId, TemporalDomainKey,
 };
 pub use template_pass::{
     ComputePassBuilder, RenderPassBuilder, StandardComputeNode, StandardFullscreenNode,

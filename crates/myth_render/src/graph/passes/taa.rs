@@ -12,20 +12,16 @@ use crate::HDR_TEXTURE_FORMAT;
 use crate::core::gpu::binding_layout::{depth_texture_2d, sampler, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
+use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, HistoryPlan, HistoryRegistry, HistorySetId,
-    HistoryTextureRef, PassNode, PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
+    HistoryTextureRef, PassNode, PrepareContext, RenderTargetOps, TemporalDomainKey, TextureDesc,
+    TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
 };
 use myth_scene::camera::RenderCamera;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct TaaHistoryKey {
-    scene_id: u32,
-    camera_id: u128,
-}
 
 #[derive(Clone, Copy)]
 pub struct TaaSnapshot {
@@ -49,11 +45,17 @@ struct TaaPipelineResources {
     layout: Option<Tracked<wgpu::BindGroupLayout>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TaaHistoryDomain {
+    set_id: HistorySetId,
+    last_planned_frame: u64,
+}
+
 /// Long-lived TAA feature. Static pipeline state remains Feature-owned while
 /// dynamic cross-frame textures live in the renderer's HistoryRegistry.
 pub struct TaaFeature {
     pipeline: TaaPipelineResources,
-    histories: FxHashMap<TaaHistoryKey, HistorySetId>,
+    histories: FxHashMap<TemporalDomainKey, TaaHistoryDomain>,
 }
 
 impl Default for TaaFeature {
@@ -81,18 +83,33 @@ impl TaaFeature {
         camera: &RenderCamera,
         feedback_weight: f32,
         temporal_serial: u64,
+        renderer_frame: u64,
         size: (u32, u32),
         depth_format: wgpu::TextureFormat,
     ) -> TaaSnapshot {
-        let key = TaaHistoryKey {
-            scene_id,
-            camera_id: camera.camera_id,
-        };
-        let set_id = if let Some(&id) = self.histories.get(&key) {
-            id
+        let key = TemporalDomainKey::new(scene_id, camera.camera_id);
+        if self.histories.get(&key).is_some_and(|domain| {
+            renderer_frame.saturating_sub(domain.last_planned_frame) > TEMPORAL_DOMAIN_TTL_FRAMES
+        }) {
+            let expired = self
+                .histories
+                .remove(&key)
+                .expect("expired TAA history domain must exist");
+            let removed = histories.remove_set(expired.set_id);
+            debug_assert!(removed, "TAA history domain lost its registry set");
+        }
+        let set_id = if let Some(domain) = self.histories.get_mut(&key) {
+            domain.last_planned_frame = renderer_frame;
+            domain.set_id
         } else {
             let id = histories.create_set();
-            self.histories.insert(key, id);
+            self.histories.insert(
+                key,
+                TaaHistoryDomain {
+                    set_id: id,
+                    last_planned_frame: renderer_frame,
+                },
+            );
             id
         };
 
@@ -129,6 +146,26 @@ impl TaaFeature {
             history,
             extent,
         }
+    }
+
+    /// Retire history for scene/camera domains that have not planned a TAA
+    /// frame within `ttl` renderer frames.
+    pub(crate) fn garbage_collect(
+        &mut self,
+        histories: &mut HistoryRegistry,
+        current_frame: u64,
+        ttl: u64,
+    ) -> usize {
+        let before = self.histories.len();
+        self.histories.retain(|_, domain| {
+            let live = current_frame.saturating_sub(domain.last_planned_frame) <= ttl;
+            if !live {
+                let removed = histories.remove_set(domain.set_id);
+                debug_assert!(removed, "TAA history domain lost its registry set");
+            }
+            live
+        });
+        before - self.histories.len()
     }
 
     /// Resolve into the next persistent color bank, then copy its clean result
@@ -424,6 +461,7 @@ mod tests {
             &camera,
             0.9,
             1,
+            1,
             (128, 64),
             wgpu::TextureFormat::Depth32Float,
         );
@@ -439,6 +477,7 @@ mod tests {
             1,
             &camera,
             0.9,
+            2,
             2,
             (128, 64),
             wgpu::TextureFormat::Depth32Float,
@@ -460,6 +499,7 @@ mod tests {
             &camera_a,
             0.9,
             1,
+            1,
             (64, 64),
             wgpu::TextureFormat::Depth32Float,
         );
@@ -469,6 +509,7 @@ mod tests {
             &camera_b,
             0.9,
             1,
+            1,
             (64, 64),
             wgpu::TextureFormat::Depth32Float,
         );
@@ -477,6 +518,7 @@ mod tests {
             2,
             &camera_a,
             0.9,
+            1,
             1,
             (64, 64),
             wgpu::TextureFormat::Depth32Float,
@@ -505,6 +547,7 @@ mod tests {
             &camera_a,
             0.9,
             1,
+            1,
             (64, 64),
             wgpu::TextureFormat::Depth32Float,
         );
@@ -517,6 +560,7 @@ mod tests {
             1,
             &camera_b,
             0.9,
+            1,
             1,
             (64, 64),
             wgpu::TextureFormat::Depth32Float,
@@ -532,6 +576,7 @@ mod tests {
             &camera_a,
             0.9,
             2,
+            2,
             (64, 64),
             wgpu::TextureFormat::Depth32Float,
         );
@@ -541,6 +586,7 @@ mod tests {
             &camera_b,
             0.9,
             2,
+            2,
             (64, 64),
             wgpu::TextureFormat::Depth32Float,
         );
@@ -549,5 +595,87 @@ mod tests {
         assert!(b2.history.valid);
         assert_eq!(a2.previous_color(), Some(a1.history.next[0]));
         assert_eq!(b2.previous_color(), Some(b1.history.next[0]));
+    }
+
+    #[test]
+    fn abandoned_domain_expires_after_ttl_and_reenters_with_invalid_history() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = TaaFeature::new();
+        let camera = render_camera(31);
+
+        let first = feature.extract(
+            &mut registry,
+            1,
+            &camera,
+            0.9,
+            1,
+            10,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert!(registry.commit(
+            first.history.commit,
+            &first.history.next.map(|texture| texture.id),
+        ));
+
+        assert_eq!(feature.garbage_collect(&mut registry, 12, 2), 0);
+        assert_eq!(feature.histories.len(), 1);
+        assert_eq!(feature.garbage_collect(&mut registry, 13, 2), 1);
+        assert!(feature.histories.is_empty());
+
+        let replacement = feature.extract(
+            &mut registry,
+            1,
+            &camera,
+            0.9,
+            2,
+            13,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert!(!replacement.history.valid);
+        assert_ne!(
+            replacement.history.commit.set_id,
+            first.history.commit.set_id
+        );
+        assert_ne!(replacement.history.next[0].id, first.history.next[0].id);
+    }
+
+    #[test]
+    fn reentry_expires_stale_history_even_without_a_periodic_sweep() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = TaaFeature::new();
+        let camera = render_camera(32);
+
+        let first = feature.extract(
+            &mut registry,
+            1,
+            &camera,
+            0.9,
+            1,
+            1,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert!(registry.commit(
+            first.history.commit,
+            &first.history.next.map(|texture| texture.id),
+        ));
+
+        let replacement = feature.extract(
+            &mut registry,
+            1,
+            &camera,
+            0.9,
+            2,
+            TEMPORAL_DOMAIN_TTL_FRAMES + 2,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert!(!replacement.history.valid);
+        assert_ne!(
+            replacement.history.commit.set_id,
+            first.history.commit.set_id
+        );
     }
 }

@@ -4,30 +4,37 @@
 //! raw Hi-Z ray march, temporal accumulation, multi-stage A-Trous cleanup,
 //! and material-modulated merge back into the HDR scene color.
 
+use std::mem::size_of;
+
 use rustc_hash::FxHashMap;
 
 use crate::HDR_TEXTURE_FORMAT;
-use crate::core::gpu::{CommonSampler, Tracked};
-use crate::graph::composer::GraphBuilderContext;
-use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, HistoryTextureRef, PassNode,
-    PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
+use crate::core::gpu::binding_layout::{
+    depth_texture_2d, sampler, texture, texture_2d, uniform_buffer,
 };
-use crate::graph::passes::utils::CopyTextureNode;
+use crate::core::gpu::{CommonSampler, GlobalStateKey, Tracked};
+use crate::graph::composer::GraphBuilderContext;
+use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
+use crate::graph::core::{
+    BufferDesc, BufferNodeId, ExecuteContext, HistoryPlan, HistoryRegistry, HistorySetId,
+    HistoryTextureRef, PassNode, PrepareContext, RenderTargetOps, TemporalDomainKey, TextureDesc,
+    TextureNodeId,
+};
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
 };
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::ssgi::SsgiUniforms;
 use myth_resources::uniforms::WgslStruct;
+use myth_scene::camera::RenderCamera;
 
 const SSGI_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-#[allow(dead_code)]
-const SSGI_WORKGROUP_SIZE: u32 = 8;
 const MAX_ATROUS_PASSES: usize = 4;
 const HISTORY_FLAG_INDIRECT_VALID: u32 = 1 << 0;
 const HISTORY_FLAG_SOURCE_VALID: u32 = 1 << 1;
+const HISTORY_FLAG_CAMERA_CUT: u32 = 1 << 2;
 const HISTORY_VALID_MASK: u32 = HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID;
+const HISTORY_RUNTIME_MASK: u32 = HISTORY_VALID_MASK | HISTORY_FLAG_CAMERA_CUT;
 const SSGI_ATROUS_PASS_NAMES: [&str; MAX_ATROUS_PASSES] = [
     "SSGI_ATrous_Step_1",
     "SSGI_ATrous_Step_2",
@@ -39,18 +46,6 @@ const SSGI_ATROUS_OUTPUT_NAMES: [&str; MAX_ATROUS_PASSES] = [
     "SSGI_ATrous_Step_2_Output",
     "SSGI_ATrous_Step_4_Output",
     "SSGI_ATrous_Step_8_Output",
-];
-const SSGI_ATROUS_UNIFORM_NAMES: [&str; MAX_ATROUS_PASSES] = [
-    "SSGI_ATrous_Uniforms_1",
-    "SSGI_ATrous_Uniforms_2",
-    "SSGI_ATrous_Uniforms_4",
-    "SSGI_ATrous_Uniforms_8",
-];
-const SSGI_ATROUS_BUFFER_LABELS: [&str; MAX_ATROUS_PASSES] = [
-    "SSGI A-Trous Uniform Step 1",
-    "SSGI A-Trous Uniform Step 2",
-    "SSGI A-Trous Uniform Step 4",
-    "SSGI A-Trous Uniform Step 8",
 ];
 
 fn blue_noise_view_dimension() -> wgpu::TextureViewDimension {
@@ -68,34 +63,60 @@ pub struct SsgiOutputs {
     pub clean_indirect: TextureNodeId,
 }
 
-pub struct SsgiFeature {
-    raw_pipelines: FxHashMap<u32, RenderPipelineId>,
-    temporal_pipeline: Option<RenderPipelineId>,
-    atrous_pipeline: Option<RenderPipelineId>,
-    merge_pipeline: Option<RenderPipelineId>,
-
-    raw_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    temporal_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    atrous_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    merge_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-
-    uniforms_buffer: Option<Tracked<wgpu::Buffer>>,
-    black_cube_view: Option<Tracked<wgpu::TextureView>>,
-    blue_noise_view: Option<Tracked<wgpu::TextureView>>,
-    blue_noise_sampler: Option<Tracked<wgpu::Sampler>>,
-
-    indirect_history_view: Option<Tracked<wgpu::TextureView>>,
-    history_meta_view: Option<Tracked<wgpu::TextureView>>,
-    source_history_view: Option<Tracked<wgpu::TextureView>>,
-    atrous_uniform_buffers: Vec<Tracked<wgpu::Buffer>>,
-
-    prepared_max_steps: u32,
-    prepared_atrous_passes: u32,
+/// Per-frame, CPU-only SSGI data captured while Composer builds the graph.
+/// Physical WGPU objects remain feature-owned and are materialized only from
+/// live nodes during deferred prepare.
+#[derive(Clone, Copy)]
+pub struct SsgiSnapshot {
+    uniforms: SsgiUniforms,
+    indirect_history: HistoryPlan<2>,
+    source_history: HistoryPlan<1>,
     full_resolution: (u32, u32),
     half_resolution: (u32, u32),
-    history_valid: bool,
-    source_history_valid: bool,
-    prev_frame_taa_enabled: bool,
+    max_steps: u32,
+    atrous_pass_count: usize,
+    taa_history: Option<HistoryTextureRef>,
+    global_state_key: GlobalStateKey,
+}
+
+#[derive(Default)]
+struct SsgiRawFeature {
+    pipelines: FxHashMap<u32, RenderPipelineId>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+}
+
+#[derive(Default)]
+struct SsgiTemporalFeature {
+    pipeline_id: Option<RenderPipelineId>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+}
+
+#[derive(Default)]
+struct SsgiAtrousFeature {
+    pipeline_id: Option<RenderPipelineId>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+}
+
+#[derive(Default)]
+struct SsgiMergeFeature {
+    pipeline_id: Option<RenderPipelineId>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SsgiHistoryDomain {
+    indirect_set_id: HistorySetId,
+    source_set_id: HistorySetId,
+    full_resolution: (u32, u32),
+    last_planned_frame: u64,
+}
+
+pub struct SsgiFeature {
+    raw: SsgiRawFeature,
+    temporal: SsgiTemporalFeature,
+    atrous: [SsgiAtrousFeature; MAX_ATROUS_PASSES],
+    merge: SsgiMergeFeature,
+    histories: FxHashMap<TemporalDomainKey, SsgiHistoryDomain>,
 }
 
 impl Default for SsgiFeature {
@@ -108,1108 +129,875 @@ impl SsgiFeature {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            raw_pipelines: FxHashMap::default(),
-            temporal_pipeline: None,
-            atrous_pipeline: None,
-            merge_pipeline: None,
-
-            raw_layout: None,
-            temporal_layout: None,
-            atrous_layout: None,
-            merge_layout: None,
-
-            uniforms_buffer: None,
-            black_cube_view: None,
-            blue_noise_view: None,
-            blue_noise_sampler: None,
-
-            indirect_history_view: None,
-            history_meta_view: None,
-            source_history_view: None,
-            atrous_uniform_buffers: Vec::with_capacity(MAX_ATROUS_PASSES),
-
-            prepared_max_steps: 16,
-            prepared_atrous_passes: 3,
-            full_resolution: (0, 0),
-            half_resolution: (0, 0),
-            history_valid: false,
-            source_history_valid: false,
-            prev_frame_taa_enabled: false,
+            raw: SsgiRawFeature::default(),
+            temporal: SsgiTemporalFeature::default(),
+            atrous: std::array::from_fn(|_| SsgiAtrousFeature::default()),
+            merge: SsgiMergeFeature::default(),
+            histories: FxHashMap::default(),
         }
     }
 
-    #[must_use]
-    pub fn history_flags(&self) -> u32 {
-        let mut flags = 0;
-        if self.history_valid {
-            flags |= HISTORY_FLAG_INDIRECT_VALID;
-        }
-        if self.source_history_valid {
-            flags |= HISTORY_FLAG_SOURCE_VALID;
-        }
-        flags
-    }
-
-    pub fn invalidate_history(&mut self) {
-        self.history_valid = false;
-        self.source_history_valid = false;
-        self.prev_frame_taa_enabled = false;
-    }
-
-    fn sync_history_flags(&self, ssgi_uniforms: &CpuBuffer<SsgiUniforms>) {
-        let mut uniforms = ssgi_uniforms.write();
-        let external_runtime_bits = uniforms.frame_params.w & !HISTORY_VALID_MASK;
-        uniforms.frame_params.w = external_runtime_bits | self.history_flags();
-    }
-
-    fn ensure_layouts(&mut self, device: &wgpu::Device) {
-        if self.raw_layout.is_some() {
-            return;
-        }
-
-        let raw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SSGI Raw Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: blue_noise_view_dimension(),
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-        let temporal_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SSGI Temporal Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let atrous_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SSGI A-Trous Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let merge_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SSGI Merge Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        self.raw_layout = Some(Tracked::new(raw_layout));
-        self.temporal_layout = Some(Tracked::new(temporal_layout));
-        self.atrous_layout = Some(Tracked::new(atrous_layout));
-        self.merge_layout = Some(Tracked::new(merge_layout));
-    }
-
-    fn ensure_atrous_uniform_buffers(
+    /// Capture a lightweight snapshot and plan both independently-published
+    /// history sets. No WGPU object is created and the scene-owned CPU buffer
+    /// is never mutated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract(
         &mut self,
-        ctx: &mut ExtractContext,
-        base_uniforms: SsgiUniforms,
-    ) {
-        while self.atrous_uniform_buffers.len() < MAX_ATROUS_PASSES {
-            let label = SSGI_ATROUS_BUFFER_LABELS[self.atrous_uniform_buffers.len()];
-            let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: std::mem::size_of::<SsgiUniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.atrous_uniform_buffers.push(Tracked::new(buffer));
-        }
-
-        self.prepared_atrous_passes = base_uniforms
-            .denoise_params
-            .x
-            .clamp(1, MAX_ATROUS_PASSES as u32);
-
-        for (pass_index, buffer) in self
-            .atrous_uniform_buffers
-            .iter()
-            .enumerate()
-            .take(self.prepared_atrous_passes as usize)
-        {
-            let mut pass_uniforms = base_uniforms;
-            pass_uniforms.denoise_params.y = 1u32 << pass_index;
-            ctx.queue
-                .write_buffer(buffer, 0, bytemuck::bytes_of(&pass_uniforms));
-        }
-    }
-
-    fn ensure_history_buffers(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        let half_w = (width / 2).max(1);
-        let half_h = (height / 2).max(1);
-
-        if self.full_resolution == (width, height)
-            && self.half_resolution == (half_w, half_h)
-            && self.indirect_history_view.is_some()
-            && self.history_meta_view.is_some()
-            && self.source_history_view.is_some()
-        {
-            return;
-        }
-
-        let half_extent = wgpu::Extent3d {
-            width: half_w,
-            height: half_h,
-            depth_or_array_layers: 1,
-        };
-        let full_extent = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-
-        let indirect_history = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SSGI History Indirect"),
-            size: half_extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: SSGI_TEXTURE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let history_meta = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SSGI History Meta"),
-            size: half_extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: SSGI_TEXTURE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let source_history = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SSGI Source History"),
-            size: full_extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: HDR_TEXTURE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        self.indirect_history_view = Some(Tracked::new(
-            indirect_history.create_view(&wgpu::TextureViewDescriptor::default()),
-        ));
-        self.history_meta_view = Some(Tracked::new(
-            history_meta.create_view(&wgpu::TextureViewDescriptor::default()),
-        ));
-        self.source_history_view = Some(Tracked::new(
-            source_history.create_view(&wgpu::TextureViewDescriptor::default()),
-        ));
-
-        self.full_resolution = (width, height);
-        self.half_resolution = (half_w, half_h);
-        self.invalidate_history();
-    }
-
-    fn ensure_pipelines(&mut self, ctx: &mut ExtractContext, max_steps: u32) {
-        if !self.raw_pipelines.contains_key(&max_steps) {
-            let global_state_key = (ctx.render_state.id, ctx.extracted_scene.scene_id);
-            let gpu_world = ctx
-                .resource_manager
-                .get_global_state(global_state_key.0, global_state_key.1)
-                .expect("SSGI: GpuGlobalState must exist");
-
-            let mut options = ShaderCompilationOptions::default();
-            let max_steps_define = max_steps.to_string();
-            options.add_define(
-                "struct_definitions",
-                SsgiUniforms::wgsl_struct_def("SsgiUniforms").as_str(),
-            );
-            options.inject_code("binding_code", &gpu_world.binding_wgsl);
-            options.inject_code(
-                "scene_lighting_structs",
-                myth_resources::uniforms::scene_lighting_structs_wgsl(),
-            );
-            options.inject_code("ssgi_max_steps", &max_steps_define);
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/features/ssgi/raw"),
-                &options,
-            );
-
-            let pipeline_layout =
-                ctx.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("SSGI Raw Pipeline Layout"),
-                        bind_group_layouts: &[Some(&gpu_world.layout), self.raw_layout.as_deref()],
-                        immediate_size: 0,
-                    });
-
-            let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: SSGI_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-
-            let key =
-                FullscreenPipelineKey::fullscreen(hash, smallvec::smallvec![color_target], None);
-
-            let pipeline = ctx.pipeline_cache.get_or_create_fullscreen(
-                ctx.device,
-                module,
-                &pipeline_layout,
-                &key,
-                "SSGI Raw Pipeline",
-            );
-
-            self.raw_pipelines.insert(max_steps, pipeline);
-        }
-
-        if self.temporal_pipeline.is_none() {
-            let mut options = ShaderCompilationOptions::default();
-            options.add_define(
-                "struct_definitions",
-                SsgiUniforms::wgsl_struct_def("SsgiUniforms").as_str(),
-            );
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/features/ssgi/temporal"),
-                &options,
-            );
-
-            let pipeline_layout =
-                ctx.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("SSGI Temporal Pipeline Layout"),
-                        bind_group_layouts: &[self.temporal_layout.as_deref()],
-                        immediate_size: 0,
-                    });
-
-            let indirect_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: SSGI_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            let meta_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: SSGI_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-
-            let key = FullscreenPipelineKey::fullscreen(
-                hash,
-                smallvec::smallvec![indirect_target, meta_target],
-                None,
-            );
-
-            self.temporal_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                ctx.device,
-                module,
-                &pipeline_layout,
-                &key,
-                "SSGI Temporal Pipeline",
-            ));
-        }
-
-        if self.atrous_pipeline.is_none() {
-            let mut options = ShaderCompilationOptions::default();
-            options.add_define(
-                "struct_definitions",
-                SsgiUniforms::wgsl_struct_def("SsgiUniforms").as_str(),
-            );
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/features/ssgi/atrous_blur"),
-                &options,
-            );
-
-            let pipeline_layout =
-                ctx.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("SSGI A-Trous Pipeline Layout"),
-                        bind_group_layouts: &[self.atrous_layout.as_deref()],
-                        immediate_size: 0,
-                    });
-
-            let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: SSGI_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-
-            let key =
-                FullscreenPipelineKey::fullscreen(hash, smallvec::smallvec![color_target], None);
-
-            self.atrous_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                ctx.device,
-                module,
-                &pipeline_layout,
-                &key,
-                "SSGI A-Trous Pipeline",
-            ));
-        }
-
-        if self.merge_pipeline.is_none() {
-            let mut options = ShaderCompilationOptions::default();
-            options.add_define(
-                "struct_definitions",
-                SsgiUniforms::wgsl_struct_def("SsgiUniforms").as_str(),
-            );
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/features/ssgi/merge"),
-                &options,
-            );
-
-            let pipeline_layout =
-                ctx.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("SSGI Merge Pipeline Layout"),
-                        bind_group_layouts: &[self.merge_layout.as_deref()],
-                        immediate_size: 0,
-                    });
-
-            let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: HDR_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-
-            let key =
-                FullscreenPipelineKey::fullscreen(hash, smallvec::smallvec![color_target], None);
-
-            self.merge_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                ctx.device,
-                module,
-                &pipeline_layout,
-                &key,
-                "SSGI Merge Pipeline",
-            ));
-        }
-    }
-
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
-        ssgi_uniforms: &CpuBuffer<SsgiUniforms>,
+        histories: &mut HistoryRegistry,
+        scene_id: u32,
+        camera: &RenderCamera,
+        temporal_serial: u64,
+        renderer_frame: u64,
+        source_uniforms: &CpuBuffer<SsgiUniforms>,
         size: (u32, u32),
-    ) {
-        self.ensure_layouts(ctx.device);
-        self.ensure_history_buffers(ctx.device, size.0, size.1);
-        self.sync_history_flags(ssgi_uniforms);
+        frame_index: u32,
+        taa_history: Option<HistoryTextureRef>,
+        global_state_key: GlobalStateKey,
+    ) -> SsgiSnapshot {
+        let key = TemporalDomainKey::new(scene_id, camera.camera_id);
+        if self.histories.get(&key).is_some_and(|domain| {
+            renderer_frame.saturating_sub(domain.last_planned_frame) > TEMPORAL_DOMAIN_TTL_FRAMES
+        }) {
+            let expired = self
+                .histories
+                .remove(&key)
+                .expect("expired SSGI history domain must exist");
+            let indirect_removed = histories.remove_set(expired.indirect_set_id);
+            let source_removed = histories.remove_set(expired.source_set_id);
+            debug_assert!(
+                indirect_removed && source_removed,
+                "SSGI history domain lost a registry set"
+            );
+        }
 
-        let uniforms = *ssgi_uniforms.read();
-        let max_steps = uniforms.frame_params.y;
-        self.ensure_pipelines(ctx, max_steps);
-        self.prepared_max_steps = max_steps;
-        self.ensure_atrous_uniform_buffers(ctx, uniforms);
+        let (indirect_set_id, source_set_id, full_resolution_changed) =
+            if let Some(domain) = self.histories.get_mut(&key) {
+                let changed = domain.full_resolution != size;
+                domain.full_resolution = size;
+                domain.last_planned_frame = renderer_frame;
+                (domain.indirect_set_id, domain.source_set_id, changed)
+            } else {
+                let indirect_set_id = histories.create_set();
+                let source_set_id = histories.create_set();
+                self.histories.insert(
+                    key,
+                    SsgiHistoryDomain {
+                        indirect_set_id,
+                        source_set_id,
+                        full_resolution: size,
+                        last_planned_frame: renderer_frame,
+                    },
+                );
+                (indirect_set_id, source_set_id, false)
+            };
 
-        ctx.resource_manager.ensure_buffer(ssgi_uniforms);
-
-        self.black_cube_view = Some(ctx.resource_manager.system_textures().black_cube.clone());
-        self.blue_noise_view = Some(ctx.resource_manager.system_textures().blue_noise.clone());
-        self.blue_noise_sampler = Some(
-            ctx.resource_manager
-                .system_textures()
-                .blue_noise_sampler
-                .clone(),
+        let full_resolution = (size.0.max(1), size.1.max(1));
+        let half_resolution = (
+            (full_resolution.0 / 2).max(1),
+            (full_resolution.1 / 2).max(1),
         );
-        self.uniforms_buffer = ssgi_uniforms.gpu_handle().and_then(|handle| {
-            ctx.resource_manager
-                .get_gpu_buffer(handle)
-                .map(|gpu| Tracked::with_id(gpu.buffer.clone(), gpu.id))
-        });
+        let indirect_desc = TextureDesc::new_2d(
+            half_resolution.0,
+            half_resolution.1,
+            SSGI_TEXTURE_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let source_desc = TextureDesc::new_2d(
+            full_resolution.0,
+            full_resolution.1,
+            HDR_TEXTURE_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let reset = camera.camera_cut != 0 || full_resolution_changed;
+        let indirect_history = histories.plan_set(
+            indirect_set_id,
+            [indirect_desc, indirect_desc],
+            temporal_serial,
+            reset,
+        );
+        let source_history =
+            histories.plan_set(source_set_id, [source_desc], temporal_serial, reset);
+
+        let mut uniforms = *source_uniforms.read();
+        uniforms.full_resolution = glam::Vec4::new(
+            full_resolution.0 as f32,
+            full_resolution.1 as f32,
+            1.0 / full_resolution.0 as f32,
+            1.0 / full_resolution.1 as f32,
+        );
+        uniforms.half_resolution = glam::Vec4::new(
+            half_resolution.0 as f32,
+            half_resolution.1 as f32,
+            1.0 / half_resolution.0 as f32,
+            1.0 / half_resolution.1 as f32,
+        );
+        uniforms.frame_params.x = frame_index;
+        uniforms.temporal_params.z = camera.near.max(0.0001);
+        uniforms.frame_params.w &= !HISTORY_RUNTIME_MASK;
+        if indirect_history.valid {
+            uniforms.frame_params.w |= HISTORY_FLAG_INDIRECT_VALID;
+        }
+        if source_history.valid {
+            uniforms.frame_params.w |= HISTORY_FLAG_SOURCE_VALID;
+        }
+        if camera.camera_cut != 0 {
+            uniforms.frame_params.w |= HISTORY_FLAG_CAMERA_CUT;
+        }
+
+        SsgiSnapshot {
+            uniforms,
+            indirect_history,
+            source_history,
+            full_resolution,
+            half_resolution,
+            max_steps: uniforms.frame_params.y,
+            atrous_pass_count: uniforms.denoise_params.x.clamp(1, MAX_ATROUS_PASSES as u32)
+                as usize,
+            taa_history: source_history.valid.then_some(taa_history).flatten(),
+            global_state_key,
+        }
     }
 
+    pub(crate) fn garbage_collect(
+        &mut self,
+        histories: &mut HistoryRegistry,
+        current_frame: u64,
+        ttl: u64,
+    ) -> usize {
+        let before = self.histories.len();
+        self.histories.retain(|_, domain| {
+            let live = current_frame.saturating_sub(domain.last_planned_frame) <= ttl;
+            if !live {
+                let indirect_removed = histories.remove_set(domain.indirect_set_id);
+                let source_removed = histories.remove_set(domain.source_set_id);
+                debug_assert!(
+                    indirect_removed && source_removed,
+                    "SSGI history domain lost a registry set"
+                );
+            }
+            live
+        });
+        before - self.histories.len()
+    }
+
+    /// Emit Raw → Temporal → A-Trous → Merge. Temporal renders directly into
+    /// the next indirect/meta bank and Merge writes both its isolated transient
+    /// output and the next source-history bank as identical MRT attachments.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_to_graph<'a>(
         &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: SsgiSnapshot,
         current_color: TextureNodeId,
         scene_depth: TextureNodeId,
         scene_hiz: TextureNodeId,
         scene_normals: TextureNodeId,
         velocity: TextureNodeId,
         material_mrt: TextureNodeId,
-        pmrem_tex: Option<TextureNodeId>,
-        taa_history: Option<HistoryTextureRef>,
-        taa_enabled: bool,
+        pmrem_texture: Option<TextureNodeId>,
     ) -> SsgiOutputs {
-        let raw_pipeline_id = self
-            .raw_pipelines
-            .get(&self.prepared_max_steps)
-            .copied()
-            .expect("SSGI raw pipeline missing");
-        let temporal_pipeline_id = self
-            .temporal_pipeline
-            .expect("SSGI temporal pipeline missing");
-        let atrous_pipeline_id = self.atrous_pipeline.expect("SSGI A-Trous pipeline missing");
-        let merge_pipeline_id = self.merge_pipeline.expect("SSGI merge pipeline missing");
+        let raw_feature = &mut self.raw;
+        let temporal_feature = &mut self.temporal;
+        let atrous_features = &mut self.atrous;
+        let merge_feature = &mut self.merge;
 
-        let raw_layout = self.raw_layout.as_ref().unwrap();
-        let temporal_layout = self.temporal_layout.as_ref().unwrap();
-        let atrous_layout = self.atrous_layout.as_ref().unwrap();
-        let merge_layout = self.merge_layout.as_ref().unwrap();
+        ctx.with_group("SSGI_System", |ctx| {
+            let previous_indirect = ctx.graph.import_persistent_texture(
+                "SSGI_History_Indirect_Previous",
+                snapshot.indirect_history.previous[0],
+            );
+            let previous_meta = ctx.graph.import_persistent_texture(
+                "SSGI_History_Meta_Previous",
+                snapshot.indirect_history.previous[1],
+            );
+            let next_indirect = ctx.graph.import_persistent_texture(
+                "SSGI_History_Indirect_Next",
+                snapshot.indirect_history.next[0],
+            );
+            let next_meta = ctx.graph.import_persistent_texture(
+                "SSGI_History_Meta_Next",
+                snapshot.indirect_history.next[1],
+            );
+            let previous_source = if let Some(taa_history) = snapshot.taa_history {
+                ctx.graph
+                    .import_persistent_texture("TAA_History_Color_Previous", taa_history)
+            } else {
+                ctx.graph.import_persistent_texture(
+                    "SSGI_History_Source_Previous",
+                    snapshot.source_history.previous[0],
+                )
+            };
+            let next_source = ctx.graph.import_persistent_texture(
+                "SSGI_History_Source_Next",
+                snapshot.source_history.next[0],
+            );
 
-        let uniforms_buffer = self
-            .uniforms_buffer
-            .as_ref()
-            .expect("SSGI uniforms buffer missing");
-        let indirect_history_view = self.indirect_history_view.as_ref().unwrap();
-        let history_meta_view = self.history_meta_view.as_ref().unwrap();
-        let source_history_view = self.source_history_view.as_ref().unwrap();
-        let black_cube_view = self.black_cube_view.as_ref().unwrap();
-        let blue_noise_view = self.blue_noise_view.as_ref().unwrap();
-        let blue_noise_sampler = self.blue_noise_sampler.as_ref().unwrap();
-        let atrous_uniform_buffers = &self.atrous_uniform_buffers;
-
-        let half_w = (ctx.frame_config.width / 2).max(1);
-        let half_h = (ctx.frame_config.height / 2).max(1);
-        let atrous_pass_count = self
-            .prepared_atrous_passes
-            .clamp(1, MAX_ATROUS_PASSES as u32) as usize;
-
-        let use_taa_source_history =
-            self.source_history_valid && self.prev_frame_taa_enabled && taa_history.is_some();
-
-        let source_history_desc = persistent_texture_desc(
-            source_history_view.texture().width(),
-            source_history_view.texture().height(),
-            HDR_TEXTURE_FORMAT,
-        );
-        let source_history_input = if use_taa_source_history {
-            ctx.graph.import_persistent_texture(
-                "TAA_History_Color_Previous",
-                taa_history.expect("SSGI TAA history reference missing"),
-            )
-        } else {
-            ctx.graph.import_external_texture(
-                "SSGI_Source_History_Read",
-                source_history_desc,
-                source_history_view,
-            )
-        };
-
-        let indirect_history_desc = persistent_texture_desc(
-            indirect_history_view.texture().width(),
-            indirect_history_view.texture().height(),
-            SSGI_TEXTURE_FORMAT,
-        );
-        let history_meta_desc = persistent_texture_desc(
-            history_meta_view.texture().width(),
-            history_meta_view.texture().height(),
-            SSGI_TEXTURE_FORMAT,
-        );
-        let uniforms_desc = BufferDesc::new(
-            std::mem::size_of::<SsgiUniforms>() as u64,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-
-        let outputs = ctx.with_group("SSGI_System", |ctx| {
-            let raw_desc = TextureDesc::new_2d(
-                half_w,
-                half_h,
+            let uniforms_desc = BufferDesc::new(
+                size_of::<SsgiUniforms>() as u64,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            );
+            let half_desc = TextureDesc::new_2d(
+                snapshot.half_resolution.0,
+                snapshot.half_resolution.1,
                 SSGI_TEXTURE_FORMAT,
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             );
 
-            let raw_indirect: TextureNodeId = ctx.graph.add_pass("SSGI_Raw", |builder| {
+            let (raw_indirect, uniforms_buffer) = ctx.graph.add_pass("SSGI_Raw", |builder| {
                 builder.read_texture(scene_depth);
                 builder.read_texture(scene_hiz);
                 builder.read_texture(scene_normals);
+                builder.read_texture(previous_source);
+                if let Some(pmrem_texture) = pmrem_texture {
+                    builder.read_texture(pmrem_texture);
+                }
 
-                let source_history = builder.read_texture(source_history_input);
-                let uniforms =
-                    builder.read_external_buffer("SSGI_Uniforms", uniforms_desc, uniforms_buffer);
-                let pmrem_input = if let Some(pmrem) = pmrem_tex {
-                    builder.read_texture(pmrem)
-                } else {
-                    builder.read_external_texture(
-                        "SSGI_PMREM_Fallback",
-                        TextureDesc::new(
-                            1,
-                            1,
-                            6,
-                            1,
-                            1,
-                            wgpu::TextureDimension::D2,
-                            wgpu::TextureFormat::Rgba8Unorm,
-                            wgpu::TextureUsages::TEXTURE_BINDING,
-                        ),
-                        black_cube_view,
-                    )
-                };
-
-                let out = builder.create_texture("SSGI_Raw_Indirect", raw_desc);
+                let uniforms_buffer = builder.create_buffer("SSGI_Uniforms", uniforms_desc);
+                let output = builder.create_texture("SSGI_Raw_Indirect", half_desc);
                 let node = SsgiRawNode {
+                    feature: raw_feature,
+                    global_state_key: snapshot.global_state_key,
+                    max_steps: snapshot.max_steps,
+                    uniforms_data: snapshot.uniforms,
                     scene_depth,
                     scene_hiz,
                     scene_normals,
-                    source_history,
-                    pmrem_texture: pmrem_input,
-                    uniforms,
-                    blue_noise_view,
-                    blue_noise_sampler,
-                    output_tex: out,
-                    pipeline_id: raw_pipeline_id,
-                    layout: raw_layout,
-                    transient_bg: None,
+                    source_history: previous_source,
+                    pmrem_texture,
+                    uniforms: uniforms_buffer,
+                    output_tex: output,
+                    pipeline_id: None,
+                    bind_group: None,
                 };
-
-                (node, out)
+                (node, (output, uniforms_buffer))
             });
 
-            let temporal_desc = TextureDesc::new_2d(
-                half_w,
-                half_h,
-                SSGI_TEXTURE_FORMAT,
-                wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
+            ctx.graph.add_pass("SSGI_Temporal", |builder| {
+                builder.read_texture(raw_indirect);
+                builder.read_texture(previous_indirect);
+                builder.read_texture(scene_depth);
+                builder.read_texture(scene_normals);
+                builder.read_texture(previous_meta);
+                builder.read_texture(velocity);
+                builder.read_buffer(uniforms_buffer);
+                builder.write_texture(next_indirect);
+                builder.write_texture(next_meta);
+
+                let node = SsgiTemporalNode {
+                    feature: temporal_feature,
+                    raw_indirect,
+                    indirect_history: previous_indirect,
+                    scene_depth,
+                    scene_normals,
+                    history_meta: previous_meta,
+                    velocity,
+                    uniforms: uniforms_buffer,
+                    output_indirect: next_indirect,
+                    output_meta: next_meta,
+                    pipeline_id: None,
+                    bind_group: None,
+                };
+                (node, ())
+            });
+            ctx.graph.register_history_commit(
+                snapshot.indirect_history.commit,
+                &[next_indirect, next_meta],
             );
 
-            let (temporal_indirect, temporal_meta) =
-                ctx.graph.add_pass("SSGI_Temporal", |builder| {
-                    let indirect_history = builder.read_external_texture(
-                        "SSGI_History_Indirect_Read",
-                        indirect_history_desc,
-                        indirect_history_view,
-                    );
-                    let history_meta = builder.read_external_texture(
-                        "SSGI_History_Meta_Read",
-                        history_meta_desc,
-                        history_meta_view,
-                    );
+            let mut clean_indirect = next_indirect;
+            for (pass_index, feature) in atrous_features
+                .iter_mut()
+                .take(snapshot.atrous_pass_count)
+                .enumerate()
+            {
+                let input = clean_indirect;
+                clean_indirect =
+                    ctx.graph
+                        .add_pass(SSGI_ATROUS_PASS_NAMES[pass_index], |builder| {
+                            builder.read_texture(input);
+                            builder.read_texture(scene_depth);
+                            builder.read_texture(scene_normals);
+                            builder.read_texture(next_meta);
+                            builder.read_buffer(uniforms_buffer);
 
-                    builder.read_texture(raw_indirect);
-                    builder.read_texture(scene_depth);
-                    builder.read_texture(scene_normals);
-                    builder.read_texture(velocity);
-
-                    let uniforms = builder.read_external_buffer(
-                        "SSGI_Uniforms",
-                        uniforms_desc,
-                        uniforms_buffer,
-                    );
-
-                    let temporal_indirect =
-                        builder.create_texture("SSGI_Temporal_Indirect", temporal_desc);
-                    let temporal_meta = builder.create_texture("SSGI_Temporal_Meta", temporal_desc);
-
-                    let node = SsgiTemporalNode {
-                        raw_indirect,
-                        indirect_history,
-                        scene_depth,
-                        scene_normals,
-                        history_meta,
-                        velocity,
-                        uniforms,
-                        output_indirect: temporal_indirect,
-                        output_meta: temporal_meta,
-                        pipeline_id: temporal_pipeline_id,
-                        layout: temporal_layout,
-                        transient_bg: None,
-                    };
-
-                    (node, (temporal_indirect, temporal_meta))
-                });
-
-            let atrous_desc = TextureDesc::new_2d(
-                half_w,
-                half_h,
-                SSGI_TEXTURE_FORMAT,
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            );
-
-            let mut clean_indirect = temporal_indirect;
-            for pass_index in 0..atrous_pass_count {
-                let pass_name = SSGI_ATROUS_PASS_NAMES[pass_index];
-                let output_name = SSGI_ATROUS_OUTPUT_NAMES[pass_index];
-                let uniform_name = SSGI_ATROUS_UNIFORM_NAMES[pass_index];
-                let pass_uniform_buffer = atrous_uniform_buffers
-                    .get(pass_index)
-                    .expect("SSGI A-Trous uniform buffer missing");
-
-                clean_indirect = ctx.graph.add_pass(pass_name, |builder| {
-                    builder.read_texture(clean_indirect);
-                    builder.read_texture(scene_depth);
-                    builder.read_texture(scene_normals);
-                    builder.read_texture(temporal_meta);
-                    let uniforms = builder.read_external_buffer(
-                        uniform_name,
-                        uniforms_desc,
-                        pass_uniform_buffer,
-                    );
-
-                    let out = builder.create_texture(output_name, atrous_desc);
-                    let node = SsgiAtrousNode {
-                        input_indirect: clean_indirect,
-                        scene_depth,
-                        scene_normals,
-                        variance_meta: temporal_meta,
-                        uniforms,
-                        output_tex: out,
-                        pipeline_id: atrous_pipeline_id,
-                        layout: atrous_layout,
-                        transient_bg: None,
-                    };
-
-                    (node, out)
-                });
+                            let output = builder
+                                .create_texture(SSGI_ATROUS_OUTPUT_NAMES[pass_index], half_desc);
+                            let node = SsgiAtrousNode {
+                                feature,
+                                step_size: 1 << pass_index,
+                                input_indirect: input,
+                                scene_depth,
+                                scene_normals,
+                                variance_meta: next_meta,
+                                uniforms: uniforms_buffer,
+                                output_tex: output,
+                                pipeline_id: None,
+                                bind_group: None,
+                            };
+                            (node, output)
+                        });
             }
 
             let merged_desc = TextureDesc::new_2d(
-                ctx.frame_config.width,
-                ctx.frame_config.height,
+                snapshot.full_resolution.0,
+                snapshot.full_resolution.1,
                 HDR_TEXTURE_FORMAT,
                 wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_SRC,
             );
-
-            let merged_color: TextureNodeId = ctx.graph.add_pass("SSGI_Merge", |builder| {
+            let merged_color = ctx.graph.add_pass("SSGI_Merge", |builder| {
                 builder.read_texture(current_color);
                 builder.read_texture(clean_indirect);
                 builder.read_texture(material_mrt);
                 builder.read_texture(scene_depth);
                 builder.read_texture(scene_normals);
-                let uniforms =
-                    builder.read_external_buffer("SSGI_Uniforms", uniforms_desc, uniforms_buffer);
+                builder.read_buffer(uniforms_buffer);
+                builder.write_texture(next_source);
 
-                let out = builder.create_texture("SSGI_Merged_Color", merged_desc);
+                let output = builder.create_texture("SSGI_Merged_Color", merged_desc);
                 let node = SsgiMergeNode {
+                    feature: merge_feature,
                     current_color,
                     clean_indirect,
                     material_mrt,
                     scene_depth,
                     scene_normals,
-                    uniforms,
-                    output_tex: out,
-                    pipeline_id: merge_pipeline_id,
-                    layout: merge_layout,
-                    transient_bg: None,
+                    uniforms: uniforms_buffer,
+                    output_tex: output,
+                    output_source: next_source,
+                    pipeline_id: None,
+                    bind_group: None,
                 };
-
-                (node, out)
+                (node, output)
             });
-
-            ctx.graph.add_pass("SSGI_Save_History_Indirect", |builder| {
-                builder.read_texture(temporal_indirect);
-                let history_out = builder.write_external_texture(
-                    "SSGI_History_Indirect_Write",
-                    indirect_history_desc,
-                    indirect_history_view,
-                );
-                (
-                    CopyTextureNode {
-                        src: temporal_indirect,
-                        dst: history_out,
-                    },
-                    (),
-                )
-            });
-
-            ctx.graph.add_pass("SSGI_Save_History_Meta", |builder| {
-                builder.read_texture(temporal_meta);
-                let history_out = builder.write_external_texture(
-                    "SSGI_History_Meta_Write",
-                    history_meta_desc,
-                    history_meta_view,
-                );
-                (
-                    CopyTextureNode {
-                        src: temporal_meta,
-                        dst: history_out,
-                    },
-                    (),
-                )
-            });
-
-            ctx.graph.add_pass("SSGI_Save_Source_History", |builder| {
-                builder.read_texture(merged_color);
-                let history_out = builder.write_external_texture(
-                    "SSGI_Source_History_Write",
-                    persistent_texture_desc(
-                        source_history_view.texture().width(),
-                        source_history_view.texture().height(),
-                        HDR_TEXTURE_FORMAT,
-                    ),
-                    source_history_view,
-                );
-                (
-                    CopyTextureNode {
-                        src: merged_color,
-                        dst: history_out,
-                    },
-                    (),
-                )
-            });
+            ctx.graph
+                .register_history_commit(snapshot.source_history.commit, &[next_source]);
 
             SsgiOutputs {
                 merged_color,
                 raw_indirect,
                 clean_indirect,
             }
-        });
-
-        self.history_valid = true;
-        self.source_history_valid = true;
-        self.prev_frame_taa_enabled = taa_enabled;
-        outputs
+        })
     }
 }
 
+impl SsgiRawFeature {
+    fn ensure_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        global_state_key: GlobalStateKey,
+        max_steps: u32,
+    ) {
+        if self.pipelines.contains_key(&max_steps) && self.layout.is_some() {
+            return;
+        }
+
+        let global_state = ctx
+            .global_states
+            .get(global_state_key)
+            .expect("SSGI raw: global binding state must exist before RDG prepare");
+        let mut options = global_shader_options(global_state.binding_wgsl.as_str());
+        options.inject_code("ssgi_max_steps", max_steps.to_string());
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/features/ssgi/raw"),
+            &options,
+        );
+        let key = FullscreenPipelineKey::fullscreen(
+            shader_hash,
+            smallvec::smallvec![color_target(SSGI_TEXTURE_FORMAT)],
+            None,
+        );
+
+        let pipeline_id = if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+            self.layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 1).clone());
+            id
+        } else {
+            let local_layout = self
+                .layout
+                .clone()
+                .unwrap_or_else(|| create_raw_layout(ctx.device));
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("SSGI Raw Pipeline Layout"),
+                        bind_group_layouts: &[Some(&global_state.layout), Some(&local_layout)],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_fullscreen(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &key,
+                "SSGI Raw Pipeline",
+            );
+            register_global_and_local_layouts(ctx, id, global_state, local_layout.clone());
+            self.layout = Some(local_layout);
+            id
+        };
+        self.pipelines.insert(max_steps, pipeline_id);
+    }
+
+    fn pipeline_id(&self, max_steps: u32) -> RenderPipelineId {
+        self.pipelines
+            .get(&max_steps)
+            .copied()
+            .expect("SSGI raw pipeline must be prepared by the live node")
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("SSGI raw layout must be prepared by the live node")
+    }
+}
+
+impl SsgiTemporalFeature {
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>) {
+        if self.pipeline_id.is_some() && self.layout.is_some() {
+            return;
+        }
+
+        let options = local_shader_options();
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/features/ssgi/temporal"),
+            &options,
+        );
+        let key = FullscreenPipelineKey::fullscreen(
+            shader_hash,
+            smallvec::smallvec![
+                color_target(SSGI_TEXTURE_FORMAT),
+                color_target(SSGI_TEXTURE_FORMAT),
+            ],
+            None,
+        );
+        let pipeline_id = if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+            self.layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 0).clone());
+            id
+        } else {
+            let layout = create_temporal_layout(ctx.device);
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("SSGI Temporal Pipeline Layout"),
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_fullscreen(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &key,
+                "SSGI Temporal Pipeline",
+            );
+            ctx.pipeline_cache
+                .register_render_layouts(id, smallvec::smallvec![layout.clone()]);
+            self.layout = Some(layout);
+            id
+        };
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn pipeline_id(&self) -> RenderPipelineId {
+        self.pipeline_id
+            .expect("SSGI temporal pipeline must be prepared by the live node")
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("SSGI temporal layout must be prepared by the live node")
+    }
+}
+
+impl SsgiAtrousFeature {
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>, step_size: u32) {
+        if self.pipeline_id.is_some() && self.layout.is_some() {
+            return;
+        }
+
+        let options = local_shader_options();
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/features/ssgi/atrous_blur"),
+            &options,
+        );
+        let constants = [("SSGI_ATROUS_STEP_SIZE", f64::from(step_size))];
+        let compilation_options = wgpu::PipelineCompilationOptions {
+            constants: &constants,
+            ..Default::default()
+        };
+        let key = FullscreenPipelineKey::fullscreen(
+            shader_hash,
+            smallvec::smallvec![color_target(SSGI_TEXTURE_FORMAT)],
+            None,
+        )
+        .with_compilation_options(&compilation_options);
+        let pipeline_id = if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+            self.layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 0).clone());
+            id
+        } else {
+            let layout = create_atrous_layout(ctx.device);
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("SSGI A-Trous Pipeline Layout"),
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_fullscreen_with_options(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &key,
+                &compilation_options,
+                "SSGI A-Trous Pipeline",
+            );
+            ctx.pipeline_cache
+                .register_render_layouts(id, smallvec::smallvec![layout.clone()]);
+            self.layout = Some(layout);
+            id
+        };
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn pipeline_id(&self) -> RenderPipelineId {
+        self.pipeline_id
+            .expect("SSGI A-Trous pipeline must be prepared by the live node")
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("SSGI A-Trous layout must be prepared by the live node")
+    }
+}
+
+impl SsgiMergeFeature {
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>) {
+        if self.pipeline_id.is_some() && self.layout.is_some() {
+            return;
+        }
+
+        let options = local_shader_options();
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/features/ssgi/merge"),
+            &options,
+        );
+        let key = FullscreenPipelineKey::fullscreen(
+            shader_hash,
+            smallvec::smallvec![
+                color_target(HDR_TEXTURE_FORMAT),
+                color_target(HDR_TEXTURE_FORMAT),
+            ],
+            None,
+        );
+        let pipeline_id = if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+            self.layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 0).clone());
+            id
+        } else {
+            let layout = create_merge_layout(ctx.device);
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("SSGI Merge Pipeline Layout"),
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_fullscreen(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &key,
+                "SSGI Merge Pipeline",
+            );
+            ctx.pipeline_cache
+                .register_render_layouts(id, smallvec::smallvec![layout.clone()]);
+            self.layout = Some(layout);
+            id
+        };
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn pipeline_id(&self) -> RenderPipelineId {
+        self.pipeline_id
+            .expect("SSGI merge pipeline must be prepared by the live node")
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("SSGI merge layout must be prepared by the live node")
+    }
+}
+
+fn local_shader_options() -> ShaderCompilationOptions {
+    let mut options = ShaderCompilationOptions::default();
+    options.add_define(
+        "struct_definitions",
+        SsgiUniforms::wgsl_struct_def("SsgiUniforms").as_str(),
+    );
+    options
+}
+
+fn global_shader_options(binding_wgsl: &str) -> ShaderCompilationOptions {
+    let mut options = local_shader_options();
+    options.inject_code("binding_code", binding_wgsl);
+    options.inject_code(
+        "scene_lighting_structs",
+        myth_resources::uniforms::scene_lighting_structs_wgsl(),
+    );
+    options
+}
+
+fn register_global_and_local_layouts(
+    ctx: &mut PrepareContext<'_>,
+    pipeline_id: RenderPipelineId,
+    global_state: &crate::core::gpu::GpuGlobalState,
+    local_layout: Tracked<wgpu::BindGroupLayout>,
+) {
+    let global_layout = Tracked::with_id(global_state.layout.clone(), global_state.layout_id);
+    ctx.pipeline_cache.register_render_layouts(
+        pipeline_id,
+        smallvec::smallvec![global_layout, local_layout],
+    );
+}
+
+fn color_target(format: wgpu::TextureFormat) -> ColorTargetKey {
+    ColorTargetKey::from(wgpu::ColorTargetState {
+        format,
+        blend: Some(wgpu::BlendState::REPLACE),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+fn create_raw_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSGI Raw Layout"),
+            entries: &[
+                depth_texture_2d(0, fragment),
+                texture_2d(
+                    1,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    3,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                ),
+                texture(
+                    4,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                    wgpu::TextureViewDimension::Cube,
+                    false,
+                ),
+                sampler(5, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(6, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(7, fragment),
+                texture(
+                    8,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                    blue_noise_view_dimension(),
+                    false,
+                ),
+                sampler(9, fragment, wgpu::SamplerBindingType::Filtering),
+            ],
+        }),
+    )
+}
+
+fn create_temporal_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSGI Temporal Layout"),
+            entries: &[
+                texture_2d(
+                    0,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    1,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                depth_texture_2d(2, fragment),
+                texture_2d(
+                    3,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    4,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    5,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                ),
+                sampler(6, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(7, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(8, fragment),
+            ],
+        }),
+    )
+}
+
+fn create_atrous_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSGI A-Trous Layout"),
+            entries: &[
+                texture_2d(
+                    0,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                depth_texture_2d(1, fragment),
+                texture_2d(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    3,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler(4, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(5, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(6, fragment),
+            ],
+        }),
+    )
+}
+
+fn create_merge_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSGI Merge Layout"),
+            entries: &[
+                texture_2d(
+                    0,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    1,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                depth_texture_2d(3, fragment),
+                texture_2d(
+                    4,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler(5, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(6, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(7, fragment),
+            ],
+        }),
+    )
+}
+
 struct SsgiRawNode<'a> {
+    feature: &'a mut SsgiRawFeature,
+    global_state_key: GlobalStateKey,
+    max_steps: u32,
+    uniforms_data: SsgiUniforms,
     scene_depth: TextureNodeId,
     scene_hiz: TextureNodeId,
     scene_normals: TextureNodeId,
     source_history: TextureNodeId,
-    pmrem_texture: TextureNodeId,
+    pmrem_texture: Option<TextureNodeId>,
     uniforms: BufferNodeId,
-    blue_noise_view: &'a Tracked<wgpu::TextureView>,
-    blue_noise_sampler: &'a Tracked<wgpu::Sampler>,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    pipeline_id: Option<RenderPipelineId>,
+    bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SsgiRawNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature
+            .ensure_resources(ctx, self.global_state_key, self.max_steps);
+        self.pipeline_id = Some(self.feature.pipeline_id(self.max_steps));
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.uniforms),
+            0,
+            bytemuck::bytes_of(&self.uniforms_data),
+        );
+
+        let layout = self.feature.layout().clone();
+        let blue_noise_view = ctx.system_textures.blue_noise.clone();
+        let blue_noise_sampler = ctx.system_textures.blue_noise_sampler.clone();
+        let black_cube = ctx.system_textures.black_cube.clone();
         let builder = ctx
-            .build_bind_group(self.layout, Some("SSGI Raw BG"))
+            .build_bind_group(&layout, Some("SSGI Raw BG"))
             .bind_texture(0, self.scene_depth)
             .bind_texture(1, self.scene_normals)
             .bind_texture(2, self.source_history)
-            .bind_texture(3, self.scene_hiz)
-            .bind_texture(4, self.pmrem_texture)
-            .bind_common_sampler(5, CommonSampler::LinearClamp)
-            .bind_common_sampler(6, CommonSampler::NearestClamp)
-            .bind_buffer(7, self.uniforms)
-            .bind_tracked_texture_view(8, self.blue_noise_view)
-            .bind_tracked_sampler(9, self.blue_noise_sampler);
-
-        self.transient_bg = Some(builder.build());
+            .bind_texture(3, self.scene_hiz);
+        let builder = if let Some(pmrem_texture) = self.pmrem_texture {
+            builder.bind_texture(4, pmrem_texture)
+        } else {
+            builder.bind_tracked_texture_view(4, &black_cube)
+        };
+        self.bind_group = Some(
+            builder
+                .bind_common_sampler(5, CommonSampler::LinearClamp)
+                .bind_common_sampler(6, CommonSampler::NearestClamp)
+                .bind_buffer(7, self.uniforms)
+                .bind_tracked_texture_view(8, &blue_noise_view)
+                .bind_tracked_sampler(9, &blue_noise_sampler)
+                .build(),
+        );
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let output = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
-        let global_bg = ctx.baked_lists.global_bind_group;
-
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("SSGI Raw Pass"),
             color_attachments: &[output],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
+            ..Default::default()
         });
-
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, global_bg, &[]);
-        rpass.set_bind_group(1, self.transient_bg.expect("SSGI raw BG missing"), &[]);
-        rpass.draw(0..3, 0..1);
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_render_pipeline(self.pipeline_id.expect("SSGI raw pipeline not prepared")),
+        );
+        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(1, self.bind_group.expect("SSGI raw BG missing"), &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
 struct SsgiTemporalNode<'a> {
+    feature: &'a mut SsgiTemporalFeature,
     raw_indirect: TextureNodeId,
     indirect_history: TextureNodeId,
     scene_depth: TextureNodeId,
@@ -1219,15 +1007,17 @@ struct SsgiTemporalNode<'a> {
     uniforms: BufferNodeId,
     output_indirect: TextureNodeId,
     output_meta: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    pipeline_id: Option<RenderPipelineId>,
+    bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SsgiTemporalNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.layout, Some("SSGI Temporal BG"), [
+        self.feature.ensure_resources(ctx);
+        self.pipeline_id = Some(self.feature.pipeline_id());
+        let layout = self.feature.layout().clone();
+        self.bind_group = Some(
+            crate::myth_bind_group!(ctx, &layout, Some("SSGI Temporal BG"), [
                 0 => self.raw_indirect,
                 1 => self.indirect_history,
                 2 => self.scene_depth,
@@ -1246,38 +1036,43 @@ impl<'a> PassNode<'a> for SsgiTemporalNode<'a> {
             ctx.get_color_attachment(self.output_indirect, RenderTargetOps::DontCare, None),
             ctx.get_color_attachment(self.output_meta, RenderTargetOps::DontCare, None),
         ];
-
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("SSGI Temporal Pass"),
             color_attachments: &attachments,
             depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
+            ..Default::default()
         });
-
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, self.transient_bg.expect("SSGI temporal BG missing"), &[]);
-        rpass.draw(0..3, 0..1);
+        pass.set_pipeline(
+            ctx.pipeline_cache.get_render_pipeline(
+                self.pipeline_id
+                    .expect("SSGI temporal pipeline not prepared"),
+            ),
+        );
+        pass.set_bind_group(0, self.bind_group.expect("SSGI temporal BG missing"), &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
 struct SsgiAtrousNode<'a> {
+    feature: &'a mut SsgiAtrousFeature,
+    step_size: u32,
     input_indirect: TextureNodeId,
     scene_depth: TextureNodeId,
     scene_normals: TextureNodeId,
     variance_meta: TextureNodeId,
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    pipeline_id: Option<RenderPipelineId>,
+    bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SsgiAtrousNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.layout, Some("SSGI A-Trous BG"), [
+        self.feature.ensure_resources(ctx, self.step_size);
+        self.pipeline_id = Some(self.feature.pipeline_id());
+        let layout = self.feature.layout().clone();
+        self.bind_group = Some(
+            crate::myth_bind_group!(ctx, &layout, Some("SSGI A-Trous BG"), [
                 0 => self.input_indirect,
                 1 => self.scene_depth,
                 2 => self.scene_normals,
@@ -1291,22 +1086,25 @@ impl<'a> PassNode<'a> for SsgiAtrousNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let output = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("SSGI A-Trous Pass"),
             color_attachments: &[output],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
+            ..Default::default()
         });
-
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, self.transient_bg.expect("SSGI A-Trous BG missing"), &[]);
-        rpass.draw(0..3, 0..1);
+        pass.set_pipeline(
+            ctx.pipeline_cache.get_render_pipeline(
+                self.pipeline_id
+                    .expect("SSGI A-Trous pipeline not prepared"),
+            ),
+        );
+        pass.set_bind_group(0, self.bind_group.expect("SSGI A-Trous BG missing"), &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
 struct SsgiMergeNode<'a> {
+    feature: &'a mut SsgiMergeFeature,
     current_color: TextureNodeId,
     clean_indirect: TextureNodeId,
     material_mrt: TextureNodeId,
@@ -1314,15 +1112,18 @@ struct SsgiMergeNode<'a> {
     scene_normals: TextureNodeId,
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    output_source: TextureNodeId,
+    pipeline_id: Option<RenderPipelineId>,
+    bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SsgiMergeNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.layout, Some("SSGI Merge BG"), [
+        self.feature.ensure_resources(ctx);
+        self.pipeline_id = Some(self.feature.pipeline_id());
+        let layout = self.feature.layout().clone();
+        self.bind_group = Some(
+            crate::myth_bind_group!(ctx, &layout, Some("SSGI Merge BG"), [
                 0 => self.current_color,
                 1 => self.clean_indirect,
                 2 => self.material_mrt,
@@ -1336,70 +1137,622 @@ impl<'a> PassNode<'a> for SsgiMergeNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let output = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let attachments = [
+            ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None),
+            ctx.get_color_attachment(self.output_source, RenderTargetOps::DontCare, None),
+        ];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("SSGI Merge Pass"),
-            color_attachments: &[output],
+            color_attachments: &attachments,
             depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
+            ..Default::default()
         });
-
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, self.transient_bg.expect("SSGI merge BG missing"), &[]);
-        rpass.draw(0..3, 0..1);
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_render_pipeline(self.pipeline_id.expect("SSGI merge pipeline not prepared")),
+        );
+        pass.set_bind_group(0, self.bind_group.expect("SSGI merge BG missing"), &[]);
+        pass.draw(0..3, 0..1);
     }
-}
-
-#[allow(dead_code)]
-fn pyramid_mip_count(width: u32, height: u32) -> u32 {
-    width.max(height).max(1).ilog2() + 1
-}
-
-fn persistent_texture_desc(width: u32, height: u32, format: wgpu::TextureFormat) -> TextureDesc {
-    TextureDesc::new_2d(
-        width,
-        height,
-        format,
-        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HISTORY_FLAG_INDIRECT_VALID, HISTORY_FLAG_SOURCE_VALID, SsgiFeature};
+    use super::*;
+    use crate::graph::core::graph::FrameConfig;
+    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph};
     use myth_resources::ssgi::SsgiSettings;
+    use myth_scene::camera::Camera;
 
-    const CAMERA_CUT_FLAG: u32 = 1 << 2;
+    const CUSTOM_RUNTIME_BIT: u32 = 1 << 7;
 
-    #[test]
-    fn sync_history_flags_clears_stale_validity_after_resize() {
-        let mut feature = SsgiFeature::new();
-        let mut settings = SsgiSettings::default();
-        settings.set_history_flags(
-            HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID | CAMERA_CUT_FLAG,
+    fn camera(camera_id: u128) -> RenderCamera {
+        let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
+        let mut render_camera = camera.extract_render_camera();
+        render_camera.camera_id = camera_id;
+        render_camera.camera_cut = 0;
+        render_camera
+    }
+
+    fn extract(
+        feature: &mut SsgiFeature,
+        histories: &mut HistoryRegistry,
+        settings: &SsgiSettings,
+        camera: &RenderCamera,
+        temporal_serial: u64,
+        size: (u32, u32),
+    ) -> SsgiSnapshot {
+        feature.extract(
+            histories,
+            1,
+            camera,
+            temporal_serial,
+            temporal_serial,
+            &settings.uniforms,
+            size,
+            temporal_serial as u32,
+            None,
+            GlobalStateKey::new(1, 1),
+        )
+    }
+
+    fn commit_indirect(histories: &mut HistoryRegistry, snapshot: SsgiSnapshot) -> bool {
+        histories.commit(
+            snapshot.indirect_history.commit,
+            &snapshot.indirect_history.next.map(|texture| texture.id),
+        )
+    }
+
+    fn commit_source(histories: &mut HistoryRegistry, snapshot: SsgiSnapshot) -> bool {
+        histories.commit(
+            snapshot.source_history.commit,
+            &snapshot.source_history.next.map(|texture| texture.id),
+        )
+    }
+
+    struct TestNode;
+
+    impl<'a> PassNode<'a> for TestNode {
+        fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    fn frame_config() -> FrameConfig {
+        FrameConfig {
+            width: 1280,
+            height: 720,
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            msaa_samples: 1,
+            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            hdr_format: HDR_TEXTURE_FORMAT,
+        }
+    }
+
+    fn register_inputs(
+        graph: &mut RenderGraph<'_>,
+    ) -> (
+        TextureNodeId,
+        TextureNodeId,
+        TextureNodeId,
+        TextureNodeId,
+        TextureNodeId,
+        TextureNodeId,
+    ) {
+        let sampled = wgpu::TextureUsages::TEXTURE_BINDING;
+        let color = graph.register_texture(
+            "SSGI_Test_Color",
+            TextureDesc::new_2d(1280, 720, HDR_TEXTURE_FORMAT, sampled),
+            true,
         );
+        let depth = graph.register_texture(
+            "SSGI_Test_Depth",
+            TextureDesc::new_2d(1280, 720, wgpu::TextureFormat::Depth32Float, sampled),
+            true,
+        );
+        let hiz = graph.register_texture(
+            "SSGI_Test_HiZ",
+            TextureDesc::new_2d(1280, 720, wgpu::TextureFormat::R32Float, sampled),
+            true,
+        );
+        let data = graph.register_texture(
+            "SSGI_Test_Data",
+            TextureDesc::new_2d(1280, 720, SSGI_TEXTURE_FORMAT, sampled),
+            true,
+        );
+        (color, depth, hiz, data, data, data)
+    }
 
-        feature.invalidate_history();
-        feature.sync_history_flags(&settings.uniforms);
+    fn add_graph<'a>(
+        feature: &'a mut SsgiFeature,
+        graph: &mut RenderGraph<'a>,
+        snapshot: SsgiSnapshot,
+    ) -> SsgiOutputs {
+        let config = frame_config();
+        let (color, depth, hiz, normals, velocity, material) = register_inputs(graph);
+        let mut ctx = GraphBuilderContext::new(graph, &config, 0);
+        feature.add_to_graph(
+            &mut ctx, snapshot, color, depth, hiz, normals, velocity, material, None,
+        )
+    }
 
-        assert_eq!(settings.uniforms.read().frame_params.w, CAMERA_CUT_FLAG);
+    fn add_root(graph: &mut RenderGraph<'_>, source: TextureNodeId) {
+        let output = graph.register_texture(
+            "SSGI_Test_Output",
+            TextureDesc::new_2d(
+                1280,
+                720,
+                HDR_TEXTURE_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            ),
+            true,
+        );
+        graph.add_pass("SSGI_Test_Root", |builder| {
+            builder.read_texture(source);
+            builder.write_texture(output);
+            (TestNode, ())
+        });
+    }
+
+    fn followup_validity(histories: &mut HistoryRegistry, snapshot: SsgiSnapshot) -> (bool, bool) {
+        let indirect = histories.plan_set(
+            snapshot.indirect_history.commit.set_id,
+            snapshot.indirect_history.next.map(|texture| texture.desc),
+            2,
+            false,
+        );
+        let source = histories.plan_set(
+            snapshot.source_history.commit.set_id,
+            snapshot.source_history.next.map(|texture| texture.desc),
+            2,
+            false,
+        );
+        (indirect.valid, source.valid)
     }
 
     #[test]
-    fn sync_history_flags_preserves_external_runtime_bits() {
+    fn extract_does_not_mutate_scene_uniforms_and_validity_requires_commit() {
         let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
         let mut settings = SsgiSettings::default();
-        settings.set_history_flags(CAMERA_CUT_FLAG);
-        feature.history_valid = true;
-        feature.source_history_valid = true;
+        settings.set_history_flags(CUSTOM_RUNTIME_BIT);
+        let camera = camera(7);
+        let before = *settings.uniforms.read();
 
-        feature.sync_history_flags(&settings.uniforms);
-
-        assert_eq!(
-            settings.uniforms.read().frame_params.w,
-            HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID | CAMERA_CUT_FLAG
+        let first = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1920, 1080),
         );
+        assert!(!first.indirect_history.valid);
+        assert!(!first.source_history.valid);
+        assert_eq!(first.uniforms.frame_params.w, CUSTOM_RUNTIME_BIT);
+        assert_eq!(
+            bytemuck::bytes_of(&*settings.uniforms.read()),
+            bytemuck::bytes_of(&before)
+        );
+
+        assert!(commit_indirect(&mut histories, first));
+        assert!(commit_source(&mut histories, first));
+        let second = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            2,
+            (1920, 1080),
+        );
+        assert!(second.indirect_history.valid);
+        assert!(second.source_history.valid);
+        assert_eq!(
+            second.uniforms.frame_params.w,
+            CUSTOM_RUNTIME_BIT | HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID
+        );
+    }
+
+    #[test]
+    fn taa_source_is_gated_by_committed_ssgi_source_history() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera(70);
+        let taa_set = histories.create_set();
+        let taa_desc = TextureDesc::new_2d(
+            1280,
+            720,
+            HDR_TEXTURE_FORMAT,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let taa_plan = histories.plan_set(taa_set, [taa_desc], 1, false);
+        let taa_previous = taa_plan.previous[0];
+
+        let first = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            1,
+            1,
+            &settings.uniforms,
+            (1280, 720),
+            1,
+            Some(taa_previous),
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(first.taa_history.is_none());
+        assert!(commit_indirect(&mut histories, first));
+        assert!(commit_source(&mut histories, first));
+
+        let second = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            2,
+            2,
+            &settings.uniforms,
+            (1280, 720),
+            2,
+            Some(taa_previous),
+            GlobalStateKey::new(1, 1),
+        );
+        assert_eq!(second.taa_history, Some(taa_previous));
+    }
+
+    #[test]
+    fn alternating_scene_camera_domains_keep_independent_continuity() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera_a = camera(71);
+        let camera_b = camera(72);
+
+        let a1 = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera_a,
+            1,
+            (1280, 720),
+        );
+        let b1 = feature.extract(
+            &mut histories,
+            2,
+            &camera_b,
+            1,
+            1,
+            &settings.uniforms,
+            (1280, 720),
+            1,
+            None,
+            GlobalStateKey::new(1, 2),
+        );
+        assert!(commit_indirect(&mut histories, a1));
+        assert!(commit_source(&mut histories, a1));
+        assert!(commit_indirect(&mut histories, b1));
+        assert!(commit_source(&mut histories, b1));
+
+        let a2 = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera_a,
+            2,
+            (1280, 720),
+        );
+        let b2 = feature.extract(
+            &mut histories,
+            2,
+            &camera_b,
+            2,
+            2,
+            &settings.uniforms,
+            (1280, 720),
+            2,
+            None,
+            GlobalStateKey::new(1, 2),
+        );
+        assert!(a2.indirect_history.valid && a2.source_history.valid);
+        assert!(b2.indirect_history.valid && b2.source_history.valid);
+        assert_ne!(
+            a2.indirect_history.previous[0].id,
+            b2.indirect_history.previous[0].id
+        );
+    }
+
+    #[test]
+    fn odd_full_resize_and_camera_cut_reset_both_sets() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let mut camera = camera(8);
+        let first = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1280, 720),
+        );
+        assert!(commit_indirect(&mut histories, first));
+        assert!(commit_source(&mut histories, first));
+
+        let resized = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            2,
+            (1280, 721),
+        );
+        assert_eq!(first.half_resolution, resized.half_resolution);
+        assert!(!resized.indirect_history.valid);
+        assert!(!resized.source_history.valid);
+        assert!(commit_indirect(&mut histories, resized));
+        assert!(commit_source(&mut histories, resized));
+
+        camera.camera_cut = 1;
+        let cut = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            3,
+            (1280, 721),
+        );
+        assert!(!cut.indirect_history.valid);
+        assert!(!cut.source_history.valid);
+        assert_ne!(cut.uniforms.frame_params.w & HISTORY_FLAG_CAMERA_CUT, 0);
+    }
+
+    #[test]
+    fn abandoned_domain_gc_recreates_both_sets_as_invalid() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera(9);
+        let first = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            1,
+            10,
+            &settings.uniforms,
+            (1280, 720),
+            1,
+            None,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(commit_indirect(&mut histories, first));
+        assert!(commit_source(&mut histories, first));
+        assert_eq!(feature.garbage_collect(&mut histories, 12, 2), 0);
+        assert_eq!(feature.garbage_collect(&mut histories, 13, 2), 1);
+
+        let replacement = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            2,
+            13,
+            &settings.uniforms,
+            (1280, 720),
+            2,
+            None,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(!replacement.indirect_history.valid);
+        assert!(!replacement.source_history.valid);
+        assert_ne!(
+            replacement.indirect_history.commit.set_id,
+            first.indirect_history.commit.set_id
+        );
+        assert_ne!(
+            replacement.source_history.commit.set_id,
+            first.source_history.commit.set_id
+        );
+    }
+
+    #[test]
+    fn reentry_expires_stale_domain_even_without_periodic_gc() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera(73);
+        let first = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            1,
+            1,
+            &settings.uniforms,
+            (1280, 720),
+            1,
+            None,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(commit_indirect(&mut histories, first));
+        assert!(commit_source(&mut histories, first));
+
+        let replacement = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            2,
+            TEMPORAL_DOMAIN_TTL_FRAMES + 2,
+            &settings.uniforms,
+            (1280, 720),
+            2,
+            None,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(!replacement.indirect_history.valid);
+        assert!(!replacement.source_history.valid);
+        assert_ne!(
+            replacement.indirect_history.commit.set_id,
+            first.indirect_history.commit.set_id
+        );
+        assert_ne!(
+            replacement.source_history.commit.set_id,
+            first.source_history.commit.set_id
+        );
+    }
+
+    #[test]
+    fn graph_has_one_uniform_no_archive_passes_and_no_eager_static_state() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera(10);
+        let snapshot = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1280, 720),
+        );
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let _outputs = add_graph(&mut feature, &mut graph, snapshot);
+
+        assert!(
+            graph
+                .storage
+                .passes
+                .iter()
+                .all(|pass| !pass.name.contains("Save"))
+        );
+        assert_eq!(
+            graph
+                .storage
+                .resources
+                .iter()
+                .filter(|resource| resource.name == "SSGI_Uniforms")
+                .count(),
+            1
+        );
+        assert!(feature.raw.pipelines.is_empty());
+        assert!(feature.temporal.pipeline_id.is_none());
+        assert!(
+            feature
+                .atrous
+                .iter()
+                .all(|stage| stage.pipeline_id.is_none())
+        );
+        assert!(feature.merge.pipeline_id.is_none());
+    }
+
+    #[test]
+    fn raw_root_commits_neither_history_set() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera(11);
+        let snapshot = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1280, 720),
+        );
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let outputs = add_graph(&mut feature, &mut graph, snapshot);
+        add_root(&mut graph, outputs.raw_indirect);
+        graph.compile_topology();
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(live, ["SSGI_Raw", "SSGI_Test_Root"]);
+        graph.commit_submitted_histories(&mut histories);
+        assert_eq!(followup_validity(&mut histories, snapshot), (false, false));
+    }
+
+    #[test]
+    fn clean_root_commits_only_indirect_history() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera(12);
+        let snapshot = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1280, 720),
+        );
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let outputs = add_graph(&mut feature, &mut graph, snapshot);
+        add_root(&mut graph, outputs.clean_indirect);
+        graph.compile_topology();
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(
+            live,
+            [
+                "SSGI_Raw",
+                "SSGI_Temporal",
+                "SSGI_ATrous_Step_1",
+                "SSGI_ATrous_Step_2",
+                "SSGI_ATrous_Step_4",
+                "SSGI_Test_Root",
+            ]
+        );
+        graph.commit_submitted_histories(&mut histories);
+        assert_eq!(followup_validity(&mut histories, snapshot), (true, false));
+    }
+
+    #[test]
+    fn merged_root_commits_both_history_sets() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera(13);
+        let snapshot = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1280, 720),
+        );
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let outputs = add_graph(&mut feature, &mut graph, snapshot);
+        add_root(&mut graph, outputs.merged_color);
+        graph.compile_topology();
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(
+            live,
+            [
+                "SSGI_Raw",
+                "SSGI_Temporal",
+                "SSGI_ATrous_Step_1",
+                "SSGI_ATrous_Step_2",
+                "SSGI_ATrous_Step_4",
+                "SSGI_Merge",
+                "SSGI_Test_Root",
+            ]
+        );
+        graph.commit_submitted_histories(&mut histories);
+        assert_eq!(followup_validity(&mut histories, snapshot), (true, true));
     }
 }

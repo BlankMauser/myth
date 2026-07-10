@@ -530,8 +530,13 @@ impl RenderFrame {
         );
 
         // ── 7. Global GPU resources ────────────────────────────────────
-        self.render_state
-            .update(scene.id(), camera, frame_time, surface_size);
+        self.render_state.update(
+            scene.id(),
+            camera,
+            frame_time,
+            resource_manager.frame_index(),
+            surface_size,
+        );
         resource_manager.prepare_global(assets, &self.extracted_scene, &self.render_state);
         resource_manager.ensure_buffer(&self.extracted_scene.local_light_metadata_buffer);
         resource_manager.ensure_buffer(&self.extracted_scene.local_light_storage_buffer);

@@ -9,6 +9,8 @@ use myth_resources::uniforms::RenderStateUniforms;
 use myth_scene::camera::RenderCamera;
 use rustc_hash::FxHashMap;
 
+use crate::graph::core::TemporalDomainKey;
+use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
 use crate::renderer::FrameTime;
 
 // ─── Debug View Target (compile-time gated) ─────────────────────────────────
@@ -73,18 +75,13 @@ impl DebugViewTarget {
 
 static NEXT_RENDER_STATE_ID: AtomicU32 = AtomicU32::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct TemporalViewKey {
-    scene_id: u32,
-    camera_id: u128,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct TemporalViewState {
     view_projection: glam::Mat4,
     jitter: glam::Vec2,
     unjittered_view_projection: glam::Mat4,
     serial: u64,
+    last_used_frame: u64,
 }
 
 pub struct RenderState {
@@ -92,7 +89,7 @@ pub struct RenderState {
     uniforms: CpuBuffer<RenderStateUniforms>,
     /// Previous matrices and local frame sequence, partitioned by temporal
     /// render domain so interleaved scene/camera rendering cannot cross-talk.
-    temporal_views: FxHashMap<TemporalViewKey, TemporalViewState>,
+    temporal_views: FxHashMap<TemporalDomainKey, TemporalViewState>,
     current_temporal_serial: u64,
     /// Active debug-view mode (from camera settings, resolved per-frame).
     #[cfg(feature = "debug_view")]
@@ -147,13 +144,13 @@ impl RenderState {
         scene_id: u32,
         camera: &RenderCamera,
         frame_time: FrameTime,
+        renderer_frame: u64,
         viewport_size: (u32, u32),
     ) {
-        let key = TemporalViewKey {
-            scene_id,
-            camera_id: camera.camera_id,
-        };
-        let previous = self.temporal_views.get(&key).copied();
+        let key = TemporalDomainKey::new(scene_id, camera.camera_id);
+        let previous = self.temporal_views.get(&key).copied().filter(|state| {
+            renderer_frame.saturating_sub(state.last_used_frame) <= TEMPORAL_DOMAIN_TTL_FRAMES
+        });
         let prev_vp = previous.map_or(glam::Mat4::IDENTITY, |state| state.view_projection);
         let prev_j = previous.map_or(glam::Vec2::ZERO, |state| state.jitter);
         let prev_unjittered_vp = previous.map_or(glam::Mat4::IDENTITY, |state| {
@@ -203,9 +200,19 @@ impl RenderState {
                 jitter: camera.jitter,
                 unjittered_view_projection: unjittered_vp,
                 serial: temporal_serial,
+                last_used_frame: renderer_frame,
             },
         );
         self.current_temporal_serial = temporal_serial;
+    }
+
+    /// Drop previous-view state for scene/camera domains that have not been
+    /// extracted within `ttl` renderer frames.
+    pub(crate) fn garbage_collect_temporal_views(&mut self, current_frame: u64, ttl: u64) -> usize {
+        let before = self.temporal_views.len();
+        self.temporal_views
+            .retain(|_, state| current_frame.saturating_sub(state.last_used_frame) <= ttl);
+        before - self.temporal_views.len()
     }
 }
 
@@ -235,14 +242,61 @@ mod tests {
         let camera_a = camera(1);
         let camera_b = camera(2);
 
-        state.update(10, &camera_a, frame_time(), (64, 64));
+        state.update(10, &camera_a, frame_time(), 1, (64, 64));
         assert_eq!(state.temporal_serial(), 1);
-        state.update(10, &camera_b, frame_time(), (64, 64));
+        state.update(10, &camera_b, frame_time(), 2, (64, 64));
         assert_eq!(state.temporal_serial(), 1);
-        state.update(10, &camera_a, frame_time(), (64, 64));
+        state.update(10, &camera_a, frame_time(), 3, (64, 64));
         assert_eq!(state.temporal_serial(), 2);
-        state.update(11, &camera_a, frame_time(), (64, 64));
+        state.update(11, &camera_a, frame_time(), 4, (64, 64));
         assert_eq!(state.temporal_serial(), 1);
         assert_eq!(state.temporal_views.len(), 3);
+    }
+
+    #[test]
+    fn temporal_view_gc_preserves_boundary_and_restarts_an_abandoned_domain() {
+        let mut state = RenderState::new();
+        let camera_a = camera(1);
+        let camera_b = camera(2);
+
+        state.update(10, &camera_a, frame_time(), 10, (64, 64));
+        state.update(10, &camera_b, frame_time(), 10, (64, 64));
+        state.update(10, &camera_a, frame_time(), 12, (64, 64));
+
+        assert_eq!(state.garbage_collect_temporal_views(12, 2), 0);
+        assert_eq!(state.garbage_collect_temporal_views(13, 2), 1);
+        assert_eq!(state.temporal_views.len(), 1);
+
+        state.update(10, &camera_b, frame_time(), 13, (64, 64));
+        assert_eq!(state.temporal_serial(), 1);
+        assert_eq!(
+            state.uniforms.read().prev_view_projection,
+            glam::Mat4::IDENTITY
+        );
+
+        state.update(10, &camera_a, frame_time(), 14, (64, 64));
+        assert_eq!(state.temporal_serial(), 3);
+    }
+
+    #[test]
+    fn reentry_restarts_stale_view_state_even_without_a_periodic_sweep() {
+        let mut state = RenderState::new();
+        let camera = camera(1);
+
+        state.update(10, &camera, frame_time(), 1, (64, 64));
+        state.update(
+            10,
+            &camera,
+            frame_time(),
+            TEMPORAL_DOMAIN_TTL_FRAMES + 2,
+            (64, 64),
+        );
+
+        assert_eq!(state.temporal_serial(), 1);
+        assert_eq!(
+            state.uniforms.read().prev_view_projection,
+            glam::Mat4::IDENTITY
+        );
+        assert_eq!(state.temporal_views.len(), 1);
     }
 }

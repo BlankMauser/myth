@@ -14,9 +14,10 @@ use crate::HDR_TEXTURE_FORMAT;
 use crate::core::gpu::binding_layout::{sampler, texture, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, GlobalStateKey, Tracked};
 use crate::graph::composer::GraphBuilderContext;
+use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, HistoryPlan, HistoryRegistry, HistorySetId, PassNode,
-    PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
+    PrepareContext, RenderTargetOps, TemporalDomainKey, TextureDesc, TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
@@ -58,12 +59,6 @@ pub struct SsrOutputs {
     pub raw_diagnostic: Option<TextureNodeId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SsrHistoryKey {
-    scene_id: u32,
-    camera_id: u128,
-}
-
 /// Per-frame CPU-only data captured while Composer builds the graph.
 #[derive(Clone, Copy)]
 pub struct SsrSnapshot {
@@ -82,13 +77,14 @@ pub struct SsrFeature {
     temporal: SsrTemporalFeature,
     spatial: SsrSpatialFeature,
     merge: SsrMergeFeature,
-    histories: FxHashMap<SsrHistoryKey, SsrHistoryDomain>,
+    histories: FxHashMap<TemporalDomainKey, SsrHistoryDomain>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SsrHistoryDomain {
     set_id: HistorySetId,
     full_resolution: (u32, u32),
+    last_planned_frame: u64,
 }
 
 #[derive(Default)]
@@ -145,18 +141,27 @@ impl SsrFeature {
         temporal_serial: u64,
         source_uniforms: &CpuBuffer<SsrUniforms>,
         size: (u32, u32),
+        renderer_frame: u64,
         frame_index: u32,
         trace_diagnostics: bool,
         global_state_key: GlobalStateKey,
     ) -> SsrSnapshot {
-        let history_key = SsrHistoryKey {
-            scene_id,
-            camera_id: camera.camera_id,
-        };
+        let history_key = TemporalDomainKey::new(scene_id, camera.camera_id);
+        if self.histories.get(&history_key).is_some_and(|domain| {
+            renderer_frame.saturating_sub(domain.last_planned_frame) > TEMPORAL_DOMAIN_TTL_FRAMES
+        }) {
+            let expired = self
+                .histories
+                .remove(&history_key)
+                .expect("expired SSR history domain must exist");
+            let removed = histories.remove_set(expired.set_id);
+            debug_assert!(removed, "SSR history domain lost its registry set");
+        }
         let (set_id, full_resolution_changed) =
             if let Some(domain) = self.histories.get_mut(&history_key) {
                 let changed = domain.full_resolution != size;
                 domain.full_resolution = size;
+                domain.last_planned_frame = renderer_frame;
                 (domain.set_id, changed)
             } else {
                 let id = histories.create_set();
@@ -165,6 +170,7 @@ impl SsrFeature {
                     SsrHistoryDomain {
                         set_id: id,
                         full_resolution: size,
+                        last_planned_frame: renderer_frame,
                     },
                 );
                 (id, false)
@@ -210,6 +216,26 @@ impl SsrFeature {
             trace_diagnostics,
             global_state_key,
         }
+    }
+
+    /// Retire history for scene/camera domains that have not planned an SSR
+    /// frame within `ttl` renderer frames.
+    pub(crate) fn garbage_collect(
+        &mut self,
+        histories: &mut HistoryRegistry,
+        current_frame: u64,
+        ttl: u64,
+    ) -> usize {
+        let before = self.histories.len();
+        self.histories.retain(|_, domain| {
+            let live = current_frame.saturating_sub(domain.last_planned_frame) <= ttl;
+            if !live {
+                let removed = histories.remove_set(domain.set_id);
+                debug_assert!(removed, "SSR history domain lost its registry set");
+            }
+            live
+        });
+        before - self.histories.len()
     }
 
     /// Emit Trace → Temporal → Spatial → Merge. Temporal renders directly into
@@ -1161,6 +1187,7 @@ mod tests {
             temporal_serial,
             &settings.uniforms,
             size,
+            temporal_serial,
             temporal_serial as u32,
             false,
             GlobalStateKey::new(1, scene_id),
@@ -1650,5 +1677,91 @@ mod tests {
             false,
         );
         assert!(followup.valid);
+    }
+
+    #[test]
+    fn abandoned_domain_expires_after_ttl_and_reenters_with_invalid_history() {
+        let mut histories = HistoryRegistry::new();
+        let mut feature = SsrFeature::new();
+        let settings = SsrSettings::default();
+        let camera = camera(41);
+
+        let first = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            1,
+            &settings.uniforms,
+            (1280, 720),
+            10,
+            1,
+            false,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(commit(&mut histories, first));
+
+        assert_eq!(feature.garbage_collect(&mut histories, 12, 2), 0);
+        assert_eq!(feature.histories.len(), 1);
+        assert_eq!(feature.garbage_collect(&mut histories, 13, 2), 1);
+        assert!(feature.histories.is_empty());
+
+        let replacement = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            2,
+            &settings.uniforms,
+            (1280, 720),
+            13,
+            2,
+            false,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(!replacement.history.valid);
+        assert_ne!(
+            replacement.history.commit.set_id,
+            first.history.commit.set_id
+        );
+        assert_ne!(replacement.history.next[0].id, first.history.next[0].id);
+    }
+
+    #[test]
+    fn reentry_expires_stale_history_even_without_a_periodic_sweep() {
+        let mut histories = HistoryRegistry::new();
+        let mut feature = SsrFeature::new();
+        let settings = SsrSettings::default();
+        let camera = camera(42);
+
+        let first = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            1,
+            &settings.uniforms,
+            (1280, 720),
+            1,
+            1,
+            false,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(commit(&mut histories, first));
+
+        let replacement = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            2,
+            &settings.uniforms,
+            (1280, 720),
+            TEMPORAL_DOMAIN_TTL_FRAMES + 2,
+            2,
+            false,
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(!replacement.history.valid);
+        assert_ne!(
+            replacement.history.commit.set_id,
+            first.history.commit.set_id
+        );
     }
 }

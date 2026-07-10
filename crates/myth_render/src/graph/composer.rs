@@ -568,12 +568,30 @@ impl<'a> FrameComposer<'a> {
                 &self.ctx.camera,
                 settings.feedback_weight,
                 self.ctx.render_state.temporal_serial(),
+                self.ctx.resource_manager.frame_index(),
                 (self.frame_config.width, self.frame_config.height),
                 self.frame_config.depth_format,
             ))
         } else {
             None
         };
+
+        let taa_history =
+            taa_snapshot.and_then(crate::graph::passes::taa::TaaSnapshot::previous_color);
+        let ssgi_snapshot = ssgi_enabled.then(|| {
+            self.ctx.ssgi_pass.extract(
+                self.ctx.history_registry,
+                self.ctx.scene.id(),
+                &self.ctx.camera,
+                self.ctx.render_state.temporal_serial(),
+                self.ctx.resource_manager.frame_index(),
+                &self.ctx.scene.ssgi.uniforms,
+                (self.frame_config.width, self.frame_config.height),
+                self.ctx.frame_time.frame_count as u32,
+                taa_history,
+                GlobalStateKey::new(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id),
+            )
+        });
 
         let ssr_snapshot = ssr_enabled.then(|| {
             self.ctx.ssr_pass.extract(
@@ -583,6 +601,7 @@ impl<'a> FrameComposer<'a> {
                 self.ctx.render_state.temporal_serial(),
                 &self.ctx.scene.ssr.uniforms,
                 (self.frame_config.width, self.frame_config.height),
+                self.ctx.resource_manager.frame_index(),
                 self.ctx.frame_time.frame_count as u32,
                 ssr_trace_diagnostics,
                 GlobalStateKey::new(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id),
@@ -701,6 +720,11 @@ impl<'a> FrameComposer<'a> {
                     }
                 }
             });
+
+            // SSGI samples the actual scene PMREM. If IBL recomputes it this
+            // frame, reading the same graph resource creates the dependency;
+            // without an environment, Raw prepare binds the system black cube.
+            let ssgi_pmrem = scene_environment_resources.as_ref().map(|env| env.pmrem);
 
             let shadow_output = if self.ctx.extracted_scene.has_shadow_casters() {
                 graph_ctx.with_group("Shadow", |c| self.ctx.shadow_pass.add_to_graph(c))
@@ -924,11 +948,9 @@ impl<'a> FrameComposer<'a> {
                         }
 
                         if ssgi_enabled {
-                            let taa_history = taa_snapshot
-                                .and_then(crate::graph::passes::taa::TaaSnapshot::previous_color);
-
                             let ssgi_out = self.ctx.ssgi_pass.add_to_graph(
                                 c,
+                                ssgi_snapshot.expect("SSGI snapshot missing"),
                                 active_color,
                                 scene_depth,
                                 scene_hiz.expect("SSGI requires Hi-Z pyramid"),
@@ -941,9 +963,7 @@ impl<'a> FrameComposer<'a> {
                                 opaque_out
                                     .material_mrt
                                     .expect("SSGI requires opaque material MRT"),
-                                env_dependency_pmrem,
-                                taa_history,
-                                taa_enabled,
+                                ssgi_pmrem,
                             );
 
                             #[cfg(feature = "debug_view")]

@@ -16,6 +16,33 @@ use super::types::{ResourceRecord, TextureDesc};
 static NEXT_PERSISTENT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HISTORY_SET_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Number of renderer frames an inactive scene/camera temporal domain remains
+/// reusable. The frame-end sweep enforces the memory bound, while each active
+/// domain also checks this age on re-entry so missed sweeps cannot revive stale
+/// temporal state.
+pub(crate) const TEMPORAL_DOMAIN_TTL_FRAMES: u64 = 120;
+
+/// Stable identity for state that belongs to one scene/camera timeline.
+///
+/// Feature histories and the renderer's previous-view state share this key,
+/// but retain independent lifetimes: disabling one feature must not reset the
+/// view state used by another temporal consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TemporalDomainKey {
+    scene_id: u32,
+    camera_id: u128,
+}
+
+impl TemporalDomainKey {
+    #[must_use]
+    pub const fn new(scene_id: u32, camera_id: u128) -> Self {
+        Self {
+            scene_id,
+            camera_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PersistentTextureId(u64);
 
@@ -129,10 +156,6 @@ pub struct HistoryRegistry {
     textures: FxHashMap<PersistentTextureId, PersistentTextureRecord>,
 }
 
-// TODO: add renderer-frame TTL eviction for abandoned scene/camera domains.
-// Descriptor changes already reuse IDs, so resize does not grow this storage;
-// domain churn still needs an explicit ownership/retirement policy.
-
 impl HistoryRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -144,6 +167,20 @@ impl HistoryRegistry {
         let id = HistorySetId::new();
         debug_assert!(!self.sets.contains_key(&id));
         id
+    }
+
+    /// Atomically retire a logical set and every materialized texture bank it
+    /// owns. Set IDs are globally monotonic and are never reused, so stale
+    /// commit tokens cannot target a later domain after retirement.
+    pub(crate) fn remove_set(&mut self, set_id: HistorySetId) -> bool {
+        let Some(record) = self.sets.remove(&set_id) else {
+            return false;
+        };
+
+        for id in record.members.into_iter().flatten() {
+            self.textures.remove(&id);
+        }
+        true
     }
 
     /// Plan one frame of a grouped ping-pong history set.
@@ -320,6 +357,11 @@ impl HistoryRegistry {
     fn physical_texture_count(&self) -> usize {
         self.textures.len()
     }
+
+    #[cfg(test)]
+    fn history_set_count(&self) -> usize {
+        self.sets.len()
+    }
 }
 
 #[cfg(test)]
@@ -428,5 +470,23 @@ mod tests {
         assert!(!registry.commit(plan.commit, &[plan.next[0].id]));
         assert!(!registry.commit(plan.commit, &[plan.previous[0].id, plan.previous[1].id]));
         assert!(commit(&mut registry, plan));
+    }
+
+    #[test]
+    fn removing_a_set_rejects_pending_commits_and_never_reuses_its_identity() {
+        let mut registry = HistoryRegistry::new();
+        let retired_set = registry.create_set();
+        let pending = registry.plan_set(retired_set, [desc(64), desc(64)], 1, false);
+
+        assert_eq!(registry.history_set_count(), 1);
+        assert!(registry.remove_set(retired_set));
+        assert_eq!(registry.history_set_count(), 0);
+        assert!(!commit(&mut registry, pending));
+        assert!(!registry.remove_set(retired_set));
+
+        let replacement_set = registry.create_set();
+        assert_ne!(replacement_set, retired_set);
+        let replacement = registry.plan_set(replacement_set, [desc(64), desc(64)], 1, false);
+        assert!(!replacement.valid);
     }
 }
