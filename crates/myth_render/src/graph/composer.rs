@@ -538,17 +538,18 @@ impl<'a> FrameComposer<'a> {
         let needs_feature_id = is_high_fidelity && (self.ctx.scene.ssss.enabled || ssr_enabled);
 
         #[cfg(feature = "debug_view")]
-        let (dbg_needs_normal, dbg_needs_velocity) = {
+        let (dbg_needs_normal, dbg_needs_velocity, ssr_trace_diagnostics) = {
             use crate::graph::render_state::DebugViewTarget;
             let target = DebugViewTarget::from_mode(self.ctx.render_state.debug_view_mode);
             (
                 target == DebugViewTarget::SceneNormal,
                 target == DebugViewTarget::Velocity,
+                target == DebugViewTarget::SsrTraceDebug,
             )
         };
 
         #[cfg(not(feature = "debug_view"))]
-        let (dbg_needs_normal, dbg_needs_velocity) = (false, false);
+        let (dbg_needs_normal, dbg_needs_velocity, ssr_trace_diagnostics) = (false, false, false);
 
         let taa_enabled = self.ctx.camera.aa_mode.is_taa();
         let needs_normal = ssao_enabled || ssgi_enabled || needs_feature_id || dbg_needs_normal;
@@ -573,6 +574,20 @@ impl<'a> FrameComposer<'a> {
         } else {
             None
         };
+
+        let ssr_snapshot = ssr_enabled.then(|| {
+            self.ctx.ssr_pass.extract(
+                self.ctx.history_registry,
+                self.ctx.scene.id(),
+                &self.ctx.camera,
+                self.ctx.render_state.temporal_serial(),
+                &self.ctx.scene.ssr.uniforms,
+                (self.frame_config.width, self.frame_config.height),
+                self.ctx.frame_time.frame_count as u32,
+                ssr_trace_diagnostics,
+                GlobalStateKey::new(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id),
+            )
+        });
 
         // let needs_normal = ssao_enabled || needs_feature_id;
         let needs_skybox = self.ctx.scene.background.needs_skybox_pass();
@@ -943,6 +958,7 @@ impl<'a> FrameComposer<'a> {
                         if ssr_enabled {
                             let ssr_out = self.ctx.ssr_pass.add_to_graph(
                                 c,
+                                ssr_snapshot.expect("SSR snapshot missing"),
                                 active_color,
                                 scene_depth,
                                 scene_hiz.expect("SSR requires Hi-Z pyramid"),

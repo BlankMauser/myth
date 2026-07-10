@@ -42,7 +42,6 @@ use crate::pipeline::{
 use crate::settings::{ClusteredShadingMode, RenderPath, RendererInitConfig, RendererSettings};
 
 const SSGI_HISTORY_FLAG_CAMERA_CUT: u32 = 1 << 2;
-const SSR_HISTORY_FLAG_CAMERA_CUT: u32 = 1 << 1;
 
 fn build_pipeline_layout(
     device: &wgpu::Device,
@@ -607,26 +606,6 @@ impl Renderer {
                 } else {
                     state.ssgi_pass.invalidate_history();
                     scene.ssgi.set_history_flags(0);
-                }
-
-                if ssr_enabled {
-                    scene.ssr.update_resolution(self.size.0, self.size.1);
-                    scene.ssr.set_frame_index(frame_time.frame_count as u32);
-                    scene.ssr.set_runtime_camera_near(camera.near);
-
-                    let mut ssr_history_flags = state.ssr_pass.history_flags();
-                    if camera.camera_cut != 0 {
-                        ssr_history_flags |= SSR_HISTORY_FLAG_CAMERA_CUT;
-                    }
-                    scene.ssr.set_history_flags(ssr_history_flags);
-                    state.ssr_pass.extract_and_prepare(
-                        &mut extract_ctx,
-                        &scene.ssr.uniforms,
-                        self.size,
-                    );
-                } else {
-                    state.ssr_pass.invalidate_history();
-                    scene.ssr.set_history_flags(0);
                 }
 
                 state.tone_map_pass.extract_and_prepare(
