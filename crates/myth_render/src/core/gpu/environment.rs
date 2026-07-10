@@ -14,7 +14,6 @@ use crate::core::gpu::{ResourceState, Tracked};
 
 use super::ResourceManager;
 
-pub const BRDF_LUT_SIZE: u32 = 128;
 const PROCEDURAL_IBL_SUN_UPDATE_THRESHOLD_DEGREES: f32 = 0.5;
 
 /// How the scene environment source must be converted before PMREM filtering.
@@ -568,54 +567,5 @@ impl ResourceManager {
         self.environments
             .scene_environment(scene_id)
             .map_or(0.0, GpuEnvironment::env_map_max_mip_level)
-    }
-
-    /// Ensure the global BRDF LUT texture exists.
-    ///
-    /// Creates the texture on first call and sets `needs_brdf_compute`.
-    /// Returns the resource ID of the BRDF LUT view.
-    pub fn ensure_brdf_lut(&mut self) -> u64 {
-        if let Some(id) = self.environments.brdf_lut_view_id() {
-            return id;
-        }
-
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("BRDF LUT"),
-            size: wgpu::Extent3d {
-                width: BRDF_LUT_SIZE,
-                height: BRDF_LUT_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let id = self.register_internal_texture_by_name("BRDF_LUT", view);
-
-        self.environments.set_brdf_lut(texture, id);
-
-        id
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn brdf_lut_texture(&self) -> Option<&wgpu::Texture> {
-        self.environments.brdf_lut_texture()
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn needs_brdf_compute(&self) -> bool {
-        self.environments.needs_brdf_compute()
-    }
-
-    #[inline]
-    pub fn mark_brdf_lut_computed(&mut self) {
-        self.environments.mark_brdf_lut_computed();
     }
 }

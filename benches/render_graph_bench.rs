@@ -604,7 +604,7 @@ fn bench_side_effect_passes(c: &mut Criterion) {
 //
 // Simulates the engine's actual HighFidelity rendering pipeline with the
 // realistic pass count and topology from the composer:
-//   BRDF_LUT → IBL → Shadow → Prepass → SSAO → Opaque → MSAA_Sync
+//   IBL → Shadow → Prepass → SSAO → Opaque → MSAA_Sync
 //   → Skybox (relay) → TransmissionCopy → Transparent (relay)
 //   → Bloom (downsample chain + upsample) → ToneMap → FXAA → Backbuffer
 //

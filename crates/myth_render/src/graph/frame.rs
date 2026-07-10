@@ -491,14 +491,13 @@ impl RenderFrame {
         // ── 2. Resolve frame-dependent shader variants ────────────────
         self.resolve_scene_feature_variants(scene, feature_config);
 
-        // ── 3. Resolve GPU environment + BRDF LUT ─────────────────────
+        // ── 3. Resolve GPU environment ─────────────────────────────────
         let env_max_mip = resource_manager.resolve_gpu_environment(
             scene.id(),
             assets,
             &scene.environment,
             &scene.background.mode,
         );
-        resource_manager.ensure_brdf_lut();
         self.extracted_scene.prepare_gpu_scene_inputs(env_max_mip);
 
         // ── 4. Build shadow views (pure math) ──────────────────────────

@@ -424,19 +424,13 @@ impl ResourceManager {
             )
         };
 
-        let brdf_lut_id = self
-            .environments
-            .brdf_lut_view_id()
-            .unwrap_or(self.system_textures.black_2d.id());
-
         // === Collect: gather all resource IDs ===
-        let mut current_ids = super::ResourceIdSet::with_capacity(8);
+        let mut current_ids = super::ResourceIdSet::with_capacity(5);
         current_ids.push(camera_result.resource_id);
         current_ids.push(scene_uniform_result.resource_id);
         current_ids.push(directional_light_result.resource_id);
         current_ids.push(processed_env_map_id);
         current_ids.push(pmrem_map_id);
-        current_ids.push(brdf_lut_id);
 
         let state_id = GlobalStateKey::new(render_state.id, extracted_scene.scene_id);
 
@@ -574,20 +568,6 @@ impl ResourceManager {
             pmrem_source,
             wgpu::TextureSampleType::Float { filterable: true },
             wgpu::TextureViewDimension::Cube,
-            wgpu::ShaderStages::FRAGMENT,
-        );
-
-        // Resolve brdf_lut from ResourceManager
-        let brdf_lut_source = self
-            .environments
-            .brdf_lut_view_id()
-            .map(|id| TextureSource::Attachment(id, wgpu::TextureViewDimension::D2));
-
-        builder.add_texture(
-            "brdf_lut",
-            brdf_lut_source,
-            wgpu::TextureSampleType::Float { filterable: true },
-            wgpu::TextureViewDimension::D2,
             wgpu::ShaderStages::FRAGMENT,
         );
     }

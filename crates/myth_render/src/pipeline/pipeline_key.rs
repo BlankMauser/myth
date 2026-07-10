@@ -11,7 +11,7 @@
 //! - [`FullscreenPipelineKey`] — post-processing / fullscreen passes
 //!   (bloom, SSAO, FXAA, tone map, SSSS, skybox…).
 //! - [`SimpleGeometryPipelineKey`] — simplified geometry passes (prepass, shadow).
-//! - [`ComputePipelineKey`] — compute shader pipelines (BRDF LUT, IBL).
+//! - [`ComputePipelineKey`] — compute shader pipelines (IBL, clustered lighting).
 
 use bitflags::bitflags;
 use std::hash::{Hash, Hasher};

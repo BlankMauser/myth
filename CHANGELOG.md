@@ -60,6 +60,7 @@ v0.3.0 establishes a stable baseline for the work completed since v0.2.0. The op
 - Existing opt-in flags such as `debug_view`, `rdg_inspector`, and `gltf-meshopt` remain opt-in.
 
 ### Refactored / Changed
+- Removed the unused BRDF LUT runtime path, including `BrdfLutFeature`, the ResourceManager BRDF APIs, the `entry/utility/brdf_lut` shader, and the generated `t_brdf_lut` / `s_brdf_lut` global bindings. Built-in physical materials already use the analytic `DFGApprox` path; downstream custom shaders that referenced these undocumented generated bindings must provide their own LUT binding if needed.
 - Split egui support into a dedicated `myth_egui` crate with a Myth-native renderer and optional `myth/egui` facade, removing the examples' dependency on `egui-wgpu`.
   - Added stable Myth texture registration for egui via `UiPass::texture_id` / `UiPass::register_texture`, allowing `TextureHandle` values to be shown directly in egui while the backend keeps the GPU view and sampler synchronized.
 

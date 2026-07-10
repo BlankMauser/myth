@@ -22,13 +22,13 @@
 //! │                    Unified RDG Pipeline                        │
 //! │                                                                │
 //! │  HighFidelity:                                                 │
-//! │  BRDF LUT → IBL → Shadow → Prepass → SSAO → Opaque →         │
+//! │  IBL → Shadow → Prepass → SSAO → Opaque →                    │
 //! │  SSSS → Skybox → TransmissionCopy → Transparent →             │
 //! │  [Bloom_System: Extract → DS_1..N → US_N..0 → Composite] →   │
 //! │  ToneMap → FXAA → [User Hooks] → Surface                     │
 //! │                                                                │
 //! │  BasicForward:                                                 │
-//! │  BRDF LUT → IBL → Shadow → Skybox(prepare) →                  │
+//! │  IBL → Shadow → Skybox(prepare) →                             │
 //! │  SimpleForward → [User Hooks] → Surface                       │
 //! └────────────────────────────────────────────────────────────────┘
 //! ```
@@ -65,9 +65,9 @@ use crate::graph::frame::{PreparedSkyboxDraw, RenderLists};
 use crate::graph::passes::GaussianSplattingFeature;
 use crate::graph::passes::utils::add_msaa_resolve_pass;
 use crate::graph::passes::{
-    AtmosphereFeature, BloomFeature, BrdfLutFeature, CasFeature, ClusteredLightingFeature,
-    ClusteredLightingInputs, EquirectToCubeFeature, FxaaFeature, HiZFeature, IblComputeFeature,
-    MipmapFeature, MsaaSyncFeature, OpaqueFeature, PrepassFeature, PresentFeature, ShadowFeature,
+    AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, ClusteredLightingInputs,
+    EquirectToCubeFeature, FxaaFeature, HiZFeature, IblComputeFeature, MipmapFeature,
+    MsaaSyncFeature, OpaqueFeature, PrepassFeature, PresentFeature, ShadowFeature,
     SimpleForwardFeature, SkyboxFeature, SsaoFeature, SsgiFeature, SsrFeature, SsssFeature,
     TaaFeature, ToneMappingFeature, TransmissionCopyFeature, TransparentFeature,
 };
@@ -144,7 +144,6 @@ pub struct ComposerContext<'a> {
 
     // Shadow + Compute
     pub shadow_pass: &'a mut ShadowFeature,
-    pub brdf_pass: &'a mut BrdfLutFeature,
     pub equirect_to_cube_pass: &'a mut EquirectToCubeFeature,
     pub ibl_pass: &'a mut IblComputeFeature,
     pub atmosphere_pass: &'a mut AtmosphereFeature,
@@ -670,10 +669,6 @@ impl<'a> FrameComposer<'a> {
             // ── 2c. Wire Compute + Shadow Passes ───────────────────────────
             graph_ctx.with_group("Compute", |c| {
                 self.ctx.mipmap_pass.add_to_graph(c);
-
-                if self.ctx.resource_manager.needs_brdf_compute() {
-                    self.ctx.brdf_pass.add_to_graph(c);
-                }
 
                 if let (Some(env), Some(gpu_env)) =
                     (scene_environment_resources.as_ref(), scene_gpu_environment)

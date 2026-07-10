@@ -19,11 +19,11 @@ use crate::graph::passes::DebugViewFeature;
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
 use crate::graph::passes::{
-    AtmosphereFeature, BloomFeature, BrdfLutFeature, CasFeature, ClusteredLightingFeature,
-    EquirectToCubeFeature, FxaaFeature, HiZFeature, IblComputeFeature, MipmapFeature,
-    MsaaSyncFeature, OpaqueFeature, PrepassFeature, PresentFeature, ShadowFeature,
-    SimpleForwardFeature, SkyboxFeature, SsaoFeature, SsgiFeature, SsrFeature, SsssFeature,
-    TaaFeature, ToneMappingFeature, TransmissionCopyFeature, TransparentFeature,
+    AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, EquirectToCubeFeature,
+    FxaaFeature, HiZFeature, IblComputeFeature, MipmapFeature, MsaaSyncFeature, OpaqueFeature,
+    PrepassFeature, PresentFeature, ShadowFeature, SimpleForwardFeature, SkyboxFeature,
+    SsaoFeature, SsgiFeature, SsrFeature, SsssFeature, TaaFeature, ToneMappingFeature,
+    TransmissionCopyFeature, TransparentFeature,
 };
 use myth_assets::AssetServer;
 use myth_core::Result;
@@ -136,7 +136,6 @@ struct RendererState {
 
     // Shadow + Compute passes (migrated from old system)
     pub(crate) shadow_pass: ShadowFeature,
-    pub(crate) brdf_pass: BrdfLutFeature,
     pub(crate) equirect_to_cube_pass: EquirectToCubeFeature,
     pub(crate) ibl_pass: IblComputeFeature,
     pub(crate) atmosphere_pass: AtmosphereFeature,
@@ -276,7 +275,6 @@ impl Renderer {
         let global_bind_group_cache = GlobalBindGroupCache::new();
 
         let shadow_pass = ShadowFeature::new(&wgpu_ctx.device);
-        let brdf_pass = BrdfLutFeature::new(&wgpu_ctx.device);
         let equirect_to_cube_pass = EquirectToCubeFeature::new(&wgpu_ctx.device);
         let ibl_pass = IblComputeFeature::new(&wgpu_ctx.device);
         let mipmap_pass = MipmapFeature::new(&wgpu_ctx.device);
@@ -316,7 +314,6 @@ impl Renderer {
             msaa_sync_pass: MsaaSyncFeature::new(),
 
             shadow_pass,
-            brdf_pass,
             equirect_to_cube_pass,
             ibl_pass,
             atmosphere_pass: AtmosphereFeature::new(),
@@ -513,8 +510,7 @@ impl Renderer {
                 assets,
             };
 
-            // Always: compute + shadow
-            state.brdf_pass.extract_and_prepare(&mut extract_ctx);
+            // Always: environment maintenance + shadow
             let environment_cache_frame = extract_ctx.resource_manager.frame_index();
             state
                 .equirect_to_cube_pass
@@ -659,7 +655,6 @@ impl Renderer {
             msaa_sync_pass: &mut state.msaa_sync_pass,
 
             shadow_pass: &mut state.shadow_pass,
-            brdf_pass: &mut state.brdf_pass,
             equirect_to_cube_pass: &mut state.equirect_to_cube_pass,
             ibl_pass: &mut state.ibl_pass,
             atmosphere_pass: &mut state.atmosphere_pass,
@@ -1278,6 +1273,62 @@ mod tests {
         let black_cube_id = state.resource_manager.system_textures.black_cube.id();
         assert_eq!(black_cube_id, resource_ids[3]);
         assert_eq!(black_cube_id, resource_ids[4]);
+    }
+
+    #[test]
+    fn global_state_and_render_graph_exclude_the_unused_brdf_lut() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let camera = make_camera();
+
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert!(
+                !state
+                    .resource_manager
+                    .internal_textures
+                    .contains_name("BRDF_LUT"),
+                "renderer initialization must not allocate the unused LUT"
+            );
+        }
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let global_state = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene.id())
+            .expect("global state missing after render");
+        assert_eq!(
+            global_state.resource_ids.as_slice().len(),
+            5,
+            "global fingerprint should contain only camera, environment, lights, and two environment cube identities"
+        );
+        assert_eq!(
+            global_state.binding_wgsl.matches("@group(0)").count(),
+            5,
+            "global layout should contain three buffers plus PMREM texture/sampler"
+        );
+        assert!(
+            !global_state.binding_wgsl.contains("brdf_lut"),
+            "the generated global shader interface must not expose a dead LUT binding"
+        );
+        assert!(
+            !state
+                .resource_manager
+                .internal_textures
+                .contains_name("BRDF_LUT"),
+            "rendering a frame must not allocate the unused LUT"
+        );
+        assert!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .all(|pass| pass.name != "BRDF_LUT"),
+            "the graph must not schedule a dead BRDF compute pass"
+        );
     }
 
     #[test]

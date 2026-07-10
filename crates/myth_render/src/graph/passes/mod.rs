@@ -2,7 +2,6 @@ pub mod atmosphere;
 pub mod bloom;
 pub mod cas;
 pub mod clustered_lighting;
-pub mod compute;
 #[cfg(feature = "debug_view")]
 pub mod debug_view;
 pub mod draw;
@@ -37,7 +36,6 @@ pub use cas::CasFeature;
 pub use clustered_lighting::{
     ClusteredLightingFeature, ClusteredLightingInputs, ClusteredLightingSnapshot,
 };
-pub use compute::BrdfLutFeature;
 #[cfg(feature = "debug_view")]
 pub use debug_view::DebugViewFeature;
 pub use equirect_to_cube::EquirectToCubeFeature;

@@ -8,9 +8,6 @@ use super::{GpuEnvironment, InternalTextureRegistry};
 #[derive(Default)]
 pub(crate) struct EnvironmentStore {
     scene_gpu_environments: FxHashMap<u32, GpuEnvironment>,
-    brdf_lut_texture: Option<wgpu::Texture>,
-    brdf_lut_view_id: Option<u64>,
-    needs_brdf_compute: bool,
 }
 
 impl EnvironmentStore {
@@ -50,35 +47,5 @@ impl EnvironmentStore {
     #[inline]
     pub(super) fn insert_scene_environment(&mut self, scene_id: u32, gpu_env: GpuEnvironment) {
         self.scene_gpu_environments.insert(scene_id, gpu_env);
-    }
-
-    #[inline]
-    #[must_use]
-    pub(super) fn brdf_lut_view_id(&self) -> Option<u64> {
-        self.brdf_lut_view_id
-    }
-
-    #[inline]
-    pub(super) fn set_brdf_lut(&mut self, texture: wgpu::Texture, view_id: u64) {
-        self.brdf_lut_texture = Some(texture);
-        self.brdf_lut_view_id = Some(view_id);
-        self.needs_brdf_compute = true;
-    }
-
-    #[inline]
-    #[must_use]
-    pub(super) fn brdf_lut_texture(&self) -> Option<&wgpu::Texture> {
-        self.brdf_lut_texture.as_ref()
-    }
-
-    #[inline]
-    #[must_use]
-    pub(super) fn needs_brdf_compute(&self) -> bool {
-        self.needs_brdf_compute
-    }
-
-    #[inline]
-    pub(super) fn mark_brdf_lut_computed(&mut self) {
-        self.needs_brdf_compute = false;
     }
 }
