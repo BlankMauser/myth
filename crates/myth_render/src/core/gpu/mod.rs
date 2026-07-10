@@ -51,7 +51,7 @@ pub(crate) use crate::core::gpu::environment::{BRDF_LUT_SIZE, CubeSourceType};
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
 pub(crate) use crate::core::gpu::material::GpuMaterial;
 pub(crate) use crate::core::gpu::texture::{GpuImage, ResourceState, TextureBinding};
-pub use bind_group_store::{BindGroupContext, GpuGlobalState};
+pub use bind_group_store::{BindGroupContext, GlobalStateKey, GlobalStateResolver, GpuGlobalState};
 pub(crate) use bind_group_store::{BindGroupStore, ObjectBindGroupKey};
 pub(crate) use environment_store::EnvironmentStore;
 pub(crate) use internal_texture_registry::InternalTextureRegistry;

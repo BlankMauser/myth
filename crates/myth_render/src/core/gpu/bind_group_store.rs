@@ -8,6 +8,32 @@ use crate::pipeline::vertex::VertexLayoutSignature;
 
 use super::{ResourceIdSet, generate_gpu_resource_id};
 
+/// Stable logical key for the scene-level global binding state.
+///
+/// The key is lightweight snapshot data. It deliberately identifies the
+/// state without exposing its physical bind group, layout, or generated WGSL
+/// interface to graph construction.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GlobalStateKey(u64);
+
+impl GlobalStateKey {
+    #[must_use]
+    pub const fn new(render_state_id: u32, scene_id: u32) -> Self {
+        Self((scene_id as u64) << 32 | render_state_id as u64)
+    }
+
+    #[must_use]
+    pub const fn render_state_id(self) -> u32 {
+        self.0 as u32
+    }
+
+    #[must_use]
+    pub const fn scene_id(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
+
 /// GPU global state (Group 0)
 ///
 /// Contains Camera Uniforms, Light Storage Buffer, Environment Maps, etc.
@@ -37,10 +63,29 @@ pub struct BindGroupContext {
     pub binding_wgsl: Arc<str>,
 }
 
+/// Narrow, immutable post-compile capability for resolving global binding
+/// state from a lightweight [`GlobalStateKey`].
+#[derive(Clone, Copy)]
+pub struct GlobalStateResolver<'a> {
+    store: &'a BindGroupStore,
+}
+
+impl<'a> GlobalStateResolver<'a> {
+    pub(crate) const fn new(store: &'a BindGroupStore) -> Self {
+        Self { store }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn get(self, key: GlobalStateKey) -> Option<&'a GpuGlobalState> {
+        self.store.global_state(key)
+    }
+}
+
 /// Persistent bind-group, layout, and shader-interface caches.
 #[derive(Default)]
 pub(crate) struct BindGroupStore {
-    global_states: FxHashMap<u64, GpuGlobalState>,
+    global_states: FxHashMap<GlobalStateKey, GpuGlobalState>,
     layout_cache: FxHashMap<Vec<wgpu::BindGroupLayoutEntry>, (wgpu::BindGroupLayout, u64)>,
     vertex_layout_cache: FxHashMap<VertexLayoutSignature, u64>,
     object_bind_group_cache: FxHashMap<ObjectBindGroupKey, BindGroupContext>,
@@ -120,17 +165,42 @@ impl BindGroupStore {
 
     #[inline]
     #[must_use]
-    pub(super) fn global_state(&self, state_id: u64) -> Option<&GpuGlobalState> {
+    pub(super) fn global_state(&self, state_id: GlobalStateKey) -> Option<&GpuGlobalState> {
         self.global_states.get(&state_id)
     }
 
     #[inline]
-    pub(super) fn global_state_mut(&mut self, state_id: u64) -> Option<&mut GpuGlobalState> {
+    pub(super) fn global_state_mut(
+        &mut self,
+        state_id: GlobalStateKey,
+    ) -> Option<&mut GpuGlobalState> {
         self.global_states.get_mut(&state_id)
     }
 
     #[inline]
-    pub(super) fn insert_global_state(&mut self, state_id: u64, gpu_state: GpuGlobalState) {
+    pub(super) fn insert_global_state(
+        &mut self,
+        state_id: GlobalStateKey,
+        gpu_state: GpuGlobalState,
+    ) {
         self.global_states.insert(state_id, gpu_state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalStateKey;
+
+    #[test]
+    fn global_state_key_round_trips_both_ids() {
+        let key = GlobalStateKey::new(0x89ab_cdef, 0x0123_4567);
+
+        assert_eq!(key.render_state_id(), 0x89ab_cdef);
+        assert_eq!(key.scene_id(), 0x0123_4567);
+    }
+
+    #[test]
+    fn global_state_key_keeps_render_and_scene_ids_distinct() {
+        assert_ne!(GlobalStateKey::new(1, 2), GlobalStateKey::new(2, 1));
     }
 }

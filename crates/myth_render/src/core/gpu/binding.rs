@@ -21,8 +21,8 @@ use myth_resources::builder::{Binding, BindingDesc};
 use myth_resources::{BindingResource, ResourceBuilder, WgslStructName};
 
 use super::{
-    BindGroupContext, GpuGlobalState, ModelBufferAllocator, ObjectBindGroupKey, ResourceManager,
-    generate_gpu_resource_id,
+    BindGroupContext, GlobalStateKey, GpuGlobalState, ModelBufferAllocator, ObjectBindGroupKey,
+    ResourceManager, generate_gpu_resource_id,
 };
 
 static NEXT_GLOBAL_STATE_ID: AtomicU32 = AtomicU32::new(0);
@@ -437,7 +437,7 @@ impl ResourceManager {
         current_ids.push(pmrem_map_id);
         current_ids.push(brdf_lut_id);
 
-        let state_id = Self::compute_global_state_key(render_state.id, extracted_scene.scene_id);
+        let state_id = GlobalStateKey::new(render_state.id, extracted_scene.scene_id);
 
         // === Check: fast fingerprint comparison ===
         if let Some(gpu_state) = self.bind_groups.global_state_mut(state_id)
@@ -451,15 +451,10 @@ impl ResourceManager {
         self.create_global_state(assets, state_id, render_state, extracted_scene, current_ids)
     }
 
-    #[inline]
-    fn compute_global_state_key(render_state_id: u32, scene_id: u32) -> u64 {
-        (u64::from(scene_id) << 32) | u64::from(render_state_id)
-    }
-
     fn create_global_state(
         &mut self,
         assets: &AssetServer,
-        state_id: u64,
+        state_id: GlobalStateKey,
         render_state: &RenderState,
         extracted_scene: &ExtractedScene,
         resource_ids: super::ResourceIdSet,
@@ -597,7 +592,7 @@ impl ResourceManager {
     }
 
     pub fn get_global_state(&self, render_state_id: u32, scene_id: u32) -> Option<&GpuGlobalState> {
-        let state_id = Self::compute_global_state_key(render_state_id, scene_id);
+        let state_id = GlobalStateKey::new(render_state_id, scene_id);
         self.bind_groups.global_state(state_id)
     }
 }

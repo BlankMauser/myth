@@ -4,7 +4,8 @@ use crate::core::ResourceManager;
 use crate::core::WgpuContext;
 use crate::core::binding::{BindGroupKey, GlobalBindGroupCache};
 use crate::core::gpu::{
-    BufferUploadContext, CommonSampler, MipmapGenerator, SamplerRegistry, SystemTextures, Tracked,
+    BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator, SamplerRegistry,
+    SystemTextures, Tracked,
 };
 use crate::graph::frame::{BakedRenderLists, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
@@ -85,6 +86,10 @@ pub struct PrepareContext<'a> {
     /// Narrow persistent-buffer upload capability. This borrows only the
     /// ResourceManager's resource-store partition.
     pub uploads: BufferUploadContext<'a>,
+    /// Immutable lookup capability for scene-level global binding state.
+    /// Snapshots carry only a lightweight key; live feature nodes resolve the
+    /// physical layout and WGSL interface through this capability on L1 miss.
+    pub global_states: GlobalStateResolver<'a>,
     /// Shared sampler registry (persistent, immutable during prepare).
     pub sampler_registry: &'a SamplerRegistry,
     /// System fallback textures and Group 3 bind-group infrastructure.

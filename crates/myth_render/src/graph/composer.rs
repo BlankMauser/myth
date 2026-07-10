@@ -48,7 +48,7 @@
 //! ```
 
 use crate::core::binding::GlobalBindGroupCache;
-use crate::core::gpu::{CubeSourceType, Tracked};
+use crate::core::gpu::{CubeSourceType, GlobalStateResolver, Tracked};
 use crate::core::{ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
 use crate::graph::RenderState;
@@ -1271,6 +1271,7 @@ impl<'a> FrameComposer<'a> {
                     self.ctx.resource_manager.frame_index,
                     &mut self.ctx.resource_manager.resources,
                 ),
+                global_states: GlobalStateResolver::new(&self.ctx.resource_manager.bind_groups),
                 sampler_registry: &self.ctx.resource_manager.sampler_registry,
                 system_textures: &self.ctx.resource_manager.system_textures,
                 global_bind_group_cache: self.ctx.global_bind_group_cache,
