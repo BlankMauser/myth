@@ -1,10 +1,11 @@
 //! SSSS Feature + Ephemeral PassNodes (Flattened)
 //!
-//! - **`SsssFeature`** (long-lived): owns the lazily-created shared layout and
-//!   profiles storage buffer.
+//! - **`SsssFeature`** (long-lived): owns the lazily-created shared layout,
+//!   profiles storage buffer, and the L1 pipeline state for both blur passes.
 //! - **`SsssHorizontalNode`** / **`SsssVerticalNode`** (ephemeral per-frame):
 //!   two independent RDG passes created by `SsssFeature::add_to_graph()`.
-//!   Each live node resolves only its own pipeline during deferred prepare.
+//!   Each live node ensures only its own persistent resources during deferred
+//!   prepare, then builds its per-frame transient bind group.
 //!
 //! Implements a separable Gaussian blur for SSS materials identified via
 //! a **data-driven soft mask**: the `Feature_ID` colour attachment written
@@ -37,7 +38,6 @@
 //!   Uploaded from `AssetServer.sss_registry`.
 //! - **temp_blur TransientTexture**: `Rgba16Float`, same size as scene colour.
 
-use crate::HDR_TEXTURE_FORMAT;
 use crate::core::gpu::binding_layout::{depth_texture_2d, sampler, storage_buffer, texture_2d};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
@@ -64,11 +64,33 @@ pub struct SsssSnapshot<'a> {
 }
 
 /// Long-lived SSSS feature. CPU extraction remains lightweight; persistent GPU
-/// resources are initialized only by a live horizontal node after DPE.
+/// resources are initialized only by live nodes after DPE and reused across
+/// frames while their L1 keys remain unchanged.
 pub struct SsssFeature {
+    shared: SsssSharedResources,
+    horizontal: SsssPipelineResources,
+    vertical: SsssPipelineResources,
+}
+
+/// Persistent resources shared by both blur directions.
+struct SsssSharedResources {
     bind_group_layout: OnceLock<Tracked<wgpu::BindGroupLayout>>,
     profiles_buffer: OnceLock<Tracked<wgpu::Buffer>>,
     last_uploaded_registry_version: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SsssPipelineL1Key {
+    output_format: wgpu::TextureFormat,
+    vertical: bool,
+}
+
+/// Per-node persistent pipeline state. The two instances are physically
+/// partitioned so both graph nodes can hold independent mutable borrows.
+#[derive(Default)]
+struct SsssPipelineResources {
+    l1_key: Option<SsssPipelineL1Key>,
+    pipeline_id: Option<RenderPipelineId>,
 }
 
 impl Default for SsssFeature {
@@ -81,9 +103,13 @@ impl SsssFeature {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            bind_group_layout: OnceLock::new(),
-            profiles_buffer: OnceLock::new(),
-            last_uploaded_registry_version: AtomicU64::new(u64::MAX),
+            shared: SsssSharedResources {
+                bind_group_layout: OnceLock::new(),
+                profiles_buffer: OnceLock::new(),
+                last_uploaded_registry_version: AtomicU64::new(u64::MAX),
+            },
+            horizontal: SsssPipelineResources::default(),
+            vertical: SsssPipelineResources::default(),
         }
     }
 
@@ -96,7 +122,99 @@ impl SsssFeature {
         }
     }
 
-    fn prepare_shared_resources(&self, ctx: &PrepareContext<'_>, snapshot: SsssSnapshot<'_>) {
+    /// Build the ephemeral pass nodes and insert them into the graph as
+    /// two independent RDG passes within an `"SSSS_System"` group.
+    ///
+    /// All inputs are explicitly wired — no blackboard lookups.
+    /// The pass modifies `scene_color` in-place (read + write via alias).
+    ///
+    /// # Flattened Pass Chain
+    ///
+    /// 1. **SSSS_Blur_H** — horizontal scatter: `scene_color` → `temp_blur`
+    /// 2. **SSSS_Blur_V** — vertical scatter: `temp_blur` → `scene_color` alias
+    pub fn add_to_graph<'a>(
+        &'a mut self,
+        ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: SsssSnapshot<'a>,
+        scene_color: TextureNodeId,
+        scene_depth: TextureNodeId,
+        scene_normals: TextureNodeId,
+        feature_id: TextureNodeId,
+        specular_tex: TextureNodeId,
+    ) -> TextureNodeId {
+        let shared = &self.shared;
+        let horizontal = &mut self.horizontal;
+        let vertical = &mut self.vertical;
+
+        ctx.with_group("SSSS_System", |ctx| {
+            // ─── Pass 1: Horizontal blur ───────────────────────────
+            let fc = ctx.frame_config;
+            let (w, h) = (fc.width, fc.height);
+            let hdr_format = fc.hdr_format;
+            let temp_desc = TextureDesc::new_2d(
+                w,
+                h,
+                hdr_format,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            );
+
+            let temp_blur: TextureNodeId = ctx.graph.add_pass("SSSS_Blur_H", |builder| {
+                builder.read_texture(scene_color);
+                builder.read_texture(scene_depth);
+                builder.read_texture(scene_normals);
+                builder.read_texture(feature_id);
+                builder.read_texture(specular_tex);
+                let out = builder.create_texture("SSSS_Temp", temp_desc);
+                let node = SsssHorizontalNode {
+                    shared,
+                    resources: horizontal,
+                    snapshot,
+                    output_format: hdr_format,
+                    scene_color_in: scene_color,
+                    temp_blur: out,
+                    depth_in: scene_depth,
+                    normal_in: scene_normals,
+                    feature_id,
+                    specular_tex,
+                    pipeline_id: None,
+                    bind_group: None,
+                };
+                (node, out)
+            });
+
+            // ─── Pass 2: Vertical blur ─────────────────────────────
+            let ssss_out: TextureNodeId = ctx.graph.add_pass("SSSS_Blur_V", |builder| {
+                builder.read_texture(temp_blur);
+                builder.read_texture(scene_depth);
+                builder.read_texture(scene_normals);
+                builder.read_texture(feature_id);
+                builder.read_texture(specular_tex);
+                let out = builder.mutate_texture(scene_color, "Scene_Color_SSSS");
+                let node = SsssVerticalNode {
+                    shared,
+                    resources: vertical,
+                    output_format: hdr_format,
+                    scene_color_out: out,
+                    temp_blur,
+                    depth_in: scene_depth,
+                    normal_in: scene_normals,
+                    feature_id,
+                    specular_tex,
+                    pipeline_id: None,
+                    bind_group: None,
+                };
+                (node, out)
+            });
+
+            ssss_out
+        })
+    }
+}
+
+impl SsssSharedResources {
+    /// Ensure the shared cross-frame resources exist and that dynamic profile
+    /// contents match the snapshot observed by this live graph.
+    fn ensure_resources(&self, ctx: &PrepareContext<'_>, snapshot: SsssSnapshot<'_>) {
         self.bind_group_layout
             .get_or_init(|| Tracked::new(create_bind_group_layout(ctx.device)));
 
@@ -129,85 +247,29 @@ impl SsssFeature {
             .get()
             .expect("SSSS profiles buffer must be prepared by the horizontal node")
     }
+}
 
-    /// Build the ephemeral pass nodes and insert them into the graph as
-    /// two independent RDG passes within an `"SSSS_System"` group.
+impl SsssPipelineResources {
+    /// Ensure the cross-frame pipeline exists for `expected_key`.
     ///
-    /// All inputs are explicitly wired — no blackboard lookups.
-    /// The pass modifies `scene_color` in-place (read + write via alias).
-    ///
-    /// # Flattened Pass Chain
-    ///
-    /// 1. **SSSS_Blur_H** — horizontal scatter: `scene_color` → `temp_blur`
-    /// 2. **SSSS_Blur_V** — vertical scatter: `temp_blur` → `scene_color` alias
-    pub fn add_to_graph<'a>(
-        &'a self,
-        ctx: &mut GraphBuilderContext<'a, '_>,
-        snapshot: SsssSnapshot<'a>,
-        scene_color: TextureNodeId,
-        scene_depth: TextureNodeId,
-        scene_normals: TextureNodeId,
-        feature_id: TextureNodeId,
-        specular_tex: TextureNodeId,
-    ) -> TextureNodeId {
-        ctx.with_group("SSSS_System", |ctx| {
-            // ─── Pass 1: Horizontal blur ───────────────────────────
-            let fc = ctx.frame_config;
-            let (w, h) = (fc.width, fc.height);
-            let hdr_format = fc.hdr_format;
-            let temp_desc = TextureDesc::new_2d(
-                w,
-                h,
-                hdr_format,
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            );
+    /// The L1 comparison happens before shader compilation and L2 pipeline
+    /// cache access, so stable frames pay only an equality check.
+    fn ensure_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        bind_group_layout: &Tracked<wgpu::BindGroupLayout>,
+        expected_key: SsssPipelineL1Key,
+    ) -> RenderPipelineId {
+        if self.l1_key == Some(expected_key) {
+            return self
+                .pipeline_id
+                .expect("SSSS L1 key without a prepared pipeline");
+        }
 
-            let temp_blur: TextureNodeId = ctx.graph.add_pass("SSSS_Blur_H", |builder| {
-                builder.read_texture(scene_color);
-                builder.read_texture(scene_depth);
-                builder.read_texture(scene_normals);
-                builder.read_texture(feature_id);
-                builder.read_texture(specular_tex);
-                let out = builder.create_texture("SSSS_Temp", temp_desc);
-                let node = SsssHorizontalNode {
-                    feature: self,
-                    snapshot,
-                    scene_color_in: scene_color,
-                    temp_blur: out,
-                    depth_in: scene_depth,
-                    normal_in: scene_normals,
-                    feature_id,
-                    specular_tex,
-                    pipeline_id: None,
-                    bind_group: None,
-                };
-                (node, out)
-            });
-
-            // ─── Pass 2: Vertical blur ─────────────────────────────
-            let ssss_out: TextureNodeId = ctx.graph.add_pass("SSSS_Blur_V", |builder| {
-                builder.read_texture(temp_blur);
-                builder.read_texture(scene_depth);
-                builder.read_texture(scene_normals);
-                builder.read_texture(feature_id);
-                builder.read_texture(specular_tex);
-                let out = builder.mutate_texture(scene_color, "Scene_Color_SSSS");
-                let node = SsssVerticalNode {
-                    feature: self,
-                    scene_color_out: out,
-                    temp_blur,
-                    depth_in: scene_depth,
-                    normal_in: scene_normals,
-                    feature_id,
-                    specular_tex,
-                    pipeline_id: None,
-                    bind_group: None,
-                };
-                (node, out)
-            });
-
-            ssss_out
-        })
+        let pipeline_id = create_pipeline(ctx, bind_group_layout, expected_key);
+        self.l1_key = Some(expected_key);
+        self.pipeline_id = Some(pipeline_id);
+        pipeline_id
     }
 }
 
@@ -246,13 +308,13 @@ fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn prepare_pipeline(
+fn create_pipeline(
     ctx: &mut PrepareContext<'_>,
     bind_group_layout: &Tracked<wgpu::BindGroupLayout>,
-    vertical: bool,
+    l1_key: SsssPipelineL1Key,
 ) -> RenderPipelineId {
     let mut options = ShaderCompilationOptions::default();
-    if vertical {
+    if l1_key.vertical {
         options.add_define("SSSS_VERTICAL_PASS", "1");
     }
 
@@ -263,7 +325,7 @@ fn prepare_pipeline(
     );
 
     let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-        format: HDR_TEXTURE_FORMAT,
+        format: l1_key.output_format,
         blend: Some(wgpu::BlendState::REPLACE),
         write_mask: wgpu::ColorWrites::ALL,
     });
@@ -278,7 +340,7 @@ fn prepare_pipeline(
     let pipeline_layout = ctx
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(if vertical {
+            label: Some(if l1_key.vertical {
                 "SSSS Vertical Pipeline Layout"
             } else {
                 "SSSS Horizontal Pipeline Layout"
@@ -286,7 +348,7 @@ fn prepare_pipeline(
             bind_group_layouts: &[Some(raw_layout)],
             immediate_size: 0,
         });
-    let label = if vertical {
+    let label = if l1_key.vertical {
         "SSSS Vertical Pipeline"
     } else {
         "SSSS Horizontal Pipeline"
@@ -312,8 +374,10 @@ fn prepare_pipeline(
 /// Reads scene colour and writes to the scratch `temp_blur` texture.
 /// Non-SSS pixels are skipped via shader early-out on `Feature_ID`.
 struct SsssHorizontalNode<'a> {
-    feature: &'a SsssFeature,
+    shared: &'a SsssSharedResources,
+    resources: &'a mut SsssPipelineResources,
     snapshot: SsssSnapshot<'a>,
+    output_format: wgpu::TextureFormat,
     scene_color_in: TextureNodeId,
     temp_blur: TextureNodeId,
     depth_in: TextureNodeId,
@@ -327,10 +391,17 @@ struct SsssHorizontalNode<'a> {
 
 impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.feature.prepare_shared_resources(ctx, self.snapshot);
-        let bind_group_layout = self.feature.bind_group_layout();
-        let profiles_buffer = self.feature.profiles_buffer();
-        self.pipeline_id = Some(prepare_pipeline(ctx, bind_group_layout, false));
+        self.shared.ensure_resources(ctx, self.snapshot);
+        let bind_group_layout = self.shared.bind_group_layout();
+        let profiles_buffer = self.shared.profiles_buffer();
+        self.pipeline_id = Some(self.resources.ensure_resources(
+            ctx,
+            bind_group_layout,
+            SsssPipelineL1Key {
+                output_format: self.output_format,
+                vertical: false,
+            },
+        ));
         self.bind_group = Some(
             crate::myth_bind_group!(ctx, bind_group_layout, Some("SSSS Horizontal Bind Group"), [
                 0 => self.scene_color_in,
@@ -379,7 +450,9 @@ impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
 /// alias (via `mutate_texture`).  Non-SSS pixels pass through unchanged
 /// thanks to the shader soft-mask on `Feature_ID`.
 struct SsssVerticalNode<'a> {
-    feature: &'a SsssFeature,
+    shared: &'a SsssSharedResources,
+    resources: &'a mut SsssPipelineResources,
+    output_format: wgpu::TextureFormat,
     scene_color_out: TextureNodeId,
     temp_blur: TextureNodeId,
     depth_in: TextureNodeId,
@@ -395,9 +468,16 @@ impl<'a> PassNode<'a> for SsssVerticalNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
         // The vertical pass reads the horizontal pass's transient output, so
         // RDG topological order guarantees shared preparation has completed.
-        let bind_group_layout = self.feature.bind_group_layout();
-        let profiles_buffer = self.feature.profiles_buffer();
-        self.pipeline_id = Some(prepare_pipeline(ctx, bind_group_layout, true));
+        let bind_group_layout = self.shared.bind_group_layout();
+        let profiles_buffer = self.shared.profiles_buffer();
+        self.pipeline_id = Some(self.resources.ensure_resources(
+            ctx,
+            bind_group_layout,
+            SsssPipelineL1Key {
+                output_format: self.output_format,
+                vertical: true,
+            },
+        ));
         self.bind_group = Some(
             crate::myth_bind_group!(ctx, bind_group_layout, Some("SSSS Vertical Bind Group"), [
                 0 => self.temp_blur,
