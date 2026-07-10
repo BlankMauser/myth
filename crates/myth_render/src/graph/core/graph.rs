@@ -10,7 +10,8 @@ use crate::graph::core::arena::FrameArena;
 use super::builder::PassBuilder;
 use super::node::{NodeSlot, PassNode, PassRecord};
 use super::persistent::{
-    HistoryCommitToken, HistoryRegistry, HistoryTextureRef, PersistentTextureId,
+    CacheCommitToken, CachePublicationReceipt, HistoryCommitToken, HistoryRegistry,
+    PersistentTextureId, PersistentTextureRef,
 };
 use super::types::{
     BufferDesc, BufferNodeId, ErasedResourceNodeId, GraphResourceType, ResourceClass, ResourceKind,
@@ -87,6 +88,17 @@ struct HistoryCommitRequest {
     required_writes: SmallVec<[ErasedResourceNodeId; 4]>,
 }
 
+struct CacheCommitRequest {
+    token: CacheCommitToken,
+    required_writes: SmallVec<[ErasedResourceNodeId; 4]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PersistentTextureImport {
+    node: TextureNodeId,
+    spec: super::persistent::PersistentTextureSpec,
+}
+
 // Rust's BinaryHeap is a max-heap, so we define the ordering such that higher priority scores come first.
 impl Ord for ReadyNode {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -124,9 +136,11 @@ pub struct GraphStorage {
     pub execution_queue: Vec<usize>,
 
     /// Per-frame logical import deduplication for persistent textures.
-    persistent_texture_lookup: FxHashMap<PersistentTextureId, TextureNodeId>,
+    persistent_texture_lookup: FxHashMap<PersistentTextureId, PersistentTextureImport>,
     /// Grouped history publications evaluated after DPE and applied post-submit.
     history_commit_requests: Vec<HistoryCommitRequest>,
+    /// Ordinary cache publications evaluated after DPE and applied post-submit.
+    cache_commit_requests: Vec<CacheCommitRequest>,
 
     // /// Name-based resource registry for self-wiring passes.
     // resource_registry: FxHashMap<&'static str, TextureNodeId>,
@@ -162,6 +176,7 @@ impl GraphStorage {
             execution_queue: Vec::new(),
             persistent_texture_lookup: FxHashMap::default(),
             history_commit_requests: Vec::new(),
+            cache_commit_requests: Vec::new(),
             // resource_registry: FxHashMap::default(),
             compile_stack: Vec::new(),
             compile_in_degrees: Vec::new(),
@@ -182,6 +197,7 @@ impl GraphStorage {
         self.execution_queue.clear();
         self.persistent_texture_lookup.clear();
         self.history_commit_requests.clear();
+        self.cache_commit_requests.clear();
         // self.resource_registry.clear();
         #[cfg(feature = "rdg_inspector")]
         self.current_group_stack.clear();
@@ -577,33 +593,60 @@ impl<'a> RenderGraph<'a> {
     /// Repeated imports of the same ID in one frame return the same graph root.
     /// Persistent writes are not DPE roots by default; they become live only
     /// through normal downstream demand or an explicit side effect.
-    pub fn import_persistent_texture(
-        &mut self,
-        name: &'static str,
-        texture: HistoryTextureRef,
-    ) -> TextureNodeId {
+    pub fn import_persistent_texture<T>(&mut self, name: &'static str, texture: T) -> TextureNodeId
+    where
+        T: Into<PersistentTextureRef>,
+    {
+        let texture = texture.into();
         if let Some(&existing) = self.storage.persistent_texture_lookup.get(&texture.id) {
-            let resource = &self.storage.resources[existing.index() as usize];
             assert_eq!(
-                resource.texture_desc(),
-                texture.desc,
-                "persistent texture {:?} imported with conflicting descriptors",
+                existing.spec, texture.spec,
+                "persistent texture {:?} imported with conflicting specifications",
                 texture.id
             );
-            return existing;
+            return existing.node;
         }
 
         let id = ResourceNodeId::from_erased(self.register_resource_with_root(
             name,
-            ResourceKind::persistent_texture(texture.desc, texture.id),
+            ResourceKind::persistent_texture(texture.spec.desc, texture.id),
             true,
             false,
             0,
         ));
-        self.storage
-            .persistent_texture_lookup
-            .insert(texture.id, id);
+        self.storage.persistent_texture_lookup.insert(
+            texture.id,
+            PersistentTextureImport {
+                node: id,
+                spec: texture.spec,
+            },
+        );
         id
+    }
+
+    /// Materialize only logical persistent imports touched by live passes.
+    ///
+    /// The per-frame import side table retains the complete requested view
+    /// specification without inflating every [`ResourceRecord`]. Both the graph
+    /// descriptor and registry's current logical specification are validated
+    /// before physical creation.
+    pub fn materialize_live_persistent_textures(
+        &self,
+        registry: &mut HistoryRegistry,
+        device: &Device,
+    ) {
+        for (&id, import) in &self.storage.persistent_texture_lookup {
+            let resource = &self.storage.resources[import.node.index() as usize];
+            if resource.first_use == usize::MAX {
+                continue;
+            }
+            assert_eq!(
+                resource.texture_desc(),
+                import.spec.desc,
+                "persistent texture {id:?} graph descriptor disagrees with its import spec"
+            );
+            registry.materialize_texture(device, resource.name, id, import.spec);
+        }
     }
 
     /// Register an atomic history publication. The bank is committed only if
@@ -633,6 +676,57 @@ impl<'a> RenderGraph<'a> {
             });
     }
 
+    /// Register an atomic ordinary-cache publication.
+    ///
+    /// Registration adds no dependency and never seeds DPE liveness. The cache
+    /// is published only by the post-submit step when every required resource
+    /// has a producer and every such producer survived DPE.
+    pub fn register_cache_commit(
+        &mut self,
+        token: CacheCommitToken,
+        required_writes: &[TextureNodeId],
+    ) {
+        assert!(!required_writes.is_empty(), "cache commit requires writers");
+        assert!(
+            required_writes
+                .iter()
+                .enumerate()
+                .all(|(index, id)| !required_writes[..index].contains(id)),
+            "cache commit writer set contains duplicates"
+        );
+        for &id in required_writes {
+            assert!(
+                self.storage.resources[id.index() as usize]
+                    .persistent_texture_id()
+                    .is_some(),
+                "cache commit output must be a persistent texture"
+            );
+        }
+        let required_writes: SmallVec<[ErasedResourceNodeId; 4]> =
+            required_writes.iter().map(|id| id.erase()).collect();
+        if let Some(existing) = self
+            .storage
+            .cache_commit_requests
+            .iter()
+            .find(|request| request.token == token)
+        {
+            let same_set = existing.required_writes.len() == required_writes.len()
+                && existing
+                    .required_writes
+                    .iter()
+                    .all(|id| required_writes.contains(id));
+            assert!(
+                same_set,
+                "cache commit token registered with conflicting writer sets"
+            );
+            return;
+        }
+        self.storage.cache_commit_requests.push(CacheCommitRequest {
+            token,
+            required_writes,
+        });
+    }
+
     /// Creates a versioned alias of `input_id` that shares the same physical
     /// GPU memory.
     pub fn create_alias<T: GraphResourceType>(
@@ -646,7 +740,7 @@ impl<'a> RenderGraph<'a> {
         let root_res = &self.storage.resources[root_idx];
         assert!(
             root_res.persistent_texture_id().is_none(),
-            "persistent history textures cannot be versioned or mutated in place"
+            "persistent textures cannot be versioned or mutated in place"
         );
         let kind = root_res.kind.without_external_binding();
         let is_external = root_res.is_external;
@@ -784,6 +878,45 @@ impl<'a> RenderGraph<'a> {
                 );
             }
         }
+    }
+
+    /// Publish every eligible persistent resource after command submission.
+    ///
+    /// History behavior is intentionally delegated to the existing API. Cache
+    /// requests return typed receipts instead of storing callbacks or feature
+    /// pointers in graph storage; callers may use those receipts to update
+    /// feature-local bookkeeping after submission.
+    pub fn commit_submitted_persistent_resources(
+        &self,
+        registry: &mut HistoryRegistry,
+    ) -> SmallVec<[CachePublicationReceipt; 4]> {
+        self.commit_submitted_histories(registry);
+
+        let mut receipts = SmallVec::new();
+        for request in &self.storage.cache_commit_requests {
+            let all_writers_live = request.required_writes.iter().all(|id| {
+                self.storage.resources[id.index() as usize]
+                    .producer
+                    .is_some_and(|producer| self.storage.passes[producer].reference_count > 0)
+            });
+            if !all_writers_live {
+                continue;
+            }
+
+            let written_textures: SmallVec<[PersistentTextureId; 4]> = request
+                .required_writes
+                .iter()
+                .map(|id| {
+                    self.storage.resources[id.index() as usize]
+                        .persistent_texture_id()
+                        .expect("validated cache writer lost persistent backing")
+                })
+                .collect();
+            let receipt = registry.commit_cache(request.token, &written_textures);
+            debug_assert!(receipt.is_some(), "stale persistent cache commit token");
+            receipts.extend(receipt);
+        }
+        receipts
     }
 
     /// Compile-time **edge contraction** for pure-forwarding (blit / present)
@@ -1201,6 +1334,7 @@ impl<'a> RenderGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
     use crate::graph::{composer::GraphBuilderContext, core::context::ExecuteContext};
 
@@ -1854,10 +1988,295 @@ mod tests {
         graph.compile_topology();
 
         assert_eq!(graph.storage.execution_queue.len(), 2);
-        graph.commit_submitted_histories(&mut histories);
+        assert!(
+            graph
+                .commit_submitted_persistent_resources(&mut histories)
+                .is_empty(),
+            "history publication must not manufacture cache receipts"
+        );
         let next = histories.plan_set(set, [dummy_desc(), dummy_desc()], 2, false);
         assert!(next.valid);
         assert_eq!(next.previous, plan.next);
+    }
+
+    #[test]
+    fn cache_publication_registration_does_not_seed_dpe_liveness() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let plan = registry.plan_cache(
+            cache,
+            CacheKey::new(1),
+            [PersistentTextureSpec::default_view(dummy_desc())],
+            1,
+        );
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.import_persistent_texture("Cache", plan.textures[0]);
+        graph.add_pass("CacheOnly", |builder| {
+            builder.write_texture(texture);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            plan.commit.expect("invalid cache needs a token"),
+            &[texture],
+        );
+        graph.compile_topology();
+
+        assert!(graph.storage.execution_queue.is_empty());
+        assert!(
+            graph
+                .commit_submitted_persistent_resources(&mut registry)
+                .is_empty()
+        );
+        assert!(
+            !registry
+                .plan_cache(
+                    cache,
+                    CacheKey::new(1),
+                    [PersistentTextureSpec::default_view(dummy_desc())],
+                    2,
+                )
+                .valid
+        );
+    }
+
+    #[test]
+    fn demanded_cache_writer_publishes_after_submit_with_typed_receipt() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let key = CacheKey::new(42);
+        let specs = [
+            PersistentTextureSpec::default_view(dummy_desc()),
+            PersistentTextureSpec::default_view(dummy_desc()),
+        ];
+        let plan = registry.plan_cache(cache, key, specs, 1);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let cache_a = graph.import_persistent_texture("CacheA", plan.textures[0]);
+        let cache_b = graph.import_persistent_texture("CacheB", plan.textures[1]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+        graph.add_pass("PopulateCache", |builder| {
+            builder.write_texture(cache_a);
+            builder.write_texture(cache_b);
+            (MockExec, ())
+        });
+        graph.add_pass("ConsumeCache", |builder| {
+            builder.read_texture(cache_a);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        let token = plan.commit.expect("invalid cache needs a token");
+        graph.register_cache_commit(token, &[cache_a, cache_b]);
+        graph.register_cache_commit(token, &[cache_b, cache_a]);
+        graph.compile_topology();
+
+        let receipts = graph.commit_submitted_persistent_resources(&mut registry);
+        assert_eq!(
+            receipts.as_slice(),
+            &[CachePublicationReceipt {
+                cache_id: cache,
+                key,
+                epoch: plan.epoch,
+                generation: token.generation,
+                attempt_serial: 1,
+            }]
+        );
+        assert!(registry.plan_cache(cache, key, specs, 2).valid);
+    }
+
+    #[test]
+    fn partial_or_missing_cache_writers_do_not_publish() {
+        let mut registry = HistoryRegistry::new();
+        let partial_cache = registry.create_cache();
+        let missing_cache = registry.create_cache();
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let partial = registry.plan_cache(partial_cache, CacheKey::new(1), [spec, spec], 1);
+        let missing = registry.plan_cache(missing_cache, CacheKey::new(2), [spec], 1);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let partial_a = graph.import_persistent_texture("PartialA", partial.textures[0]);
+        let partial_b = graph.import_persistent_texture("PartialB", partial.textures[1]);
+        let missing_texture = graph.import_persistent_texture("Missing", missing.textures[0]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+        graph.add_pass("LivePartialWriter", |builder| {
+            builder.write_texture(partial_a);
+            (MockExec, ())
+        });
+        graph.add_pass("DeadPartialWriter", |builder| {
+            builder.write_texture(partial_b);
+            (MockExec, ())
+        });
+        graph.add_pass("ConsumePartial", |builder| {
+            builder.read_texture(partial_a);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            partial.commit.expect("invalid cache needs a token"),
+            &[partial_a, partial_b],
+        );
+        graph.register_cache_commit(
+            missing.commit.expect("invalid cache needs a token"),
+            &[missing_texture],
+        );
+        graph.compile_topology();
+
+        assert!(
+            graph
+                .commit_submitted_persistent_resources(&mut registry)
+                .is_empty()
+        );
+        assert!(
+            !registry
+                .plan_cache(partial_cache, CacheKey::new(1), [spec, spec], 2)
+                .valid
+        );
+        assert!(
+            !registry
+                .plan_cache(missing_cache, CacheKey::new(2), [spec], 2)
+                .valid
+        );
+    }
+
+    #[test]
+    fn valid_cache_is_read_only_and_partial_refresh_stays_invalid() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let key = CacheKey::new(8);
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let initial = registry.plan_cache(cache, key, [spec, spec], 1);
+        assert!(
+            registry
+                .commit_cache(
+                    initial.commit.expect("invalid cache needs a token"),
+                    &initial.textures.map(|texture| texture.id),
+                )
+                .is_some()
+        );
+
+        let valid = registry.plan_cache(cache, key, [spec, spec], 2);
+        assert!(valid.valid);
+        assert!(valid.commit.is_none(), "valid caches must be read-only");
+        assert!(registry.invalidate_cache(cache));
+        let refresh = registry.plan_cache(cache, key, [spec, spec], 2);
+        assert!(!refresh.valid);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let refresh_a = graph.import_persistent_texture("RefreshA", refresh.textures[0]);
+        let refresh_b = graph.import_persistent_texture("RefreshB", refresh.textures[1]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+        graph.add_pass("LiveRefreshWriter", |builder| {
+            builder.write_texture(refresh_a);
+            (MockExec, ())
+        });
+        graph.add_pass("DeadRefreshWriter", |builder| {
+            builder.write_texture(refresh_b);
+            (MockExec, ())
+        });
+        graph.add_pass("ConsumeRefresh", |builder| {
+            builder.read_texture(refresh_a);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            refresh.commit.expect("invalid cache needs a token"),
+            &[refresh_a, refresh_b],
+        );
+        graph.compile_topology();
+
+        assert!(
+            graph
+                .commit_submitted_persistent_resources(&mut registry)
+                .is_empty()
+        );
+        let next = registry.plan_cache(cache, key, [spec, spec], 3);
+        assert!(!next.valid);
+        assert!(next.commit.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting writer sets")]
+    fn duplicate_cache_token_rejects_a_different_writer_set() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let plan = registry.plan_cache(cache, CacheKey::new(1), [spec, spec], 1);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let cache_a = graph.import_persistent_texture("CacheA", plan.textures[0]);
+        let cache_b = graph.import_persistent_texture("CacheB", plan.textures[1]);
+        let token = plan.commit.expect("invalid cache needs a token");
+        graph.register_cache_commit(token, &[cache_a, cache_b]);
+        graph.register_cache_commit(token, &[cache_a]);
+    }
+
+    #[test]
+    fn cache_does_not_publish_when_post_submit_step_is_not_called() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let key = CacheKey::new(3);
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let first = registry.plan_cache(cache, key, [spec], 1);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.import_persistent_texture("Cache", first.textures[0]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+        graph.add_pass("Populate", |builder| {
+            builder.write_texture(texture);
+            (MockExec, ())
+        });
+        graph.add_pass("Consume", |builder| {
+            builder.read_texture(texture);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            first.commit.expect("invalid cache needs a token"),
+            &[texture],
+        );
+        graph.compile_topology();
+
+        let second = registry.plan_cache(cache, key, [spec], 2);
+        assert!(!second.valid);
+        assert!(second.commit.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting specifications")]
+    fn persistent_import_dedup_rejects_a_different_canonical_view() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let plan = registry.plan_cache(
+            cache,
+            CacheKey::new(1),
+            [PersistentTextureSpec::default_view(dummy_desc())],
+            1,
+        );
+        let conflicting = PersistentTextureRef {
+            id: plan.textures[0].id,
+            spec: PersistentTextureSpec::new(
+                dummy_desc(),
+                Some(wgpu::TextureViewDimension::D2Array),
+            ),
+        };
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let _ = graph.import_persistent_texture("Default", plan.textures[0]);
+        let _ = graph.import_persistent_texture("Conflicting", conflicting);
     }
 
     #[test]
@@ -1903,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "persistent history textures cannot be versioned")]
+    #[should_panic(expected = "persistent textures cannot be versioned")]
     fn persistent_history_cannot_be_mutated_in_place() {
         let mut histories = HistoryRegistry::new();
         let set = histories.create_set();

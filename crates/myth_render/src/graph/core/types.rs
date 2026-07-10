@@ -513,4 +513,12 @@ mod tests {
         let empty = BufferDesc::new(0, wgpu::BufferUsages::STORAGE);
         assert!(empty.logical_binding_size().is_none());
     }
+
+    #[test]
+    fn texture_backing_remains_an_id_or_pointer_sized_discriminated_value() {
+        assert!(
+            std::mem::size_of::<TextureBacking>() <= 2 * std::mem::size_of::<u64>(),
+            "per-resource backing must not embed full persistent texture specifications"
+        );
+    }
 }

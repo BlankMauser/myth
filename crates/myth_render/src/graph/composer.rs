@@ -1330,9 +1330,10 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 3. Compile & Execute RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             graph.compile(self.ctx.transient_pool, &self.ctx.wgpu_ctx.device);
-            self.ctx
-                .history_registry
-                .materialize_live_textures(&self.ctx.wgpu_ctx.device, &graph.storage.resources);
+            graph.materialize_live_persistent_textures(
+                self.ctx.history_registry,
+                &self.ctx.wgpu_ctx.device,
+            );
 
             // ─── 3a. RDG Prepare: live-pass deferred preparation ───────────
             //
@@ -1432,7 +1433,8 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
-            graph.commit_submitted_histories(self.ctx.history_registry);
+            let _cache_publications =
+                graph.commit_submitted_persistent_resources(self.ctx.history_registry);
             graph.run_after_submit_hooks();
         };
 
