@@ -494,6 +494,10 @@ impl Renderer {
 
             // let needs_normal = ssao_enabled || needs_feature_id;
             let needs_skybox = scene.background.needs_skybox_pass();
+            let uses_procedural_environment =
+                matches!(scene.background.mode, BackgroundMode::Procedural(_));
+            let has_source_environment = scene.environment.has_env_map();
+            let has_active_environment = uses_procedural_environment || has_source_environment;
             let mut extract_ctx = ExtractContext {
                 device: &state.wgpu_ctx.device,
                 queue: &state.wgpu_ctx.queue,
@@ -511,14 +515,26 @@ impl Renderer {
 
             // Always: compute + shadow
             state.brdf_pass.extract_and_prepare(&mut extract_ctx);
-            if scene.environment.has_env_map() {
+            let environment_cache_frame = extract_ctx.resource_manager.frame_index();
+            state
+                .equirect_to_cube_pass
+                .maintain(environment_cache_frame);
+            state.ibl_pass.maintain(environment_cache_frame);
+            state.atmosphere_pass.maintain(environment_cache_frame);
+            if has_source_environment && !uses_procedural_environment {
                 state
                     .equirect_to_cube_pass
                     .extract_and_prepare(&mut extract_ctx, scene);
+            } else {
+                state.equirect_to_cube_pass.deactivate_scene(scene.id());
             }
-            state
-                .ibl_pass
-                .extract_and_prepare(&mut extract_ctx, scene.id());
+            if has_active_environment {
+                state
+                    .ibl_pass
+                    .extract_and_prepare(&mut extract_ctx, scene.id());
+            } else {
+                state.ibl_pass.deactivate_scene(scene.id());
+            }
             state.shadow_pass.extract_and_prepare(&mut extract_ctx);
 
             // Procedural atmosphere (LUT + cubemap + PMREM compute)
@@ -549,6 +565,8 @@ impl Renderer {
                     color_format,
                     procedural_skybox_resources,
                 );
+            } else {
+                state.skybox_pass.deactivate();
             }
 
             // Gaussian Splatting
@@ -1193,8 +1211,9 @@ impl Renderer {
 mod tests {
     use super::*;
 
-    use glam::{Affine3A, Quat, Vec3};
+    use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::AssetServer;
+    use myth_resources::texture::TextureSource;
     use myth_scene::Scene;
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
@@ -1233,6 +1252,361 @@ mod tests {
             )
             .expect("frame composer must exist")
             .render();
+    }
+
+    #[test]
+    fn inactive_environment_uses_black_cube_without_allocating_scene_textures() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let scene_id = scene.id();
+        assert!(
+            state.resource_manager.gpu_environment(scene_id).is_none(),
+            "a color background without IBL must not allocate scene environment textures"
+        );
+
+        let global_state = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene_id)
+            .expect("global state missing after render");
+        let resource_ids = global_state.resource_ids.as_slice();
+        let black_cube_id = state.resource_manager.system_textures.black_cube.id();
+        assert_eq!(black_cube_id, resource_ids[3]);
+        assert_eq!(black_cube_id, resource_ids[4]);
+    }
+
+    #[test]
+    fn background_only_skybox_modes_do_not_allocate_ibl_textures() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let camera = make_camera();
+
+        scene.background.set_mode(BackgroundMode::gradient(
+            Vec4::new(0.1, 0.2, 0.3, 1.0),
+            Vec4::new(0.01, 0.02, 0.03, 1.0),
+        ));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+        assert!(
+            renderer
+                .context
+                .as_ref()
+                .expect("renderer state missing")
+                .resource_manager
+                .gpu_environment(scene.id())
+                .is_none(),
+            "a gradient background must not implicitly allocate IBL textures"
+        );
+
+        let background_texture = assets.checkerboard(16, 2);
+        scene
+            .background
+            .set_mode(BackgroundMode::planar(background_texture, 1.0));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+        assert!(
+            renderer
+                .context
+                .as_ref()
+                .expect("renderer state missing")
+                .resource_manager
+                .gpu_environment(scene.id())
+                .is_none(),
+            "a background-only texture must not implicitly allocate IBL textures"
+        );
+    }
+
+    #[test]
+    fn reenabled_environment_before_ttl_reuses_persistent_views() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        scene.background.set_mode(BackgroundMode::procedural());
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let scene_id = scene.id();
+        let initial_env = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("initial scene environment missing");
+        let initial_base_cube_id = initial_env.base_cube_view.id();
+        let initial_pmrem_id = initial_env.pmrem_view.id();
+        let initial_last_used_frame = initial_env.last_used_frame;
+
+        scene
+            .background
+            .set_mode(BackgroundMode::color(0.0, 0.0, 0.0));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+        scene.background.set_mode(BackgroundMode::procedural());
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
+
+        let reenabled_env = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("re-enabled scene environment missing");
+        assert_eq!(initial_base_cube_id, reenabled_env.base_cube_view.id());
+        assert_eq!(initial_pmrem_id, reenabled_env.pmrem_view.id());
+        assert!(reenabled_env.last_used_frame > initial_last_used_frame);
+    }
+
+    #[test]
+    fn environment_feature_maintenance_prunes_abandoned_scene_domains() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let camera = make_camera();
+
+        let mut source_scene = Scene::new();
+        source_scene.environment.set_base_cube_size(16);
+        source_scene.environment.set_pmrem_size(8);
+        source_scene
+            .environment
+            .set_env_map(Some(assets.checkerboard(16, 2)));
+        render_frame(&mut renderer, &mut source_scene, camera, &assets, 0);
+
+        let source_scene_id = source_scene.id();
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert!(state.equirect_to_cube_pass.has_scene_state(source_scene_id));
+            assert!(state.ibl_pass.has_scene_state(source_scene_id));
+        }
+
+        let mut procedural_scene = Scene::new();
+        procedural_scene.environment.set_base_cube_size(16);
+        procedural_scene.environment.set_pmrem_size(8);
+        procedural_scene
+            .background
+            .set_mode(BackgroundMode::procedural());
+        render_frame(&mut renderer, &mut procedural_scene, camera, &assets, 1);
+
+        let procedural_scene_id = procedural_scene.id();
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert!(state.ibl_pass.has_scene_state(procedural_scene_id));
+            assert!(state.atmosphere_pass.has_scene_state(procedural_scene_id));
+        }
+
+        // Advance beyond the feature-local 120-frame TTL without rendering
+        // either active scene, then render an unrelated inactive scene. The
+        // unconditional maintenance path must reclaim both abandoned domains.
+        {
+            let state = renderer.context.as_mut().expect("renderer state missing");
+            for _ in 0..120 {
+                state.resource_manager.next_frame();
+            }
+        }
+        let mut inactive_scene = Scene::new();
+        render_frame(&mut renderer, &mut inactive_scene, camera, &assets, 2);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(!state.equirect_to_cube_pass.has_scene_state(source_scene_id));
+        assert!(!state.ibl_pass.has_scene_state(source_scene_id));
+        assert!(!state.ibl_pass.has_scene_state(procedural_scene_id));
+        assert!(!state.atmosphere_pass.has_scene_state(procedural_scene_id));
+    }
+
+    #[test]
+    fn missing_environment_attachment_stays_pending_without_graph_panic() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        scene
+            .environment
+            .set_env_map(Some(TextureSource::Attachment(
+                u64::MAX,
+                wgpu::TextureViewDimension::D2,
+            )));
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let gpu_env = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .gpu_environment(scene.id())
+            .expect("configured environment should retain an active cache domain");
+        assert!(!gpu_env.source_ready);
+        assert!(!gpu_env.needs_compute());
+    }
+
+    #[test]
+    fn disabling_environment_stops_keepalive_and_allows_ttl_pruning() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        scene.background.set_mode(BackgroundMode::procedural());
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let scene_id = scene.id();
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let active_env = state
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("active scene environment missing");
+        let last_active_frame = active_env.last_used_frame;
+        let base_cube_id = active_env.base_cube_view.id();
+        let pmrem_id = active_env.pmrem_view.id();
+
+        scene
+            .background
+            .set_mode(BackgroundMode::color(0.02, 0.03, 0.04));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let dormant_env = state
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("environment should remain available until TTL pruning");
+        assert_eq!(
+            last_active_frame, dormant_env.last_used_frame,
+            "an inactive environment must not refresh its cache lifetime"
+        );
+
+        let global_state = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene_id)
+            .expect("global state missing after disabling environment");
+        let black_cube_id = state.resource_manager.system_textures.black_cube.id();
+        assert_eq!(black_cube_id, global_state.resource_ids.as_slice()[3]);
+        assert_eq!(black_cube_id, global_state.resource_ids.as_slice()[4]);
+        assert!(state.skybox_pass.current_bind_group.is_none());
+        assert!(state.skybox_pass.current_pipeline.is_none());
+        assert!(
+            state.atmosphere_pass.has_scene_state(scene_id),
+            "procedural LUTs should remain reusable until their feature TTL expires"
+        );
+
+        let state = renderer.context.as_mut().expect("renderer state missing");
+        state.resource_manager.next_frame();
+        state.resource_manager.prune(1);
+        assert!(state.resource_manager.gpu_environment(scene_id).is_none());
+        assert!(
+            state
+                .resource_manager
+                .get_internal_texture(base_cube_id)
+                .is_none()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_internal_texture(pmrem_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reenabled_environment_recreates_using_current_configuration() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        scene.background.set_mode(BackgroundMode::procedural());
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let scene_id = scene.id();
+        let initial_env = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("initial scene environment missing");
+        let initial_base_cube_id = initial_env.base_cube_view.id();
+        let initial_pmrem_id = initial_env.pmrem_view.id();
+
+        scene
+            .background
+            .set_mode(BackgroundMode::color(0.0, 0.0, 0.0));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+        {
+            let state = renderer.context.as_mut().expect("renderer state missing");
+            state.resource_manager.next_frame();
+            state.resource_manager.prune(1);
+            assert!(state.resource_manager.gpu_environment(scene_id).is_none());
+        }
+
+        scene.environment.set_base_cube_size(32);
+        scene.environment.set_pmrem_size(16);
+        scene.background.set_mode(BackgroundMode::procedural());
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
+
+        let recreated_env = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("re-enabled scene environment missing");
+        assert_ne!(initial_base_cube_id, recreated_env.base_cube_view.id());
+        assert_ne!(initial_pmrem_id, recreated_env.pmrem_view.id());
+        assert_eq!(32, recreated_env.base_cube_texture.width());
+        assert_eq!(16, recreated_env.pmrem_texture.width());
+    }
+
+    #[test]
+    fn active_environment_source_switch_reuses_persistent_views() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        let first_source = assets.checkerboard(16, 2);
+        scene.environment.set_env_map(Some(first_source));
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let scene_id = scene.id();
+        let initial_env = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("initial scene environment missing");
+        let initial_base_cube_id = initial_env.base_cube_view.id();
+        let initial_pmrem_id = initial_env.pmrem_view.id();
+        let initial_source_version = initial_env.source_version;
+
+        let second_source = assets.checkerboard(32, 4);
+        scene.environment.set_env_map(Some(second_source));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let switched_env = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("switched scene environment missing");
+        assert_eq!(Some(second_source.into()), switched_env.source_key);
+        assert_ne!(initial_source_version, switched_env.source_version);
+        assert_eq!(initial_base_cube_id, switched_env.base_cube_view.id());
+        assert_eq!(initial_pmrem_id, switched_env.pmrem_view.id());
     }
 
     #[test]

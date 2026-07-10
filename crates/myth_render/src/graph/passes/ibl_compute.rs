@@ -110,8 +110,6 @@ impl IblComputeFeature {
     }
 
     pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext, scene_id: u32) {
-        self.prune_scene_states(ctx.resource_manager.frame_index());
-
         let Some(pipeline_variant) = ctx
             .resource_manager
             .gpu_environment(scene_id)
@@ -186,6 +184,24 @@ impl IblComputeFeature {
         } else if let Some(state) = self.scene_states.get_mut(&scene_id) {
             state.last_used_frame = frame_index;
         }
+    }
+
+    /// Drop scene-local PMREM views and parameter buffers when IBL is
+    /// disabled. In particular, do not let a dormant `GpuEnvironment` entry
+    /// make this eager compatibility path look active.
+    pub(crate) fn deactivate_scene(&mut self, scene_id: u32) {
+        self.scene_states.remove(&scene_id);
+    }
+
+    /// Prune abandoned scene domains independently of whether the current
+    /// scene has an active environment.
+    pub(crate) fn maintain(&mut self, current_frame: u64) {
+        self.prune_scene_states(current_frame);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_scene_state(&self, scene_id: u32) -> bool {
+        self.scene_states.contains_key(&scene_id)
     }
 
     fn pipeline_variant(source_type: crate::core::gpu::CubeSourceType) -> IblPipelineVariant {

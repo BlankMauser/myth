@@ -311,7 +311,17 @@ impl AtmosphereFeature {
         self.ensure_scene_state(ctx, scene_id, params);
         self.update_starbox_state(ctx, scene_id, params);
         self.update_moon_texture_state(ctx, scene_id, params);
-        self.prune_scene_states(ctx.resource_manager.frame_index());
+    }
+
+    /// Prune abandoned scene domains even while the current scene does not
+    /// use a procedural atmosphere.
+    pub(crate) fn maintain(&mut self, current_frame: u64) {
+        self.prune_scene_states(current_frame);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_scene_state(&self, scene_id: u32) -> bool {
+        self.scene_states.contains_key(&scene_id)
     }
 
     pub(crate) fn procedural_skybox_resources(

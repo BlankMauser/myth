@@ -405,9 +405,10 @@ impl ResourceManager {
         let (_, scene_uniform_result) =
             self.ensure_buffer(&extracted_scene.environment_uniforms_buffer);
 
-        // Resolve environment texture IDs from GpuEnvironment cache.
-        // resolve_gpu_environment runs before prepare_global and always creates
-        // cache entries, so a miss here should not happen in normal operation.
+        // Resolve environment texture IDs from the scene cache. Inactive
+        // environments intentionally have no cache entry (or may retain a
+        // dormant entry until TTL expiry), so their bindings always use the
+        // system black cube.
         let (processed_env_map_id, pmrem_map_id) = if has_active_environment {
             self.gpu_environment(extracted_scene.scene_id).map_or(
                 (

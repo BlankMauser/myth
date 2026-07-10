@@ -875,6 +875,15 @@ impl SkyboxFeature {
             Some(self.get_or_create_pipeline(ctx, pipeline_key, global_state_key));
     }
 
+    /// Release frame-selected state when the current background uses only a
+    /// hardware color clear. In particular, a procedural bind group retains
+    /// atmosphere LUT views and buffers and could otherwise outlive the
+    /// feature's scene-domain TTL.
+    pub(crate) fn deactivate(&mut self) {
+        self.current_bind_group = None;
+        self.current_pipeline = None;
+    }
+
     /// Create an ephemeral [`SkyboxPassNode`] and add it to the render graph.
     /// Build the ephemeral pass node and insert it into the graph.
     ///

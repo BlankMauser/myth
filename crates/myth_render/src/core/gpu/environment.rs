@@ -259,6 +259,18 @@ impl ResourceManager {
         environment: &Environment,
         background: &BackgroundMode,
     ) -> f32 {
+        // A solid/gradient/texture background does not imply image-based
+        // lighting. Keep an existing scene environment dormant so it can be
+        // reused if the scene enables IBL again before the cache TTL expires,
+        // but deliberately do not create it or refresh its last-used frame.
+        // `prepare_global` binds the system black cube while this path is
+        // inactive.
+        let has_active_environment =
+            matches!(background, BackgroundMode::Procedural(_)) || environment.has_env_map();
+        if !has_active_environment {
+            return 0.0;
+        }
+
         let config = environment.map_config();
 
         let needs_recreate = self
@@ -339,17 +351,21 @@ impl ResourceManager {
             };
 
             let mut source_version = environment.source_version();
-            let mut source_ready = true;
+            let source_ready = match &source {
+                TextureSource::Asset(handle) => {
+                    let state = self.prepare_texture(assets, *handle);
+                    let source_ready =
+                        !matches!(state, ResourceState::Pending | ResourceState::Unknown);
 
-            if let TextureSource::Asset(handle) = &source {
-                let state = self.prepare_texture(assets, *handle);
-                source_ready = !matches!(state, ResourceState::Pending | ResourceState::Unknown);
+                    if source_ready && let Some(tex) = assets.textures.get(*handle) {
+                        source_version = source_version.wrapping_shl(32)
+                            ^ u64::from(assets.images.get_version(tex.image).unwrap_or(0));
+                    }
 
-                if source_ready && let Some(tex) = assets.textures.get(*handle) {
-                    source_version = source_version.wrapping_shl(32)
-                        ^ u64::from(assets.images.get_version(tex.image).unwrap_or(0));
+                    source_ready
                 }
-            }
+                TextureSource::Attachment(id, _) => self.get_internal_texture(*id).is_some(),
+            };
 
             let source_type = match &source {
                 TextureSource::Asset(handle) => self.resources.texture_image(*handle).map_or(

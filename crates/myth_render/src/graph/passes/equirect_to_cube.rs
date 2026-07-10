@@ -139,7 +139,6 @@ impl EquirectToCubeFeature {
 
     pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext, scene: &Scene) {
         self.ensure_pipelines(ctx);
-        self.prune_scene_states(ctx.resource_manager.frame_index());
 
         let scene_id = scene.id();
         let Some(gpu_env) = ctx.resource_manager.gpu_environment(scene_id) else {
@@ -153,6 +152,7 @@ impl EquirectToCubeFeature {
         };
 
         let Some(resolved_source) = Self::resolve_source_view(ctx.resource_manager, source) else {
+            self.scene_states.remove(&scene_id);
             return;
         };
 
@@ -208,6 +208,25 @@ impl EquirectToCubeFeature {
         } else if let Some(state) = self.scene_states.get_mut(&scene_id) {
             state.last_used_frame = frame_index;
         }
+    }
+
+    /// Drop scene-local conversion bindings when source-driven IBL is
+    /// disabled. Those bind groups retain the persistent base-cube view, so
+    /// keeping them alive would delay physical reclamation after the
+    /// `GpuEnvironment` cache entry expires.
+    pub(crate) fn deactivate_scene(&mut self, scene_id: u32) {
+        self.scene_states.remove(&scene_id);
+    }
+
+    /// Prune abandoned scene domains even when the currently rendered scene
+    /// does not use source-driven IBL.
+    pub(crate) fn maintain(&mut self, current_frame: u64) {
+        self.prune_scene_states(current_frame);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_scene_state(&self, scene_id: u32) -> bool {
+        self.scene_states.contains_key(&scene_id)
     }
 
     pub fn resolve_source_view<'a>(
