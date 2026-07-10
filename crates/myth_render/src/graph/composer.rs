@@ -608,6 +608,20 @@ impl<'a> FrameComposer<'a> {
             )
         });
 
+        let clustered_snapshot = self.ctx.clustered_lighting_pass.extract(
+            self.ctx.render_state,
+            &self.ctx.camera,
+            self.ctx.extracted_scene,
+            self.ctx
+                .wgpu_ctx
+                .device
+                .limits()
+                .max_storage_buffer_binding_size,
+            GlobalStateKey::new(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id),
+            self.ctx.clustered_lighting_enabled,
+            self.ctx.extracted_scene.local_light_count() as u32,
+        );
+
         // let needs_normal = ssao_enabled || needs_feature_id;
         let needs_skybox = self.ctx.scene.background.needs_skybox_pass();
         let ssss_enabled = self.ctx.scene.ssss.enabled;
@@ -803,8 +817,8 @@ impl<'a> FrameComposer<'a> {
                             .and_then(|hook| c.with_group("Inject_GPU_Local_Lights", |c| hook(c)));
                         let clustered_out = self.ctx.clustered_lighting_pass.add_to_graph(
                             c,
+                            clustered_snapshot,
                             ClusteredLightingInputs {
-                                enabled: self.ctx.clustered_lighting_enabled,
                                 cpu_light_metadata_buffer: scene_lights.light_metadata,
                                 cpu_light_data_buffer: scene_lights.light_storage,
                                 injected_gpu_lights,
@@ -1245,8 +1259,8 @@ impl<'a> FrameComposer<'a> {
                         .and_then(|hook| c.with_group("Inject_GPU_Local_Lights", |c| hook(c)));
                     let clustered_out = self.ctx.clustered_lighting_pass.add_to_graph(
                         c,
+                        clustered_snapshot,
                         ClusteredLightingInputs {
-                            enabled: self.ctx.clustered_lighting_enabled,
                             cpu_light_metadata_buffer: scene_lights.light_metadata,
                             cpu_light_data_buffer: scene_lights.light_storage,
                             injected_gpu_lights,

@@ -432,8 +432,6 @@ impl Renderer {
             assets,
         );
 
-        let active_local_light_count =
-            state.render_frame.extracted_scene.local_light_count() as u32;
         let clustered_lighting_enabled = state
             .render_frame
             .extracted_scene
@@ -522,11 +520,6 @@ impl Renderer {
                 .ibl_pass
                 .extract_and_prepare(&mut extract_ctx, scene.id());
             state.shadow_pass.extract_and_prepare(&mut extract_ctx);
-            state.clustered_lighting_pass.extract_and_prepare(
-                &mut extract_ctx,
-                clustered_lighting_enabled,
-                active_local_light_count,
-            );
 
             // Procedural atmosphere (LUT + cubemap + PMREM compute)
             let procedural_skybox_resources =

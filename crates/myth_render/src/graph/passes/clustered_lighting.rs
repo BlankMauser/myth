@@ -1,17 +1,18 @@
 //! Clustered lighting feature.
 //!
-//! This feature owns the persistent CPU-updated buffers required to drive the
-//! clustered-lighting compute passes and injects the transient RDG buffer flow
-//! that forwards clustered light lists into the forward scene passes.
+//! Graph construction captures only a lightweight CPU snapshot. Persistent
+//! pipeline state is physically partitioned by pass and initialized by live
+//! nodes during deferred prepare; per-frame parameters use an RDG transient
+//! uniform buffer so dead-pass elimination suppresses their upload entirely.
 
 use crate::core::gpu::Tracked;
 use crate::core::gpu::binding_layout::{storage_buffer, uniform_buffer};
 use crate::graph::composer::GpuLightBuffers;
 use crate::graph::composer::GraphBuilderContext;
-use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassNode, PrepareContext,
-};
+use crate::graph::core::{BufferDesc, BufferNodeId, ExecuteContext, PassNode, PrepareContext};
+use crate::graph::extracted::ExtractedLight;
 use crate::graph::passes::light_merge::LightMergeFeature;
+use crate::graph::{ExtractedScene, RenderState};
 use crate::pipeline::{
     ComputePipelineId, ComputePipelineKey, ShaderCompilationOptions, ShaderSource,
 };
@@ -19,6 +20,7 @@ use myth_resources::uniforms::{
     ClusterRecord, ClusteredLightingParams, GpuLightStorage, clustered_lighting_structs_wgsl,
     scene_lighting_structs_wgsl,
 };
+use myth_scene::RenderCamera;
 use myth_scene::light::LightKind;
 
 /// Default cluster depth slices for forward clustered lighting.
@@ -56,20 +58,28 @@ impl Default for ClusteredLightingConfig {
 
 pub struct ClusteredLightingFeature {
     pub config: ClusteredLightingConfig,
-    params_buffer: Option<Tracked<wgpu::Buffer>>,
     light_merge: LightMergeFeature,
-    dispatch_args_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    light_view_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    cull_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    dispatch_args_pipeline: Option<ComputePipelineId>,
-    light_view_pipeline: Option<ComputePipelineId>,
-    cull_pipeline: Option<ComputePipelineId>,
-    frame_params: ClusteredLightingParams,
+    dispatch_args: ClusterDispatchArgsFeature,
+    light_view: ClusterLightViewFeature,
+    cull: ClusterCullFeature,
+}
+
+/// Lightweight per-frame input captured while the Composer builds the graph.
+/// No WGPU object, physical layout, or generated WGSL interface crosses the
+/// graph-construction boundary.
+#[derive(Clone, Copy)]
+pub struct ClusteredLightingSnapshot<'a> {
+    params: ClusteredLightingParams,
+    global_state_key: crate::core::gpu::GlobalStateKey,
+    cull_max_lights_per_cluster: u32,
+    lights: &'a [ExtractedLight],
+    view_matrix: glam::Mat4,
+    camera_near: f32,
+    camera_far: f32,
 }
 
 #[derive(Clone, Copy)]
 pub struct ClusteredLightingInputs {
-    pub enabled: bool,
     pub cpu_light_metadata_buffer: BufferNodeId,
     pub cpu_light_data_buffer: BufferNodeId,
     pub injected_gpu_lights: Option<GpuLightBuffers>,
@@ -95,21 +105,16 @@ impl ClusteredLightingFeature {
     pub fn new() -> Self {
         Self {
             config: ClusteredLightingConfig::default(),
-            params_buffer: None,
             light_merge: LightMergeFeature::new(),
-            dispatch_args_layout: None,
-            light_view_layout: None,
-            cull_layout: None,
-            dispatch_args_pipeline: None,
-            light_view_pipeline: None,
-            cull_pipeline: None,
-            frame_params: ClusteredLightingParams::default(),
+            dispatch_args: ClusterDispatchArgsFeature::default(),
+            light_view: ClusterLightViewFeature::default(),
+            cull: ClusterCullFeature::default(),
         }
     }
 
     #[inline]
     #[must_use]
-    pub fn params_desc(&self) -> BufferDesc {
+    pub fn params_desc() -> BufferDesc {
         BufferDesc::new(
             std::mem::size_of::<ClusteredLightingParams>() as u64,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -118,26 +123,25 @@ impl ClusteredLightingFeature {
 
     #[inline]
     #[must_use]
-    pub fn cluster_record_desc(&self) -> BufferDesc {
+    pub fn cluster_record_desc(params: ClusteredLightingParams) -> BufferDesc {
         BufferDesc::new(
-            u64::from(self.frame_params.grid_dimensions.y)
-                * std::mem::size_of::<ClusterRecord>() as u64,
+            u64::from(params.grid_dimensions.y) * std::mem::size_of::<ClusterRecord>() as u64,
             wgpu::BufferUsages::STORAGE,
         )
     }
 
     #[inline]
     #[must_use]
-    pub fn light_index_desc(&self) -> BufferDesc {
+    pub fn light_index_desc(params: ClusteredLightingParams) -> BufferDesc {
         BufferDesc::new(
-            u64::from(self.frame_params.budget.y) * std::mem::size_of::<u32>() as u64,
+            u64::from(params.budget.y) * std::mem::size_of::<u32>() as u64,
             wgpu::BufferUsages::STORAGE,
         )
     }
 
     #[inline]
     #[must_use]
-    pub fn light_index_allocator_desc(&self) -> BufferDesc {
+    pub fn light_index_allocator_desc() -> BufferDesc {
         BufferDesc::new(
             std::mem::size_of::<u32>() as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -146,7 +150,7 @@ impl ClusteredLightingFeature {
 
     #[inline]
     #[must_use]
-    pub fn light_view_positions_desc(&self, light_slot_count: u32) -> BufferDesc {
+    pub fn light_view_positions_desc(light_slot_count: u32) -> BufferDesc {
         BufferDesc::new(
             u64::from(light_slot_count.max(1)) * std::mem::size_of::<[f32; 4]>() as u64,
             wgpu::BufferUsages::STORAGE,
@@ -155,211 +159,29 @@ impl ClusteredLightingFeature {
 
     #[inline]
     #[must_use]
-    pub fn dispatch_args_desc(&self) -> BufferDesc {
+    pub fn dispatch_args_desc() -> BufferDesc {
         BufferDesc::new(
             std::mem::size_of::<[u32; 4]>() as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
         )
     }
 
-    #[must_use]
-    pub fn params_buffer(&self) -> Option<&Tracked<wgpu::Buffer>> {
-        self.params_buffer.as_ref()
-    }
-
-    #[must_use]
-    pub fn frame_params(&self) -> ClusteredLightingParams {
-        self.frame_params
-    }
-
-    fn ensure_layouts(&mut self, device: &wgpu::Device) {
-        if self.dispatch_args_layout.is_some()
-            && self.light_view_layout.is_some()
-            && self.cull_layout.is_some()
-        {
-            return;
-        }
-
-        self.dispatch_args_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Cluster Dispatch Args Layout"),
-                entries: &[
-                    storage_buffer(0, wgpu::ShaderStages::COMPUTE, true),
-                    storage_buffer(1, wgpu::ShaderStages::COMPUTE, false),
-                ],
-            },
-        )));
-
-        self.light_view_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Cluster Light View Layout"),
-                entries: &[
-                    uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
-                    storage_buffer(1, wgpu::ShaderStages::COMPUTE, true),
-                    storage_buffer(2, wgpu::ShaderStages::COMPUTE, false),
-                ],
-            },
-        )));
-
-        self.cull_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Cluster Cull Layout"),
-                entries: &[
-                    uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
-                    storage_buffer(1, wgpu::ShaderStages::COMPUTE, false),
-                    storage_buffer(2, wgpu::ShaderStages::COMPUTE, false),
-                    storage_buffer(3, wgpu::ShaderStages::COMPUTE, false),
-                    uniform_buffer(4, wgpu::ShaderStages::COMPUTE),
-                    storage_buffer(5, wgpu::ShaderStages::COMPUTE, true),
-                ],
-            },
-        )));
-    }
-
-    fn ensure_pipelines(&mut self, ctx: &mut ExtractContext) {
-        if self.dispatch_args_pipeline.is_some()
-            && self.light_view_pipeline.is_some()
-            && self.cull_pipeline.is_some()
-        {
-            return;
-        }
-
-        self.ensure_layouts(ctx.device);
-
-        let global_state_key = (ctx.render_state.id, ctx.extracted_scene.scene_id);
-        let gpu_world = ctx
-            .resource_manager
-            .get_global_state(global_state_key.0, global_state_key.1)
-            .expect("Clustered lighting requires a prepared global bind group");
-
-        let compilation_options = wgpu::PipelineCompilationOptions::default();
-        let dispatch_args_layout = self
-            .dispatch_args_layout
-            .as_ref()
-            .expect("cluster dispatch args layout missing");
-        let light_view_layout = self
-            .light_view_layout
-            .as_ref()
-            .expect("cluster light view layout missing");
-        let cull_layout = self
-            .cull_layout
-            .as_ref()
-            .expect("cluster cull layout missing");
-
-        if self.dispatch_args_pipeline.is_none() {
-            let (module, shader_hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/utility/clustered/cluster_dispatch_args"),
-                &ShaderCompilationOptions::default(),
-            );
-
-            let layout = ctx
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Cluster Dispatch Args Pipeline Layout"),
-                    bind_group_layouts: &[Some(dispatch_args_layout)],
-                    immediate_size: 0,
-                });
-
-            self.dispatch_args_pipeline = Some(
-                ctx.pipeline_cache.get_or_create_compute(
-                    ctx.device,
-                    module,
-                    &layout,
-                    &ComputePipelineKey::new(shader_hash)
-                        .with_compilation_options(&compilation_options),
-                    &compilation_options,
-                    "Cluster Dispatch Args Pipeline",
-                ),
-            );
-        }
-
-        if self.light_view_pipeline.is_none() {
-            let mut options = ShaderCompilationOptions::default();
-            options.inject_code("binding_code", &gpu_world.binding_wgsl);
-            options.inject_code("scene_lighting_structs", scene_lighting_structs_wgsl());
-            let (module, shader_hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/utility/clustered/cluster_light_view_transform"),
-                &options,
-            );
-
-            let layout = ctx
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Cluster Light View Pipeline Layout"),
-                    bind_group_layouts: &[Some(&gpu_world.layout), Some(light_view_layout)],
-                    immediate_size: 0,
-                });
-
-            self.light_view_pipeline = Some(
-                ctx.pipeline_cache.get_or_create_compute(
-                    ctx.device,
-                    module,
-                    &layout,
-                    &ComputePipelineKey::new(shader_hash)
-                        .with_compilation_options(&compilation_options),
-                    &compilation_options,
-                    "Cluster Light View Pipeline",
-                ),
-            );
-        }
-
-        if self.cull_pipeline.is_none() {
-            let mut options = ShaderCompilationOptions::default();
-            options.inject_code("binding_code", &gpu_world.binding_wgsl);
-            options.inject_code("scene_lighting_structs", scene_lighting_structs_wgsl());
-            options.inject_code(
-                "clustered_lighting_structs",
-                clustered_lighting_structs_wgsl(),
-            );
-            options.inject_code(
-                "clustered_max_local_lights",
-                format!("{}u", self.config.max_lights_per_cluster.max(1)),
-            );
-            let (module, shader_hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/utility/clustered/cluster_cull"),
-                &options,
-            );
-
-            let layout = ctx
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Cluster Cull Pipeline Layout"),
-                    bind_group_layouts: &[Some(&gpu_world.layout), Some(cull_layout)],
-                    immediate_size: 0,
-                });
-
-            self.cull_pipeline = Some(
-                ctx.pipeline_cache.get_or_create_compute(
-                    ctx.device,
-                    module,
-                    &layout,
-                    &ComputePipelineKey::new(shader_hash)
-                        .with_compilation_options(&compilation_options),
-                    &compilation_options,
-                    "Cluster Cull Pipeline",
-                ),
-            );
-        }
-    }
-
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
+    pub fn extract<'a>(
+        &self,
+        render_state: &RenderState,
+        render_camera: &RenderCamera,
+        extracted_scene: &'a ExtractedScene,
+        max_storage_buffer_binding_size: u64,
+        global_state_key: crate::core::gpu::GlobalStateKey,
         enabled: bool,
         active_local_light_count: u32,
-    ) {
-        let render_uniforms = ctx.render_state.uniforms().read();
+    ) -> ClusteredLightingSnapshot<'a> {
+        let render_uniforms = render_state.uniforms().read();
         let width = render_uniforms.viewport.x.max(1.0) as u32;
         let height = render_uniforms.viewport.y.max(1.0) as u32;
         let near = render_uniforms.camera_near.max(0.001);
         let camera_far = render_uniforms.camera_far;
         drop(render_uniforms);
-
-        let far =
-            resolve_cluster_far_depth(near, camera_far, estimate_cluster_light_max_depth(ctx));
 
         let cluster_x = width.div_ceil(self.config.tile_size_x.max(1));
         let cluster_y = height.div_ceil(self.config.tile_size_y.max(1));
@@ -368,9 +190,9 @@ impl ClusteredLightingFeature {
             .saturating_mul(cluster_y)
             .saturating_mul(cluster_z)
             .max(1);
-        let max_storage_bytes = ctx.device.limits().max_storage_buffer_binding_size;
-        let max_indices_by_limit =
-            (max_storage_bytes / std::mem::size_of::<u32>() as u64).max(u64::from(total_clusters));
+        let max_indices_by_limit = (max_storage_buffer_binding_size
+            / std::mem::size_of::<u32>() as u64)
+            .max(u64::from(total_clusters));
         let requested_light_indices =
             u64::from(total_clusters) * u64::from(self.config.max_lights_per_cluster.max(1));
         let effective_light_indices = requested_light_indices.min(max_indices_by_limit);
@@ -385,11 +207,7 @@ impl ClusteredLightingFeature {
             );
         }
 
-        let log_ratio = (far / near).ln().max(0.0001);
-        let slice_scale = cluster_z as f32 / log_ratio;
-        let slice_bias = -(near.ln() * slice_scale);
-
-        let frame_params = ClusteredLightingParams {
+        let params = ClusteredLightingParams {
             screen_dimensions: glam::UVec4::new(width, height, cluster_x, cluster_y),
             grid_dimensions: glam::UVec4::new(
                 cluster_z,
@@ -407,52 +225,47 @@ impl ClusteredLightingFeature {
                 },
                 active_local_light_count,
             ),
-            depth_params: glam::Vec4::new(near, far, slice_scale, slice_bias),
+            // The depth range requires an O(light_count) derivation for
+            // infinite-far cameras. Keep it unresolved until a live params
+            // upload node reaches deferred prepare.
+            depth_params: glam::Vec4::ZERO,
         };
-        let params_changed =
-            bytemuck::bytes_of(&self.frame_params) != bytemuck::bytes_of(&frame_params);
-        self.frame_params = frame_params;
 
-        self.ensure_pipelines(ctx);
-        self.light_merge.extract_and_prepare(ctx);
-
-        let params_desc = self.params_desc();
-        let params_buffer_missing = self.params_buffer.is_none();
-        ensure_tracked_buffer(
-            &mut self.params_buffer,
-            ctx.device,
-            params_desc,
-            "Clustered Lighting Params",
-        );
-
-        if params_buffer_missing || params_changed {
-            ctx.queue.write_buffer(
-                self.params_buffer
-                    .as_ref()
-                    .expect("clustered params buffer must exist"),
-                0,
-                bytemuck::bytes_of(&self.frame_params),
-            );
+        ClusteredLightingSnapshot {
+            params,
+            global_state_key,
+            cull_max_lights_per_cluster: self.config.max_lights_per_cluster.max(1),
+            lights: &extracted_scene.lights,
+            view_matrix: render_camera.view_matrix,
+            camera_near: near,
+            camera_far,
         }
     }
 
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: ClusteredLightingSnapshot<'a>,
         inputs: ClusteredLightingInputs,
     ) -> ClusteredLightingOutputs {
-        let params_buffer = self
-            .params_buffer
-            .as_ref()
-            .expect("Clustered lighting params buffer must exist before graph build");
-        let imported_params = ctx.graph.import_external_buffer(
-            "Clustered_Params",
-            BufferDesc::new(
-                std::mem::size_of::<ClusteredLightingParams>() as u64,
-                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            ),
-            params_buffer,
-        );
+        let params_buffer = ctx.graph.add_pass("Cluster_Params_Upload", |builder| {
+            let params_buffer = builder.create_buffer("Clustered_Params", Self::params_desc());
+            (
+                ClusterParamsPassNode {
+                    params_buffer,
+                    snapshot,
+                },
+                params_buffer,
+            )
+        });
+
+        let Self {
+            light_merge: light_merge_feature,
+            dispatch_args: dispatch_args_feature,
+            light_view: light_view_feature,
+            cull: cull_feature,
+            ..
+        } = self;
 
         let cpu_local_light_count = ctx.scene_local_light_count();
         let cpu_light_capacity =
@@ -463,12 +276,12 @@ impl ClusteredLightingFeature {
                 final_light_metadata_buffer: gpu_lights.light_metadata,
                 final_light_data_buffer: gpu_lights.light_storage,
                 final_indirect_count_buffer: gpu_lights.indirect_count_buffer,
-                params_buffer: imported_params,
+                params_buffer,
                 cluster_records: None,
                 light_indices: None,
             },
             Some(gpu_lights) => {
-                let merged = self.light_merge.add_to_graph(
+                let merged = light_merge_feature.add_to_graph(
                     ctx,
                     inputs.cpu_light_metadata_buffer,
                     inputs.cpu_light_data_buffer,
@@ -479,7 +292,7 @@ impl ClusteredLightingFeature {
                     final_light_metadata_buffer: merged.light_metadata,
                     final_light_data_buffer: merged.light_storage,
                     final_indirect_count_buffer: Some(merged.indirect_count_buffer),
-                    params_buffer: imported_params,
+                    params_buffer,
                     cluster_records: None,
                     light_indices: None,
                 }
@@ -488,38 +301,18 @@ impl ClusteredLightingFeature {
                 final_light_metadata_buffer: inputs.cpu_light_metadata_buffer,
                 final_light_data_buffer: inputs.cpu_light_data_buffer,
                 final_indirect_count_buffer: None,
-                params_buffer: imported_params,
+                params_buffer,
                 cluster_records: None,
                 light_indices: None,
             },
         };
 
-        if !inputs.enabled {
+        if snapshot.params.budget.z & CLUSTERED_LIGHTING_FLAG_ENABLED == 0 {
             return final_lights;
         }
 
         let light_slots =
             light_capacity_from_desc(ctx.buffer_desc(final_lights.final_light_data_buffer));
-
-        let dispatch_args_layout = self
-            .dispatch_args_layout
-            .as_ref()
-            .expect("Cluster dispatch args layout must exist");
-        let cull_layout = self
-            .cull_layout
-            .as_ref()
-            .expect("Clustered lighting cull layout must exist");
-        let light_view_layout = self
-            .light_view_layout
-            .as_ref()
-            .expect("Clustered lighting light-view layout must exist");
-        let dispatch_args_pipeline_id = self
-            .dispatch_args_pipeline
-            .expect("Cluster dispatch args pipeline missing");
-        let light_view_pipeline_id = self
-            .light_view_pipeline
-            .expect("Cluster light view pipeline missing");
-        let cull_pipeline_id = self.cull_pipeline.expect("Clustered cull pipeline missing");
 
         let dispatch_args_buffer = final_lights
             .final_indirect_count_buffer
@@ -529,14 +322,13 @@ impl ClusteredLightingFeature {
                         let count_buffer = builder.read_buffer(count_buffer);
                         let dispatch_args = builder.create_buffer(
                             "Cluster_Light_Dispatch_Args",
-                            self.dispatch_args_desc(),
+                            Self::dispatch_args_desc(),
                         );
 
                         let node = ClusterDispatchArgsPassNode {
+                            feature: dispatch_args_feature,
                             count_buffer,
                             dispatch_args,
-                            dispatch_args_layout,
-                            dispatch_args_pipeline_id,
                             bind_group: None,
                         };
 
@@ -553,16 +345,16 @@ impl ClusteredLightingFeature {
             }
             let light_view_positions = builder.create_buffer(
                 "Cluster_Light_View_Positions",
-                self.light_view_positions_desc(light_slots),
+                Self::light_view_positions_desc(light_slots),
             );
 
             let node = ClusterLightViewPassNode {
+                feature: light_view_feature,
+                global_state_key: snapshot.global_state_key,
                 light_metadata_buffer,
                 light_data_buffer,
                 light_view_positions,
                 indirect_dispatch_buffer: dispatch_args_buffer,
-                light_view_layout,
-                light_view_pipeline_id,
                 bind_group: None,
                 total_light_slots: light_slots,
             };
@@ -571,32 +363,37 @@ impl ClusteredLightingFeature {
         });
 
         ctx.graph.add_pass("Cluster_Cull_Pass", |builder| {
-            let params_buffer = builder.read_buffer(imported_params);
+            let params_buffer = builder.read_buffer(params_buffer);
             let light_metadata_buffer =
                 builder.read_buffer(final_lights.final_light_metadata_buffer);
             let light_view_positions = builder.read_buffer(light_view_positions);
-            let cluster_records =
-                builder.create_buffer("Cluster_Records", self.cluster_record_desc());
-            let light_indices =
-                builder.create_buffer("Cluster_Light_Indices", self.light_index_desc());
+            let cluster_records = builder.create_buffer(
+                "Cluster_Records",
+                Self::cluster_record_desc(snapshot.params),
+            );
+            let light_indices = builder.create_buffer(
+                "Cluster_Light_Indices",
+                Self::light_index_desc(snapshot.params),
+            );
             let light_index_allocator = builder.create_buffer(
                 "Cluster_Light_Index_Allocator",
-                self.light_index_allocator_desc(),
+                Self::light_index_allocator_desc(),
             );
 
             let node = ClusterCullPassNode {
+                feature: cull_feature,
+                global_state_key: snapshot.global_state_key,
+                resource_key: ClusterCullResourceKey::new(snapshot.cull_max_lights_per_cluster),
                 params_buffer,
                 light_metadata_buffer,
                 light_view_positions,
                 cluster_records,
                 light_indices,
                 light_index_allocator,
-                cull_layout,
-                cull_pipeline_id,
                 bind_group: None,
-                dispatch_grid_x: self.frame_params.screen_dimensions.z.max(1),
-                dispatch_grid_y: self.frame_params.screen_dimensions.w.max(1),
-                dispatch_grid_z: self.frame_params.grid_dimensions.x.max(1),
+                dispatch_grid_x: snapshot.params.screen_dimensions.z.max(1),
+                dispatch_grid_y: snapshot.params.screen_dimensions.w.max(1),
+                dispatch_grid_z: snapshot.params.grid_dimensions.x.max(1),
             };
             (
                 node,
@@ -613,11 +410,13 @@ impl ClusteredLightingFeature {
     }
 }
 
-fn estimate_cluster_light_max_depth(ctx: &ExtractContext) -> Option<f32> {
-    let view_matrix = ctx.render_camera.view_matrix;
+fn estimate_cluster_light_max_depth(
+    lights: &[ExtractedLight],
+    view_matrix: glam::Mat4,
+) -> Option<f32> {
     let mut max_depth = 0.0_f32;
 
-    for light in &ctx.extracted_scene.lights {
+    for light in lights {
         let range = match &light.kind {
             LightKind::Point(point) => point.range,
             LightKind::Spot(spot) => spot.range,
@@ -638,6 +437,28 @@ fn estimate_cluster_light_max_depth(ctx: &ExtractContext) -> Option<f32> {
     (max_depth > 0.0).then_some(max_depth)
 }
 
+fn resolve_cluster_params_for_upload(
+    mut params: ClusteredLightingParams,
+    lights: &[ExtractedLight],
+    view_matrix: glam::Mat4,
+    camera_near: f32,
+    camera_far: f32,
+) -> ClusteredLightingParams {
+    let near = camera_near.max(0.001);
+    let estimated_light_depth = if camera_far.is_finite() {
+        None
+    } else {
+        estimate_cluster_light_max_depth(lights, view_matrix)
+    };
+    let far = resolve_cluster_far_depth(near, camera_far, estimated_light_depth);
+    let cluster_z = params.grid_dimensions.x.max(1);
+    let log_ratio = (far / near).ln().max(0.0001);
+    let slice_scale = cluster_z as f32 / log_ratio;
+    let slice_bias = -(near.ln() * slice_scale);
+    params.depth_params = glam::Vec4::new(near, far, slice_scale, slice_bias);
+    params
+}
+
 fn resolve_cluster_far_depth(
     near: f32,
     camera_far: f32,
@@ -652,18 +473,334 @@ fn resolve_cluster_far_depth(
         .max(near + DEFAULT_CLUSTER_FAR_DEPTH_FALLBACK)
 }
 
+#[derive(Default)]
+struct ClusterDispatchArgsFeature {
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    pipeline_id: Option<ComputePipelineId>,
+}
+
+impl ClusterDispatchArgsFeature {
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>) {
+        if self.layout.is_some() && self.pipeline_id.is_some() {
+            return;
+        }
+
+        let options = ShaderCompilationOptions::default();
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/utility/clustered/cluster_dispatch_args"),
+            &options,
+        );
+        let compilation_options = wgpu::PipelineCompilationOptions::default();
+        let pipeline_key =
+            ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options);
+
+        let (pipeline_id, layout) =
+            if let Some(id) = ctx.pipeline_cache.get_compute_pipeline_id(&pipeline_key) {
+                (
+                    id,
+                    ctx.pipeline_cache.get_tracked_compute_layout(id, 0).clone(),
+                )
+            } else {
+                let layout = create_dispatch_args_layout(ctx.device);
+                let pipeline_layout =
+                    ctx.device
+                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: Some("Cluster Dispatch Args Pipeline Layout"),
+                            bind_group_layouts: &[Some(&layout)],
+                            immediate_size: 0,
+                        });
+                let id = ctx.pipeline_cache.get_or_create_compute(
+                    ctx.device,
+                    module,
+                    &pipeline_layout,
+                    &pipeline_key,
+                    &compilation_options,
+                    "Cluster Dispatch Args Pipeline",
+                );
+                ctx.pipeline_cache
+                    .register_compute_layouts(id, smallvec::smallvec![layout.clone()]);
+                (id, layout)
+            };
+
+        self.layout = Some(layout);
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("cluster dispatch-args layout must be prepared by the live node")
+    }
+
+    fn pipeline_id(&self) -> ComputePipelineId {
+        self.pipeline_id
+            .expect("cluster dispatch-args pipeline must be prepared by the live node")
+    }
+}
+
+#[derive(Default)]
+struct ClusterLightViewFeature {
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    pipeline_id: Option<ComputePipelineId>,
+}
+
+impl ClusterLightViewFeature {
+    fn ensure_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        global_state_key: crate::core::gpu::GlobalStateKey,
+    ) {
+        if self.layout.is_some() && self.pipeline_id.is_some() {
+            return;
+        }
+
+        let global_state = ctx
+            .global_states
+            .get(global_state_key)
+            .expect("cluster light-view requires prepared global binding state");
+        let mut options = ShaderCompilationOptions::default();
+        options.inject_code("binding_code", &global_state.binding_wgsl);
+        options.inject_code("scene_lighting_structs", scene_lighting_structs_wgsl());
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/utility/clustered/cluster_light_view_transform"),
+            &options,
+        );
+        let compilation_options = wgpu::PipelineCompilationOptions::default();
+        let pipeline_key =
+            ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options);
+
+        let (pipeline_id, layout) = if let Some(id) =
+            ctx.pipeline_cache.get_compute_pipeline_id(&pipeline_key)
+        {
+            (
+                id,
+                ctx.pipeline_cache.get_tracked_compute_layout(id, 1).clone(),
+            )
+        } else {
+            let layout = create_light_view_layout(ctx.device);
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Cluster Light View Pipeline Layout"),
+                        bind_group_layouts: &[Some(&global_state.layout), Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_compute(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &pipeline_key,
+                &compilation_options,
+                "Cluster Light View Pipeline",
+            );
+            let global_layout =
+                Tracked::with_id(global_state.layout.clone(), global_state.layout_id);
+            ctx.pipeline_cache
+                .register_compute_layouts(id, smallvec::smallvec![global_layout, layout.clone()]);
+            (id, layout)
+        };
+
+        self.layout = Some(layout);
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("cluster light-view layout must be prepared by the live node")
+    }
+
+    fn pipeline_id(&self) -> ComputePipelineId {
+        self.pipeline_id
+            .expect("cluster light-view pipeline must be prepared by the live node")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClusterCullResourceKey {
+    max_lights_per_cluster: u32,
+}
+
+impl ClusterCullResourceKey {
+    const fn new(max_lights_per_cluster: u32) -> Self {
+        Self {
+            max_lights_per_cluster,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClusterCullFeature {
+    resource_key: Option<ClusterCullResourceKey>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    pipeline_id: Option<ComputePipelineId>,
+}
+
+impl ClusterCullFeature {
+    fn ensure_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        global_state_key: crate::core::gpu::GlobalStateKey,
+        resource_key: ClusterCullResourceKey,
+    ) {
+        if self.resource_key == Some(resource_key)
+            && self.layout.is_some()
+            && self.pipeline_id.is_some()
+        {
+            return;
+        }
+
+        let global_state = ctx
+            .global_states
+            .get(global_state_key)
+            .expect("cluster cull requires prepared global binding state");
+        let mut options = ShaderCompilationOptions::default();
+        options.inject_code("binding_code", &global_state.binding_wgsl);
+        options.inject_code("scene_lighting_structs", scene_lighting_structs_wgsl());
+        options.inject_code(
+            "clustered_lighting_structs",
+            clustered_lighting_structs_wgsl(),
+        );
+        options.inject_code(
+            "clustered_max_local_lights",
+            format!("{}u", resource_key.max_lights_per_cluster),
+        );
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/utility/clustered/cluster_cull"),
+            &options,
+        );
+        let compilation_options = wgpu::PipelineCompilationOptions::default();
+        let pipeline_key =
+            ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options);
+
+        let (pipeline_id, layout) = if let Some(id) =
+            ctx.pipeline_cache.get_compute_pipeline_id(&pipeline_key)
+        {
+            (
+                id,
+                ctx.pipeline_cache.get_tracked_compute_layout(id, 1).clone(),
+            )
+        } else {
+            let layout = create_cull_layout(ctx.device);
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Cluster Cull Pipeline Layout"),
+                        bind_group_layouts: &[Some(&global_state.layout), Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_compute(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &pipeline_key,
+                &compilation_options,
+                "Cluster Cull Pipeline",
+            );
+            let global_layout =
+                Tracked::with_id(global_state.layout.clone(), global_state.layout_id);
+            ctx.pipeline_cache
+                .register_compute_layouts(id, smallvec::smallvec![global_layout, layout.clone()]);
+            (id, layout)
+        };
+
+        self.resource_key = Some(resource_key);
+        self.layout = Some(layout);
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("cluster cull layout must be prepared by the live node")
+    }
+
+    fn pipeline_id(&self) -> ComputePipelineId {
+        self.pipeline_id
+            .expect("cluster cull pipeline must be prepared by the live node")
+    }
+}
+
+fn create_dispatch_args_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Cluster Dispatch Args Layout"),
+            entries: &[
+                storage_buffer(0, wgpu::ShaderStages::COMPUTE, true),
+                storage_buffer(1, wgpu::ShaderStages::COMPUTE, false),
+            ],
+        }),
+    )
+}
+
+fn create_light_view_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Cluster Light View Layout"),
+            entries: &[
+                uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
+                storage_buffer(1, wgpu::ShaderStages::COMPUTE, true),
+                storage_buffer(2, wgpu::ShaderStages::COMPUTE, false),
+            ],
+        }),
+    )
+}
+
+fn create_cull_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Cluster Cull Layout"),
+            entries: &[
+                uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
+                storage_buffer(1, wgpu::ShaderStages::COMPUTE, false),
+                storage_buffer(2, wgpu::ShaderStages::COMPUTE, false),
+                storage_buffer(3, wgpu::ShaderStages::COMPUTE, false),
+                uniform_buffer(4, wgpu::ShaderStages::COMPUTE),
+                storage_buffer(5, wgpu::ShaderStages::COMPUTE, true),
+            ],
+        }),
+    )
+}
+
+struct ClusterParamsPassNode<'a> {
+    params_buffer: BufferNodeId,
+    snapshot: ClusteredLightingSnapshot<'a>,
+}
+
+impl<'a> PassNode<'a> for ClusterParamsPassNode<'a> {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        let params = resolve_cluster_params_for_upload(
+            self.snapshot.params,
+            self.snapshot.lights,
+            self.snapshot.view_matrix,
+            self.snapshot.camera_near,
+            self.snapshot.camera_far,
+        );
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.params_buffer),
+            0,
+            bytemuck::bytes_of(&params),
+        );
+    }
+
+    fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+}
+
 struct ClusterDispatchArgsPassNode<'a> {
+    feature: &'a mut ClusterDispatchArgsFeature,
     count_buffer: BufferNodeId,
     dispatch_args: BufferNodeId,
-    dispatch_args_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    dispatch_args_pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for ClusterDispatchArgsPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.ensure_resources(ctx);
         self.bind_group = Some(
-            ctx.build_bind_group(self.dispatch_args_layout, Some("Cluster Dispatch Args BG"))
+            ctx.build_bind_group(self.feature.layout(), Some("Cluster Dispatch Args BG"))
                 .bind_buffer(0, self.count_buffer)
                 .bind_buffer(1, self.dispatch_args)
                 .build(),
@@ -677,7 +814,7 @@ impl<'a> PassNode<'a> for ClusterDispatchArgsPassNode<'a> {
         });
         pass.set_pipeline(
             ctx.pipeline_cache
-                .get_compute_pipeline(self.dispatch_args_pipeline_id),
+                .get_compute_pipeline(self.feature.pipeline_id()),
         );
         pass.set_bind_group(
             0,
@@ -689,20 +826,21 @@ impl<'a> PassNode<'a> for ClusterDispatchArgsPassNode<'a> {
 }
 
 struct ClusterLightViewPassNode<'a> {
+    feature: &'a mut ClusterLightViewFeature,
+    global_state_key: crate::core::gpu::GlobalStateKey,
     light_metadata_buffer: BufferNodeId,
     light_data_buffer: BufferNodeId,
     light_view_positions: BufferNodeId,
     indirect_dispatch_buffer: Option<BufferNodeId>,
-    light_view_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    light_view_pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
     total_light_slots: u32,
 }
 
 impl<'a> PassNode<'a> for ClusterLightViewPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.ensure_resources(ctx, self.global_state_key);
         self.bind_group = Some(
-            ctx.build_bind_group(self.light_view_layout, Some("Cluster Light View BG"))
+            ctx.build_bind_group(self.feature.layout(), Some("Cluster Light View BG"))
                 .bind_buffer(0, self.light_metadata_buffer)
                 .bind_buffer(1, self.light_data_buffer)
                 .bind_buffer(2, self.light_view_positions)
@@ -717,7 +855,7 @@ impl<'a> PassNode<'a> for ClusterLightViewPassNode<'a> {
         });
         pass.set_pipeline(
             ctx.pipeline_cache
-                .get_compute_pipeline(self.light_view_pipeline_id),
+                .get_compute_pipeline(self.feature.pipeline_id()),
         );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
         pass.set_bind_group(
@@ -739,14 +877,15 @@ impl<'a> PassNode<'a> for ClusterLightViewPassNode<'a> {
 }
 
 struct ClusterCullPassNode<'a> {
+    feature: &'a mut ClusterCullFeature,
+    global_state_key: crate::core::gpu::GlobalStateKey,
+    resource_key: ClusterCullResourceKey,
     params_buffer: BufferNodeId,
     light_metadata_buffer: BufferNodeId,
     light_view_positions: BufferNodeId,
     cluster_records: BufferNodeId,
     light_indices: BufferNodeId,
     light_index_allocator: BufferNodeId,
-    cull_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    cull_pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
     dispatch_grid_x: u32,
     dispatch_grid_y: u32,
@@ -755,14 +894,11 @@ struct ClusterCullPassNode<'a> {
 
 impl<'a> PassNode<'a> for ClusterCullPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        // ctx.queue.write_buffer(
-        //     ctx.views.get_buffer(self.light_index_allocator),
-        //     0,
-        //     bytemuck::bytes_of(&0u32),
-        // );
+        self.feature
+            .ensure_resources(ctx, self.global_state_key, self.resource_key);
 
         self.bind_group = Some(
-            ctx.build_bind_group(self.cull_layout, Some("Cluster Cull BG"))
+            ctx.build_bind_group(self.feature.layout(), Some("Cluster Cull BG"))
                 .bind_buffer(0, self.params_buffer)
                 .bind_buffer(1, self.cluster_records)
                 .bind_buffer(2, self.light_indices)
@@ -783,7 +919,7 @@ impl<'a> PassNode<'a> for ClusterCullPassNode<'a> {
         });
         pass.set_pipeline(
             ctx.pipeline_cache
-                .get_compute_pipeline(self.cull_pipeline_id),
+                .get_compute_pipeline(self.feature.pipeline_id()),
         );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
         pass.set_bind_group(1, self.bind_group.expect("Cluster cull BG missing"), &[]);
@@ -795,28 +931,6 @@ impl<'a> PassNode<'a> for ClusterCullPassNode<'a> {
     }
 }
 
-fn ensure_tracked_buffer(
-    slot: &mut Option<Tracked<wgpu::Buffer>>,
-    device: &wgpu::Device,
-    desc: BufferDesc,
-    label: &'static str,
-) {
-    let needs_recreate = slot
-        .as_ref()
-        .is_none_or(|buffer| buffer.size() != desc.logical_size);
-
-    if needs_recreate {
-        *slot = Some(Tracked::new(device.create_buffer(
-            &wgpu::BufferDescriptor {
-                label: Some(label),
-                size: desc.logical_size.max(1),
-                usage: desc.usage,
-                mapped_at_creation: false,
-            },
-        )));
-    }
-}
-
 fn light_capacity_from_desc(desc: BufferDesc) -> u32 {
     let bytes_per_light = std::mem::size_of::<GpuLightStorage>() as u64;
     ((desc.logical_size / bytes_per_light).max(1)).min(u64::from(u32::MAX)) as u32
@@ -824,7 +938,127 @@ fn light_capacity_from_desc(desc: BufferDesc) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CLUSTER_FAR_DEPTH_FALLBACK, resolve_cluster_far_depth};
+    use super::*;
+    use crate::core::gpu::GlobalStateKey;
+    use crate::graph::core::graph::FrameConfig;
+    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph};
+    use myth_resources::uniforms::LightBufferMetadata;
+
+    struct TestNode;
+
+    impl PassNode<'_> for TestNode {
+        fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    fn frame_config() -> FrameConfig {
+        FrameConfig {
+            width: 1280,
+            height: 720,
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            msaa_samples: 1,
+            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            hdr_format: crate::HDR_TEXTURE_FORMAT,
+        }
+    }
+
+    fn snapshot(
+        enabled: bool,
+        active_local_light_count: u32,
+    ) -> ClusteredLightingSnapshot<'static> {
+        let cluster_x = 11;
+        let cluster_y = 6;
+        let cluster_z = DEFAULT_CLUSTER_Z_SLICES;
+        let total_clusters = cluster_x * cluster_y * cluster_z;
+        ClusteredLightingSnapshot {
+            params: ClusteredLightingParams {
+                screen_dimensions: glam::UVec4::new(1280, 720, cluster_x, cluster_y),
+                grid_dimensions: glam::UVec4::new(
+                    cluster_z,
+                    total_clusters,
+                    DEFAULT_CLUSTER_TILE_SIZE,
+                    DEFAULT_CLUSTER_TILE_SIZE,
+                ),
+                budget: glam::UVec4::new(
+                    DEFAULT_MAX_LIGHTS_PER_CLUSTER,
+                    total_clusters * DEFAULT_MAX_LIGHTS_PER_CLUSTER,
+                    u32::from(enabled) * CLUSTERED_LIGHTING_FLAG_ENABLED,
+                    active_local_light_count,
+                ),
+                depth_params: glam::Vec4::ZERO,
+            },
+            global_state_key: GlobalStateKey::new(1, 1),
+            cull_max_lights_per_cluster: DEFAULT_MAX_LIGHTS_PER_CLUSTER,
+            lights: &[],
+            view_matrix: glam::Mat4::IDENTITY,
+            camera_near: 0.1,
+            camera_far: f32::INFINITY,
+        }
+    }
+
+    fn metadata_desc() -> BufferDesc {
+        BufferDesc::new(
+            std::mem::size_of::<LightBufferMetadata>() as u64,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE,
+        )
+    }
+
+    fn light_storage_desc(capacity: u32) -> BufferDesc {
+        BufferDesc::new(
+            u64::from(capacity) * std::mem::size_of::<GpuLightStorage>() as u64,
+            wgpu::BufferUsages::STORAGE,
+        )
+    }
+
+    fn indirect_count_desc() -> BufferDesc {
+        BufferDesc::new(
+            std::mem::size_of::<u32>() as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+        )
+    }
+
+    fn final_lights_live_passes(clustered_enabled: bool) -> Vec<&'static str> {
+        let mut feature = ClusteredLightingFeature::new();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let cpu_metadata = graph.register_buffer("CPU_Metadata", metadata_desc(), true);
+        let cpu_lights = graph.register_buffer("CPU_Lights", light_storage_desc(4), true);
+        let gpu_metadata = graph.register_buffer("GPU_Metadata", metadata_desc(), true);
+        let gpu_lights = graph.register_buffer("GPU_Lights", light_storage_desc(8), true);
+        let gpu_count = graph.register_buffer("GPU_Count", indirect_count_desc(), true);
+        let config = frame_config();
+        let outputs = {
+            let mut ctx = GraphBuilderContext::new(&mut graph, &config, 1);
+            feature.add_to_graph(
+                &mut ctx,
+                snapshot(clustered_enabled, 1),
+                ClusteredLightingInputs {
+                    cpu_light_metadata_buffer: cpu_metadata,
+                    cpu_light_data_buffer: cpu_lights,
+                    injected_gpu_lights: Some(GpuLightBuffers {
+                        light_metadata: gpu_metadata,
+                        light_storage: gpu_lights,
+                        indirect_count_buffer: Some(gpu_count),
+                    }),
+                },
+            )
+        };
+
+        graph.add_pass("Cluster_Test_Root", |builder| {
+            builder.read_buffer(outputs.final_light_metadata_buffer);
+            builder.read_buffer(outputs.final_light_data_buffer);
+            builder.mark_side_effect();
+            (TestNode, ())
+        });
+        graph.compile_topology();
+
+        graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect()
+    }
 
     #[test]
     fn infinite_camera_far_resolves_to_finite_cluster_depth() {
@@ -839,5 +1073,120 @@ mod tests {
         let far = resolve_cluster_far_depth(near, f32::INFINITY, None);
         assert!(far.is_finite());
         assert!(far >= near + DEFAULT_CLUSTER_FAR_DEPTH_FALLBACK);
+    }
+
+    #[test]
+    fn upload_derivation_resolves_depth_without_changing_topology_fields() {
+        let snapshot = snapshot(true, 3);
+        assert_eq!(snapshot.params.depth_params, glam::Vec4::ZERO);
+
+        let resolved = resolve_cluster_params_for_upload(
+            snapshot.params,
+            snapshot.lights,
+            snapshot.view_matrix,
+            snapshot.camera_near,
+            snapshot.camera_far,
+        );
+
+        assert_eq!(
+            resolved.screen_dimensions,
+            snapshot.params.screen_dimensions
+        );
+        assert_eq!(resolved.grid_dimensions, snapshot.params.grid_dimensions);
+        assert_eq!(resolved.budget, snapshot.params.budget);
+        assert_eq!(
+            ClusteredLightingFeature::cluster_record_desc(resolved),
+            ClusteredLightingFeature::cluster_record_desc(snapshot.params)
+        );
+        assert_eq!(
+            ClusteredLightingFeature::light_index_desc(resolved),
+            ClusteredLightingFeature::light_index_desc(snapshot.params)
+        );
+        assert_eq!(resolved.depth_params.x, snapshot.camera_near);
+        assert!(resolved.depth_params.y.is_finite());
+        assert!(resolved.depth_params.y > resolved.depth_params.x);
+        assert!(resolved.depth_params.z.is_finite());
+        assert!(resolved.depth_params.w.is_finite());
+    }
+
+    #[test]
+    fn cluster_outputs_keep_params_upload_light_view_and_cull_live() {
+        let mut feature = ClusteredLightingFeature::new();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let cpu_metadata = graph.register_buffer("CPU_Metadata", metadata_desc(), true);
+        let cpu_lights = graph.register_buffer("CPU_Lights", light_storage_desc(4), true);
+        let config = frame_config();
+        let outputs = {
+            let mut ctx = GraphBuilderContext::new(&mut graph, &config, 1);
+            feature.add_to_graph(
+                &mut ctx,
+                snapshot(true, 1),
+                ClusteredLightingInputs {
+                    cpu_light_metadata_buffer: cpu_metadata,
+                    cpu_light_data_buffer: cpu_lights,
+                    injected_gpu_lights: None,
+                },
+            )
+        };
+
+        graph.add_pass("Cluster_Test_Root", |builder| {
+            builder.read_buffer(outputs.params_buffer);
+            builder.read_buffer(outputs.cluster_records.expect("cluster records missing"));
+            builder.read_buffer(outputs.light_indices.expect("light indices missing"));
+            builder.mark_side_effect();
+            (TestNode, ())
+        });
+        graph.compile_topology();
+
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert!(live.contains(&"Cluster_Params_Upload"));
+        assert!(live.contains(&"Cluster_Light_View_Pass"));
+        assert!(live.contains(&"Cluster_Cull_Pass"));
+
+        let params_resource = graph
+            .storage
+            .resources
+            .iter()
+            .find(|resource| resource.name == "Clustered_Params")
+            .expect("cluster params resource missing");
+        let params_producer = params_resource
+            .producer
+            .map(|index| graph.storage.passes[index].name);
+        assert_eq!(params_producer, Some("Cluster_Params_Upload"));
+    }
+
+    #[test]
+    fn final_lights_only_culls_cluster_suffix() {
+        let live = final_lights_live_passes(true);
+        assert_eq!(live, ["Merge_Local_Lights", "Cluster_Test_Root"]);
+        assert!(!live.contains(&"Cluster_Params_Upload"));
+        assert!(!live.contains(&"Cluster_Light_Dispatch_Args"));
+        assert!(!live.contains(&"Cluster_Light_View_Pass"));
+        assert!(!live.contains(&"Cluster_Cull_Pass"));
+    }
+
+    #[test]
+    fn merge_stays_live_when_clustering_is_disabled() {
+        assert_eq!(
+            final_lights_live_passes(false),
+            ["Merge_Local_Lights", "Cluster_Test_Root"]
+        );
+    }
+
+    #[test]
+    fn cull_l1_key_changes_and_reverts_with_wgsl_specialization() {
+        let original = ClusterCullResourceKey::new(64);
+        let changed = ClusterCullResourceKey::new(128);
+        let reverted = ClusterCullResourceKey::new(64);
+
+        assert_ne!(original, changed);
+        assert_eq!(original, reverted);
     }
 }

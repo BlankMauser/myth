@@ -158,6 +158,23 @@ impl PipelineCache {
             .copied()
     }
 
+    /// Look up a compute pipeline by its canonical descriptor without
+    /// creating any WGPU objects.
+    ///
+    /// Deferred RDG nodes use this to recover the tracked layouts registered
+    /// alongside an existing L2 pipeline instead of recreating compatible
+    /// physical layouts on an L1 miss.
+    #[inline]
+    #[must_use]
+    pub fn get_compute_pipeline_id(
+        &self,
+        canonical_key: &ComputePipelineKey,
+    ) -> Option<ComputePipelineId> {
+        self.compute_lookup
+            .get(&fx_hash_key(canonical_key))
+            .copied()
+    }
+
     // ── Layout Registration & Retrieval ──────────────────────────────────────
 
     /// Associate tracked bind-group layouts with an existing render pipeline.

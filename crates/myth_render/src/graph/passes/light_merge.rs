@@ -1,9 +1,7 @@
 use crate::core::gpu::Tracked;
 use crate::core::gpu::binding_layout::{storage_buffer, uniform_buffer};
 use crate::graph::composer::{GpuLightBuffers, GraphBuilderContext};
-use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassNode, PrepareContext,
-};
+use crate::graph::core::{BufferDesc, BufferNodeId, ExecuteContext, PassNode, PrepareContext};
 use crate::pipeline::{
     ComputePipelineId, ComputePipelineKey, ShaderCompilationOptions, ShaderSource,
 };
@@ -81,26 +79,8 @@ impl LightMergeFeature {
         }
     }
 
-    fn ensure_pipeline(&mut self, ctx: &mut ExtractContext) {
-        let layout = self.layout.get_or_insert_with(|| {
-            Tracked::new(
-                ctx.device
-                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                        label: Some("Light Merge Layout"),
-                        entries: &[
-                            uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
-                            storage_buffer(1, wgpu::ShaderStages::COMPUTE, true),
-                            uniform_buffer(2, wgpu::ShaderStages::COMPUTE),
-                            storage_buffer(3, wgpu::ShaderStages::COMPUTE, true),
-                            storage_buffer(4, wgpu::ShaderStages::COMPUTE, false),
-                            storage_buffer(5, wgpu::ShaderStages::COMPUTE, false),
-                            storage_buffer(6, wgpu::ShaderStages::COMPUTE, false),
-                        ],
-                    }),
-            )
-        });
-
-        if self.pipeline.is_some() {
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>) {
+        if self.layout.is_some() && self.pipeline.is_some() {
             return;
         }
 
@@ -122,30 +102,53 @@ impl LightMergeFeature {
             &options,
         );
 
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Light Merge Pipeline Layout"),
-                bind_group_layouts: &[Some(&**layout)],
-                immediate_size: 0,
-            });
+        let pipeline_key =
+            ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options);
+        let (pipeline_id, layout) =
+            if let Some(id) = ctx.pipeline_cache.get_compute_pipeline_id(&pipeline_key) {
+                (
+                    id,
+                    ctx.pipeline_cache.get_tracked_compute_layout(id, 0).clone(),
+                )
+            } else {
+                let layout = create_light_merge_layout(ctx.device);
+                let pipeline_layout =
+                    ctx.device
+                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: Some("Light Merge Pipeline Layout"),
+                            bind_group_layouts: &[Some(&layout)],
+                            immediate_size: 0,
+                        });
+                let id = ctx.pipeline_cache.get_or_create_compute(
+                    ctx.device,
+                    module,
+                    &pipeline_layout,
+                    &pipeline_key,
+                    &compilation_options,
+                    "Light Merge Pipeline",
+                );
+                ctx.pipeline_cache
+                    .register_compute_layouts(id, smallvec::smallvec![layout.clone()]);
+                (id, layout)
+            };
 
-        self.pipeline = Some(ctx.pipeline_cache.get_or_create_compute(
-            ctx.device,
-            module,
-            &pipeline_layout,
-            &ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options),
-            &compilation_options,
-            "Light Merge Pipeline",
-        ));
+        self.layout = Some(layout);
+        self.pipeline = Some(pipeline_id);
     }
 
-    pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext) {
-        self.ensure_pipeline(ctx);
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("light merge layout must be prepared by the live merge node")
+    }
+
+    fn pipeline_id(&self) -> ComputePipelineId {
+        self.pipeline
+            .expect("light merge pipeline must be prepared by the live merge node")
     }
 
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
         cpu_light_metadata: BufferNodeId,
         cpu_light_storage: BufferNodeId,
@@ -156,14 +159,6 @@ impl LightMergeFeature {
         let gpu_capacity = light_capacity_from_desc(ctx.buffer_desc(gpu_lights.light_storage));
         let merged_capacity = cpu_light_capacity.saturating_add(gpu_capacity).max(1);
         let merged_storage_size = u64::from(merged_capacity).saturating_mul(bytes_per_light);
-
-        let layout = self
-            .layout
-            .as_ref()
-            .expect("Light merge layout must exist before graph build");
-        let pipeline_id = self
-            .pipeline
-            .expect("Light merge pipeline must exist before graph build");
 
         ctx.with_group("Merge_Local_Lights", |ctx| {
             ctx.graph.add_pass("Merge_Local_Lights", |builder| {
@@ -190,6 +185,7 @@ impl LightMergeFeature {
 
                 (
                     LightMergePassNode {
+                        feature: self,
                         cpu_light_metadata,
                         cpu_light_storage,
                         gpu_light_metadata: gpu_lights.light_metadata,
@@ -198,8 +194,6 @@ impl LightMergeFeature {
                         merged_light_storage,
                         merged_indirect_count,
                         merged_capacity,
-                        layout,
-                        pipeline_id,
                         bind_group: None,
                     },
                     LightMergePassOutputs {
@@ -213,7 +207,25 @@ impl LightMergeFeature {
     }
 }
 
+fn create_light_merge_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Light Merge Layout"),
+            entries: &[
+                uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
+                storage_buffer(1, wgpu::ShaderStages::COMPUTE, true),
+                uniform_buffer(2, wgpu::ShaderStages::COMPUTE),
+                storage_buffer(3, wgpu::ShaderStages::COMPUTE, true),
+                storage_buffer(4, wgpu::ShaderStages::COMPUTE, false),
+                storage_buffer(5, wgpu::ShaderStages::COMPUTE, false),
+                storage_buffer(6, wgpu::ShaderStages::COMPUTE, false),
+            ],
+        }),
+    )
+}
+
 struct LightMergePassNode<'a> {
+    feature: &'a mut LightMergeFeature,
     cpu_light_metadata: BufferNodeId,
     cpu_light_storage: BufferNodeId,
     gpu_light_metadata: BufferNodeId,
@@ -222,15 +234,14 @@ struct LightMergePassNode<'a> {
     merged_light_storage: BufferNodeId,
     merged_indirect_count: BufferNodeId,
     merged_capacity: u32,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
-    pipeline_id: ComputePipelineId,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for LightMergePassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.ensure_resources(ctx);
         self.bind_group = Some(
-            ctx.build_bind_group(self.layout, Some("Light Merge BG"))
+            ctx.build_bind_group(self.feature.layout(), Some("Light Merge BG"))
                 .bind_buffer(0, self.cpu_light_metadata)
                 .bind_buffer(1, self.cpu_light_storage)
                 .bind_buffer(2, self.gpu_light_metadata)
@@ -247,7 +258,10 @@ impl<'a> PassNode<'a> for LightMergePassNode<'a> {
             label: Some("Light Merge Pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.feature.pipeline_id()),
+        );
         pass.set_bind_group(0, self.bind_group.expect("Light merge BG missing"), &[]);
         pass.dispatch_workgroups(self.merged_capacity.div_ceil(LIGHT_MERGE_WG_SIZE), 1, 1);
     }

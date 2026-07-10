@@ -34,7 +34,9 @@ pub mod utils;
 pub use atmosphere::AtmosphereFeature;
 pub use bloom::BloomFeature;
 pub use cas::CasFeature;
-pub use clustered_lighting::{ClusteredLightingFeature, ClusteredLightingInputs};
+pub use clustered_lighting::{
+    ClusteredLightingFeature, ClusteredLightingInputs, ClusteredLightingSnapshot,
+};
 pub use compute::BrdfLutFeature;
 #[cfg(feature = "debug_view")]
 pub use debug_view::DebugViewFeature;
