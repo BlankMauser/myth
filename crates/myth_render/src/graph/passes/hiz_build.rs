@@ -4,6 +4,7 @@
 //! screen-space ray features can conservatively skip empty space.
 
 use crate::core::gpu::Tracked;
+use crate::core::gpu::binding_layout::{depth_texture_2d, storage_texture, texture_2d};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ExecuteContext, PassNode, PrepareContext, SubViewKey, TextureDesc, TextureNodeId,
@@ -96,52 +97,32 @@ impl HiZFeature {
         let init_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Hi-Z Init Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: HIZ_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
+                depth_texture_2d(0, wgpu::ShaderStages::COMPUTE),
+                storage_texture(
+                    1,
+                    wgpu::ShaderStages::COMPUTE,
+                    wgpu::StorageTextureAccess::WriteOnly,
+                    HIZ_FORMAT,
+                    wgpu::TextureViewDimension::D2,
+                ),
             ],
         });
 
         let downsample_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Hi-Z Downsample Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: HIZ_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
+                texture_2d(
+                    0,
+                    wgpu::ShaderStages::COMPUTE,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                ),
+                storage_texture(
+                    1,
+                    wgpu::ShaderStages::COMPUTE,
+                    wgpu::StorageTextureAccess::WriteOnly,
+                    HIZ_FORMAT,
+                    wgpu::TextureViewDimension::D2,
+                ),
             ],
         });
 

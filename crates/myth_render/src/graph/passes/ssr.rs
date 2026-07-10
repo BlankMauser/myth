@@ -7,6 +7,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::gpu::binding_layout::{sampler, texture, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -127,73 +128,148 @@ impl SsrFeature {
             return;
         }
 
+        let fragment = wgpu::ShaderStages::FRAGMENT;
+
         let raw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SSR Trace Layout"),
             entries: &[
-                texture_entry(0, wgpu::TextureSampleType::Depth),
-                texture_entry(1, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(3, wgpu::TextureSampleType::Float { filterable: false }),
-                texture_entry(4, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(5, wgpu::TextureSampleType::Float { filterable: true }),
-                sampler_entry(6, wgpu::SamplerBindingType::Filtering),
-                sampler_entry(7, wgpu::SamplerBindingType::NonFiltering),
-                uniform_entry(8),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: blue_noise_view_dimension(),
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                sampler_entry(10, wgpu::SamplerBindingType::Filtering),
+                texture_2d(0, fragment, wgpu::TextureSampleType::Depth),
+                texture_2d(
+                    1,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    3,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                ),
+                texture_2d(
+                    4,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    5,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler(6, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(7, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(8, fragment),
+                texture(
+                    9,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                    blue_noise_view_dimension(),
+                    false,
+                ),
+                sampler(10, fragment, wgpu::SamplerBindingType::Filtering),
             ],
         });
 
         let temporal_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SSR Temporal Layout"),
             entries: &[
-                texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(1, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(2, wgpu::TextureSampleType::Depth),
-                texture_entry(3, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(4, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(5, wgpu::TextureSampleType::Float { filterable: false }),
-                texture_entry(6, wgpu::TextureSampleType::Float { filterable: true }),
-                sampler_entry(7, wgpu::SamplerBindingType::Filtering),
-                sampler_entry(8, wgpu::SamplerBindingType::NonFiltering),
-                uniform_entry(9),
+                texture_2d(
+                    0,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    1,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(2, fragment, wgpu::TextureSampleType::Depth),
+                texture_2d(
+                    3,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    4,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    5,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                ),
+                texture_2d(
+                    6,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler(7, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(8, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(9, fragment),
             ],
         });
 
         let spatial_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SSR Spatial Layout"),
             entries: &[
-                texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(1, wgpu::TextureSampleType::Depth),
-                texture_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(3, wgpu::TextureSampleType::Float { filterable: true }),
-                sampler_entry(4, wgpu::SamplerBindingType::Filtering),
-                sampler_entry(5, wgpu::SamplerBindingType::NonFiltering),
-                uniform_entry(6),
+                texture_2d(
+                    0,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(1, fragment, wgpu::TextureSampleType::Depth),
+                texture_2d(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    3,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler(4, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(5, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(6, fragment),
             ],
         });
 
         let merge_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SSR Merge Layout"),
             entries: &[
-                texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(1, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(3, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(4, wgpu::TextureSampleType::Depth),
-                texture_entry(5, wgpu::TextureSampleType::Float { filterable: true }),
-                sampler_entry(6, wgpu::SamplerBindingType::Filtering),
-                sampler_entry(7, wgpu::SamplerBindingType::NonFiltering),
-                uniform_entry(8),
+                texture_2d(
+                    0,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    1,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    3,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(4, fragment, wgpu::TextureSampleType::Depth),
+                texture_2d(
+                    5,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler(6, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(7, fragment, wgpu::SamplerBindingType::NonFiltering),
+                uniform_buffer(8, fragment),
             ],
         });
 
@@ -1062,41 +1138,6 @@ impl<'a> PassNode<'a> for SsrMergeNode<'a> {
         rpass.set_bind_group(0, global_bg, &[]);
         rpass.set_bind_group(1, self.transient_bg.expect("SSR merge BG missing"), &[]);
         rpass.draw(0..3, 0..1);
-    }
-}
-
-fn texture_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn sampler_entry(binding: u32, ty: wgpu::SamplerBindingType) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Sampler(ty),
-        count: None,
-    }
-}
-
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
     }
 }
 

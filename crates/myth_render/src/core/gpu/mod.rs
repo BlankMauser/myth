@@ -26,6 +26,7 @@
 mod allocator;
 mod bind_group_store;
 mod binding;
+pub(crate) mod binding_layout;
 mod buffer;
 mod environment;
 mod environment_store;

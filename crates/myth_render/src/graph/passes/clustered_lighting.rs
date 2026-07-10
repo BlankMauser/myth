@@ -5,6 +5,7 @@
 //! that forwards clustered light lists into the forward scene passes.
 
 use crate::core::gpu::Tracked;
+use crate::core::gpu::binding_layout::{storage_buffer, uniform_buffer};
 use crate::graph::composer::GpuLightBuffers;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -182,7 +183,10 @@ impl ClusteredLightingFeature {
         self.dispatch_args_layout = Some(Tracked::new(device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
                 label: Some("Cluster Dispatch Args Layout"),
-                entries: &[storage_entry(0, true), storage_entry(1, false)],
+                entries: &[
+                    storage_buffer(0, wgpu::ShaderStages::COMPUTE, true),
+                    storage_buffer(1, wgpu::ShaderStages::COMPUTE, false),
+                ],
             },
         )));
 
@@ -190,9 +194,9 @@ impl ClusteredLightingFeature {
             &wgpu::BindGroupLayoutDescriptor {
                 label: Some("Cluster Light View Layout"),
                 entries: &[
-                    uniform_entry(0),
-                    storage_entry(1, true),
-                    storage_entry(2, false),
+                    uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
+                    storage_buffer(1, wgpu::ShaderStages::COMPUTE, true),
+                    storage_buffer(2, wgpu::ShaderStages::COMPUTE, false),
                 ],
             },
         )));
@@ -201,12 +205,12 @@ impl ClusteredLightingFeature {
             &wgpu::BindGroupLayoutDescriptor {
                 label: Some("Cluster Cull Layout"),
                 entries: &[
-                    uniform_entry(0),
-                    storage_entry(1, false),
-                    storage_entry(2, false),
-                    storage_entry(3, false),
-                    uniform_entry(4),
-                    storage_entry(5, true),
+                    uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
+                    storage_buffer(1, wgpu::ShaderStages::COMPUTE, false),
+                    storage_buffer(2, wgpu::ShaderStages::COMPUTE, false),
+                    storage_buffer(3, wgpu::ShaderStages::COMPUTE, false),
+                    uniform_buffer(4, wgpu::ShaderStages::COMPUTE),
+                    storage_buffer(5, wgpu::ShaderStages::COMPUTE, true),
                 ],
             },
         )));
@@ -816,32 +820,6 @@ fn ensure_tracked_buffer(
 fn light_capacity_from_desc(desc: BufferDesc) -> u32 {
     let bytes_per_light = std::mem::size_of::<GpuLightStorage>() as u64;
     ((desc.logical_size / bytes_per_light).max(1)).min(u64::from(u32::MAX)) as u32
-}
-
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
 }
 
 #[cfg(test)]

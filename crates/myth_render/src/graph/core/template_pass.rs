@@ -1,5 +1,6 @@
 use smallvec::SmallVec;
 
+use crate::core::gpu::binding_layout;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::core::{
     BufferNodeId, ExecuteContext, ExtractContext, GraphBinding, PassBuilder, PassNode,
@@ -58,11 +59,11 @@ impl TemplateBindingLayoutDesc {
             group,
             binding,
             visibility,
-            binding_type: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable },
+            binding_type: binding_layout::texture_type(
+                wgpu::TextureSampleType::Float { filterable },
                 view_dimension,
-                multisampled: false,
-            },
+                false,
+            ),
         }
     }
 
@@ -104,11 +105,11 @@ impl TemplateBindingLayoutDesc {
             group,
             binding,
             visibility,
-            binding_type: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Depth,
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
+            binding_type: binding_layout::texture_type(
+                wgpu::TextureSampleType::Depth,
+                wgpu::TextureViewDimension::D2,
+                false,
+            ),
         }
     }
 
@@ -123,7 +124,7 @@ impl TemplateBindingLayoutDesc {
             group,
             binding,
             visibility,
-            binding_type: wgpu::BindingType::Sampler(sampler_type),
+            binding_type: binding_layout::sampler_type(sampler_type),
         }
     }
 
@@ -133,11 +134,7 @@ impl TemplateBindingLayoutDesc {
             group,
             binding,
             visibility,
-            binding_type: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
+            binding_type: binding_layout::uniform_buffer_type(),
         }
     }
 
@@ -152,11 +149,7 @@ impl TemplateBindingLayoutDesc {
             group,
             binding,
             visibility,
-            binding_type: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
+            binding_type: binding_layout::storage_buffer_type(read_only),
         }
     }
 
@@ -173,11 +166,7 @@ impl TemplateBindingLayoutDesc {
             group,
             binding,
             visibility,
-            binding_type: wgpu::BindingType::StorageTexture {
-                access,
-                format,
-                view_dimension,
-            },
+            binding_type: binding_layout::storage_texture_type(access, format, view_dimension),
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::core::gpu::Tracked;
+use crate::core::gpu::binding_layout::{storage_buffer, uniform_buffer};
 use crate::graph::composer::{GpuLightBuffers, GraphBuilderContext};
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassNode, PrepareContext,
@@ -87,13 +88,13 @@ impl LightMergeFeature {
                     .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                         label: Some("Light Merge Layout"),
                         entries: &[
-                            uniform_entry(0),
-                            storage_entry(1, true),
-                            uniform_entry(2),
-                            storage_entry(3, true),
-                            storage_entry(4, false),
-                            storage_entry(5, false),
-                            storage_entry(6, false),
+                            uniform_buffer(0, wgpu::ShaderStages::COMPUTE),
+                            storage_buffer(1, wgpu::ShaderStages::COMPUTE, true),
+                            uniform_buffer(2, wgpu::ShaderStages::COMPUTE),
+                            storage_buffer(3, wgpu::ShaderStages::COMPUTE, true),
+                            storage_buffer(4, wgpu::ShaderStages::COMPUTE, false),
+                            storage_buffer(5, wgpu::ShaderStages::COMPUTE, false),
+                            storage_buffer(6, wgpu::ShaderStages::COMPUTE, false),
                         ],
                     }),
             )
@@ -249,32 +250,6 @@ impl<'a> PassNode<'a> for LightMergePassNode<'a> {
         pass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
         pass.set_bind_group(0, self.bind_group.expect("Light merge BG missing"), &[]);
         pass.dispatch_workgroups(self.merged_capacity.div_ceil(LIGHT_MERGE_WG_SIZE), 1, 1);
-    }
-}
-
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
     }
 }
 
