@@ -1,37 +1,26 @@
 //! SSAO Feature + Ephemeral PassNodes (Flattened)
 //!
-//! - **`SsaoFeature`** (long-lived): owns pipelines, bind group layouts,
-//!   and system blue-noise handles. `extract_and_prepare()` compiles pipelines and uploads
-//!   persistent GPU data.
-//! - **`SsaoRawNode`** / **`SsaoBlurNode`** (ephemeral per-frame):
-//!   two independent RDG passes created by `SsaoFeature::add_to_graph()`.
+//! - **`SsaoFeature`** (long-lived): owns physically partitioned raw/blur
+//!   pipeline state and tracked layouts.
+//! - **`SsaoSnapshot`** (per-frame): contains only copied uniforms and a
+//!   lightweight global-state key.
+//! - **`SsaoRawNode`** / **`SsaoBlurNode`** (ephemeral): ensure persistent
+//!   state only after surviving DPE, then build transient bind groups.
 //!
-//! Implements production-grade SSAO within the RDG framework.
-//! The output texture is registered by `add_to_graph()` and returned
-//! as a [`TextureNodeId`] for explicit downstream wiring.
-//!
-//! # RDG Slots (explicit wiring)
-//!
-//! - `depth_tex`: Scene depth buffer (input, from Prepass)
-//! - `normal_tex`: Scene normal buffer (input, from Prepass)
-//! - `output_tex`: Blurred AO texture (output, half-res R8Unorm)
-//!
-//! # Internal Sub-Passes
-//!
-//! 1. **Raw SSAO**: Hemisphere sampling with kernel, produces noisy R8Unorm
-//! 2. **Cross-Bilateral Blur**: Depth/normal-aware spatial filter
-//!
-//! # Push Model
-//!
-//! All parameters (uniform buffer ID, global state key) are pushed by the
-//! Composer via `add_to_graph()`.  The pass never accesses Scene directly.
-//! Samplers are obtained from the global [`SamplerRegistry`].
+//! The two RDG nodes form a raw SSAO → cross-bilateral blur chain. Parameters
+//! are uploaded through an RDG transient uniform buffer only when the raw node
+//! is live.
 
-use crate::core::gpu::{CommonSampler, Tracked};
+use std::mem::size_of;
+
+use crate::core::gpu::binding_layout::{
+    depth_texture_2d, sampler, texture, texture_2d, uniform_buffer,
+};
+use crate::core::gpu::{CommonSampler, GlobalStateKey, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc,
-    TextureNodeId,
+    BufferDesc, BufferNodeId, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
+    TextureDesc, TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
@@ -43,362 +32,76 @@ use myth_resources::uniforms::WgslStruct;
 /// The SSAO output texture format: single-channel unsigned normalized.
 const SSAO_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Feature (long-lived, stored in RendererState)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Lightweight per-frame scene snapshot. No WGPU object or generated shader
+/// interface crosses the graph-construction boundary.
+#[derive(Clone, Copy)]
+pub struct SsaoSnapshot {
+    uniforms: SsaoUniforms,
+    global_state_key: GlobalStateKey,
+}
 
-/// Long-lived SSAO feature — owns persistent GPU resources (pipelines,
-/// bind group layouts, system blue-noise handles).
-///
-/// Produces an ephemeral [`SsaoPassNode`] each frame via [`Self::add_to_graph`].
+/// Long-lived SSAO feature. Raw and blur state are physically partitioned so
+/// both graph nodes can independently borrow their own persistent resources.
 #[derive(Default)]
 pub struct SsaoFeature {
-    // ─── Pipelines ─────────────────────────────────────────────────
-    raw_pipeline: Option<RenderPipelineId>,
-    blur_pipeline: Option<RenderPipelineId>,
+    raw: SsaoRawFeature,
+    blur: SsaoBlurFeature,
+}
 
-    // ─── Bind Group Layouts ────────────────────────────────────────
+#[derive(Default)]
+struct SsaoRawFeature {
+    pipeline_id: Option<RenderPipelineId>,
     raw_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    raw_uniforms_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    blur_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    uniforms_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+}
 
-    // ─── Persistent Resources ──────────────────────────────────────
-    blue_noise_view: Option<Tracked<wgpu::TextureView>>,
-    blue_noise_sampler: Option<Tracked<wgpu::Sampler>>,
-
-    // ─── Pre-Built Static BindGroup (Group 2: uniforms) ────────────
-    /// Feature-owned uniform bind group — eliminates GPU buffer leak to PassNode.
-    uniforms_static_bg: Option<wgpu::BindGroup>,
-    /// Tracked buffer identity for staleness detection.
-    last_uniforms_buffer_id: u64,
+#[derive(Default)]
+struct SsaoBlurFeature {
+    pipeline_id: Option<RenderPipelineId>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
 }
 
 impl SsaoFeature {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            raw_pipeline: None,
-            blur_pipeline: None,
-
-            raw_layout: None,
-            raw_uniforms_layout: None,
-            blur_layout: None,
-
-            blue_noise_view: None,
-            blue_noise_sampler: None,
-
-            uniforms_static_bg: None,
-            last_uniforms_buffer_id: 0,
-        }
+        Self::default()
     }
 
-    // =========================================================================
-    // Lazy Initialization
-    // =========================================================================
-
-    fn ensure_layouts(&mut self, device: &wgpu::Device) {
-        if self.raw_layout.is_some() {
-            return;
-        }
-
-        // ─── Raw SSAO Layout (Group 1): depth, normal, blue noise + samplers ───
-        let raw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SSAO Raw Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: blue_noise_view_dimension(),
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
-        });
-
-        // ─── Uniforms Layout (Group 2) ─────────────────────────────
-        let raw_uniforms_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("SSAO Uniforms Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
-
-        // ─── Blur Layout (Group 0): raw AO + depth + normal + samplers ────
-        let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SSAO Blur Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
-        });
-
-        self.raw_layout = Some(Tracked::new(raw_layout));
-        self.raw_uniforms_layout = Some(Tracked::new(raw_uniforms_layout));
-        self.blur_layout = Some(Tracked::new(blur_layout));
-    }
-
-    fn ensure_pipelines(&mut self, ctx: &mut ExtractContext) {
-        if self.raw_pipeline.is_some() {
-            return;
-        }
-
-        let device = ctx.device;
-        let raw_layout = self.raw_layout.as_ref().unwrap();
-        let uniforms_layout = self.raw_uniforms_layout.as_ref().unwrap();
-        let blur_layout = self.blur_layout.as_ref().unwrap();
-
-        let global_state_key = (ctx.render_state.id, ctx.extracted_scene.scene_id);
-        let gpu_world = ctx
-            .resource_manager
-            .get_global_state(global_state_key.0, global_state_key.1)
-            .expect("SSAO: GpuGlobalState must exist");
-
-        let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-            format: SSAO_TEXTURE_FORMAT,
-            blend: Some(wgpu::BlendState::REPLACE),
-            write_mask: wgpu::ColorWrites::ALL,
-        });
-
-        // ─── Raw SSAO Pipeline ─────────────────────────────────────
-        {
-            let mut options = ShaderCompilationOptions::default();
-            options.add_define(
-                "struct_definitions",
-                SsaoUniforms::wgsl_struct_def("SsaoUniforms").as_str(),
-            );
-            options.inject_code("binding_code", &gpu_world.binding_wgsl);
-            options.inject_code(
-                "scene_lighting_structs",
-                myth_resources::uniforms::scene_lighting_structs_wgsl(),
-            );
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                device,
-                ShaderSource::File("entry/features/ssao/raw"),
-                &options,
-            );
-
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("SSAO Raw Pipeline Layout"),
-                bind_group_layouts: &[
-                    Some(&gpu_world.layout),
-                    Some(raw_layout),
-                    Some(uniforms_layout),
-                ],
-                immediate_size: 0,
-            });
-
-            let key = FullscreenPipelineKey::fullscreen(
-                hash,
-                smallvec::smallvec![color_target.clone()],
-                None,
-            );
-
-            self.raw_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                device,
-                module,
-                &pipeline_layout,
-                &key,
-                "SSAO Raw Pipeline",
-            ));
-        }
-
-        // ─── Blur Pipeline ─────────────────────────────────────────
-        {
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                device,
-                ShaderSource::File("entry/features/ssao/blur"),
-                &ShaderCompilationOptions::default(),
-            );
-
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("SSAO Blur Pipeline Layout"),
-                bind_group_layouts: &[Some(blur_layout)],
-                immediate_size: 0,
-            });
-
-            let key =
-                FullscreenPipelineKey::fullscreen(hash, smallvec::smallvec![color_target], None);
-
-            self.blur_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                device,
-                module,
-                &pipeline_layout,
-                &key,
-                "SSAO Blur Pipeline",
-            ));
-        }
-    }
-
-    /// Pre-RDG resource preparation: create layouts, sync blue-noise state, compile pipelines,
-    /// build the static uniforms bind group (Group 2).
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
+    /// Capture CPU-only values during graph construction. The global binding
+    /// state remains represented by a stable logical key and is resolved only
+    /// if the live raw node finds its Feature-owned static resources missing.
+    pub fn extract(
+        &self,
         ssao_uniforms: &CpuBuffer<SsaoUniforms>,
-    ) {
-        // Persistent GPU resources: layouts and pipelines.
-        self.ensure_layouts(ctx.device);
-        self.ensure_pipelines(ctx);
+        viewport: glam::Vec2,
+        frame_index: u32,
+        global_state_key: GlobalStateKey,
+    ) -> SsaoSnapshot {
+        let mut uniforms = *ssao_uniforms.read();
+        uniforms.noise_scale =
+            glam::Vec2::new((viewport.x * 0.5).max(1.0), (viewport.y * 0.5).max(1.0));
+        uniforms.frame_index = frame_index;
 
-        {
-            let viewport = ctx.render_state.uniforms().read().viewport;
-            let mut uniforms = ssao_uniforms.write();
-            uniforms.noise_scale =
-                glam::Vec2::new((viewport.x * 0.5).max(1.0), (viewport.y * 0.5).max(1.0));
-            uniforms.frame_index = ctx.resource_manager.frame_index() as u32;
-        }
-
-        ctx.resource_manager.ensure_buffer(ssao_uniforms);
-        self.blue_noise_view = Some(ctx.resource_manager.system_textures().blue_noise.clone());
-        self.blue_noise_sampler = Some(
-            ctx.resource_manager
-                .system_textures()
-                .blue_noise_sampler
-                .clone(),
-        );
-
-        // Build Group 2 static BG (uniforms only) — rebuild on buffer identity change.
-        if let Some(handle) = ssao_uniforms.gpu_handle()
-            && let Some(g) = ctx.resource_manager.get_gpu_buffer(handle)
-            && (self.uniforms_static_bg.is_none() || self.last_uniforms_buffer_id != g.id)
-        {
-            let layout = self.raw_uniforms_layout.as_ref().unwrap();
-            self.uniforms_static_bg =
-                Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("SSAO Uniforms G2 (static)"),
-                    layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: g.buffer.as_entire_binding(),
-                    }],
-                }));
-            self.last_uniforms_buffer_id = g.id;
+        SsaoSnapshot {
+            uniforms,
+            global_state_key,
         }
     }
 
-    /// Build the ephemeral pass nodes and insert them into the graph as
-    /// two independent RDG passes within an `"SSAO_System"` group.
-    ///
-    /// Returns the [`TextureNodeId`] of the half-resolution AO output for
-    /// explicit downstream wiring (Opaque, Transparent).
-    ///
-    /// # Flattened Pass Chain
-    ///
-    /// 1. **SSAO_Raw** — hemisphere sampling → noisy R8Unorm
-    /// 2. **SSAO_Blur** — cross-bilateral blur → clean AO output
+    /// Emit the raw SSAO and cross-bilateral blur nodes.
     pub fn add_to_graph<'a>(
-        &'a self,
+        &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: SsaoSnapshot,
         scene_depth: TextureNodeId,
         scene_normals: TextureNodeId,
     ) -> TextureNodeId {
-        let fc = ctx.frame_config;
-        let half_w = (fc.width / 2).max(1);
-        let half_h = (fc.height / 2).max(1);
-
-        let raw_pipeline_id = self.raw_pipeline.expect("SsaoFeature not prepared");
-        let blur_pipeline_id = self.blur_pipeline.expect("SsaoFeature not prepared");
-        let raw_layout = self.raw_layout.as_ref().unwrap();
-        let blur_layout = self.blur_layout.as_ref().unwrap();
-        let blue_noise_view = self.blue_noise_view.as_ref().unwrap();
-        let blue_noise_sampler = self.blue_noise_sampler.as_ref().unwrap();
-        let uniforms_static_bg = self
-            .uniforms_static_bg
-            .as_ref()
-            .expect("SsaoFeature: uniforms static BG not built");
+        let raw_feature = &mut self.raw;
+        let blur_feature = &mut self.blur;
+        let half_w = (ctx.frame_config.width / 2).max(1);
+        let half_h = (ctx.frame_config.height / 2).max(1);
 
         ctx.with_group("SSAO_System", |ctx| {
-            // ─── Pass 1: Raw SSAO ──────────────────────────────────
             let raw_desc = TextureDesc::new_2d(
                 half_w,
                 half_h,
@@ -406,25 +109,30 @@ impl SsaoFeature {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             );
 
-            let raw_tex: TextureNodeId = ctx.graph.add_pass("SSAO_Raw", |builder| {
+            let raw_tex = ctx.graph.add_pass("SSAO_Raw", |builder| {
                 builder.read_texture(scene_depth);
                 builder.read_texture(scene_normals);
-                let out = builder.create_texture("SSAO_Raw_Tex", raw_desc);
+                let uniforms_buffer = builder.create_buffer(
+                    "SSAO_Uniforms",
+                    BufferDesc::new(
+                        size_of::<SsaoUniforms>() as u64,
+                        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    ),
+                );
+                let output_tex = builder.create_texture("SSAO_Raw_Tex", raw_desc);
                 let node = SsaoRawNode {
+                    feature: raw_feature,
+                    snapshot,
                     depth_tex: scene_depth,
                     normal_tex: scene_normals,
-                    output_tex: out,
-                    uniforms_static_bg,
-                    pipeline_id: raw_pipeline_id,
-                    raw_layout,
-                    blue_noise_view,
-                    blue_noise_sampler,
-                    transient_bg: None,
+                    uniforms_buffer,
+                    output_tex,
+                    raw_bind_group: None,
+                    uniforms_bind_group: None,
                 };
-                (node, out)
+                (node, output_tex)
             });
 
-            // ─── Pass 2: Cross-Bilateral Blur ──────────────────────
             let output_desc = TextureDesc::new_2d(
                 half_w,
                 half_h,
@@ -432,83 +140,355 @@ impl SsaoFeature {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             );
 
-            let blur_out: TextureNodeId = ctx.graph.add_pass("SSAO_Blur", |builder| {
+            ctx.graph.add_pass("SSAO_Blur", |builder| {
                 builder.read_texture(raw_tex);
                 builder.read_texture(scene_depth);
                 builder.read_texture(scene_normals);
-                let out = builder.create_texture("SSAO_Output", output_desc);
+                let output_tex = builder.create_texture("SSAO_Output", output_desc);
                 let node = SsaoBlurNode {
+                    feature: blur_feature,
                     raw_tex,
                     depth_tex: scene_depth,
                     normal_tex: scene_normals,
-                    output_tex: out,
-                    pipeline_id: blur_pipeline_id,
-                    blur_layout,
-                    transient_bg: None,
+                    output_tex,
+                    bind_group: None,
                 };
-                (node, out)
-            });
-
-            blur_out
+                (node, output_tex)
+            })
         })
     }
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Pass 1: SsaoRawNode (ephemeral, created per frame)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+impl SsaoRawFeature {
+    /// Ensure raw-pass static resources exist.
+    /// Stable frames return before global-state resolution, shader compilation,
+    /// layout creation, or L2 pipeline-cache access.
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>, global_state_key: GlobalStateKey) {
+        if self.pipeline_id.is_some() && self.raw_layout.is_some() && self.uniforms_layout.is_some()
+        {
+            return;
+        }
 
-/// Ephemeral per-frame node for the raw SSAO hemisphere sampling pass.
-///
-/// Binds depth, normals, blue noise, and uniforms to produce a noisy
-/// single-channel AO texture at half resolution.
+        let global_state = ctx
+            .global_states
+            .get(global_state_key)
+            .expect("SSAO: global binding state must exist before RDG prepare");
+
+        let mut options = ShaderCompilationOptions::default();
+        options.add_define(
+            "struct_definitions",
+            SsaoUniforms::wgsl_struct_def("SsaoUniforms").as_str(),
+        );
+        options.inject_code("binding_code", &global_state.binding_wgsl);
+        options.inject_code(
+            "scene_lighting_structs",
+            myth_resources::uniforms::scene_lighting_structs_wgsl(),
+        );
+
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/features/ssao/raw"),
+            &options,
+        );
+        let key = FullscreenPipelineKey::fullscreen(
+            shader_hash,
+            smallvec::smallvec![color_target(SSAO_TEXTURE_FORMAT)],
+            None,
+        );
+
+        let pipeline_id = if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+            self.raw_layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 1).clone());
+            self.uniforms_layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 2).clone());
+            id
+        } else {
+            let global_layout =
+                Tracked::with_id(global_state.layout.clone(), global_state.layout_id);
+            let raw_layout = create_raw_layout(ctx.device);
+            let uniforms_layout = create_uniforms_layout(ctx.device);
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("SSAO Raw Pipeline Layout"),
+                        bind_group_layouts: &[
+                            Some(&global_state.layout),
+                            Some(&raw_layout),
+                            Some(&uniforms_layout),
+                        ],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_fullscreen(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &key,
+                "SSAO Raw Pipeline",
+            );
+
+            self.raw_layout = Some(raw_layout.clone());
+            self.uniforms_layout = Some(uniforms_layout.clone());
+            ctx.pipeline_cache.register_render_layouts(
+                id,
+                smallvec::smallvec![global_layout, raw_layout, uniforms_layout],
+            );
+            id
+        };
+
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn pipeline_id(&self) -> RenderPipelineId {
+        self.pipeline_id
+            .expect("SSAO raw pipeline must be prepared by the live raw node")
+    }
+
+    fn raw_layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.raw_layout
+            .as_ref()
+            .expect("SSAO raw layout must be prepared by the live raw node")
+    }
+
+    fn uniforms_layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.uniforms_layout
+            .as_ref()
+            .expect("SSAO uniforms layout must be prepared by the live raw node")
+    }
+}
+
+impl SsaoBlurFeature {
+    /// Ensure blur-pass static resources exist.
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>) {
+        if self.pipeline_id.is_some() && self.layout.is_some() {
+            return;
+        }
+
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/features/ssao/blur"),
+            &ShaderCompilationOptions::default(),
+        );
+        let key = FullscreenPipelineKey::fullscreen(
+            shader_hash,
+            smallvec::smallvec![color_target(SSAO_TEXTURE_FORMAT)],
+            None,
+        );
+
+        let pipeline_id = if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+            self.layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 0).clone());
+            id
+        } else {
+            let layout = create_blur_layout(ctx.device);
+            let pipeline_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("SSAO Blur Pipeline Layout"),
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_fullscreen(
+                ctx.device,
+                module,
+                &pipeline_layout,
+                &key,
+                "SSAO Blur Pipeline",
+            );
+
+            self.layout = Some(layout.clone());
+            ctx.pipeline_cache
+                .register_render_layouts(id, smallvec::smallvec![layout]);
+            id
+        };
+
+        self.pipeline_id = Some(pipeline_id);
+    }
+
+    fn pipeline_id(&self) -> RenderPipelineId {
+        self.pipeline_id
+            .expect("SSAO blur pipeline must be prepared by the live blur node")
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("SSAO blur layout must be prepared by the live blur node")
+    }
+}
+
+fn color_target(format: wgpu::TextureFormat) -> ColorTargetKey {
+    ColorTargetKey::from(wgpu::ColorTargetState {
+        format,
+        blend: Some(wgpu::BlendState::REPLACE),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+fn create_raw_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSAO Raw Layout"),
+            entries: &[
+                depth_texture_2d(0, fragment),
+                texture_2d(
+                    1,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                    blue_noise_view_dimension(),
+                    false,
+                ),
+                sampler(3, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(4, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(5, fragment, wgpu::SamplerBindingType::NonFiltering),
+            ],
+        }),
+    )
+}
+
+fn create_uniforms_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSAO Uniforms Layout"),
+            entries: &[uniform_buffer(0, wgpu::ShaderStages::FRAGMENT)],
+        }),
+    )
+}
+
+fn create_blur_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSAO Blur Layout"),
+            entries: &[
+                texture_2d(
+                    0,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                depth_texture_2d(1, fragment),
+                texture_2d(
+                    2,
+                    fragment,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                sampler(3, fragment, wgpu::SamplerBindingType::Filtering),
+                sampler(4, fragment, wgpu::SamplerBindingType::NonFiltering),
+            ],
+        }),
+    )
+}
+
 struct SsaoRawNode<'a> {
+    feature: &'a mut SsaoRawFeature,
+    snapshot: SsaoSnapshot,
     depth_tex: TextureNodeId,
     normal_tex: TextureNodeId,
+    uniforms_buffer: BufferNodeId,
     output_tex: TextureNodeId,
-
-    uniforms_static_bg: &'a wgpu::BindGroup,
-    pipeline_id: RenderPipelineId,
-    raw_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    blue_noise_view: &'a Tracked<wgpu::TextureView>,
-    blue_noise_sampler: &'a Tracked<wgpu::Sampler>,
-
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    raw_bind_group: Option<&'a wgpu::BindGroup>,
+    uniforms_bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SsaoRawNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.raw_layout, Some("SSAO Raw BG (G1)"), [
-                0 => self.depth_tex,
-                1 => self.normal_tex,
-                2 => self.blue_noise_view,
-                3 => CommonSampler::LinearClamp,
-                4 => self.blue_noise_sampler,
-                5 => CommonSampler::NearestClamp,
-            ]),
+        self.feature
+            .ensure_resources(ctx, self.snapshot.global_state_key);
+
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.uniforms_buffer),
+            0,
+            bytemuck::bytes_of(&self.snapshot.uniforms),
+        );
+
+        let blue_noise = ctx.system_textures.blue_noise.clone();
+        let blue_noise_sampler = ctx.system_textures.blue_noise_sampler.clone();
+        self.raw_bind_group = Some(
+            ctx.build_bind_group(self.feature.raw_layout(), Some("SSAO Raw BG (G1)"))
+                .bind_texture(0, self.depth_tex)
+                .bind_texture(1, self.normal_tex)
+                .bind_tracked_texture_view(2, &blue_noise)
+                .bind_common_sampler(3, CommonSampler::LinearClamp)
+                .bind_tracked_sampler(4, &blue_noise_sampler)
+                .bind_common_sampler(5, CommonSampler::NearestClamp)
+                .build(),
+        );
+        self.uniforms_bind_group = Some(
+            ctx.build_bind_group(
+                self.feature.uniforms_layout(),
+                Some("SSAO Uniforms BG (G2)"),
+            )
+            .bind_buffer(0, self.uniforms_buffer)
+            .build(),
         );
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let global_bg = ctx.baked_lists.global_bind_group;
-        let raw_bg = self.transient_bg.expect("SSAO raw BG not prepared");
-
-        let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
-
+        let target = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("SSAO Raw Pass"),
-            color_attachments: &[rtt],
+            color_attachments: &[target],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
+            ..Default::default()
         });
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_render_pipeline(self.feature.pipeline_id()),
+        );
+        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(
+            1,
+            self.raw_bind_group.expect("SSAO raw BG not prepared"),
+            &[],
+        );
+        pass.set_bind_group(
+            2,
+            self.uniforms_bind_group
+                .expect("SSAO uniforms BG not prepared"),
+            &[],
+        );
+        pass.draw(0..3, 0..1);
+    }
+}
 
-        pass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        pass.set_bind_group(0, global_bg, &[]);
-        pass.set_bind_group(1, raw_bg, &[]);
-        pass.set_bind_group(2, self.uniforms_static_bg, &[]);
+struct SsaoBlurNode<'a> {
+    feature: &'a mut SsaoBlurFeature,
+    raw_tex: TextureNodeId,
+    depth_tex: TextureNodeId,
+    normal_tex: TextureNodeId,
+    output_tex: TextureNodeId,
+    bind_group: Option<&'a wgpu::BindGroup>,
+}
+
+impl<'a> PassNode<'a> for SsaoBlurNode<'a> {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.ensure_resources(ctx);
+        self.bind_group = Some(
+            ctx.build_bind_group(self.feature.layout(), Some("SSAO Blur BG (G0)"))
+                .bind_texture(0, self.raw_tex)
+                .bind_texture(1, self.depth_tex)
+                .bind_texture(2, self.normal_tex)
+                .bind_common_sampler(3, CommonSampler::LinearClamp)
+                .bind_common_sampler(4, CommonSampler::NearestClamp)
+                .build(),
+        );
+    }
+
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+        let target = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("SSAO Blur Pass"),
+            color_attachments: &[target],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_render_pipeline(self.feature.pipeline_id()),
+        );
+        pass.set_bind_group(0, self.bind_group.expect("SSAO blur BG not prepared"), &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -518,58 +498,5 @@ fn blue_noise_view_dimension() -> wgpu::TextureViewDimension {
         wgpu::TextureViewDimension::D2Array
     } else {
         wgpu::TextureViewDimension::D2
-    }
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Pass 2: SsaoBlurNode (ephemeral, created per frame)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-/// Ephemeral per-frame node for the cross-bilateral blur pass.
-///
-/// Reads the noisy raw AO texture and produces the final clean AO output
-/// using depth/normal-aware spatial filtering.
-struct SsaoBlurNode<'a> {
-    raw_tex: TextureNodeId,
-    depth_tex: TextureNodeId,
-    normal_tex: TextureNodeId,
-    output_tex: TextureNodeId,
-
-    pipeline_id: RenderPipelineId,
-    blur_layout: &'a Tracked<wgpu::BindGroupLayout>,
-
-    transient_bg: Option<&'a wgpu::BindGroup>,
-}
-
-impl<'a> PassNode<'a> for SsaoBlurNode<'a> {
-    fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.blur_layout, Some("SSAO Blur BG (G0)"), [
-                0 => self.raw_tex,
-                1 => self.depth_tex,
-                2 => self.normal_tex,
-                3 => CommonSampler::LinearClamp,
-                4 => CommonSampler::NearestClamp,
-            ]),
-        );
-    }
-
-    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let blur_bg = self.transient_bg.expect("SSAO blur BG not prepared");
-
-        let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("SSAO Blur Pass"),
-            color_attachments: &[rtt],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-
-        pass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        pass.set_bind_group(0, blur_bg, &[]);
-        pass.draw(0..3, 0..1);
     }
 }

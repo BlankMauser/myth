@@ -16,10 +16,9 @@
 //!
 //! These structs are defined here (rather than in the render pass) so that
 //! `BloomSettings` can own the `CpuBuffer<T>` instances. User-facing setters
-//! write directly into the buffers via `CpuBuffer::write()`, which automatically
-//! tracks the data version. The render pass only calls `ensure_buffer_id()` and
-//! never writes to the buffers itself; GPU sync happens only when the version
-//! has actually changed.
+//! write through `CpuBuffer::write()`. During graph construction the renderer
+//! copies their POD values into a lightweight snapshot; only live RDG nodes
+//! upload those values into transient uniform buffers after DPE.
 //!
 //! # Reference
 //!
@@ -57,10 +56,9 @@ pub struct CompositeUniforms {
 /// Bloom post-processing configuration (pure data + automatic version control).
 ///
 /// This struct holds all parameters for the physically-based bloom pass.
-/// Dynamic GPU uniform data lives in `CpuBuffer<T>` fields; the internal
-/// version is automatically bumped when setter methods modify values via
-/// `CpuBuffer::write()`. The render pass calls `ensure_buffer_id()` which
-/// only performs a GPU upload when the version has changed.
+/// Dynamic uniform values live in `CpuBuffer<T>` fields; setter methods update
+/// those CPU-side values through `CpuBuffer::write()`. The renderer snapshots
+/// them into frame-local POD data and live RDG nodes perform transient uploads.
 ///
 /// # Usage
 ///

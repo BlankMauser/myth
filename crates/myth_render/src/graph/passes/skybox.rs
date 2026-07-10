@@ -536,6 +536,7 @@ impl SkyboxFeature {
 
         let fullscreen_key = FullscreenPipelineKey {
             shader_hash,
+            compilation_hash: 0,
             color_targets: smallvec::smallvec![ColorTargetKey::from(wgpu::ColorTargetState {
                 format: key.color_format,
                 blend: Some(wgpu::BlendState::REPLACE),

@@ -48,7 +48,7 @@
 //! ```
 
 use crate::core::binding::GlobalBindGroupCache;
-use crate::core::gpu::{CubeSourceType, GlobalStateResolver, Tracked};
+use crate::core::gpu::{CubeSourceType, GlobalStateKey, GlobalStateResolver, Tracked};
 use crate::core::{ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
 use crate::graph::RenderState;
@@ -789,9 +789,20 @@ impl<'a> FrameComposer<'a> {
 
                         // 2. SSAO
                         let ssao_output = if ssao_enabled {
+                            let viewport = self.ctx.render_state.uniforms().read().viewport;
+                            let snapshot = self.ctx.ssao_pass.extract(
+                                &self.ctx.scene.ssao.uniforms,
+                                viewport,
+                                self.ctx.resource_manager.frame_index() as u32,
+                                GlobalStateKey::new(
+                                    self.ctx.render_state.id,
+                                    self.ctx.extracted_scene.scene_id,
+                                ),
+                            );
                             Some(
                                 self.ctx.ssao_pass.add_to_graph(
                                     c,
+                                    snapshot,
                                     scene_depth,
                                     prepass_out
                                         .scene_normals
@@ -1050,12 +1061,11 @@ impl<'a> FrameComposer<'a> {
                 let mut current_target = graph_ctx.with_group("PostProcess", |ctx| {
                     // Bloom (internally flattened into Bloom_System subgroup)
                     if bloom_enabled {
-                        active_color = self.ctx.bloom_pass.add_to_graph(
-                            ctx,
-                            active_color,
-                            self.ctx.scene.bloom.karis_average,
-                            self.ctx.scene.bloom.max_mip_levels(),
-                        );
+                        let snapshot = self.ctx.bloom_pass.extract(&self.ctx.scene.bloom);
+                        active_color =
+                            self.ctx
+                                .bloom_pass
+                                .add_to_graph(ctx, snapshot, active_color);
                     }
 
                     // ToneMapping: HDR → LDR, into a transient target.

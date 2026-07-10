@@ -439,11 +439,11 @@ impl Renderer {
             .scene_variants
             .contains(SceneFeatures::USE_CLUSTERED_SHADING);
 
-        // ── Phase 2.5: Feature extract & prepare ────────────────────────
+        // ── Phase 2.5: Remaining eager feature preparation ─────────────
         //
-        // Resolve persistent GPU resources (pipelines, layouts, bind groups)
-        // BEFORE the render graph is built. This ensures all Features are
-        // fully prepared when their ephemeral PassNodes are created.
+        // Features not yet migrated to deferred RDG preparation still resolve
+        // their persistent resources here. Migrated features capture snapshots
+        // in FrameComposer and materialize resources only in live PassNodes.
         {
             use crate::HDR_TEXTURE_FORMAT;
             use crate::graph::core::context::ExtractContext;
@@ -495,7 +495,6 @@ impl Renderer {
 
             // let needs_normal = ssao_enabled || needs_feature_id;
             let needs_skybox = scene.background.needs_skybox_pass();
-            let bloom_enabled = scene.bloom.enabled && is_hf;
             let mut extract_ctx = ExtractContext {
                 device: &state.wgpu_ctx.device,
                 queue: &state.wgpu_ctx.queue,
@@ -597,12 +596,6 @@ impl Renderer {
                     needs_velocity,
                 );
 
-                if ssao_enabled {
-                    state
-                        .ssao_pass
-                        .extract_and_prepare(&mut extract_ctx, &scene.ssao.uniforms);
-                }
-
                 if ssgi_enabled {
                     scene.ssgi.update_resolution(self.size.0, self.size.1);
                     scene.ssgi.set_frame_index(frame_time.frame_count as u32);
@@ -641,14 +634,6 @@ impl Renderer {
                 } else {
                     state.ssr_pass.invalidate_history();
                     scene.ssr.set_history_flags(0);
-                }
-
-                if bloom_enabled {
-                    state.bloom_pass.extract_and_prepare(
-                        &mut extract_ctx,
-                        &scene.bloom.upsample_uniforms,
-                        &scene.bloom.composite_uniforms,
-                    );
                 }
 
                 state.tone_map_pass.extract_and_prepare(
@@ -1010,6 +995,7 @@ impl Renderer {
             build_pipeline_layout(&state.wgpu_ctx.device, bind_group_layouts, &layout_label);
         let key = FullscreenPipelineKey {
             shader_hash,
+            compilation_hash: 0,
             color_targets: color_targets
                 .iter()
                 .cloned()

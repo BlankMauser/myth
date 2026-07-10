@@ -4,16 +4,19 @@
 //! technique within the RDG framework using fully flattened per-mip passes
 //! and a strict two-layer binding separation:
 //!
-//! - **Group 0 (Static)**: Sampler + uniform buffer — built and owned by
-//!   [`BloomFeature`], lifetime matches the engine.
+//! - **Group 0 (Parameters)**: Feature-owned sampler plus, where needed, an
+//!   RDG transient uniform buffer. Karis is a pipeline override, not a buffer.
 //! - **Group 1 (Transient)**: RDG texture views — built by each micro-pass
 //!   node during `prepare`, cached via [`GlobalBindGroupCache`].
 //!
 //! # Architecture
 //!
-//! - **`BloomFeature`** – persistent owner of GPU pipelines, bind-group
-//!   layouts, static uniform buffers, and Group 0 bind groups.  Initialised
-//!   lazily by [`extract_and_prepare`](BloomFeature::extract_and_prepare).
+//! - **`BloomFeature`** – persistent owner of lazily-created GPU pipelines,
+//!   bind-group layouts, and the downsample sampler bind group. The first live
+//!   node of each micro-pass family initializes its shared state after DPE.
+//!
+//! - **`BloomSnapshot`** – lightweight copied settings captured while the
+//!   Composer constructs the graph. It contains no WGPU objects or handles.
 //!
 //! - **Micro-Passes** – each downsample, upsample, and composite step is
 //!   an independent [`PassNode`] with its own RDG resource declarations.
@@ -33,84 +36,57 @@
 //!   → Bloom_Composite (Scene HDR + Up_0 → Output)
 //! ```
 
+use std::mem::size_of;
+use std::sync::OnceLock;
+
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::gpu::binding_layout::{sampler, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc,
-    TextureNodeId,
+    BufferDesc, BufferNodeId, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
+    TextureDesc, TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
 };
-use myth_resources::bloom::{CompositeUniforms, UpsampleUniforms};
-use myth_resources::buffer::CpuBuffer;
-use myth_resources::gpu_struct;
+use myth_resources::bloom::{BloomSettings, CompositeUniforms, UpsampleUniforms};
 use myth_resources::uniforms::WgslStruct;
-
-/// Internal GPU uniform for the downsample shader (karis on/off flag).
-#[gpu_struct]
-pub struct DownsampleUniforms {
-    pub use_karis_average: u32,
-}
 
 // =============================================================================
 // BloomFeature — persistent GPU resource owner
 // =============================================================================
 
-/// Persistent bloom feature owning GPU pipelines, layouts, and pre-built
-/// static bind groups.
-///
-/// The Composer calls [`extract_and_prepare`](Self::extract_and_prepare)
-/// once per frame before the render graph is built, then
-/// [`add_to_graph`](Self::add_to_graph) to emit a chain of flattened
-/// micro-passes (Extract → Downsample × N → Upsample × N → Composite)
-/// into the RDG.
-///
-/// # Dual-Layer BindGroup Model
-///
-/// Static bind groups (Group 0) containing samplers and uniform buffers
-/// are built here and shared across all micro-pass nodes as cheap clones.
-/// Each micro-pass only assembles Group 1 (transient texture views).
+const MAX_BLOOM_MIPS: usize = 16;
+
+/// Lightweight per-frame bloom data captured during graph construction.
+#[derive(Clone, Copy)]
+pub struct BloomSnapshot {
+    upsample: UpsampleUniforms,
+    composite: CompositeUniforms,
+    karis_average: bool,
+    max_mip_levels: u32,
+}
+
+/// Persistent bloom feature. Static resources are partitioned by micro-pass
+/// family so absent upsample work does not initialize an unused pipeline.
 pub struct BloomFeature {
-    // ─── Pipelines ─────────────────────────────────────────────────
-    downsample_pipeline: Option<RenderPipelineId>,
-    upsample_pipeline: Option<RenderPipelineId>,
-    composite_pipeline: Option<RenderPipelineId>,
+    downsample: OnceLock<BloomDownsampleResources>,
+    upsample: OnceLock<BloomPipelineResources>,
+    composite: OnceLock<BloomPipelineResources>,
+}
 
-    // ─── Bind Group Layouts ────────────────────────────────────────
-    /// Group 0 layout for downsample: sampler + DownsampleUniforms.
-    ds_static_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    /// Group 1 layout for downsample: single input texture.
-    ds_transient_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    /// Group 0 layout for upsample: sampler + UpsampleUniforms.
-    us_static_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    /// Group 1 layout for upsample: single source mip texture.
-    us_transient_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    /// Group 0 layout for composite: sampler + CompositeUniforms.
-    comp_static_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    /// Group 1 layout for composite: original + bloom textures.
-    comp_transient_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+struct BloomDownsampleResources {
+    karis_on_pipeline_id: RenderPipelineId,
+    karis_off_pipeline_id: RenderPipelineId,
+    textures_layout: Tracked<wgpu::BindGroupLayout>,
+    params_bind_group: wgpu::BindGroup,
+}
 
-    // ─── Internal Static Uniform Buffers ───────────────────────────
-    /// GPU buffer with `use_karis_average = 1`, written once.
-    karis_on_buffer: Option<Tracked<wgpu::Buffer>>,
-    /// GPU buffer with `use_karis_average = 0`, written once.
-    karis_off_buffer: Option<Tracked<wgpu::Buffer>>,
-
-    // ─── Pre-Built Static BindGroups (Group 0) ─────────────────────
-    /// Downsample Group 0 with karis averaging enabled.
-    karis_on_static_bg: Option<wgpu::BindGroup>,
-    /// Downsample Group 0 with karis averaging disabled.
-    karis_off_static_bg: Option<wgpu::BindGroup>,
-    /// Upsample Group 0 (sampler + UpsampleUniforms buffer).
-    upsample_static_bg: Option<wgpu::BindGroup>,
-    /// Composite Group 0 (sampler + CompositeUniforms buffer).
-    composite_static_bg: Option<wgpu::BindGroup>,
-
-    // ─── Staleness tracking for externally-managed GPU buffers ─────
-    last_upsample_buffer_id: u64,
-    last_composite_buffer_id: u64,
+struct BloomPipelineResources {
+    pipeline_id: RenderPipelineId,
+    params_layout: Tracked<wgpu::BindGroupLayout>,
+    textures_layout: Tracked<wgpu::BindGroupLayout>,
 }
 
 impl Default for BloomFeature {
@@ -120,501 +96,89 @@ impl Default for BloomFeature {
 }
 
 impl BloomFeature {
-    /// Creates a new bloom feature. All GPU resources are lazily allocated.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            downsample_pipeline: None,
-            upsample_pipeline: None,
-            composite_pipeline: None,
-
-            ds_static_layout: None,
-            ds_transient_layout: None,
-            us_static_layout: None,
-            us_transient_layout: None,
-            comp_static_layout: None,
-            comp_transient_layout: None,
-
-            karis_on_buffer: None,
-            karis_off_buffer: None,
-
-            karis_on_static_bg: None,
-            karis_off_static_bg: None,
-            upsample_static_bg: None,
-            composite_static_bg: None,
-
-            last_upsample_buffer_id: 0,
-            last_composite_buffer_id: 0,
+            downsample: OnceLock::new(),
+            upsample: OnceLock::new(),
+            composite: OnceLock::new(),
         }
     }
 
-    // =========================================================================
-    // Extract & Prepare (called before RDG build)
-    // =========================================================================
-
-    /// Ensure all persistent GPU resources (layouts, static buffers, pipelines)
-    /// are initialised. Build or rebuild static bind groups (Group 0) when the
-    /// underlying GPU buffer identity changes.
-    ///
-    /// `upsample_uniform` and `composite_uniform` are the CpuBuffer IDs
-    /// whose GPU mirrors have already been uploaded via `ensure_buffer()`.
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
-        upsample_uniform: &CpuBuffer<UpsampleUniforms>,
-        composite_uniform: &CpuBuffer<CompositeUniforms>,
-    ) {
-        self.ensure_layouts(ctx.device);
-        self.ensure_internal_buffers(ctx.device, ctx.queue);
-        self.ensure_pipelines(ctx);
-
-        ctx.resource_manager.ensure_buffer(upsample_uniform);
-        ctx.resource_manager.ensure_buffer(composite_uniform);
-
-        self.build_static_bind_groups(ctx, upsample_uniform, composite_uniform);
-    }
-
-    // =========================================================================
-    // Lazy Initialization
-    // =========================================================================
-
-    fn ensure_layouts(&mut self, device: &wgpu::Device) {
-        if self.ds_static_layout.is_some() {
-            return;
-        }
-
-        // ─── Shared entry helpers ──────────────────────────────────
-        let sampler_entry = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-            count: None,
-        };
-        let uniform_entry = wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
-
-        // ─── Downsample ───────────────────────────────────────────
-        self.ds_static_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Bloom DS Static Layout (G0)"),
-                entries: &[sampler_entry, uniform_entry],
-            },
-        )));
-        self.ds_transient_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Bloom DS Transient Layout (G1)"),
-                entries: &[texture_entry(0)],
-            },
-        )));
-
-        // ─── Upsample ────────────────────────────────────────────
-        self.us_static_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Bloom US Static Layout (G0)"),
-                entries: &[sampler_entry, uniform_entry],
-            },
-        )));
-        self.us_transient_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Bloom US Transient Layout (G1)"),
-                entries: &[texture_entry(0)],
-            },
-        )));
-
-        // ─── Composite ───────────────────────────────────────────
-        self.comp_static_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Bloom Comp Static Layout (G0)"),
-                entries: &[sampler_entry, uniform_entry],
-            },
-        )));
-        self.comp_transient_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Bloom Comp Transient Layout (G1)"),
-                entries: &[texture_entry(0), texture_entry(1)],
-            },
-        )));
-    }
-
-    fn ensure_internal_buffers(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.karis_on_buffer.is_some() {
-            return;
-        }
-
-        let karis_on_data = DownsampleUniforms {
-            use_karis_average: 1,
-            ..Default::default()
-        };
-        let karis_off_data = DownsampleUniforms::default();
-
-        let buf_on = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Bloom Karis On"),
-            size: std::mem::size_of::<DownsampleUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&buf_on, 0, bytemuck::bytes_of(&karis_on_data));
-
-        let buf_off = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Bloom Karis Off"),
-            size: std::mem::size_of::<DownsampleUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&buf_off, 0, bytemuck::bytes_of(&karis_off_data));
-
-        self.karis_on_buffer = Some(Tracked::new(buf_on));
-        self.karis_off_buffer = Some(Tracked::new(buf_off));
-    }
-
-    fn ensure_pipelines(&mut self, ctx: &mut ExtractContext) {
-        if self.downsample_pipeline.is_some() {
-            return;
-        }
-
-        let device = ctx.device;
-
-        let color_target_replace = ColorTargetKey::from(wgpu::ColorTargetState {
-            format: HDR_TEXTURE_FORMAT,
-            blend: Some(wgpu::BlendState::REPLACE),
-            write_mask: wgpu::ColorWrites::ALL,
-        });
-
-        let color_target_additive = ColorTargetKey::from(wgpu::ColorTargetState {
-            format: HDR_TEXTURE_FORMAT,
-            blend: Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent::OVER,
-            }),
-            write_mask: wgpu::ColorWrites::ALL,
-        });
-
-        let ds_static = self.ds_static_layout.as_deref();
-        let ds_trans = self.ds_transient_layout.as_deref();
-        let us_static = self.us_static_layout.as_deref();
-        let us_trans = self.us_transient_layout.as_deref();
-        let comp_static = self.comp_static_layout.as_deref();
-        let comp_trans = self.comp_transient_layout.as_deref();
-
-        // ─── Downsample Pipeline ───────────────────────────────────
-        {
-            let mut options = ShaderCompilationOptions::default();
-            options.add_define(
-                "struct_definitions",
-                DownsampleUniforms::wgsl_struct_def("DownsampleUniforms").as_str(),
-            );
-
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Bloom DS Pipeline Layout"),
-                bind_group_layouts: &[ds_static, ds_trans],
-                immediate_size: 0,
-            });
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                device,
-                ShaderSource::File("entry/post_process/bloom/downsample"),
-                &options,
-            );
-
-            let key = FullscreenPipelineKey::fullscreen(
-                hash,
-                smallvec::smallvec![color_target_replace.clone()],
-                None,
-            );
-
-            self.downsample_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                device,
-                module,
-                &layout,
-                &key,
-                "Bloom DS Pipeline",
-            ));
-        }
-
-        // ─── Upsample Pipeline (additive blend) ───────────────────
-        {
-            let mut options = ShaderCompilationOptions::default();
-            options.add_define(
-                "struct_definitions",
-                UpsampleUniforms::wgsl_struct_def("UpsampleUniforms").as_str(),
-            );
-
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Bloom US Pipeline Layout"),
-                bind_group_layouts: &[us_static, us_trans],
-                immediate_size: 0,
-            });
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                device,
-                ShaderSource::File("entry/post_process/bloom/upsample"),
-                &options,
-            );
-
-            let key = FullscreenPipelineKey::fullscreen(
-                hash,
-                smallvec::smallvec![color_target_additive],
-                None,
-            );
-
-            self.upsample_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                device,
-                module,
-                &layout,
-                &key,
-                "Bloom US Pipeline",
-            ));
-        }
-
-        // ─── Composite Pipeline ────────────────────────────────────
-        {
-            let mut options = ShaderCompilationOptions::default();
-            options.add_define(
-                "struct_definitions",
-                CompositeUniforms::wgsl_struct_def("CompositeUniforms").as_str(),
-            );
-
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Bloom Comp Pipeline Layout"),
-                bind_group_layouts: &[comp_static, comp_trans],
-                immediate_size: 0,
-            });
-
-            let (module, hash) = ctx.shader_manager.get_or_compile(
-                device,
-                ShaderSource::File("entry/post_process/bloom/composite"),
-                &options,
-            );
-
-            let key = FullscreenPipelineKey::fullscreen(
-                hash,
-                smallvec::smallvec![color_target_replace],
-                None,
-            );
-
-            self.composite_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                device,
-                module,
-                &layout,
-                &key,
-                "Bloom Comp Pipeline",
-            ));
+    /// Capture CPU-only settings. No GPU upload, shader compilation, layout
+    /// creation, or bind-group construction occurs here.
+    #[must_use]
+    pub fn extract(&self, settings: &BloomSettings) -> BloomSnapshot {
+        BloomSnapshot {
+            upsample: *settings.upsample_uniforms.read(),
+            composite: *settings.composite_uniforms.read(),
+            karis_average: settings.karis_average,
+            max_mip_levels: settings.max_mip_levels(),
         }
     }
 
-    /// Build all static bind groups (Group 0) that pair samplers with
-    /// persistent uniform buffers. Karis BGs are built once; upsample
-    /// and composite BGs are rebuilt only when the underlying GPU buffer
-    /// identity changes (e.g. after an `ensure_buffer` resize).
-    fn build_static_bind_groups(
-        &mut self,
-        ctx: &mut ExtractContext,
-        upsample_uniform: &CpuBuffer<UpsampleUniforms>,
-        composite_uniform: &CpuBuffer<CompositeUniforms>,
-    ) {
-        let sampler = ctx
-            .resource_manager
-            .sampler_registry()
-            .get_common(CommonSampler::LinearClamp);
-        let ds_layout = self.ds_static_layout.as_ref().unwrap();
-
-        // ─── Karis BGs (eternal, built once) ───────────────────────
-        if self.karis_on_static_bg.is_none() {
-            let karis_on = self.karis_on_buffer.as_ref().unwrap();
-            let karis_off = self.karis_off_buffer.as_ref().unwrap();
-
-            self.karis_on_static_bg =
-                Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bloom DS G0 (karis on)"),
-                    layout: ds_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: karis_on.as_entire_binding(),
-                        },
-                    ],
-                }));
-
-            self.karis_off_static_bg =
-                Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bloom DS G0 (karis off)"),
-                    layout: ds_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: karis_off.as_entire_binding(),
-                        },
-                    ],
-                }));
-        }
-
-        // ─── Upsample static BG (rebuild on buffer identity change) ──
-        if let Some(handle) = upsample_uniform.gpu_handle()
-            && let Some(g) = ctx.resource_manager.get_gpu_buffer(handle)
-            && (self.upsample_static_bg.is_none() || self.last_upsample_buffer_id != g.id)
-        {
-            let us_layout = self.us_static_layout.as_ref().unwrap();
-            self.upsample_static_bg =
-                Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bloom US G0"),
-                    layout: us_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: g.buffer.as_entire_binding(),
-                        },
-                    ],
-                }));
-            self.last_upsample_buffer_id = g.id;
-        }
-
-        // ─── Composite static BG (rebuild on buffer identity change) ──
-        if let Some(handle) = composite_uniform.gpu_handle()
-            && let Some(g) = ctx.resource_manager.get_gpu_buffer(handle)
-            && (self.composite_static_bg.is_none() || self.last_composite_buffer_id != g.id)
-        {
-            let comp_layout = self.comp_static_layout.as_ref().unwrap();
-            self.composite_static_bg =
-                Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Bloom Comp G0"),
-                    layout: comp_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: g.buffer.as_entire_binding(),
-                        },
-                    ],
-                }));
-            self.last_composite_buffer_id = g.id;
-        }
+    fn ensure_downsample_resources(
+        &self,
+        ctx: &mut PrepareContext<'_>,
+    ) -> &BloomDownsampleResources {
+        self.downsample
+            .get_or_init(|| BloomDownsampleResources::create(ctx))
     }
 
-    // =========================================================================
-    // Graph Integration — Flattened Micro-Pass Architecture
-    // =========================================================================
+    fn downsample_resources(&self) -> &BloomDownsampleResources {
+        self.downsample
+            .get()
+            .expect("Bloom downsample resources must be initialized by Bloom_Extract")
+    }
+
+    fn ensure_upsample_resources(&self, ctx: &mut PrepareContext<'_>) -> &BloomPipelineResources {
+        self.upsample.get_or_init(|| create_upsample_resources(ctx))
+    }
+
+    fn upsample_resources(&self) -> &BloomPipelineResources {
+        self.upsample
+            .get()
+            .expect("Bloom upsample resources must be initialized by the coarsest upsample node")
+    }
+
+    fn ensure_composite_resources(&self, ctx: &mut PrepareContext<'_>) -> &BloomPipelineResources {
+        self.composite
+            .get_or_init(|| create_composite_resources(ctx))
+    }
 
     /// Emit the full bloom pipeline as a chain of independent RDG passes.
-    ///
-    /// Each downsample and upsample step is a separate pass operating on
-    /// independent 2D transient textures with progressively halved
-    /// resolution. The RDG compiler sees fine-grained dependencies between
-    /// every mip level, enabling:
-    ///
-    /// - **Optimal barrier/transition insertion** between individual steps.
-    /// - **Aggressive memory aliasing** — textures whose lifetimes don't
-    ///   overlap are automatically mapped to the same physical GPU memory.
-    ///
-    /// Returns the composited output [`TextureNodeId`] (scene HDR with
-    /// bloom applied) for downstream wiring (e.g. ToneMapping).
     pub fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: BloomSnapshot,
         input_color: TextureNodeId,
-        karis_average: bool,
-        max_mip_levels: u32,
     ) -> TextureNodeId {
         let fc = ctx.frame_config;
-        let hdr_format = fc.hdr_format;
+        debug_assert_eq!(fc.hdr_format, HDR_TEXTURE_FORMAT);
+        let hdr_format = HDR_TEXTURE_FORMAT;
         let bloom_w = (fc.width / 2).max(1);
         let bloom_h = (fc.height / 2).max(1);
-        let max_possible = ((bloom_w.max(bloom_h) as f32).log2().floor() as u32) + 1;
-        let mip_count = max_mip_levels.min(max_possible).max(1) as usize;
-
-        let ds_pipeline_id = self
-            .downsample_pipeline
-            .expect("BloomFeature: downsample pipeline not initialised");
-        let us_pipeline_id = self
-            .upsample_pipeline
-            .expect("BloomFeature: upsample pipeline not initialised");
-        let comp_pipeline_id = self
-            .composite_pipeline
-            .expect("BloomFeature: composite pipeline not initialised");
-
-        let karis_on_bg = self
-            .karis_on_static_bg
-            .as_ref()
-            .expect("BloomFeature: karis_on static BG not built");
-        let karis_off_bg = self
-            .karis_off_static_bg
-            .as_ref()
-            .expect("BloomFeature: karis_off static BG not built");
-        let upsample_bg = self
-            .upsample_static_bg
-            .as_ref()
-            .expect("BloomFeature: upsample static BG not built");
-        let composite_bg = self
-            .composite_static_bg
-            .as_ref()
-            .expect("BloomFeature: composite static BG not built");
-
-        let ds_transient_layout = self.ds_transient_layout.as_ref().unwrap();
-        let us_transient_layout = self.us_transient_layout.as_ref().unwrap();
-        let comp_transient_layout = self.comp_transient_layout.as_ref().unwrap();
+        let mip_count = bloom_mip_count(bloom_w, bloom_h, snapshot.max_mip_levels);
 
         ctx.with_group("Bloom_System", |ctx| {
             // ─── 1. Extract: Scene HDR → Bloom Mip 0 ──────────────
-            let mip0_w = bloom_w;
-            let mip0_h = bloom_h;
             let mip0_desc = TextureDesc::new_2d(
-                mip0_w,
-                mip0_h,
+                bloom_w,
+                bloom_h,
                 hdr_format,
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             );
-
-            let static_bg = if karis_average {
-                karis_on_bg
-            } else {
-                karis_off_bg
-            };
 
             let mut current_mip: TextureNodeId = ctx.graph.add_pass("Bloom_Extract", |builder| {
                 builder.read_texture(input_color);
                 let out = builder.create_texture("Bloom_Mip_0", mip0_desc);
                 let node = BloomDownsampleNode {
+                    feature: self,
+                    initialize_resources: true,
+                    karis_average: snapshot.karis_average,
                     input_tex: input_color,
                     output_tex: out,
-                    pipeline_id: ds_pipeline_id,
-                    static_bg,
-                    transient_layout: ds_transient_layout,
+                    pipeline_id: None,
                     transient_bg: None,
                 };
                 (node, out)
@@ -625,8 +189,8 @@ impl BloomFeature {
             downsample_chain.push(current_mip);
 
             // ─── 2. Downsample chain: Mip N → Mip N+1 ─────────────
-            let mut w = mip0_w;
-            let mut h = mip0_h;
+            let mut w = bloom_w;
+            let mut h = bloom_h;
             for i in 1..mip_count {
                 w = (w / 2).max(1);
                 h = (h / 2).max(1);
@@ -646,11 +210,12 @@ impl BloomFeature {
                     builder.read_texture(input);
                     let out = builder.create_texture(out_label, desc);
                     let node = BloomDownsampleNode {
+                        feature: self,
+                        initialize_resources: false,
+                        karis_average: false,
                         input_tex: input,
                         output_tex: out,
-                        pipeline_id: ds_pipeline_id,
-                        static_bg: karis_off_bg,
-                        transient_layout: ds_transient_layout,
+                        pipeline_id: None,
                         transient_bg: None,
                     };
                     (node, out)
@@ -660,6 +225,7 @@ impl BloomFeature {
             }
 
             // ─── 3. Upsample chain: coarse → fine with additive blend ─
+            let mut upsample_params_buffer = None;
             for i in (0..(mip_count - 1)).rev() {
                 let coarser = current_mip;
                 let finer = downsample_chain[i];
@@ -669,14 +235,29 @@ impl BloomFeature {
 
                 current_mip = ctx.graph.add_pass(label, |builder| {
                     builder.read_texture(coarser);
+                    let (params_buffer, upload_params) =
+                        if let Some(buffer) = upsample_params_buffer {
+                            (builder.read_buffer(buffer), false)
+                        } else {
+                            let buffer = create_uniform_buffer::<UpsampleUniforms>(
+                                builder,
+                                "Bloom_Upsample_Params",
+                            );
+                            upsample_params_buffer = Some(buffer);
+                            (buffer, true)
+                        };
                     let out = builder.mutate_texture(finer, out_label);
                     let node = BloomUpsampleNode {
+                        feature: self,
+                        initialize_resources: upload_params,
+                        uniforms: snapshot.upsample,
+                        params_buffer,
+                        upload_params,
                         coarser_tex: coarser,
                         output_tex: out,
-                        pipeline_id: us_pipeline_id,
-                        static_bg: upsample_bg,
-                        transient_layout: us_transient_layout,
-                        transient_bg: None,
+                        pipeline_id: None,
+                        params_bg: None,
+                        textures_bg: None,
                     };
                     (node, out)
                 });
@@ -696,20 +277,337 @@ impl BloomFeature {
                 );
 
                 let out = builder.create_texture("Scene_Color_Bloom", out_desc);
+                let params_buffer =
+                    create_uniform_buffer::<CompositeUniforms>(builder, "Bloom_Composite_Params");
 
                 let node = BloomCompositeNode {
+                    feature: self,
+                    uniforms: snapshot.composite,
+                    params_buffer,
                     original_tex: input_color,
                     bloom_tex: bloom_result,
                     output_tex: out,
-                    pipeline_id: comp_pipeline_id,
-                    static_bg: composite_bg,
-                    transient_layout: comp_transient_layout,
-                    transient_bg: None,
+                    pipeline_id: None,
+                    params_bg: None,
+                    textures_bg: None,
                 };
                 (node, out)
             })
         })
     }
+}
+
+fn bloom_mip_count(width: u32, height: u32, requested: u32) -> usize {
+    let max_possible = width.max(height).max(1).ilog2() + 1;
+    requested
+        .min(max_possible)
+        .min(MAX_BLOOM_MIPS as u32)
+        .max(1) as usize
+}
+
+fn create_upsample_resources(ctx: &mut PrepareContext<'_>) -> BloomPipelineResources {
+    let mut options = ShaderCompilationOptions::default();
+    options.add_define(
+        "struct_definitions",
+        UpsampleUniforms::wgsl_struct_def("UpsampleUniforms").as_str(),
+    );
+    prepare_uniform_pipeline(
+        ctx,
+        "entry/post_process/bloom/upsample",
+        "Bloom US Pipeline",
+        "Bloom US Pipeline Layout",
+        "Bloom US Params Layout (G0)",
+        "Bloom US Textures Layout (G1)",
+        1,
+        &options,
+        additive_blend(),
+    )
+}
+
+fn create_composite_resources(ctx: &mut PrepareContext<'_>) -> BloomPipelineResources {
+    let mut options = ShaderCompilationOptions::default();
+    options.add_define(
+        "struct_definitions",
+        CompositeUniforms::wgsl_struct_def("CompositeUniforms").as_str(),
+    );
+    prepare_uniform_pipeline(
+        ctx,
+        "entry/post_process/bloom/composite",
+        "Bloom Comp Pipeline",
+        "Bloom Comp Pipeline Layout",
+        "Bloom Comp Params Layout (G0)",
+        "Bloom Comp Textures Layout (G1)",
+        2,
+        &options,
+        wgpu::BlendState::REPLACE,
+    )
+}
+
+impl BloomDownsampleResources {
+    fn create(ctx: &mut PrepareContext<'_>) -> Self {
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/post_process/bloom/downsample"),
+            &ShaderCompilationOptions::default(),
+        );
+        let target = color_target(wgpu::BlendState::REPLACE);
+
+        let karis_off_constants = [("USE_KARIS_AVERAGE", 0.0)];
+        let karis_off_options = wgpu::PipelineCompilationOptions {
+            constants: &karis_off_constants,
+            ..Default::default()
+        };
+        let karis_off_key = FullscreenPipelineKey::fullscreen(
+            shader_hash,
+            smallvec::smallvec![target.clone()],
+            None,
+        )
+        .with_compilation_options(&karis_off_options);
+
+        let karis_on_constants = [("USE_KARIS_AVERAGE", 1.0)];
+        let karis_on_options = wgpu::PipelineCompilationOptions {
+            constants: &karis_on_constants,
+            ..Default::default()
+        };
+        let karis_on_key =
+            FullscreenPipelineKey::fullscreen(shader_hash, smallvec::smallvec![target], None)
+                .with_compilation_options(&karis_on_options);
+
+        let cached_off = ctx
+            .pipeline_cache
+            .get_fullscreen_pipeline_id(&karis_off_key);
+        let cached_on = ctx.pipeline_cache.get_fullscreen_pipeline_id(&karis_on_key);
+
+        let (params_layout, textures_layout) = if let Some(id) = cached_off.or(cached_on) {
+            (
+                ctx.pipeline_cache.get_tracked_layout(id, 0).clone(),
+                ctx.pipeline_cache.get_tracked_layout(id, 1).clone(),
+            )
+        } else {
+            (
+                create_sampler_layout(ctx.device, "Bloom DS Params Layout (G0)"),
+                create_textures_layout(ctx.device, "Bloom DS Textures Layout (G1)", 1),
+            )
+        };
+
+        let pipeline_layout = (cached_off.is_none() || cached_on.is_none()).then(|| {
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Bloom DS Pipeline Layout"),
+                    bind_group_layouts: &[Some(&params_layout), Some(&textures_layout)],
+                    immediate_size: 0,
+                })
+        });
+
+        let karis_off_pipeline_id = cached_off.unwrap_or_else(|| {
+            let id = ctx.pipeline_cache.get_or_create_fullscreen_with_options(
+                ctx.device,
+                module,
+                pipeline_layout
+                    .as_ref()
+                    .expect("missing Bloom DS pipeline layout"),
+                &karis_off_key,
+                &karis_off_options,
+                "Bloom DS Pipeline (Karis Off)",
+            );
+            ctx.pipeline_cache.register_render_layouts(
+                id,
+                smallvec::smallvec![params_layout.clone(), textures_layout.clone()],
+            );
+            id
+        });
+
+        let karis_on_pipeline_id = cached_on.unwrap_or_else(|| {
+            let id = ctx.pipeline_cache.get_or_create_fullscreen_with_options(
+                ctx.device,
+                module,
+                pipeline_layout
+                    .as_ref()
+                    .expect("missing Bloom DS pipeline layout"),
+                &karis_on_key,
+                &karis_on_options,
+                "Bloom DS Pipeline (Karis On)",
+            );
+            ctx.pipeline_cache.register_render_layouts(
+                id,
+                smallvec::smallvec![params_layout.clone(), textures_layout.clone()],
+            );
+            id
+        });
+
+        let params_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bloom DS G0"),
+            layout: &params_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Sampler(
+                    ctx.sampler_registry.get_common(CommonSampler::LinearClamp),
+                ),
+            }],
+        });
+
+        Self {
+            karis_on_pipeline_id,
+            karis_off_pipeline_id,
+            textures_layout,
+            params_bind_group,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_uniform_pipeline(
+    ctx: &mut PrepareContext<'_>,
+    shader_path: &'static str,
+    pipeline_label: &'static str,
+    pipeline_layout_label: &'static str,
+    params_layout_label: &'static str,
+    textures_layout_label: &'static str,
+    texture_count: usize,
+    options: &ShaderCompilationOptions,
+    blend: wgpu::BlendState,
+) -> BloomPipelineResources {
+    let (module, shader_hash) =
+        ctx.shader_manager
+            .get_or_compile(ctx.device, ShaderSource::File(shader_path), options);
+    let key = FullscreenPipelineKey::fullscreen(
+        shader_hash,
+        smallvec::smallvec![color_target(blend)],
+        None,
+    );
+
+    if let Some(pipeline_id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+        return BloomPipelineResources {
+            pipeline_id,
+            params_layout: ctx
+                .pipeline_cache
+                .get_tracked_layout(pipeline_id, 0)
+                .clone(),
+            textures_layout: ctx
+                .pipeline_cache
+                .get_tracked_layout(pipeline_id, 1)
+                .clone(),
+        };
+    }
+
+    let params_layout = create_sampler_uniform_layout(ctx.device, params_layout_label);
+    let textures_layout = create_textures_layout(ctx.device, textures_layout_label, texture_count);
+    let pipeline_layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(pipeline_layout_label),
+            bind_group_layouts: &[Some(&params_layout), Some(&textures_layout)],
+            immediate_size: 0,
+        });
+    let pipeline_id = ctx.pipeline_cache.get_or_create_fullscreen(
+        ctx.device,
+        module,
+        &pipeline_layout,
+        &key,
+        pipeline_label,
+    );
+    ctx.pipeline_cache.register_render_layouts(
+        pipeline_id,
+        smallvec::smallvec![params_layout.clone(), textures_layout.clone()],
+    );
+
+    BloomPipelineResources {
+        pipeline_id,
+        params_layout,
+        textures_layout,
+    }
+}
+
+fn color_target(blend: wgpu::BlendState) -> ColorTargetKey {
+    ColorTargetKey::from(wgpu::ColorTargetState {
+        format: HDR_TEXTURE_FORMAT,
+        blend: Some(blend),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+fn additive_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::OVER,
+    }
+}
+
+fn create_sampler_layout(
+    device: &wgpu::Device,
+    label: &'static str,
+) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &[sampler(
+                0,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::SamplerBindingType::Filtering,
+            )],
+        }),
+    )
+}
+
+fn create_sampler_uniform_layout(
+    device: &wgpu::Device,
+    label: &'static str,
+) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &[
+                sampler(
+                    0,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::SamplerBindingType::Filtering,
+                ),
+                uniform_buffer(1, wgpu::ShaderStages::FRAGMENT),
+            ],
+        }),
+    )
+}
+
+fn create_textures_layout(
+    device: &wgpu::Device,
+    label: &'static str,
+    texture_count: usize,
+) -> Tracked<wgpu::BindGroupLayout> {
+    let entries = [
+        texture_2d(
+            0,
+            wgpu::ShaderStages::FRAGMENT,
+            wgpu::TextureSampleType::Float { filterable: true },
+        ),
+        texture_2d(
+            1,
+            wgpu::ShaderStages::FRAGMENT,
+            wgpu::TextureSampleType::Float { filterable: true },
+        ),
+    ];
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &entries[..texture_count],
+        }),
+    )
+}
+
+fn create_uniform_buffer<T>(
+    builder: &mut crate::graph::core::PassBuilder<'_, '_>,
+    name: &'static str,
+) -> BufferNodeId {
+    builder.create_buffer(
+        name,
+        BufferDesc::new(
+            size_of::<T>() as u64,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        ),
+    )
 }
 
 // =============================================================================
@@ -721,7 +619,7 @@ impl BloomFeature {
 // to avoid runtime string formatting and heap allocation.
 
 /// Pass names for each downsample step (index 0 is the extract step).
-static DOWNSAMPLE_PASS_NAMES: [&str; 16] = [
+static DOWNSAMPLE_PASS_NAMES: [&str; MAX_BLOOM_MIPS] = [
     "Bloom_Extract",
     "Bloom_Downsample_1",
     "Bloom_Downsample_2",
@@ -741,7 +639,7 @@ static DOWNSAMPLE_PASS_NAMES: [&str; 16] = [
 ];
 
 /// Resource names for each downsample mip output.
-static DOWNSAMPLE_MIP_NAMES: [&str; 16] = [
+static DOWNSAMPLE_MIP_NAMES: [&str; MAX_BLOOM_MIPS] = [
     "Bloom_Mip_0",
     "Bloom_Mip_1",
     "Bloom_Mip_2",
@@ -761,7 +659,7 @@ static DOWNSAMPLE_MIP_NAMES: [&str; 16] = [
 ];
 
 /// Pass names for each upsample step.
-static UPSAMPLE_PASS_NAMES: [&str; 16] = [
+static UPSAMPLE_PASS_NAMES: [&str; MAX_BLOOM_MIPS] = [
     "Bloom_Upsample_0",
     "Bloom_Upsample_1",
     "Bloom_Upsample_2",
@@ -781,7 +679,7 @@ static UPSAMPLE_PASS_NAMES: [&str; 16] = [
 ];
 
 /// Resource names for each upsample output.
-static UPSAMPLE_MIP_NAMES: [&str; 16] = [
+static UPSAMPLE_MIP_NAMES: [&str; MAX_BLOOM_MIPS] = [
     "Bloom_Up_0",
     "Bloom_Up_1",
     "Bloom_Up_2",
@@ -808,21 +706,32 @@ static UPSAMPLE_MIP_NAMES: [&str; 16] = [
 /// at half resolution using a 13-tap box filter.
 ///
 /// Used for both the initial extract (scene HDR → mip 0) and subsequent
-/// mip-chain downsamples. The karis averaging flag is controlled by which
-/// static bind group (Group 0) is provided.
+/// mip-chain downsamples. Karis averaging is controlled by the selected
+/// override-specialized pipeline.
 struct BloomDownsampleNode<'a> {
+    feature: &'a BloomFeature,
+    initialize_resources: bool,
+    karis_average: bool,
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    static_bg: &'a wgpu::BindGroup,
-    transient_layout: &'a Tracked<wgpu::BindGroupLayout>,
+    pipeline_id: Option<RenderPipelineId>,
     transient_bg: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for BloomDownsampleNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        let resources = if self.initialize_resources {
+            self.feature.ensure_downsample_resources(ctx)
+        } else {
+            self.feature.downsample_resources()
+        };
+        self.pipeline_id = Some(if self.karis_average {
+            resources.karis_on_pipeline_id
+        } else {
+            resources.karis_off_pipeline_id
+        });
         self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.transient_layout, Some("Bloom DS G1"), [
+            crate::myth_bind_group!(ctx, &resources.textures_layout, Some("Bloom DS G1"), [
                 0 => self.input_tex,
             ]),
         );
@@ -843,35 +752,64 @@ impl<'a> PassNode<'a> for BloomDownsampleNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, self.static_bg, &[]);
+        rpass.set_pipeline(
+            ctx.pipeline_cache
+                .get_render_pipeline(self.pipeline_id.expect("Bloom DS pipeline not prepared")),
+        );
+        rpass.set_bind_group(
+            0,
+            &self.feature.downsample_resources().params_bind_group,
+            &[],
+        );
         rpass.set_bind_group(1, transient_bg, &[]);
         rpass.draw(0..3, 0..1);
     }
 }
 
 struct BloomUpsampleNode<'a> {
+    feature: &'a BloomFeature,
+    initialize_resources: bool,
+    uniforms: UpsampleUniforms,
+    params_buffer: BufferNodeId,
+    upload_params: bool,
     coarser_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    static_bg: &'a wgpu::BindGroup,
-    transient_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    pipeline_id: Option<RenderPipelineId>,
+    params_bg: Option<&'a wgpu::BindGroup>,
+    textures_bg: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for BloomUpsampleNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.transient_layout, Some("Bloom US G1"), [
+        let resources = if self.initialize_resources {
+            self.feature.ensure_upsample_resources(ctx)
+        } else {
+            self.feature.upsample_resources()
+        };
+        self.pipeline_id = Some(resources.pipeline_id);
+        if self.upload_params {
+            ctx.queue.write_buffer(
+                ctx.views.get_buffer(self.params_buffer),
+                0,
+                bytemuck::bytes_of(&self.uniforms),
+            );
+        }
+        self.params_bg = Some(
+            crate::myth_bind_group!(ctx, &resources.params_layout, Some("Bloom US G0"), [
+                0 => CommonSampler::LinearClamp,
+                1 => self.params_buffer,
+            ]),
+        );
+        self.textures_bg = Some(
+            crate::myth_bind_group!(ctx, &resources.textures_layout, Some("Bloom US G1"), [
                 0 => self.coarser_tex,
             ]),
         );
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let transient_bg = self
-            .transient_bg
-            .expect("Bloom US transient BG not prepared");
+        let params_bg = self.params_bg.expect("Bloom US G0 not prepared");
+        let textures_bg = self.textures_bg.expect("Bloom US G1 not prepared");
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::Load, None);
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -883,27 +821,45 @@ impl<'a> PassNode<'a> for BloomUpsampleNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, self.static_bg, &[]);
-        rpass.set_bind_group(1, transient_bg, &[]);
+        rpass.set_pipeline(
+            ctx.pipeline_cache
+                .get_render_pipeline(self.pipeline_id.expect("Bloom US pipeline not prepared")),
+        );
+        rpass.set_bind_group(0, params_bg, &[]);
+        rpass.set_bind_group(1, textures_bg, &[]);
         rpass.draw(0..3, 0..1);
     }
 }
 
 struct BloomCompositeNode<'a> {
+    feature: &'a BloomFeature,
+    uniforms: CompositeUniforms,
+    params_buffer: BufferNodeId,
     original_tex: TextureNodeId,
     bloom_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    pipeline_id: RenderPipelineId,
-    static_bg: &'a wgpu::BindGroup,
-    transient_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    pipeline_id: Option<RenderPipelineId>,
+    params_bg: Option<&'a wgpu::BindGroup>,
+    textures_bg: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for BloomCompositeNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.transient_layout, Some("Bloom Comp G1"), [
+        let resources = self.feature.ensure_composite_resources(ctx);
+        self.pipeline_id = Some(resources.pipeline_id);
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.params_buffer),
+            0,
+            bytemuck::bytes_of(&self.uniforms),
+        );
+        self.params_bg = Some(
+            crate::myth_bind_group!(ctx, &resources.params_layout, Some("Bloom Comp G0"), [
+                0 => CommonSampler::LinearClamp,
+                1 => self.params_buffer,
+            ]),
+        );
+        self.textures_bg = Some(
+            crate::myth_bind_group!(ctx, &resources.textures_layout, Some("Bloom Comp G1"), [
                 0 => self.original_tex,
                 1 => self.bloom_tex,
             ]),
@@ -911,9 +867,8 @@ impl<'a> PassNode<'a> for BloomCompositeNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let transient_bg = self
-            .transient_bg
-            .expect("Bloom Comp transient BG not prepared");
+        let params_bg = self.params_bg.expect("Bloom Comp G0 not prepared");
+        let textures_bg = self.textures_bg.expect("Bloom Comp G1 not prepared");
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -925,9 +880,97 @@ impl<'a> PassNode<'a> for BloomCompositeNode<'a> {
             multiview_mask: None,
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-        rpass.set_bind_group(0, self.static_bg, &[]);
-        rpass.set_bind_group(1, transient_bg, &[]);
+        rpass.set_pipeline(
+            ctx.pipeline_cache.get_render_pipeline(
+                self.pipeline_id
+                    .expect("Bloom composite pipeline not prepared"),
+            ),
+        );
+        rpass.set_bind_group(0, params_bg, &[]);
+        rpass.set_bind_group(1, textures_bg, &[]);
         rpass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BloomFeature, BloomSnapshot, MAX_BLOOM_MIPS, bloom_mip_count};
+    use crate::HDR_TEXTURE_FORMAT;
+    use crate::graph::composer::GraphBuilderContext;
+    use crate::graph::core::graph::FrameConfig;
+    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph, TextureDesc};
+    use myth_resources::bloom::{CompositeUniforms, UpsampleUniforms};
+
+    #[test]
+    fn bloom_mip_count_respects_size_and_requested_budget() {
+        assert_eq!(bloom_mip_count(960, 540, 6), 6);
+        assert_eq!(bloom_mip_count(1, 1, 16), 1);
+        assert_eq!(bloom_mip_count(0, 0, 0), 1);
+        assert_eq!(
+            bloom_mip_count(u32::MAX, u32::MAX, u32::MAX),
+            MAX_BLOOM_MIPS
+        );
+    }
+
+    #[test]
+    fn bloom_graph_shares_one_upsample_uniform_buffer() {
+        let feature = BloomFeature::new();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let frame_config = FrameConfig {
+            width: 1920,
+            height: 1080,
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            msaa_samples: 1,
+            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            hdr_format: HDR_TEXTURE_FORMAT,
+        };
+        let input = graph.register_texture(
+            "Bloom_Test_Input",
+            TextureDesc::new_2d(
+                frame_config.width,
+                frame_config.height,
+                HDR_TEXTURE_FORMAT,
+                wgpu::TextureUsages::TEXTURE_BINDING,
+            ),
+            true,
+        );
+        let snapshot = BloomSnapshot {
+            upsample: UpsampleUniforms::default(),
+            composite: CompositeUniforms::default(),
+            karis_average: true,
+            max_mip_levels: 6,
+        };
+
+        let mut ctx = GraphBuilderContext::new(&mut graph, &frame_config, 0);
+        let _output = feature.add_to_graph(&mut ctx, snapshot, input);
+
+        assert!(feature.downsample.get().is_none());
+        assert!(feature.upsample.get().is_none());
+        assert!(feature.composite.get().is_none());
+
+        let upsample_params = graph
+            .storage
+            .resources
+            .iter()
+            .filter(|resource| resource.name == "Bloom_Upsample_Params")
+            .count();
+        let composite_params = graph
+            .storage
+            .resources
+            .iter()
+            .filter(|resource| resource.name == "Bloom_Composite_Params")
+            .count();
+
+        assert_eq!(upsample_params, 1);
+        assert_eq!(composite_params, 1);
+        assert!(
+            graph
+                .storage
+                .resources
+                .iter()
+                .all(|resource| !resource.name.starts_with("Bloom_DS_Params"))
+        );
     }
 }

@@ -135,6 +135,7 @@ impl MsaaSyncFeature {
 
             let key = FullscreenPipelineKey {
                 shader_hash,
+                compilation_hash: 0,
                 color_targets: smallvec::smallvec![ColorTargetKey::from(wgpu::ColorTargetState {
                     format: HDR_TEXTURE_FORMAT,
                     blend: Some(wgpu::BlendState::REPLACE),

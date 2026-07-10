@@ -221,6 +221,8 @@ pub struct GraphicsPipelineKey {
 pub struct FullscreenPipelineKey {
     /// xxh3-128 hash of the final WGSL source code.
     pub shader_hash: u128,
+    /// Hash of fragment-stage compilation options such as WGSL overrides.
+    pub compilation_hash: u64,
     /// Color render targets (usually 1).
     pub color_targets: smallvec::SmallVec<[ColorTargetKey; 2]>,
     /// Depth/stencil configuration (optional).
@@ -242,10 +244,20 @@ impl FullscreenPipelineKey {
     ) -> Self {
         Self {
             shader_hash,
+            compilation_hash: 0,
             color_targets,
             depth_stencil,
             multisample: MultisampleKey::from(wgpu::MultisampleState::default()),
         }
+    }
+
+    #[must_use]
+    pub fn with_compilation_options(
+        mut self,
+        options: &wgpu::PipelineCompilationOptions<'_>,
+    ) -> Self {
+        self.compilation_hash = hash_pipeline_compilation_options(options);
+        self
     }
 }
 
@@ -324,4 +336,29 @@ pub fn hash_pipeline_compilation_options(options: &wgpu::PipelineCompilationOpti
         value.to_bits().hash(&mut hasher);
     }
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FullscreenPipelineKey;
+
+    #[test]
+    fn fullscreen_key_distinguishes_override_constants() {
+        let disabled_constants = [("USE_KARIS_AVERAGE", 0.0)];
+        let enabled_constants = [("USE_KARIS_AVERAGE", 1.0)];
+        let disabled_options = wgpu::PipelineCompilationOptions {
+            constants: &disabled_constants,
+            ..Default::default()
+        };
+        let enabled_options = wgpu::PipelineCompilationOptions {
+            constants: &enabled_constants,
+            ..Default::default()
+        };
+        let base = FullscreenPipelineKey::fullscreen(7, smallvec::smallvec![], None);
+
+        assert_ne!(
+            base.clone().with_compilation_options(&disabled_options),
+            base.with_compilation_options(&enabled_options),
+        );
+    }
 }

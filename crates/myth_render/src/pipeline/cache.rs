@@ -408,6 +408,31 @@ impl PipelineCache {
         canonical_key: &FullscreenPipelineKey,
         label: &str,
     ) -> RenderPipelineId {
+        self.get_or_create_fullscreen_with_options(
+            device,
+            shader_module,
+            pipeline_layout,
+            canonical_key,
+            &wgpu::PipelineCompilationOptions::default(),
+            label,
+        )
+    }
+
+    /// Look up or create a fullscreen pipeline with fragment-stage WGSL
+    /// override constants.
+    ///
+    /// `canonical_key` must be constructed with
+    /// [`FullscreenPipelineKey::with_compilation_options`] using the same
+    /// options so distinct specializations cannot collide in the L2 cache.
+    pub fn get_or_create_fullscreen_with_options(
+        &mut self,
+        device: &wgpu::Device,
+        shader_module: &wgpu::ShaderModule,
+        pipeline_layout: &wgpu::PipelineLayout,
+        canonical_key: &FullscreenPipelineKey,
+        compilation_options: &wgpu::PipelineCompilationOptions<'_>,
+        label: &str,
+    ) -> RenderPipelineId {
         let hash = fx_hash_key(canonical_key);
         if let Some(&id) = self.fullscreen_lookup.get(&hash) {
             return id;
@@ -479,7 +504,7 @@ impl PipelineCache {
                 module: shader_module,
                 entry_point: Some("fs_main"),
                 targets: &color_targets,
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: compilation_options.clone(),
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,

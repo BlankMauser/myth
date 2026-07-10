@@ -409,6 +409,7 @@ impl TemplatePassDescriptor {
             });
         let key = FullscreenPipelineKey {
             shader_hash,
+            compilation_hash: 0,
             color_targets: color_targets
                 .iter()
                 .cloned()

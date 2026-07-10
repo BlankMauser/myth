@@ -6,11 +6,11 @@
 
 {$ include 'core/full_screen_vertex' $}
 
-{{ struct_definitions }}
-
 // Group 0: Persistent feature resources (Feature-owned, long-lived)
 @group(0) @binding(0) var src_sampler: sampler;
-@group(0) @binding(1) var<uniform> u_bloom: DownsampleUniforms;
+
+// Pipeline-specialized because only the first downsample may use Karis.
+override USE_KARIS_AVERAGE: u32 = 0u;
 
 // Group 1: Transient RDG textures (PassNode-owned, per-frame)
 @group(1) @binding(0) var src_texture: texture_2d<f32>;
@@ -56,7 +56,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var result: vec3<f32>;
 
-    if (u_bloom.use_karis_average != 0u) {
+    if (USE_KARIS_AVERAGE != 0u) {
         // First downsample: use Karis average to suppress firefly artifacts.
         // Five 2×2 sample groups with luminance-weighted averaging.
         let g0 = (a + b + d + e) * 0.25;

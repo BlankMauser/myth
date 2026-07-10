@@ -83,6 +83,28 @@ impl BufferBucketKey {
     }
 }
 
+/// Returns whether a physical buffer can back another logical allocation in
+/// the current frame.
+///
+/// `COPY_DST` buffers may be populated through `Queue::write_buffer` during
+/// the graph-wide prepare phase. Because every live node prepares before any
+/// node executes, aliasing two such logical buffers would let a later prepare
+/// overwrite data needed by an earlier draw. They may still reuse a pooled
+/// allocation from a previous frame (`active_until == 0`), but never another
+/// logical allocation from the current frame.
+#[inline]
+fn buffer_allocation_is_available(
+    active_until: usize,
+    first_use: usize,
+    requested_usage: wgpu::BufferUsages,
+) -> bool {
+    if requested_usage.contains(wgpu::BufferUsages::COPY_DST) {
+        active_until == 0
+    } else {
+        active_until <= first_use
+    }
+}
+
 // --- Physical Texture ----------------------------------------------------------
 
 pub(crate) struct PhysicalTexture {
@@ -367,8 +389,11 @@ impl TransientPool {
 
         if let Some(bucket) = self.buffer_buckets.get(&bucket_key) {
             for &idx in bucket {
-                if self.buffer_active_allocations[idx] <= first_use
-                    && let Some(buffer) = &mut self.buffers[idx]
+                if buffer_allocation_is_available(
+                    self.buffer_active_allocations[idx],
+                    first_use,
+                    desc.usage,
+                ) && let Some(buffer) = &mut self.buffers[idx]
                     && buffer.usage.contains(desc.usage)
                 {
                     self.buffer_active_allocations[idx] = last_use + 1;
@@ -533,5 +558,39 @@ impl TransientPool {
         key: &SubViewKey,
     ) -> Option<&Tracked<wgpu::TextureView>> {
         self.get_tex(physical_index).sub_views.get(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::buffer_allocation_is_available;
+
+    #[test]
+    fn copy_dst_buffer_can_reuse_a_previous_frame_allocation() {
+        let usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+
+        assert!(buffer_allocation_is_available(0, 5, usage));
+    }
+
+    #[test]
+    fn copy_dst_buffer_cannot_alias_within_a_frame() {
+        let usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+
+        assert!(!buffer_allocation_is_available(2, 2, usage));
+        assert!(!buffer_allocation_is_available(2, 8, usage));
+    }
+
+    #[test]
+    fn gpu_only_buffer_keeps_timeline_aliasing() {
+        assert!(buffer_allocation_is_available(
+            2,
+            2,
+            wgpu::BufferUsages::STORAGE,
+        ));
+        assert!(!buffer_allocation_is_available(
+            3,
+            2,
+            wgpu::BufferUsages::STORAGE,
+        ));
     }
 }
