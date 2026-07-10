@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::uniforms::RenderStateUniforms;
 use myth_scene::camera::RenderCamera;
+use rustc_hash::FxHashMap;
 
 use crate::renderer::FrameTime;
 
@@ -72,15 +73,27 @@ impl DebugViewTarget {
 
 static NEXT_RENDER_STATE_ID: AtomicU32 = AtomicU32::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TemporalViewKey {
+    scene_id: u32,
+    camera_id: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TemporalViewState {
+    view_projection: glam::Mat4,
+    jitter: glam::Vec2,
+    unjittered_view_projection: glam::Mat4,
+    serial: u64,
+}
+
 pub struct RenderState {
     pub id: u32,
     uniforms: CpuBuffer<RenderStateUniforms>,
-    /// Previous frame's view-projection matrix (for TAA reprojection).
-    prev_view_projection: glam::Mat4,
-    /// Previous frame's jitter (for TAA de-jitter).
-    prev_jitter: glam::Vec2,
-    /// Previous frame's jitter-free VP matrix (for velocity calculation).
-    prev_unjittered_vp: glam::Mat4,
+    /// Previous matrices and local frame sequence, partitioned by temporal
+    /// render domain so interleaved scene/camera rendering cannot cross-talk.
+    temporal_views: FxHashMap<TemporalViewKey, TemporalViewState>,
+    current_temporal_serial: u64,
     /// Active debug-view mode (from camera settings, resolved per-frame).
     #[cfg(feature = "debug_view")]
     pub debug_view_mode: myth_scene::camera::DebugViewMode,
@@ -104,9 +117,8 @@ impl RenderState {
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 Some("RenderState Uniforms"),
             ),
-            prev_view_projection: glam::Mat4::IDENTITY,
-            prev_jitter: glam::Vec2::ZERO,
-            prev_unjittered_vp: glam::Mat4::IDENTITY,
+            temporal_views: FxHashMap::default(),
+            current_temporal_serial: 0,
             #[cfg(feature = "debug_view")]
             debug_view_mode: myth_scene::camera::DebugViewMode::None,
             #[cfg(feature = "debug_view")]
@@ -122,15 +134,37 @@ impl RenderState {
         self.uniforms.write()
     }
 
+    /// Sequence number of the current `(scene, camera)` temporal domain.
+    /// It advances on every extract attempt for that domain, independently of
+    /// frames spent rendering other domains.
+    #[must_use]
+    pub const fn temporal_serial(&self) -> u64 {
+        self.current_temporal_serial
+    }
+
     pub fn update(
         &mut self,
+        scene_id: u32,
         camera: &RenderCamera,
         frame_time: FrameTime,
         viewport_size: (u32, u32),
     ) {
-        let prev_vp = self.prev_view_projection;
-        let prev_j = self.prev_jitter;
-        let prev_unjittered_vp = self.prev_unjittered_vp;
+        let key = TemporalViewKey {
+            scene_id,
+            camera_id: camera.camera_id,
+        };
+        let previous = self.temporal_views.get(&key).copied();
+        let prev_vp = previous.map_or(glam::Mat4::IDENTITY, |state| state.view_projection);
+        let prev_j = previous.map_or(glam::Vec2::ZERO, |state| state.jitter);
+        let prev_unjittered_vp = previous.map_or(glam::Mat4::IDENTITY, |state| {
+            state.unjittered_view_projection
+        });
+        let temporal_serial = previous.map_or(1, |state| {
+            state
+                .serial
+                .checked_add(1)
+                .expect("temporal view serial overflow")
+        });
 
         let unjittered_projection_inverse = camera.unjittered_projection.inverse();
         let unjittered_vp = camera.unjittered_projection * camera.view_matrix;
@@ -161,9 +195,54 @@ impl RenderState {
         u.camera_far = camera.far;
         drop(u);
 
-        // Latch current values for next frame.
-        self.prev_view_projection = camera.view_projection_matrix;
-        self.prev_jitter = camera.jitter;
-        self.prev_unjittered_vp = unjittered_vp;
+        // Latch current values only for this scene/camera domain.
+        self.temporal_views.insert(
+            key,
+            TemporalViewState {
+                view_projection: camera.view_projection_matrix,
+                jitter: camera.jitter,
+                unjittered_view_projection: unjittered_vp,
+                serial: temporal_serial,
+            },
+        );
+        self.current_temporal_serial = temporal_serial;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myth_scene::camera::Camera;
+
+    fn camera(camera_id: u128) -> RenderCamera {
+        let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
+        let mut render_camera = camera.extract_render_camera();
+        render_camera.camera_id = camera_id;
+        render_camera
+    }
+
+    fn frame_time() -> FrameTime {
+        FrameTime {
+            time: 0.0,
+            delta_time: 1.0 / 60.0,
+            frame_count: 0,
+        }
+    }
+
+    #[test]
+    fn temporal_serial_and_previous_state_are_partitioned_by_scene_and_camera() {
+        let mut state = RenderState::new();
+        let camera_a = camera(1);
+        let camera_b = camera(2);
+
+        state.update(10, &camera_a, frame_time(), (64, 64));
+        assert_eq!(state.temporal_serial(), 1);
+        state.update(10, &camera_b, frame_time(), (64, 64));
+        assert_eq!(state.temporal_serial(), 1);
+        state.update(10, &camera_a, frame_time(), (64, 64));
+        assert_eq!(state.temporal_serial(), 2);
+        state.update(11, &camera_a, frame_time(), (64, 64));
+        assert_eq!(state.temporal_serial(), 1);
+        assert_eq!(state.temporal_views.len(), 3);
     }
 }

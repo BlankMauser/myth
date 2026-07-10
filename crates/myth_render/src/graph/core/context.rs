@@ -17,6 +17,7 @@ use myth_scene::RenderCamera;
 use wgpu::{Device, Queue, TextureView};
 
 use super::allocator::{SubViewKey, TransientPool};
+use super::persistent::HistoryRegistry;
 use super::types::{
     BufferNodeId, GraphResourceType, RenderTargetOps, ResourceKind, ResourceNodeId, ResourceRecord,
     TextureNodeId,
@@ -122,6 +123,7 @@ impl ClusteredScreenBindings {
 pub struct ViewResolver<'a> {
     pub resources: &'a [ResourceRecord],
     pub pool: &'a mut TransientPool,
+    pub persistent_resources: &'a HistoryRegistry,
 }
 
 #[inline]
@@ -688,6 +690,9 @@ impl ViewResolver<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_texture_id() {
+                return self.persistent_resources.get_texture_view(id);
+            }
             let ptr = res
                 .external_texture_ptr()
                 .expect("External texture missing view pointer!");
@@ -705,6 +710,9 @@ impl ViewResolver<'_> {
     #[must_use]
     pub fn get_physical_texture_uid(&self, id: TextureNodeId) -> u64 {
         let (_, res) = resolve_texture_resource(self.resources, id);
+        if res.is_external {
+            return self.get_texture_view(id).id();
+        }
         let physical_index = res.physical_index.expect("No physical memory!");
         self.pool.get_uid(physical_index)
     }
@@ -715,6 +723,9 @@ impl ViewResolver<'_> {
     #[must_use]
     pub fn get_texture(&self, id: TextureNodeId) -> &wgpu::Texture {
         let (_, res) = resolve_texture_resource(self.resources, id);
+        if res.is_external {
+            return self.get_texture_view(id).texture();
+        }
         let physical_index = res.physical_index.expect("No physical memory!");
         self.pool.get_texture(physical_index)
     }
@@ -807,15 +818,18 @@ impl ViewResolver<'_> {
 
     /// Returns `true` if the resource has a physical GPU allocation.
     ///
-    /// A resource is considered allocated if it is external (always backed by
-    /// caller-provided memory) or if the graph compiler assigned a physical
-    /// pool slot.  Dead resources — those written but never read — will
-    /// return `false`, allowing passes to skip bind-group creation and
-    /// select leaner pipeline variants in [`PassNode::prepare`].
+    /// Raw external resources are always backed by caller-provided memory;
+    /// logical persistent resources count only after post-DPE materialization;
+    /// transient resources require a compiler-assigned pool slot. Dead
+    /// resources return `false`, allowing prepare to skip unnecessary work.
     #[inline]
     #[must_use]
     pub fn is_resource_allocated<T: GraphResourceType>(&self, id: ResourceNodeId<T>) -> bool {
-        let res = &self.resources[id.index() as usize];
+        let root_id = resolve_root_id(self.resources, id);
+        let res = &self.resources[root_id.index() as usize];
+        if let Some(id) = res.persistent_texture_id() {
+            return self.persistent_resources.is_texture_materialized(id);
+        }
         res.is_external || res.physical_index.is_some()
     }
 }
@@ -1105,6 +1119,7 @@ pub fn build_screen_bind_group<'a>(
 pub struct ExecuteContext<'a> {
     pub resources: &'a [ResourceRecord],
     pub pool: &'a TransientPool,
+    pub persistent_resources: &'a HistoryRegistry,
     pub device: &'a Device,
     pub queue: &'a Queue,
     pub pipeline_cache: &'a PipelineCache,
@@ -1141,6 +1156,9 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_texture_id() {
+                return self.persistent_resources.get_texture_view(id);
+            }
             let ptr = res
                 .external_texture_ptr()
                 .expect("External texture missing view pointer!");
@@ -1159,6 +1177,9 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_texture_id() {
+                return self.persistent_resources.get_texture_view(id);
+            }
             let ptr = res
                 .external_texture_ptr()
                 .expect("External texture missing view pointer!");
@@ -1181,6 +1202,9 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_texture_id() {
+                return self.persistent_resources.get_texture_view(id).texture();
+            }
             let ptr = res
                 .external_texture_ptr()
                 .expect("External texture missing view pointer!");
@@ -1205,6 +1229,9 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_texture_id() {
+                return Some(&**self.persistent_resources.get_texture_view(id));
+            }
             let ptr = res.external_texture_ptr()?;
             let tracked = unsafe { &*ptr };
             Some(&**tracked) // Deref Tracked 获得 wgpu::TextureView
@@ -1218,6 +1245,9 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_texture_id() {
+                return Some(&**self.persistent_resources.get_texture_view(id));
+            }
             let ptr = res.external_texture_ptr()?;
             let tracked = unsafe { &*ptr };
             Some(&**tracked) // Deref Tracked 获得 wgpu::TextureView
@@ -1299,7 +1329,11 @@ impl ExecuteContext<'_> {
     #[inline]
     #[must_use]
     pub fn is_resource_allocated<T: GraphResourceType>(&self, id: ResourceNodeId<T>) -> bool {
-        let res = &self.resources[id.index() as usize];
+        let root_id = resolve_root_id(self.resources, id);
+        let res = &self.resources[root_id.index() as usize];
+        if let Some(id) = res.persistent_texture_id() {
+            return self.persistent_resources.is_texture_materialized(id);
+        }
         res.is_external || res.physical_index.is_some()
     }
 

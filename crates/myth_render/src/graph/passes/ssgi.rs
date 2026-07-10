@@ -10,8 +10,8 @@ use crate::HDR_TEXTURE_FORMAT;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassNode, PrepareContext,
-    RenderTargetOps, TextureDesc, TextureNodeId,
+    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, HistoryTextureRef, PassNode,
+    PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
 };
 use crate::graph::passes::utils::CopyTextureNode;
 use crate::pipeline::{
@@ -27,6 +27,7 @@ const SSGI_WORKGROUP_SIZE: u32 = 8;
 const MAX_ATROUS_PASSES: usize = 4;
 const HISTORY_FLAG_INDIRECT_VALID: u32 = 1 << 0;
 const HISTORY_FLAG_SOURCE_VALID: u32 = 1 << 1;
+const HISTORY_VALID_MASK: u32 = HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID;
 const SSGI_ATROUS_PASS_NAMES: [&str; MAX_ATROUS_PASSES] = [
     "SSGI_ATrous_Step_1",
     "SSGI_ATrous_Step_2",
@@ -86,7 +87,6 @@ pub struct SsgiFeature {
     indirect_history_view: Option<Tracked<wgpu::TextureView>>,
     history_meta_view: Option<Tracked<wgpu::TextureView>>,
     source_history_view: Option<Tracked<wgpu::TextureView>>,
-    source_history_input_view: Option<Tracked<wgpu::TextureView>>,
     atrous_uniform_buffers: Vec<Tracked<wgpu::Buffer>>,
 
     prepared_max_steps: u32,
@@ -126,7 +126,6 @@ impl SsgiFeature {
             indirect_history_view: None,
             history_meta_view: None,
             source_history_view: None,
-            source_history_input_view: None,
             atrous_uniform_buffers: Vec::with_capacity(MAX_ATROUS_PASSES),
 
             prepared_max_steps: 16,
@@ -155,6 +154,12 @@ impl SsgiFeature {
         self.history_valid = false;
         self.source_history_valid = false;
         self.prev_frame_taa_enabled = false;
+    }
+
+    fn sync_history_flags(&self, ssgi_uniforms: &CpuBuffer<SsgiUniforms>) {
+        let mut uniforms = ssgi_uniforms.write();
+        let external_runtime_bits = uniforms.frame_params.w & !HISTORY_VALID_MASK;
+        uniforms.frame_params.w = external_runtime_bits | self.history_flags();
     }
 
     fn ensure_layouts(&mut self, device: &wgpu::Device) {
@@ -789,6 +794,7 @@ impl SsgiFeature {
     ) {
         self.ensure_layouts(ctx.device);
         self.ensure_history_buffers(ctx.device, size.0, size.1);
+        self.sync_history_flags(ssgi_uniforms);
 
         let uniforms = *ssgi_uniforms.read();
         let max_steps = uniforms.frame_params.y;
@@ -823,7 +829,8 @@ impl SsgiFeature {
         velocity: TextureNodeId,
         material_mrt: TextureNodeId,
         pmrem_tex: Option<TextureNodeId>,
-        taa_history_view: Option<Tracked<wgpu::TextureView>>,
+        taa_history: Option<HistoryTextureRef>,
+        taa_enabled: bool,
     ) -> SsgiOutputs {
         let raw_pipeline_id = self
             .raw_pipelines
@@ -859,19 +866,26 @@ impl SsgiFeature {
             .prepared_atrous_passes
             .clamp(1, MAX_ATROUS_PASSES as u32) as usize;
 
-        let taa_enabled = taa_history_view.is_some();
         let use_taa_source_history =
-            self.source_history_valid && self.prev_frame_taa_enabled && taa_enabled;
+            self.source_history_valid && self.prev_frame_taa_enabled && taa_history.is_some();
 
-        self.source_history_input_view = Some(if use_taa_source_history {
-            taa_history_view.expect("SSGI TAA history view missing")
+        let source_history_desc = persistent_texture_desc(
+            source_history_view.texture().width(),
+            source_history_view.texture().height(),
+            HDR_TEXTURE_FORMAT,
+        );
+        let source_history_input = if use_taa_source_history {
+            ctx.graph.import_persistent_texture(
+                "TAA_History_Color_Previous",
+                taa_history.expect("SSGI TAA history reference missing"),
+            )
         } else {
-            source_history_view.clone()
-        });
-        let source_history_input_view = self
-            .source_history_input_view
-            .as_ref()
-            .expect("SSGI source history input view missing");
+            ctx.graph.import_external_texture(
+                "SSGI_Source_History_Read",
+                source_history_desc,
+                source_history_view,
+            )
+        };
 
         let indirect_history_desc = persistent_texture_desc(
             indirect_history_view.texture().width(),
@@ -882,11 +896,6 @@ impl SsgiFeature {
             history_meta_view.texture().width(),
             history_meta_view.texture().height(),
             SSGI_TEXTURE_FORMAT,
-        );
-        let source_history_desc = persistent_texture_desc(
-            source_history_input_view.texture().width(),
-            source_history_input_view.texture().height(),
-            HDR_TEXTURE_FORMAT,
         );
         let uniforms_desc = BufferDesc::new(
             std::mem::size_of::<SsgiUniforms>() as u64,
@@ -906,11 +915,7 @@ impl SsgiFeature {
                 builder.read_texture(scene_hiz);
                 builder.read_texture(scene_normals);
 
-                let source_history = builder.read_external_texture(
-                    "SSGI_Source_History_Read",
-                    source_history_desc,
-                    source_history_input_view,
-                );
+                let source_history = builder.read_texture(source_history_input);
                 let uniforms =
                     builder.read_external_buffer("SSGI_Uniforms", uniforms_desc, uniforms_buffer);
                 let pmrem_input = if let Some(pmrem) = pmrem_tex {
@@ -1359,4 +1364,42 @@ fn persistent_texture_desc(width: u32, height: u32, format: wgpu::TextureFormat)
         format,
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HISTORY_FLAG_INDIRECT_VALID, HISTORY_FLAG_SOURCE_VALID, SsgiFeature};
+    use myth_resources::ssgi::SsgiSettings;
+
+    const CAMERA_CUT_FLAG: u32 = 1 << 2;
+
+    #[test]
+    fn sync_history_flags_clears_stale_validity_after_resize() {
+        let mut feature = SsgiFeature::new();
+        let mut settings = SsgiSettings::default();
+        settings.set_history_flags(
+            HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID | CAMERA_CUT_FLAG,
+        );
+
+        feature.invalidate_history();
+        feature.sync_history_flags(&settings.uniforms);
+
+        assert_eq!(settings.uniforms.read().frame_params.w, CAMERA_CUT_FLAG);
+    }
+
+    #[test]
+    fn sync_history_flags_preserves_external_runtime_bits() {
+        let mut feature = SsgiFeature::new();
+        let mut settings = SsgiSettings::default();
+        settings.set_history_flags(CAMERA_CUT_FLAG);
+        feature.history_valid = true;
+        feature.source_history_valid = true;
+
+        feature.sync_history_flags(&settings.uniforms);
+
+        assert_eq!(
+            settings.uniforms.read().frame_params.w,
+            HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID | CAMERA_CUT_FLAG
+        );
+    }
 }

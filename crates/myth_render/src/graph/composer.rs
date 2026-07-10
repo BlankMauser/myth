@@ -56,8 +56,8 @@ use crate::graph::core::ClusteredScreenBindings;
 use crate::graph::core::GraphStorage;
 use crate::graph::core::graph::FrameConfig;
 use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GraphBlackboard, HookStage,
-    PrepareContext, RenderGraph, TextureDesc, TransientPool, ViewResolver,
+    BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GraphBlackboard, HistoryRegistry,
+    HookStage, PrepareContext, RenderGraph, TextureDesc, TransientPool, ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
 use crate::graph::frame::{PreparedSkyboxDraw, RenderLists};
@@ -116,6 +116,7 @@ pub struct ComposerContext<'a> {
 
     pub graph_storage: &'a mut GraphStorage,
     pub transient_pool: &'a mut TransientPool,
+    pub history_registry: &'a mut HistoryRegistry,
     // pub sampler_registry: &'a mut SamplerRegistry,
     pub frame_arena: &'a FrameArena,
 
@@ -553,6 +554,26 @@ impl<'a> FrameComposer<'a> {
         let needs_normal = ssao_enabled || ssgi_enabled || needs_feature_id || dbg_needs_normal;
         let needs_velocity = taa_enabled || ssgi_enabled || ssr_enabled || dbg_needs_velocity;
 
+        let taa_snapshot = if taa_enabled {
+            let settings = self
+                .ctx
+                .camera
+                .aa_mode
+                .taa_settings()
+                .expect("TAA settings must exist when TAA is enabled");
+            Some(self.ctx.taa_pass.extract(
+                self.ctx.history_registry,
+                self.ctx.scene.id(),
+                &self.ctx.camera,
+                settings.feedback_weight,
+                self.ctx.render_state.temporal_serial(),
+                (self.frame_config.width, self.frame_config.height),
+                self.frame_config.depth_format,
+            ))
+        } else {
+            None
+        };
+
         // let needs_normal = ssao_enabled || needs_feature_id;
         let needs_skybox = self.ctx.scene.background.needs_skybox_pass();
         let ssss_enabled = self.ctx.scene.ssss.enabled;
@@ -888,11 +909,8 @@ impl<'a> FrameComposer<'a> {
                         }
 
                         if ssgi_enabled {
-                            let taa_history_view = if taa_enabled {
-                                self.ctx.taa_pass.history_color_view()
-                            } else {
-                                None
-                            };
+                            let taa_history = taa_snapshot
+                                .and_then(crate::graph::passes::taa::TaaSnapshot::previous_color);
 
                             let ssgi_out = self.ctx.ssgi_pass.add_to_graph(
                                 c,
@@ -909,7 +927,8 @@ impl<'a> FrameComposer<'a> {
                                     .material_mrt
                                     .expect("SSGI requires opaque material MRT"),
                                 env_dependency_pmrem,
-                                taa_history_view,
+                                taa_history,
+                                taa_enabled,
                             );
 
                             #[cfg(feature = "debug_view")]
@@ -959,6 +978,7 @@ impl<'a> FrameComposer<'a> {
                             c.with_group("TAA_System", |c| {
                                 active_color = self.ctx.taa_pass.add_to_graph(
                                     c,
+                                    taa_snapshot.expect("TAA snapshot missing"),
                                     active_color,
                                     velocity,
                                     scene_depth,
@@ -1260,36 +1280,42 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 3. Compile & Execute RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             graph.compile(self.ctx.transient_pool, &self.ctx.wgpu_ctx.device);
+            self.ctx
+                .history_registry
+                .materialize_live_textures(&self.ctx.wgpu_ctx.device, &graph.storage.resources);
 
             // ─── 3a. RDG Prepare: live-pass deferred preparation ───────────
             //
             // Only the swapchain surface is truly external — all other textures
             // (scene_color, scene_depth, etc.) are RDG transient resources.
 
-            let mut prepare_ctx = PrepareContext {
-                views: ViewResolver {
-                    resources: &graph.storage.resources,
-                    pool: self.ctx.transient_pool,
-                },
-                device: &self.ctx.wgpu_ctx.device,
-                queue: &self.ctx.wgpu_ctx.queue,
-                pipeline_cache: self.ctx.pipeline_cache,
-                shader_manager: self.ctx.shader_manager,
-                uploads: crate::core::gpu::BufferUploadContext::new(
-                    &self.ctx.wgpu_ctx.device,
-                    &self.ctx.wgpu_ctx.queue,
-                    self.ctx.resource_manager.frame_index,
-                    &mut self.ctx.resource_manager.resources,
-                ),
-                global_states: GlobalStateResolver::new(&self.ctx.resource_manager.bind_groups),
-                sampler_registry: &self.ctx.resource_manager.sampler_registry,
-                system_textures: &self.ctx.resource_manager.system_textures,
-                global_bind_group_cache: self.ctx.global_bind_group_cache,
-            };
+            {
+                let mut prepare_ctx = PrepareContext {
+                    views: ViewResolver {
+                        resources: &graph.storage.resources,
+                        pool: self.ctx.transient_pool,
+                        persistent_resources: self.ctx.history_registry,
+                    },
+                    device: &self.ctx.wgpu_ctx.device,
+                    queue: &self.ctx.wgpu_ctx.queue,
+                    pipeline_cache: self.ctx.pipeline_cache,
+                    shader_manager: self.ctx.shader_manager,
+                    uploads: crate::core::gpu::BufferUploadContext::new(
+                        &self.ctx.wgpu_ctx.device,
+                        &self.ctx.wgpu_ctx.queue,
+                        self.ctx.resource_manager.frame_index,
+                        &mut self.ctx.resource_manager.resources,
+                    ),
+                    global_states: GlobalStateResolver::new(&self.ctx.resource_manager.bind_groups),
+                    sampler_registry: &self.ctx.resource_manager.sampler_registry,
+                    system_textures: &self.ctx.resource_manager.system_textures,
+                    global_bind_group_cache: self.ctx.global_bind_group_cache,
+                };
 
-            for &pass_idx in &graph.storage.execution_queue {
-                let pass = graph.storage.passes[pass_idx].get_pass_mut();
-                pass.prepare(&mut prepare_ctx);
+                for &pass_idx in &graph.storage.execution_queue {
+                    let pass = graph.storage.passes[pass_idx].get_pass_mut();
+                    pass.prepare(&mut prepare_ctx);
+                }
             }
 
             // ─── 3c. Bake render commands ──────────────────────────────────
@@ -1317,19 +1343,6 @@ impl<'a> FrameComposer<'a> {
 
             // ─── 3d. Execute ───────────────────────────────────────────────
 
-            let mut execute_ctx = ExecuteContext {
-                resources: &graph.storage.resources,
-                pool: self.ctx.transient_pool,
-                device: &self.ctx.wgpu_ctx.device,
-                queue: &self.ctx.wgpu_ctx.queue,
-                pipeline_cache: self.ctx.pipeline_cache,
-                global_bind_group_cache: self.ctx.global_bind_group_cache,
-                mipmap_generator: self.ctx.mipmap_pass.generator(),
-                baked_lists: &baked_lists,
-                wgpu_ctx: &*self.ctx.wgpu_ctx,
-                current_timeline_index: 0,
-            };
-
             let mut encoder =
                 self.ctx
                     .wgpu_ctx
@@ -1338,20 +1351,38 @@ impl<'a> FrameComposer<'a> {
                         label: Some("Unified Encoder"),
                     });
 
-            for (timeline_index, &pass_idx) in graph.storage.execution_queue.iter().enumerate() {
-                execute_ctx.current_timeline_index = timeline_index;
-                #[cfg(debug_assertions)]
-                encoder.push_debug_group(graph.storage.passes[pass_idx].name);
-                graph.storage.passes[pass_idx]
-                    .get_pass_mut()
-                    .execute(&execute_ctx, &mut encoder);
-                #[cfg(debug_assertions)]
-                encoder.pop_debug_group();
+            {
+                let mut execute_ctx = ExecuteContext {
+                    resources: &graph.storage.resources,
+                    pool: self.ctx.transient_pool,
+                    persistent_resources: self.ctx.history_registry,
+                    device: &self.ctx.wgpu_ctx.device,
+                    queue: &self.ctx.wgpu_ctx.queue,
+                    pipeline_cache: self.ctx.pipeline_cache,
+                    global_bind_group_cache: self.ctx.global_bind_group_cache,
+                    mipmap_generator: self.ctx.mipmap_pass.generator(),
+                    baked_lists: &baked_lists,
+                    wgpu_ctx: &*self.ctx.wgpu_ctx,
+                    current_timeline_index: 0,
+                };
+
+                for (timeline_index, &pass_idx) in graph.storage.execution_queue.iter().enumerate()
+                {
+                    execute_ctx.current_timeline_index = timeline_index;
+                    #[cfg(debug_assertions)]
+                    encoder.push_debug_group(graph.storage.passes[pass_idx].name);
+                    graph.storage.passes[pass_idx]
+                        .get_pass_mut()
+                        .execute(&execute_ctx, &mut encoder);
+                    #[cfg(debug_assertions)]
+                    encoder.pop_debug_group();
+                }
             }
 
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
+            graph.commit_submitted_histories(self.ctx.history_registry);
             graph.run_after_submit_hooks();
         };
 

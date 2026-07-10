@@ -8,6 +8,7 @@ use smallvec::SmallVec;
 use crate::core::binding::GlobalBindGroupCache;
 use crate::core::gpu::Tracked;
 use crate::graph::composer::ComposerContext;
+use crate::graph::core::HistoryRegistry;
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 use crate::graph::core::graph::GraphStorage;
@@ -110,6 +111,7 @@ struct RendererState {
     pub(crate) graph_storage: GraphStorage,
     // pub(crate) sampler_registry: SamplerRegistry,
     pub(crate) transient_pool: TransientPool,
+    pub(crate) history_registry: HistoryRegistry,
     pub(crate) frame_arena: FrameArena,
 
     // Post-processing passes
@@ -293,6 +295,7 @@ impl Renderer {
 
             graph_storage: GraphStorage::new(),
             transient_pool: TransientPool::new(),
+            history_registry: HistoryRegistry::new(),
             frame_arena: FrameArena::new(),
             fxaa_pass: FxaaFeature::new(),
             taa_pass: TaaFeature::new(),
@@ -579,16 +582,6 @@ impl Renderer {
             }
 
             if is_hf {
-                if let Some(taa_settins) = camera.aa_mode.taa_settings() {
-                    state.taa_pass.extract_and_prepare(
-                        &mut extract_ctx,
-                        taa_settins.feedback_weight,
-                        camera.camera_cut != 0,
-                        self.size,
-                        HDR_TEXTURE_FORMAT,
-                    );
-                }
-
                 state.prepass.extract_and_prepare(
                     &mut extract_ctx,
                     needs_normal,
@@ -673,6 +666,7 @@ impl Renderer {
 
             graph_storage: &mut state.graph_storage,
             transient_pool: &mut state.transient_pool,
+            history_registry: &mut state.history_registry,
             // sampler_registry: &mut state.sampler_registry,
             frame_arena: &state.frame_arena,
             fxaa_pass: &mut state.fxaa_pass,

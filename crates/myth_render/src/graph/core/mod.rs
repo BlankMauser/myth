@@ -5,6 +5,7 @@ pub mod builder;
 pub mod context;
 pub mod graph;
 pub mod node;
+pub mod persistent;
 pub mod template_pass;
 pub mod types;
 
@@ -19,6 +20,10 @@ pub use context::{
 };
 pub use graph::{GraphStorage, RenderGraph};
 pub use node::PassNode;
+pub use persistent::{
+    HistoryCommitToken, HistoryPlan, HistoryRegistry, HistorySetId, HistoryTextureRef,
+    PersistentTextureId,
+};
 pub use template_pass::{
     ComputePassBuilder, RenderPassBuilder, StandardComputeNode, StandardFullscreenNode,
     TemplateBindingLayoutDesc, TemplateComputePass, TemplateFullscreenPass,

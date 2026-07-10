@@ -1,12 +1,17 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use rustc_hash::FxHashMap;
+
 use crate::core::gpu::Tracked;
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 
 use super::builder::PassBuilder;
 use super::node::{NodeSlot, PassNode, PassRecord};
+use super::persistent::{
+    HistoryCommitToken, HistoryRegistry, HistoryTextureRef, PersistentTextureId,
+};
 use super::types::{
     BufferDesc, BufferNodeId, ErasedResourceNodeId, GraphResourceType, ResourceClass, ResourceKind,
     ResourceNodeId, ResourceRecord, TextureDesc, TextureNodeId,
@@ -77,6 +82,11 @@ struct ReadyNode {
     pass_idx: usize,
 }
 
+struct HistoryCommitRequest {
+    token: HistoryCommitToken,
+    required_writes: SmallVec<[ErasedResourceNodeId; 4]>,
+}
+
 // Rust's BinaryHeap is a max-heap, so we define the ordering such that higher priority scores come first.
 impl Ord for ReadyNode {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -113,6 +123,11 @@ pub struct GraphStorage {
     /// Compiled execution queue (topologically sorted pass indices).
     pub execution_queue: Vec<usize>,
 
+    /// Per-frame logical import deduplication for persistent textures.
+    persistent_texture_lookup: FxHashMap<PersistentTextureId, TextureNodeId>,
+    /// Grouped history publications evaluated after DPE and applied post-submit.
+    history_commit_requests: Vec<HistoryCommitRequest>,
+
     // /// Name-based resource registry for self-wiring passes.
     // resource_registry: FxHashMap<&'static str, TextureNodeId>,
 
@@ -145,6 +160,8 @@ impl GraphStorage {
             passes: Vec::new(),
             resources: Vec::new(),
             execution_queue: Vec::new(),
+            persistent_texture_lookup: FxHashMap::default(),
+            history_commit_requests: Vec::new(),
             // resource_registry: FxHashMap::default(),
             compile_stack: Vec::new(),
             compile_in_degrees: Vec::new(),
@@ -163,6 +180,8 @@ impl GraphStorage {
         self.passes.clear();
         self.resources.clear();
         self.execution_queue.clear();
+        self.persistent_texture_lookup.clear();
+        self.history_commit_requests.clear();
         // self.resource_registry.clear();
         #[cfg(feature = "rdg_inspector")]
         self.current_group_stack.clear();
@@ -460,10 +479,22 @@ impl<'a> RenderGraph<'a> {
         is_external: bool,
         version: u32,
     ) -> ErasedResourceNodeId {
+        self.register_resource_with_root(name, kind, is_external, is_external, version)
+    }
+
+    fn register_resource_with_root(
+        &mut self,
+        name: &'static str,
+        kind: ResourceKind,
+        is_external: bool,
+        is_output_root: bool,
+        version: u32,
+    ) -> ErasedResourceNodeId {
         let id = ErasedResourceNodeId::new(self.storage.resources.len() as u32, version);
         self.storage.resources.push(ResourceRecord {
             name,
             is_external,
+            is_output_root,
             producer: None,
             consumers: smallvec::SmallVec::new(),
             first_use: usize::MAX,
@@ -541,6 +572,67 @@ impl<'a> RenderGraph<'a> {
         ))
     }
 
+    /// Import a logical persistent texture without requiring a physical view.
+    ///
+    /// Repeated imports of the same ID in one frame return the same graph root.
+    /// Persistent writes are not DPE roots by default; they become live only
+    /// through normal downstream demand or an explicit side effect.
+    pub fn import_persistent_texture(
+        &mut self,
+        name: &'static str,
+        texture: HistoryTextureRef,
+    ) -> TextureNodeId {
+        if let Some(&existing) = self.storage.persistent_texture_lookup.get(&texture.id) {
+            let resource = &self.storage.resources[existing.index() as usize];
+            assert_eq!(
+                resource.texture_desc(),
+                texture.desc,
+                "persistent texture {:?} imported with conflicting descriptors",
+                texture.id
+            );
+            return existing;
+        }
+
+        let id = ResourceNodeId::from_erased(self.register_resource_with_root(
+            name,
+            ResourceKind::persistent_texture(texture.desc, texture.id),
+            true,
+            false,
+            0,
+        ));
+        self.storage
+            .persistent_texture_lookup
+            .insert(texture.id, id);
+        id
+    }
+
+    /// Register an atomic history publication. The bank is committed only if
+    /// every required writer survives DPE and the command buffer is submitted.
+    pub fn register_history_commit(
+        &mut self,
+        token: HistoryCommitToken,
+        required_writes: &[TextureNodeId],
+    ) {
+        assert!(
+            !required_writes.is_empty(),
+            "history commit requires writers"
+        );
+        for &id in required_writes {
+            assert!(
+                self.storage.resources[id.index() as usize]
+                    .persistent_texture_id()
+                    .is_some(),
+                "history commit output must be a persistent texture"
+            );
+        }
+        self.storage
+            .history_commit_requests
+            .push(HistoryCommitRequest {
+                token,
+                required_writes: required_writes.iter().map(|id| id.erase()).collect(),
+            });
+    }
+
     /// Creates a versioned alias of `input_id` that shares the same physical
     /// GPU memory.
     pub fn create_alias<T: GraphResourceType>(
@@ -552,13 +644,19 @@ impl<'a> RenderGraph<'a> {
         let root_id = ErasedResourceNodeId::new(root_idx as u32, 0);
 
         let root_res = &self.storage.resources[root_idx];
+        assert!(
+            root_res.persistent_texture_id().is_none(),
+            "persistent history textures cannot be versioned or mutated in place"
+        );
         let kind = root_res.kind.without_external_binding();
         let is_external = root_res.is_external;
+        let is_output_root = root_res.is_output_root;
 
-        let new_id = self.register_resource(
+        let new_id = self.register_resource_with_root(
             name,
             kind,
             is_external,
+            is_output_root,
             input_id.version().saturating_add(1),
         );
         self.storage.resources[new_id.index() as usize].alias_of = Some(root_id);
@@ -653,6 +751,40 @@ impl<'a> RenderGraph<'a> {
         self.allocate_physical_resources(pool, device);
     }
 
+    /// Publish history banks after the frame's command buffer was submitted.
+    pub fn commit_submitted_histories(&self, registry: &mut HistoryRegistry) {
+        for request in &self.storage.history_commit_requests {
+            let live_writers = request
+                .required_writes
+                .iter()
+                .filter(|id| {
+                    self.storage.resources[id.index() as usize]
+                        .producer
+                        .is_some_and(|producer| self.storage.passes[producer].reference_count > 0)
+                })
+                .count();
+
+            if live_writers == request.required_writes.len() {
+                let written_textures: SmallVec<[PersistentTextureId; 4]> = request
+                    .required_writes
+                    .iter()
+                    .map(|id| {
+                        self.storage.resources[id.index() as usize]
+                            .persistent_texture_id()
+                            .expect("validated history writer lost persistent backing")
+                    })
+                    .collect();
+                let committed = registry.commit(request.token, &written_textures);
+                debug_assert!(committed, "stale history commit token");
+            } else {
+                debug_assert_eq!(
+                    live_writers, 0,
+                    "history set was only partially written by live passes"
+                );
+            }
+        }
+    }
+
     /// Compile-time **edge contraction** for pure-forwarding (blit / present)
     /// passes.
     ///
@@ -705,6 +837,21 @@ impl<'a> RenderGraph<'a> {
             let src_idx = pass.reads[0].index() as usize;
             let dst_id = pass.writes[0];
             let dst_idx = dst_id.index() as usize;
+            let src_root_idx = self.resolve_alias_root(src_idx);
+            let dst_root_idx = self.resolve_alias_root(dst_idx);
+
+            // Persistent resources have logical bank identity and submit-time
+            // publication semantics. Contracting either endpoint would reroute
+            // the physical write without updating the history commit record.
+            if self.storage.resources[src_root_idx]
+                .persistent_texture_id()
+                .is_some()
+                || self.storage.resources[dst_root_idx]
+                    .persistent_texture_id()
+                    .is_some()
+            {
+                continue;
+            }
 
             // ── Condition 1: identical physical layout ──
             let src_res = &self.storage.resources[src_idx];
@@ -739,9 +886,9 @@ impl<'a> RenderGraph<'a> {
             // ── Edge contraction ──
             // Resolve the destination's physical root (the surface) that the
             // producer must ultimately render into.
-            let dst_root_idx = self.resolve_alias_root(dst_idx);
             let dst_root_id = ErasedResourceNodeId::new(dst_root_idx as u32, 0);
             let dst_root_external = self.storage.resources[dst_root_idx].is_external;
+            let dst_root_output = self.storage.resources[dst_root_idx].is_output_root;
 
             // (1) Redirect the producer's declared outputs from `src` onto `dst`
             //     so the dead-pass cull anchors the producer as the final writer.
@@ -764,6 +911,7 @@ impl<'a> RenderGraph<'a> {
             let src_res = &mut self.storage.resources[src_idx];
             src_res.alias_of = Some(dst_root_id);
             src_res.is_external = dst_root_external;
+            src_res.is_output_root = dst_root_output;
 
             // (3) Transfer destination ownership to the producer.
             self.storage.resources[dst_idx].producer = Some(producer_idx);
@@ -807,7 +955,7 @@ impl<'a> RenderGraph<'a> {
         self.storage.compile_max_ext_indices.resize(res_count, 0);
 
         for i in 0..res_count {
-            if self.storage.resources[i].is_external {
+            if self.storage.resources[i].is_external && self.storage.resources[i].is_output_root {
                 let root_idx = self.resolve_alias_root(i);
                 self.storage.compile_max_ext_indices[root_idx] = i;
             }
@@ -824,7 +972,7 @@ impl<'a> RenderGraph<'a> {
                 let write_idx = write_id.index() as usize;
                 let res = &self.storage.resources[write_idx];
 
-                if res.is_external {
+                if res.is_external && res.is_output_root {
                     let root_idx = res.alias_of.map_or(write_idx, |id| id.index() as usize);
 
                     if write_idx == self.storage.compile_max_ext_indices[root_idx] {
@@ -1651,6 +1799,120 @@ mod tests {
             .map(|&i| graph.storage.passes[i].name)
             .collect();
         assert_eq!(names, vec!["Opaque", "Skybox", "ToneMap"]);
+    }
+
+    #[test]
+    fn persistent_imports_deduplicate_without_becoming_dpe_roots() {
+        let mut histories = HistoryRegistry::new();
+        let set = histories.create_set();
+        let plan = histories.plan_set(set, [dummy_desc()], 1, false);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let first = graph.import_persistent_texture("History", plan.next[0]);
+        let repeated = graph.import_persistent_texture("HistoryAgain", plan.next[0]);
+        assert_eq!(first, repeated);
+
+        graph.add_pass("HistoryOnly", |builder| {
+            builder.write_texture(first);
+            (MockExec, ())
+        });
+        graph.register_history_commit(plan.commit, &[first]);
+        graph.compile_topology();
+
+        assert!(graph.storage.execution_queue.is_empty());
+        graph.commit_submitted_histories(&mut histories);
+        assert!(!histories.plan_set(set, [dummy_desc()], 2, false).valid);
+    }
+
+    #[test]
+    fn demanded_persistent_writer_commits_as_one_history_bank() {
+        let mut histories = HistoryRegistry::new();
+        let set = histories.create_set();
+        let plan = histories.plan_set(set, [dummy_desc(), dummy_desc()], 1, false);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let history_a = graph.import_persistent_texture("HistoryA", plan.next[0]);
+        let history_b = graph.import_persistent_texture("HistoryB", plan.next[1]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+
+        graph.add_pass("Temporal", |builder| {
+            builder.write_texture(history_a);
+            builder.write_texture(history_b);
+            (MockExec, ())
+        });
+        graph.add_pass("Consume", |builder| {
+            builder.read_texture(history_a);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        graph.register_history_commit(plan.commit, &[history_a, history_b]);
+        graph.compile_topology();
+
+        assert_eq!(graph.storage.execution_queue.len(), 2);
+        graph.commit_submitted_histories(&mut histories);
+        let next = histories.plan_set(set, [dummy_desc(), dummy_desc()], 2, false);
+        assert!(next.valid);
+        assert_eq!(next.previous, plan.next);
+    }
+
+    #[test]
+    fn pure_forwarding_does_not_contract_a_persistent_history_source() {
+        let mut histories = HistoryRegistry::new();
+        let set = histories.create_set();
+        let plan = histories.plan_set(set, [dummy_desc()], 1, false);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let history = graph.import_persistent_texture("History", plan.next[0]);
+        let surface = graph.register_texture("Surface", dummy_desc(), true);
+
+        graph.add_pass("Temporal", |builder| {
+            builder.write_texture(history);
+            (MockExec, ())
+        });
+        graph.add_pass("Present", |builder| {
+            builder.read_texture(history);
+            let output = builder.replace_texture(surface, "Surface_Present");
+            builder.mark_pure_forwarding();
+            (MockExec, output)
+        });
+        graph.register_history_commit(plan.commit, &[history]);
+        graph.compile_topology();
+
+        let names: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(names, ["Temporal", "Present"]);
+        assert!(
+            graph.storage.resources[history.index() as usize]
+                .alias_of
+                .is_none()
+        );
+
+        graph.commit_submitted_histories(&mut histories);
+        assert!(histories.plan_set(set, [dummy_desc()], 2, false).valid);
+    }
+
+    #[test]
+    #[should_panic(expected = "persistent history textures cannot be versioned")]
+    fn persistent_history_cannot_be_mutated_in_place() {
+        let mut histories = HistoryRegistry::new();
+        let set = histories.create_set();
+        let plan = histories.plan_set(set, [dummy_desc()], 1, false);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let history = graph.import_persistent_texture("History", plan.next[0]);
+        graph.create_alias(history, "Mutated_History");
     }
 
     #[cfg(feature = "rdg_inspector")]

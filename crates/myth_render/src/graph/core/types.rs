@@ -4,6 +4,8 @@ use smallvec::SmallVec;
 
 use crate::core::gpu::Tracked;
 
+use super::persistent::PersistentTextureId;
+
 pub trait GraphResourceType: 'static + Send + Sync + Copy + Clone {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -267,10 +269,17 @@ pub enum ResourceClass {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum TextureBacking {
+    Transient,
+    External(*const Tracked<wgpu::TextureView>),
+    Persistent(PersistentTextureId),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum ResourceKind {
     Texture {
         desc: TextureDesc,
-        external_view_ptr: Option<*const Tracked<wgpu::TextureView>>,
+        backing: TextureBacking,
     },
     Buffer {
         desc: BufferDesc,
@@ -284,7 +293,7 @@ impl ResourceKind {
     pub const fn texture(desc: TextureDesc) -> Self {
         Self::Texture {
             desc,
-            external_view_ptr: None,
+            backing: TextureBacking::Transient,
         }
     }
 
@@ -296,7 +305,16 @@ impl ResourceKind {
     ) -> Self {
         Self::Texture {
             desc,
-            external_view_ptr: Some(external_view_ptr),
+            backing: TextureBacking::External(external_view_ptr),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn persistent_texture(desc: TextureDesc, id: PersistentTextureId) -> Self {
+        Self::Texture {
+            desc,
+            backing: TextureBacking::Persistent(id),
         }
     }
 
@@ -362,9 +380,23 @@ impl ResourceKind {
     pub const fn external_texture_ptr(&self) -> Option<*const Tracked<wgpu::TextureView>> {
         match self {
             Self::Texture {
-                external_view_ptr, ..
-            } => *external_view_ptr,
+                backing: TextureBacking::External(ptr),
+                ..
+            } => Some(*ptr),
+            Self::Texture { .. } => None,
             Self::Buffer { .. } => None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn persistent_texture_id(&self) -> Option<PersistentTextureId> {
+        match self {
+            Self::Texture {
+                backing: TextureBacking::Persistent(id),
+                ..
+            } => Some(*id),
+            Self::Texture { .. } | Self::Buffer { .. } => None,
         }
     }
 
@@ -384,6 +416,10 @@ impl ResourceKind {
 pub struct ResourceRecord {
     pub name: &'static str,
     pub is_external: bool,
+
+    /// Whether writing this external resource seeds DPE liveness.
+    /// Persistent history backing is external but intentionally not a root.
+    pub is_output_root: bool,
 
     // 在严格 SSA 下，一个资源最多只能有一个生产者
     pub producer: Option<usize>,
@@ -436,6 +472,12 @@ impl ResourceRecord {
     #[must_use]
     pub const fn external_texture_ptr(&self) -> Option<*const Tracked<wgpu::TextureView>> {
         self.kind.external_texture_ptr()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn persistent_texture_id(&self) -> Option<PersistentTextureId> {
+        self.kind.persistent_texture_id()
     }
 
     #[inline]

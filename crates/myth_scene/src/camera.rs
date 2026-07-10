@@ -178,6 +178,8 @@ pub fn halton(index: u32, base: u32) -> f32 {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RenderCamera {
+    /// Stable camera identity used to partition temporal history.
+    pub camera_id: u128,
     pub view_matrix: Mat4,
     /// Projection matrix — may contain TAA sub-pixel jitter.
     pub projection_matrix: Mat4,
@@ -567,6 +569,7 @@ impl Camera {
         self.pending_camera_cut = false;
 
         RenderCamera {
+            camera_id: self.uuid.as_u128(),
             view_matrix: self.view_matrix,
             projection_matrix: self.projection_matrix,
             view_projection_matrix: self.view_projection_matrix,

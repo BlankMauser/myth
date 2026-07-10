@@ -1,70 +1,59 @@
-//! TAA Resolve Feature + Ephemeral PassNode
+//! TAA Feature + logical cross-frame history.
 //!
-//! Industrial-grade Temporal Anti-Aliasing implementing:
-//! - Velocity Dilation (3×3 closest-depth)
-//! - Catmull-Rom 5-Tap history sampling
-//! - Reversible Tonemapping (Reinhard)
-//! - Variance Clipping in YCoCg space
-//! - Depth Rejection (disocclusion detection)
-//!
-//! # Architecture
-//!
-//! **Persistent History Buffers** — `TaaFeature` owns independent history
-//! colour and depth textures that survive across frames.  After TAA resolve,
-//! the clean results are copied into these buffers via `CopyTextureNode`,
-//! preventing transparent-pass pollution of the history.
-//!
-//! # Binding Layout (Group 0)
-//!
-//! | Binding | Type                      | Content                      |
-//! |---------|---------------------------|------------------------------|
-//! | 0       | `texture_2d<f32>`         | Current frame colour (HDR)   |
-//! | 1       | `texture_2d<f32>`         | History colour (HDR)         |
-//! | 2       | `texture_2d<f32>`         | Velocity buffer (Rg16Float)  |
-//! | 3       | `texture_2d<f32>`         | Current scene depth          |
-//! | 4       | `texture_2d<f32>`         | History depth                |
-//! | 5       | `sampler`                 | Linear clamp sampler         |
-//! | 6       | `sampler`                 | Nearest clamp sampler        |
-//! | 7       | `uniform`                 | TaaParams                    |
+//! Graph construction captures a small [`TaaSnapshot`] and declares two-bank
+//! color/depth history through [`HistoryRegistry`]. Physical history textures,
+//! the pipeline, the parameter upload, and the bind group are all materialized
+//! only after the resolve node survives DPE. The next bank is published only
+//! after successful queue submission.
+
+use rustc_hash::FxHashMap;
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::gpu::binding_layout::{depth_texture_2d, sampler, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassNode, PrepareContext,
-    RenderTargetOps, TextureDesc, TextureNodeId,
+    BufferDesc, BufferNodeId, ExecuteContext, HistoryPlan, HistoryRegistry, HistorySetId,
+    HistoryTextureRef, PassNode, PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
 };
-use crate::graph::passes::utils::CopyTextureNode;
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
 };
+use myth_scene::camera::RenderCamera;
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Feature (long-lived, stored in RendererState)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TaaHistoryKey {
+    scene_id: u32,
+    camera_id: u128,
+}
 
-/// Persistent TAA feature owning history colour/depth buffers, the resolve
-/// pipeline, bind-group layout, and a small uniform buffer.
-pub struct TaaFeature {
-    // ─── History Buffers (persistent, single-copy archiving) ───────
-    history_view: Option<Tracked<wgpu::TextureView>>,
-    history_depth_view: Option<Tracked<wgpu::TextureView>>,
+#[derive(Clone, Copy)]
+pub struct TaaSnapshot {
+    params: [f32; 4],
+    history: HistoryPlan<2>,
+    extent: wgpu::Extent3d,
+}
 
-    /// Cached dimensions for resize detection.
-    history_size: (u32, u32),
-    /// Depth format matching `Scene_Depth`.
-    depth_format: wgpu::TextureFormat,
+impl TaaSnapshot {
+    /// Previous-frame color history for temporal consumers that execute before
+    /// TAA in the current frame (currently SSGI).
+    #[must_use]
+    pub fn previous_color(self) -> Option<HistoryTextureRef> {
+        self.history.valid.then_some(self.history.previous[0])
+    }
+}
 
-    // ─── Pipeline ──────────────────────────────────────────────────
+#[derive(Default)]
+struct TaaPipelineResources {
     pipeline_id: Option<RenderPipelineId>,
-    bind_group_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+}
 
-    // ─── Uniform Buffer ────────────────────────────────────────────
-    params_buffer: Option<Tracked<wgpu::Buffer>>,
-
-    last_feedback_weight: f32,
-    last_camera_near: f32,
-    last_camera_cut: f32,
+/// Long-lived TAA feature. Static pipeline state remains Feature-owned while
+/// dynamic cross-frame textures live in the renderer's HistoryRegistry.
+pub struct TaaFeature {
+    pipeline: TaaPipelineResources,
+    histories: FxHashMap<TaaHistoryKey, HistorySetId>,
 }
 
 impl Default for TaaFeature {
@@ -77,437 +66,277 @@ impl TaaFeature {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            history_view: None,
-            history_depth_view: None,
-            history_size: (0, 0),
-            depth_format: wgpu::TextureFormat::Depth32Float,
-            pipeline_id: None,
-            bind_group_layout: None,
-            params_buffer: None,
-            last_feedback_weight: -1.0, // invalid default to ensure first update
-            last_camera_near: -1.0,     // invalid default to ensure first update
-            last_camera_cut: -1.0,
+            pipeline: TaaPipelineResources::default(),
+            histories: FxHashMap::default(),
         }
     }
 
-    // ─── History Buffer Management ─────────────────────────────────────
-
-    /// Ensures history colour and depth buffers exist and match the given
-    /// dimensions.  Must be called before `add_to_graph` each frame.
-    pub fn ensure_history_buffers(
+    /// Capture POD parameters and plan logical history banks. No WGPU object is
+    /// created and no GPU upload occurs here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract(
         &mut self,
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-        depth_format: wgpu::TextureFormat,
-    ) {
-        self.depth_format = depth_format;
-
-        if self.history_size == (width, height)
-            && self.history_view.is_some()
-            && self.history_depth_view.is_some()
-        {
-            return;
-        }
-
-        // History colour (HDR)
-        let color_desc = wgpu::TextureDescriptor {
-            label: Some("TAA History Color"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: HDR_TEXTURE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        };
-        let color_tex = device.create_texture(&color_desc);
-        self.history_view = Some(Tracked::new(
-            color_tex.create_view(&wgpu::TextureViewDescriptor::default()),
-        ));
-
-        // History depth (same format as scene depth)
-        let depth_desc = wgpu::TextureDescriptor {
-            label: Some("TAA History Depth"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: depth_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        };
-        let depth_tex = device.create_texture(&depth_desc);
-        self.history_depth_view = Some(Tracked::new(
-            depth_tex.create_view(&wgpu::TextureViewDescriptor::default()),
-        ));
-
-        self.history_size = (width, height);
-    }
-
-    // ─── Extract & Prepare (pre-RDG) ───────────────────────────────────
-
-    /// Compile the TAA resolve pipeline (lazy, cached).
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
+        histories: &mut HistoryRegistry,
+        scene_id: u32,
+        camera: &RenderCamera,
         feedback_weight: f32,
-        camera_cut: bool,
+        temporal_serial: u64,
         size: (u32, u32),
-        output_format: wgpu::TextureFormat,
-    ) {
-        let depth_format = ctx.wgpu_ctx.depth_format;
+        depth_format: wgpu::TextureFormat,
+    ) -> TaaSnapshot {
+        let key = TaaHistoryKey {
+            scene_id,
+            camera_id: camera.camera_id,
+        };
+        let set_id = if let Some(&id) = self.histories.get(&key) {
+            id
+        } else {
+            let id = histories.create_set();
+            self.histories.insert(key, id);
+            id
+        };
 
-        // ── 1. Bind group layout (once) ────────────────────────────────
-        if self.bind_group_layout.is_none() {
-            let layout = ctx
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("TAA BindGroup Layout"),
-                    entries: &[
-                        // binding 0: current colour
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 1: history colour
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 2: velocity
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 3: current scene depth (unfilterable)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Depth,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 4: history depth (unfilterable)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Depth,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 5: linear sampler
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 5,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                        // binding 6: nearest sampler
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 6,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                            count: None,
-                        },
-                        // binding 7: TaaParams uniform
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 7,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: wgpu::BufferSize::new(16),
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-            self.bind_group_layout = Some(Tracked::new(layout));
-        }
-
-        // ── 2. Uniform buffer (create once, update on change) ──────────
-        if self.params_buffer.is_none() {
-            let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("TAA Params"),
-                size: 16, // vec4 padding
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.params_buffer = Some(Tracked::new(buffer));
-        }
-
-        let camera_cut_value = if camera_cut { 1.0 } else { 0.0 };
-        if (self.last_feedback_weight - feedback_weight).abs() > f32::EPSILON
-            || (ctx.render_camera.near - self.last_camera_near).abs() > f32::EPSILON
-            || (self.last_camera_cut - camera_cut_value).abs() > f32::EPSILON
-        {
-            let data: [f32; 4] = [
-                feedback_weight,
-                ctx.render_camera.near,
-                camera_cut_value,
-                0.0,
-            ];
-            ctx.queue.write_buffer(
-                self.params_buffer.as_ref().unwrap(),
-                0,
-                bytemuck::cast_slice(&data),
-            );
-            self.last_feedback_weight = feedback_weight;
-            self.last_camera_near = ctx.render_camera.near;
-            self.last_camera_cut = camera_cut_value;
-        }
-
-        self.ensure_history_buffers(ctx.device, size.0, size.1, depth_format);
-
-        // ── 3. Pipeline (compile on format change) ─────────────────────
-        if self.pipeline_id.is_none() {
-            let options = ShaderCompilationOptions::default();
-
-            let (shader_module, shader_hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/post_process/taa_resolve"),
-                &options,
-            );
-
-            let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: output_format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-
-            let key = FullscreenPipelineKey::fullscreen(
-                shader_hash,
-                smallvec::smallvec![color_target],
-                None,
-            );
-
-            let pipeline_layout =
-                ctx.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("TAA Pipeline Layout"),
-                        bind_group_layouts: &[self.bind_group_layout.as_deref()],
-                        immediate_size: 0,
-                    });
-
-            let id = ctx.pipeline_cache.get_or_create_fullscreen(
-                ctx.device,
-                shader_module,
-                &pipeline_layout,
-                &key,
-                "TAA Resolve Pipeline",
-            );
-            self.pipeline_id = Some(id);
-        }
-    }
-
-    // ─── Graph Integration ─────────────────────────────────────────────
-
-    /// Insert the TAA resolve pass and history-save copy nodes into the RDG.
-    ///
-    /// Returns the `TextureNodeId` of the resolved HDR colour that
-    /// downstream passes (bloom, tone-mapping) should consume.
-    pub fn add_to_graph<'a>(
-        &'a self,
-        ctx: &mut GraphBuilderContext<'a, '_>,
-        active_color: TextureNodeId,
-        velocity_buffer: TextureNodeId,
-        scene_depth: TextureNodeId,
-    ) -> TextureNodeId {
-        let pipeline_id = self.pipeline_id.expect("TaaFeature not prepared");
-        let layout = self.bind_group_layout.as_ref().unwrap();
-        let params_buffer = self.params_buffer.as_ref().unwrap();
-
-        let history_view = self
-            .history_view
-            .as_ref()
-            .expect("TAA history colour view not initialized");
-        let history_depth_view = self
-            .history_depth_view
-            .as_ref()
-            .expect("TAA history depth view not initialized");
-
-        let depth_desc = TextureDesc::new(
-            history_depth_view.texture().width(),
-            history_depth_view.texture().height(),
-            1,
-            1,
-            1,
-            wgpu::TextureDimension::D2,
-            self.depth_format,
+        let extent = wgpu::Extent3d {
+            width: size.0.max(1),
+            height: size.1.max(1),
+            depth_or_array_layers: 1,
+        };
+        let color_desc = TextureDesc::new_2d(
+            extent.width,
+            extent.height,
+            HDR_TEXTURE_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        );
+        let depth_desc = TextureDesc::new_2d(
+            extent.width,
+            extent.height,
+            depth_format,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         );
+        let camera_cut = camera.camera_cut != 0;
+        let history = histories.plan_set(
+            set_id,
+            [color_desc, depth_desc],
+            temporal_serial,
+            camera_cut,
+        );
+        let reject_history = camera_cut || !history.valid;
 
-        let resolved_color: TextureNodeId = ctx.graph.add_pass("TAA_Resolve", |builder| {
-            let history_color_desc = TextureDesc::new_2d(
-                history_view.texture().width(),
-                history_view.texture().height(),
-                HDR_TEXTURE_FORMAT,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            );
-            builder.read_external_texture(
-                "TAA_History_Color_Read",
-                history_color_desc,
-                history_view,
-            );
-            builder.read_external_texture("TAA_History_Depth_Read", depth_desc, history_depth_view);
+        TaaSnapshot {
+            params: [feedback_weight, camera.near, f32::from(reject_history), 0.0],
+            history,
+            extent,
+        }
+    }
 
+    /// Resolve into the next persistent color bank, then copy its clean result
+    /// to an isolated transient output before any downstream work. The same
+    /// node archives scene depth, so later in-place transparent/composite
+    /// passes cannot pollute history and color/depth publish atomically.
+    pub fn add_to_graph<'a>(
+        &'a mut self,
+        ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: TaaSnapshot,
+        active_color: TextureNodeId,
+        velocity: TextureNodeId,
+        scene_depth: TextureNodeId,
+    ) -> TextureNodeId {
+        let history_color = ctx
+            .graph
+            .import_persistent_texture("TAA_History_Color_Previous", snapshot.history.previous[0]);
+        let history_depth = ctx
+            .graph
+            .import_persistent_texture("TAA_History_Depth_Previous", snapshot.history.previous[1]);
+        let next_color = ctx
+            .graph
+            .import_persistent_texture("TAA_History_Color_Next", snapshot.history.next[0]);
+        let next_depth = ctx
+            .graph
+            .import_persistent_texture("TAA_History_Depth_Next", snapshot.history.next[1]);
+
+        let pipeline = &mut self.pipeline;
+        let resolved_color = ctx.graph.add_pass("TAA_Resolve", |builder| {
             builder.read_texture(active_color);
-            builder.read_texture(velocity_buffer);
+            builder.read_texture(history_color);
+            builder.read_texture(velocity);
             builder.read_texture(scene_depth);
-            let params_buffer = builder.read_external_buffer(
+            builder.read_texture(history_depth);
+            builder.write_texture(next_color);
+            builder.write_texture(next_depth);
+            let resolved_color = builder.create_texture(
+                "TAA_Resolved",
+                TextureDesc::new_2d(
+                    snapshot.extent.width,
+                    snapshot.extent.height,
+                    HDR_TEXTURE_FORMAT,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
+                ),
+            );
+            let params_buffer = builder.create_buffer(
                 "TAA_Params",
                 BufferDesc::new(
                     16,
                     wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 ),
-                params_buffer,
             );
-
-            let color_desc = TextureDesc::new_2d(
-                history_view.texture().width(),
-                history_view.texture().height(),
-                HDR_TEXTURE_FORMAT,
-                wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-            );
-
-            let resolved_color = builder.create_texture("TAA_Resolved", color_desc);
 
             let node = TaaPassNode {
+                resources: pipeline,
+                params: snapshot.params,
                 current_color: active_color,
-                velocity: velocity_buffer,
+                history_color,
+                velocity,
                 scene_depth,
-                output: resolved_color,
-                history_view,
-                history_depth_view,
-                pipeline_id,
-                layout,
+                history_depth,
+                resolved_color,
+                output_color_history: next_color,
+                output_depth: next_depth,
                 params_buffer,
-                transient_bg: None,
+                extent: snapshot.extent,
+                pipeline_id: None,
+                bind_group: None,
             };
             (node, resolved_color)
         });
-
-        // Archive resolved colour → persistent history colour buffer.
-        ctx.graph.add_pass("TAA_Save_History_Color", |builder| {
-            builder.read_texture(resolved_color);
-            let history_color_desc = TextureDesc::new_2d(
-                history_view.texture().width(),
-                history_view.texture().height(),
-                HDR_TEXTURE_FORMAT,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            );
-            let history_out = builder.write_external_texture(
-                "TAA_History_Color_Write",
-                history_color_desc,
-                history_view,
-            );
-            (
-                CopyTextureNode {
-                    src: resolved_color,
-                    dst: history_out,
-                },
-                (),
-            )
-        });
-
-        // Archive scene depth → persistent history depth buffer.
-        ctx.graph.add_pass("TAA_Save_History_Depth", |builder| {
-            builder.read_texture(scene_depth);
-            let depth_out = builder.write_external_texture(
-                "TAA_History_Depth_Write",
-                depth_desc,
-                history_depth_view,
-            );
-            (
-                CopyTextureNode {
-                    src: scene_depth,
-                    dst: depth_out,
-                },
-                (),
-            )
-        });
-
+        ctx.graph
+            .register_history_commit(snapshot.history.commit, &[next_color, next_depth]);
         resolved_color
-    }
-
-    /// Returns `true` if the TAA history buffers have been allocated.
-    #[must_use]
-    pub fn has_history(&self) -> bool {
-        self.history_view.is_some()
-    }
-
-    #[must_use]
-    pub fn history_color_view(&self) -> Option<Tracked<wgpu::TextureView>> {
-        self.history_view.clone()
-    }
-
-    #[must_use]
-    pub fn history_depth_view(&self) -> Option<Tracked<wgpu::TextureView>> {
-        self.history_depth_view.clone()
     }
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// PassNode (ephemeral, created per frame)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+impl TaaPipelineResources {
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>) {
+        if self.pipeline_id.is_some() && self.layout.is_some() {
+            return;
+        }
+
+        let (shader, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            ShaderSource::File("entry/post_process/taa_resolve"),
+            &ShaderCompilationOptions::default(),
+        );
+        let target = ColorTargetKey::from(wgpu::ColorTargetState {
+            format: HDR_TEXTURE_FORMAT,
+            blend: Some(wgpu::BlendState::REPLACE),
+            write_mask: wgpu::ColorWrites::ALL,
+        });
+        let key = FullscreenPipelineKey::fullscreen(shader_hash, smallvec::smallvec![target], None);
+
+        if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+            self.pipeline_id = Some(id);
+            self.layout = Some(ctx.pipeline_cache.get_tracked_layout(id, 0).clone());
+            return;
+        }
+
+        let layout = create_layout(ctx.device);
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("TAA Pipeline Layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let id = ctx.pipeline_cache.get_or_create_fullscreen(
+            ctx.device,
+            shader,
+            &pipeline_layout,
+            &key,
+            "TAA Resolve Pipeline",
+        );
+        ctx.pipeline_cache
+            .register_render_layouts(id, smallvec::smallvec![layout.clone()]);
+        self.pipeline_id = Some(id);
+        self.layout = Some(layout);
+    }
+
+    fn pipeline_id(&self) -> RenderPipelineId {
+        self.pipeline_id
+            .expect("TAA pipeline must be prepared by the live resolve node")
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("TAA layout must be prepared by the live resolve node")
+    }
+}
+
+fn create_layout(device: &wgpu::Device) -> Tracked<wgpu::BindGroupLayout> {
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("TAA BindGroup Layout"),
+            entries: &[
+                texture_2d(
+                    0,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    1,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                ),
+                texture_2d(
+                    2,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                ),
+                depth_texture_2d(3, wgpu::ShaderStages::FRAGMENT),
+                depth_texture_2d(4, wgpu::ShaderStages::FRAGMENT),
+                sampler(
+                    5,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::SamplerBindingType::Filtering,
+                ),
+                sampler(
+                    6,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::SamplerBindingType::NonFiltering,
+                ),
+                uniform_buffer(7, wgpu::ShaderStages::FRAGMENT),
+            ],
+        }),
+    )
+}
 
 struct TaaPassNode<'a> {
+    resources: &'a mut TaaPipelineResources,
+    params: [f32; 4],
     current_color: TextureNodeId,
+    history_color: TextureNodeId,
     velocity: TextureNodeId,
     scene_depth: TextureNodeId,
-    output: TextureNodeId,
-    history_view: &'a Tracked<wgpu::TextureView>,
-    history_depth_view: &'a Tracked<wgpu::TextureView>,
-    pipeline_id: RenderPipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
+    history_depth: TextureNodeId,
+    resolved_color: TextureNodeId,
+    output_color_history: TextureNodeId,
+    output_depth: TextureNodeId,
     params_buffer: BufferNodeId,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    extent: wgpu::Extent3d,
+    pipeline_id: Option<RenderPipelineId>,
+    bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for TaaPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.transient_bg = Some(
-            crate::myth_bind_group!(ctx, self.layout, Some("TAA BindGroup"), [
+        self.resources.ensure_resources(ctx);
+        self.pipeline_id = Some(self.resources.pipeline_id());
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.params_buffer),
+            0,
+            bytemuck::cast_slice(&self.params),
+        );
+        self.bind_group = Some(
+            crate::myth_bind_group!(ctx, self.resources.layout(), Some("TAA BindGroup"), [
                 0 => self.current_color,
-                1 => self.history_view,
+                1 => self.history_color,
                 2 => self.velocity,
                 3 => self.scene_depth,
-                4 => self.history_depth_view,
+                4 => self.history_depth,
                 5 => CommonSampler::LinearClamp,
                 6 => CommonSampler::NearestClamp,
                 7 => self.params_buffer,
@@ -516,23 +345,209 @@ impl<'a> PassNode<'a> for TaaPassNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let bind_group = self.transient_bg.expect("TAA BG not prepared!");
-
-        let rtt = ctx.get_color_attachment(self.output, RenderTargetOps::DontCare, None);
-
+        let target =
+            ctx.get_color_attachment(self.output_color_history, RenderTargetOps::DontCare, None);
         {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("TAA Resolve Pass"),
-                color_attachments: &[rtt],
+                color_attachments: &[target],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
+                ..Default::default()
             });
-
-            rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
-            rpass.set_bind_group(0, bind_group, &[]);
-            rpass.draw(0..3, 0..1);
+            pass.set_pipeline(
+                ctx.pipeline_cache
+                    .get_render_pipeline(self.pipeline_id.expect("TAA pipeline not prepared")),
+            );
+            pass.set_bind_group(
+                0,
+                self.bind_group.expect("TAA bind group not prepared"),
+                &[],
+            );
+            pass.draw(0..3, 0..1);
         }
+
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: ctx.get_texture(self.output_color_history),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: ctx.get_texture(self.resolved_color),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            self.extent,
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: ctx.get_texture(self.scene_depth),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: ctx.get_texture(self.output_depth),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            self.extent,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myth_scene::camera::Camera;
+
+    fn render_camera(camera_id: u128) -> RenderCamera {
+        let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
+        let mut render_camera = camera.extract_render_camera();
+        render_camera.camera_id = camera_id;
+        render_camera.camera_cut = 0;
+        render_camera
+    }
+
+    #[test]
+    fn submitted_history_becomes_available_on_the_next_frame() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = TaaFeature::new();
+        let camera = render_camera(7);
+
+        let first = feature.extract(
+            &mut registry,
+            1,
+            &camera,
+            0.9,
+            1,
+            (128, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert!(first.previous_color().is_none());
+        assert_eq!(first.params[2], 1.0);
+
+        assert!(registry.commit(
+            first.history.commit,
+            &first.history.next.map(|texture| texture.id),
+        ));
+        let second = feature.extract(
+            &mut registry,
+            1,
+            &camera,
+            0.9,
+            2,
+            (128, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert_eq!(second.previous_color(), Some(first.history.next[0]));
+        assert_eq!(second.params[2], 0.0);
+    }
+
+    #[test]
+    fn histories_are_partitioned_by_scene_and_camera() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = TaaFeature::new();
+        let camera_a = render_camera(11);
+        let camera_b = render_camera(12);
+
+        let scene_a_camera_a = feature.extract(
+            &mut registry,
+            1,
+            &camera_a,
+            0.9,
+            1,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        let scene_a_camera_b = feature.extract(
+            &mut registry,
+            1,
+            &camera_b,
+            0.9,
+            1,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        let scene_b_camera_a = feature.extract(
+            &mut registry,
+            2,
+            &camera_a,
+            0.9,
+            1,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+
+        assert_ne!(
+            scene_a_camera_a.history.next[0].id,
+            scene_a_camera_b.history.next[0].id
+        );
+        assert_ne!(
+            scene_a_camera_a.history.next[0].id,
+            scene_b_camera_a.history.next[0].id
+        );
+    }
+
+    #[test]
+    fn alternating_camera_domains_keep_independent_continuity() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = TaaFeature::new();
+        let camera_a = render_camera(21);
+        let camera_b = render_camera(22);
+
+        let a1 = feature.extract(
+            &mut registry,
+            1,
+            &camera_a,
+            0.9,
+            1,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert!(registry.commit(
+            a1.history.commit,
+            &a1.history.next.map(|texture| texture.id),
+        ));
+        let b1 = feature.extract(
+            &mut registry,
+            1,
+            &camera_b,
+            0.9,
+            1,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        assert!(registry.commit(
+            b1.history.commit,
+            &b1.history.next.map(|texture| texture.id),
+        ));
+
+        let a2 = feature.extract(
+            &mut registry,
+            1,
+            &camera_a,
+            0.9,
+            2,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+        let b2 = feature.extract(
+            &mut registry,
+            1,
+            &camera_b,
+            0.9,
+            2,
+            (64, 64),
+            wgpu::TextureFormat::Depth32Float,
+        );
+
+        assert!(a2.history.valid);
+        assert!(b2.history.valid);
+        assert_eq!(a2.previous_color(), Some(a1.history.next[0]));
+        assert_eq!(b2.previous_color(), Some(b1.history.next[0]));
     }
 }

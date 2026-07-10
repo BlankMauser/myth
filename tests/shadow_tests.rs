@@ -127,6 +127,7 @@ fn make_render_camera(
     let proj = Mat4::perspective_infinite_reverse_rh(fov_deg.to_radians(), aspect, near);
     let view = Mat4::look_at_rh(pos, pos + look_dir, Vec3::Y);
     RenderCamera {
+        camera_id: 0,
         view_matrix: view,
         projection_matrix: proj,
         view_projection_matrix: proj * view,
