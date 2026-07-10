@@ -643,8 +643,6 @@ impl Renderer {
                     scene.ssr.set_history_flags(0);
                 }
 
-                state.ssss_pass.extract_and_prepare(&mut extract_ctx);
-
                 if bloom_enabled {
                     state.bloom_pass.extract_and_prepare(
                         &mut extract_ctx,

@@ -142,6 +142,22 @@ impl PipelineCache {
         &self.compute_pipelines[id.index()]
     }
 
+    /// Look up a fullscreen pipeline by its canonical descriptor without
+    /// creating any WGPU objects.
+    ///
+    /// Deferred RDG nodes use this before creating bind-group and pipeline
+    /// layouts so a cache hit remains a pure ID lookup during prepare.
+    #[inline]
+    #[must_use]
+    pub fn get_fullscreen_pipeline_id(
+        &self,
+        canonical_key: &FullscreenPipelineKey,
+    ) -> Option<RenderPipelineId> {
+        self.fullscreen_lookup
+            .get(&fx_hash_key(canonical_key))
+            .copied()
+    }
+
     // ── Layout Registration & Retrieval ──────────────────────────────────────
 
     /// Associate tracked bind-group layouts with an existing render pipeline.

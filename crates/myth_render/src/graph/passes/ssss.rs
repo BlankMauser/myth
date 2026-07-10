@@ -1,10 +1,10 @@
 //! SSSS Feature + Ephemeral PassNodes (Flattened)
 //!
-//! - **`SsssFeature`** (long-lived): owns pipeline cache, bind group layout,
-//!   profiles storage buffer.  `extract_and_prepare()` compiles pipelines and
-//!   uploads SSS profile data.
+//! - **`SsssFeature`** (long-lived): owns the lazily-created shared layout and
+//!   profiles storage buffer.
 //! - **`SsssHorizontalNode`** / **`SsssVerticalNode`** (ephemeral per-frame):
 //!   two independent RDG passes created by `SsssFeature::add_to_graph()`.
+//!   Each live node resolves only its own pipeline during deferred prepare.
 //!
 //! Implements a separable Gaussian blur for SSS materials identified via
 //! a **data-driven soft mask**: the `Feature_ID` colour attachment written
@@ -41,32 +41,33 @@ use crate::HDR_TEXTURE_FORMAT;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc,
+    ExecuteContext, FrameArena, PassNode, PrepareContext, RenderTargetOps, TextureDesc,
     TextureNodeId,
 };
 use crate::pipeline::{
     ColorTargetKey, FullscreenPipelineKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
 };
-use myth_resources::ssss::SssProfileData;
+use myth_resources::ssss::{SssProfileData, SssRegistry};
 use std::mem::size_of;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Feature (long-lived, stored in RenderFeatures)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// Long-lived SSSS feature — owns persistent GPU resources (pipelines,
-/// bind group layout, profiles buffer).
-///
-/// Produces an ephemeral [`SsssPassNode`] each frame via [`Self::add_to_graph`].
-pub struct SsssFeature {
-    // --- Pipelines -------------------------------------------------
-    horizontal_pipeline: Option<RenderPipelineId>,
-    vertical_pipeline: Option<RenderPipelineId>,
-    bind_group_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+#[derive(Clone, Copy)]
+pub struct SsssSnapshot<'a> {
+    registry_version: u64,
+    profiles: &'a [SssProfileData; 256],
+}
 
-    // --- Persistent GPU Resources ----------------------------------
-    profiles_buffer: Option<Tracked<wgpu::Buffer>>,
-    last_registry_version: u64,
+/// Long-lived SSSS feature. CPU extraction remains lightweight; persistent GPU
+/// resources are initialized only by a live horizontal node after DPE.
+pub struct SsssFeature {
+    bind_group_layout: OnceLock<Tracked<wgpu::BindGroupLayout>>,
+    profiles_buffer: OnceLock<Tracked<wgpu::Buffer>>,
+    last_uploaded_registry_version: AtomicU64,
 }
 
 impl Default for SsssFeature {
@@ -79,186 +80,53 @@ impl SsssFeature {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            horizontal_pipeline: None,
-            vertical_pipeline: None,
-            bind_group_layout: None,
-            profiles_buffer: None,
-            last_registry_version: 0,
+            bind_group_layout: OnceLock::new(),
+            profiles_buffer: OnceLock::new(),
+            last_uploaded_registry_version: AtomicU64::new(u64::MAX),
         }
     }
 
-    /// Pre-RDG resource preparation: create layout, compile pipelines,
-    /// upload SSS profile data.
-    pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext) {
-        let device = ctx.device;
+    /// Capture the current registry into frame-local POD storage. This performs
+    /// no WGPU work and does not retain per-frame snapshot state on the feature.
+    pub fn extract<'a>(&self, arena: &'a FrameArena, registry: &SssRegistry) -> SsssSnapshot<'a> {
+        SsssSnapshot {
+            registry_version: registry.version,
+            profiles: arena.alloc(registry.buffer_data),
+        }
+    }
 
-        // -- 1. Lazy-create profiles storage buffer ---------------------
-        if self.profiles_buffer.is_none() {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    fn prepare_shared_resources(&self, ctx: &PrepareContext<'_>, snapshot: SsssSnapshot<'_>) {
+        self.bind_group_layout
+            .get_or_init(|| Tracked::new(create_bind_group_layout(ctx.device)));
+
+        let profiles_buffer = self.profiles_buffer.get_or_init(|| {
+            Tracked::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("SSS Profiles Buffer"),
                 size: (256 * size_of::<SssProfileData>()) as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            });
-            self.profiles_buffer = Some(Tracked::new(buffer));
+            }))
+        });
+
+        if self.last_uploaded_registry_version.load(Ordering::Acquire) != snapshot.registry_version
+        {
+            ctx.queue
+                .write_buffer(profiles_buffer, 0, bytemuck::cast_slice(snapshot.profiles));
+            self.last_uploaded_registry_version
+                .store(snapshot.registry_version, Ordering::Release);
         }
+    }
 
-        // -- 2. Diff-sync profiles data ---------------------------------
-        let registry = ctx.assets.sss_registry.read();
-        if self.last_registry_version != registry.version {
-            ctx.queue.write_buffer(
-                self.profiles_buffer.as_ref().unwrap(),
-                0,
-                bytemuck::cast_slice(&registry.buffer_data),
-            );
-            self.last_registry_version = registry.version;
-        }
+    fn bind_group_layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.bind_group_layout
+            .get()
+            .expect("SSSS shared layout must be prepared by the horizontal node")
+    }
 
-        // -- 3. Lazy-create pipelines + layout --------------------------
-        if self.horizontal_pipeline.is_none() {
-            let bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("SSSS Bind Group Layout"),
-                    entries: &[
-                        // binding 0: t_color
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 1: t_normal
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 2: t_depth
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Depth,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 3: u_profiles (storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // binding 4: s_sampler
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                        // binding 5: t_feature_id
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 5,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Uint,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        // binding 6: t_specular
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 6,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("SSSS Pipeline Layout"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
-
-            // -- Horizontal shader (no defines) -------------------------
-            let shader_defines = ShaderCompilationOptions::default();
-
-            let (hor_shader, hor_hash) = ctx.shader_manager.get_or_compile(
-                device,
-                ShaderSource::File("entry/features/ssss/blur"),
-                &shader_defines,
-            );
-
-            let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
-                format: HDR_TEXTURE_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-
-            // No depth-stencil state — pixel filtering uses the soft mask
-            // (Feature_ID texture) inside the fragment shader.
-            let hor_key = FullscreenPipelineKey::fullscreen(
-                hor_hash,
-                smallvec::smallvec![color_target.clone()],
-                None,
-            );
-
-            self.horizontal_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                device,
-                hor_shader,
-                &pipeline_layout,
-                &hor_key,
-                "SSSS Horizontal Pipeline",
-            ));
-
-            // -- Vertical shader (SSSS_VERTICAL_PASS = 1) -------------
-            let mut vert_defines = ShaderCompilationOptions::default();
-            vert_defines.add_define("SSSS_VERTICAL_PASS", "1");
-
-            let (vert_shader, vert_hash) = ctx.shader_manager.get_or_compile(
-                device,
-                ShaderSource::File("entry/features/ssss/blur"),
-                &vert_defines,
-            );
-
-            let vert_key = FullscreenPipelineKey::fullscreen(
-                vert_hash,
-                smallvec::smallvec![color_target],
-                None,
-            );
-
-            self.vertical_pipeline = Some(ctx.pipeline_cache.get_or_create_fullscreen(
-                device,
-                vert_shader,
-                &pipeline_layout,
-                &vert_key,
-                "SSSS Vertical Pipeline",
-            ));
-
-            self.bind_group_layout = Some(Tracked::new(bind_group_layout));
-        }
+    fn profiles_buffer(&self) -> &Tracked<wgpu::Buffer> {
+        self.profiles_buffer
+            .get()
+            .expect("SSSS profiles buffer must be prepared by the horizontal node")
     }
 
     /// Build the ephemeral pass nodes and insert them into the graph as
@@ -274,17 +142,13 @@ impl SsssFeature {
     pub fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: SsssSnapshot<'a>,
         scene_color: TextureNodeId,
         scene_depth: TextureNodeId,
         scene_normals: TextureNodeId,
         feature_id: TextureNodeId,
         specular_tex: TextureNodeId,
     ) -> TextureNodeId {
-        let horizontal_pipeline_id = self.horizontal_pipeline.expect("SsssFeature not prepared");
-        let vertical_pipeline_id = self.vertical_pipeline.expect("SsssFeature not prepared");
-        let bind_group_layout = self.bind_group_layout.as_ref().unwrap();
-        let profiles_buffer = self.profiles_buffer.as_ref().unwrap();
-
         ctx.with_group("SSSS_System", |ctx| {
             // ─── Pass 1: Horizontal blur ───────────────────────────
             let fc = ctx.frame_config;
@@ -302,17 +166,18 @@ impl SsssFeature {
                 builder.read_texture(scene_depth);
                 builder.read_texture(scene_normals);
                 builder.read_texture(feature_id);
+                builder.read_texture(specular_tex);
                 let out = builder.create_texture("SSSS_Temp", temp_desc);
                 let node = SsssHorizontalNode {
+                    feature: self,
+                    snapshot,
                     scene_color_in: scene_color,
                     temp_blur: out,
                     depth_in: scene_depth,
                     normal_in: scene_normals,
                     feature_id,
                     specular_tex,
-                    pipeline_id: horizontal_pipeline_id,
-                    bind_group_layout,
-                    profiles_buffer,
+                    pipeline_id: None,
                     bind_group: None,
                 };
                 (node, out)
@@ -327,15 +192,14 @@ impl SsssFeature {
                 builder.read_texture(specular_tex);
                 let out = builder.mutate_texture(scene_color, "Scene_Color_SSSS");
                 let node = SsssVerticalNode {
+                    feature: self,
                     scene_color_out: out,
                     temp_blur,
                     depth_in: scene_depth,
                     normal_in: scene_normals,
                     feature_id,
                     specular_tex,
-                    pipeline_id: vertical_pipeline_id,
-                    bind_group_layout,
-                    profiles_buffer,
+                    pipeline_id: None,
                     bind_group: None,
                 };
                 (node, out)
@@ -344,6 +208,137 @@ impl SsssFeature {
             ssss_out
         })
     }
+}
+
+fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("SSSS Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn prepare_pipeline(
+    ctx: &mut PrepareContext<'_>,
+    bind_group_layout: &Tracked<wgpu::BindGroupLayout>,
+    vertical: bool,
+) -> RenderPipelineId {
+    let mut options = ShaderCompilationOptions::default();
+    if vertical {
+        options.add_define("SSSS_VERTICAL_PASS", "1");
+    }
+
+    let (shader, shader_hash) = ctx.shader_manager.get_or_compile(
+        ctx.device,
+        ShaderSource::File("entry/features/ssss/blur"),
+        &options,
+    );
+
+    let color_target = ColorTargetKey::from(wgpu::ColorTargetState {
+        format: HDR_TEXTURE_FORMAT,
+        blend: Some(wgpu::BlendState::REPLACE),
+        write_mask: wgpu::ColorWrites::ALL,
+    });
+    let key =
+        FullscreenPipelineKey::fullscreen(shader_hash, smallvec::smallvec![color_target], None);
+
+    if let Some(id) = ctx.pipeline_cache.get_fullscreen_pipeline_id(&key) {
+        return id;
+    }
+
+    let raw_layout: &wgpu::BindGroupLayout = bind_group_layout;
+    let pipeline_layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(if vertical {
+                "SSSS Vertical Pipeline Layout"
+            } else {
+                "SSSS Horizontal Pipeline Layout"
+            }),
+            bind_group_layouts: &[Some(raw_layout)],
+            immediate_size: 0,
+        });
+    let label = if vertical {
+        "SSSS Vertical Pipeline"
+    } else {
+        "SSSS Horizontal Pipeline"
+    };
+    let id = ctx.pipeline_cache.get_or_create_fullscreen(
+        ctx.device,
+        shader,
+        &pipeline_layout,
+        &key,
+        label,
+    );
+    ctx.pipeline_cache
+        .register_render_layouts(id, smallvec::smallvec![bind_group_layout.clone()]);
+    id
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -355,6 +350,8 @@ impl SsssFeature {
 /// Reads scene colour and writes to the scratch `temp_blur` texture.
 /// Non-SSS pixels are skipped via shader early-out on `Feature_ID`.
 struct SsssHorizontalNode<'a> {
+    feature: &'a SsssFeature,
+    snapshot: SsssSnapshot<'a>,
     scene_color_in: TextureNodeId,
     temp_blur: TextureNodeId,
     depth_in: TextureNodeId,
@@ -362,21 +359,22 @@ struct SsssHorizontalNode<'a> {
     feature_id: TextureNodeId,
     specular_tex: TextureNodeId,
 
-    pipeline_id: RenderPipelineId,
-    bind_group_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    profiles_buffer: &'a Tracked<wgpu::Buffer>,
-
+    pipeline_id: Option<RenderPipelineId>,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.prepare_shared_resources(ctx, self.snapshot);
+        let bind_group_layout = self.feature.bind_group_layout();
+        let profiles_buffer = self.feature.profiles_buffer();
+        self.pipeline_id = Some(prepare_pipeline(ctx, bind_group_layout, false));
         self.bind_group = Some(
-            crate::myth_bind_group!(ctx, self.bind_group_layout, Some("SSSS Horizontal Bind Group"), [
+            crate::myth_bind_group!(ctx, bind_group_layout, Some("SSSS Horizontal Bind Group"), [
                 0 => self.scene_color_in,
                 1 => self.normal_in,
                 2 => self.depth_in,
-                3 => self.profiles_buffer,
+                3 => profiles_buffer,
                 4 => CommonSampler::LinearClamp,
                 5 => self.feature_id,
                 6 => self.specular_tex,
@@ -398,7 +396,12 @@ impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
             ..Default::default()
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
+        rpass.set_pipeline(
+            ctx.pipeline_cache.get_render_pipeline(
+                self.pipeline_id
+                    .expect("SSSS horizontal pipeline not prepared"),
+            ),
+        );
         rpass.set_bind_group(0, self.bind_group.unwrap(), &[]);
         rpass.draw(0..3, 0..1);
     }
@@ -414,6 +417,7 @@ impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
 /// alias (via `mutate_texture`).  Non-SSS pixels pass through unchanged
 /// thanks to the shader soft-mask on `Feature_ID`.
 struct SsssVerticalNode<'a> {
+    feature: &'a SsssFeature,
     scene_color_out: TextureNodeId,
     temp_blur: TextureNodeId,
     depth_in: TextureNodeId,
@@ -421,21 +425,23 @@ struct SsssVerticalNode<'a> {
     feature_id: TextureNodeId,
     specular_tex: TextureNodeId,
 
-    pipeline_id: RenderPipelineId,
-    bind_group_layout: &'a Tracked<wgpu::BindGroupLayout>,
-    profiles_buffer: &'a Tracked<wgpu::Buffer>,
-
+    pipeline_id: Option<RenderPipelineId>,
     bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 impl<'a> PassNode<'a> for SsssVerticalNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        // The vertical pass reads the horizontal pass's transient output, so
+        // RDG topological order guarantees shared preparation has completed.
+        let bind_group_layout = self.feature.bind_group_layout();
+        let profiles_buffer = self.feature.profiles_buffer();
+        self.pipeline_id = Some(prepare_pipeline(ctx, bind_group_layout, true));
         self.bind_group = Some(
-            crate::myth_bind_group!(ctx, self.bind_group_layout, Some("SSSS Vertical Bind Group"), [
+            crate::myth_bind_group!(ctx, bind_group_layout, Some("SSSS Vertical Bind Group"), [
                 0 => self.temp_blur,
                 1 => self.normal_in,
                 2 => self.depth_in,
-                3 => self.profiles_buffer,
+                3 => profiles_buffer,
                 4 => CommonSampler::LinearClamp,
                 5 => self.feature_id,
                 6 => self.specular_tex,
@@ -453,7 +459,12 @@ impl<'a> PassNode<'a> for SsssVerticalNode<'a> {
             ..Default::default()
         });
 
-        rpass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(self.pipeline_id));
+        rpass.set_pipeline(
+            ctx.pipeline_cache.get_render_pipeline(
+                self.pipeline_id
+                    .expect("SSSS vertical pipeline not prepared"),
+            ),
+        );
         rpass.set_bind_group(0, self.bind_group.unwrap(), &[]);
         rpass.draw(0..3, 0..1);
     }

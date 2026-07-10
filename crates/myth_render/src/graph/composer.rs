@@ -824,6 +824,11 @@ impl<'a> FrameComposer<'a> {
 
                         // 4. SSSS
                         if ssss_enabled {
+                            let ssss_snapshot = {
+                                let registry = self.ctx.assets.sss_registry.read();
+                                self.ctx.ssss_pass.extract(self.ctx.frame_arena, &registry)
+                            };
+
                             if is_msaa {
                                 let hdr_desc = TextureDesc::new_2d(
                                     c.frame_config.width,
@@ -839,6 +844,7 @@ impl<'a> FrameComposer<'a> {
 
                             active_color = self.ctx.ssss_pass.add_to_graph(
                                 c,
+                                ssss_snapshot,
                                 active_color,
                                 prepass_out.scene_depth,
                                 prepass_out.scene_normals.unwrap(),
