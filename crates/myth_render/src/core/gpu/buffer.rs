@@ -25,7 +25,7 @@ use myth_resources::texture::TextureSource;
 
 use super::environment::{snapshot_attachment_texture_source, snapshot_ready_asset_texture_source};
 use super::{
-    AssetTextureMaterialization, AssetTextureSnapshot, EnsureResult, GpuImage, GpuImageSpec,
+    AssetTextureMaterialization, AssetTextureSnapshot, EnsureResult, GpuImageSpec,
     InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
     materialize_asset_texture_snapshot,
 };
@@ -233,41 +233,45 @@ impl<'a> BufferUploadContext<'a> {
                     dimension: image.dimension.to_wgpu(),
                     view_dimension: texture_asset.view_dimension,
                     mip_count: 1,
+                    sample_count: 1,
                     usage: required_usage,
                 };
 
-                let needs_recreate = self
+                let materialization_spec = self
                     .resources
                     .texture_image(handle)
-                    .is_none_or(|gpu_image| {
-                        gpu_image.image_handle != base_spec.image_handle
-                            || gpu_image.size != base_spec.extent
-                            || gpu_image.default_view_dimension != base_spec.view_dimension
-                            || gpu_image.dimension != base_spec.dimension
-                            || gpu_image.format != base_spec.format
-                            || !gpu_image.usage.contains(required_usage)
+                    .filter(|gpu_image| {
+                        gpu_image.image_handle == base_spec.image_handle
+                            && gpu_image.size == base_spec.extent
+                            && gpu_image.default_view_dimension == base_spec.view_dimension
+                            && gpu_image.dimension == base_spec.dimension
+                            && gpu_image.format == base_spec.format
+                            && gpu_image.sample_count == base_spec.sample_count
+                            && gpu_image.usage.contains(required_usage)
+                    })
+                    .map_or(base_spec, |gpu_image| GpuImageSpec {
+                        image_handle: gpu_image.image_handle,
+                        extent: gpu_image.size,
+                        format: gpu_image.format,
+                        dimension: gpu_image.dimension,
+                        view_dimension: gpu_image.default_view_dimension,
+                        mip_count: gpu_image.mip_level_count,
+                        sample_count: gpu_image.sample_count,
+                        usage: gpu_image.usage,
                     });
 
-                if needs_recreate {
-                    self.resources.remove_texture_image(handle);
-                    let mut gpu_image = GpuImage::new(
-                        self.device,
-                        self.queue,
-                        &image,
-                        base_spec,
-                        texture_version,
-                        texture_identity,
-                        image_version,
-                        image_identity,
-                    );
-                    gpu_image.last_used_frame = self.frame_index;
-                    self.resources.insert_texture_image(handle, gpu_image);
-                } else if let Some(gpu_image) = self.resources.texture_image_mut(handle) {
-                    gpu_image.update_content(self.queue, &image, image_version, image_identity);
-                    gpu_image.texture_version = texture_version;
-                    gpu_image.texture_identity = texture_identity;
-                    gpu_image.last_used_frame = self.frame_index;
-                }
+                self.resources.materialize_texture_image(
+                    self.device,
+                    self.queue,
+                    self.frame_index,
+                    handle,
+                    &image,
+                    materialization_spec,
+                    texture_version,
+                    texture_identity,
+                    image_version,
+                    image_identity,
+                );
 
                 // `Image` data is mutable behind its Arc. Re-read both storage
                 // versions after `GpuImage::new/update` has consumed the bytes,

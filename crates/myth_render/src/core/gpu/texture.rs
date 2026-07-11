@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::core::gpu::{AssetTextureGenerationKey, Tracked, generate_gpu_resource_id};
+use crate::core::gpu::{PhysicalImageGenerationKey, Tracked, generate_gpu_resource_id};
 use myth_assets::{AssetServer, ImageHandle, TextureHandle};
 use myth_resources::image::Image;
 use myth_resources::texture::{Texture, TextureSampler, TextureSource};
@@ -40,13 +40,16 @@ pub struct TextureBinding {
 impl TextureBinding {
     #[inline]
     #[must_use]
-    pub(crate) fn matches_gpu_image(self, image: &GpuImage) -> bool {
+    pub(crate) fn matches_residency(self, lease: TextureImageLease, image: &GpuImage) -> bool {
         self.view_id == image.id
-            && self.image_handle == image.image_handle
-            && self.texture_version == image.texture_version
-            && self.texture_identity == image.texture_identity
-            && self.image_version == image.image_version
-            && self.image_identity == image.image_identity
+            && self.image_handle == lease.image_handle
+            && lease.image_handle == image.image_handle
+            && self.texture_version == lease.texture_version
+            && self.texture_identity == lease.texture_identity
+            && self.image_version == lease.image_version
+            && self.image_identity == lease.image_identity
+            && lease.image_version == image.image_version
+            && lease.image_identity == image.image_identity
     }
 }
 
@@ -135,6 +138,7 @@ impl AssetTextureSnapshot {
             dimension: self.dimension,
             view_dimension: self.view_dimension,
             mip_count: self.mip_count,
+            sample_count: 1,
             usage: self.usage,
         }
     }
@@ -170,7 +174,13 @@ fn requested_mip_count(width: u32, height: u32, generate_mipmaps: bool) -> u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+slotmap::new_key_type! {
+    /// Generational identity of one physical image allocation in the GPU
+    /// resource store.
+    pub(crate) struct PhysicalImageId;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GpuImageSpec {
     pub(crate) image_handle: ImageHandle,
     pub(crate) extent: wgpu::Extent3d,
@@ -178,13 +188,31 @@ pub(crate) struct GpuImageSpec {
     pub(crate) dimension: wgpu::TextureDimension,
     pub(crate) view_dimension: wgpu::TextureViewDimension,
     pub(crate) mip_count: u32,
+    pub(crate) sample_count: u32,
     pub(crate) usage: wgpu::TextureUsages,
+}
+
+/// Per-TextureHandle logical residency metadata.
+///
+/// Destructor-bearing WGPU state lives in the physical image arena. Texture
+/// and Image stamps remain lease-local so a future exact-spec pool can attach
+/// several TextureHandles to one allocation without overwriting each other's
+/// logical identity or TTL.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TextureImageLease {
+    pub(crate) physical_id: PhysicalImageId,
+    pub(crate) image_handle: ImageHandle,
+    pub(crate) texture_version: u32,
+    pub(crate) texture_identity: u64,
+    pub(crate) image_version: u32,
+    pub(crate) image_identity: u64,
+    pub(crate) last_used_frame: u64,
 }
 
 /// Physical result produced by live asset materialization.
 pub(crate) struct MaterializedAssetTexture {
     pub(crate) view: Tracked<wgpu::TextureView>,
-    pub(crate) generation_key: AssetTextureGenerationKey,
+    pub(crate) generation_key: PhysicalImageGenerationKey,
 }
 
 /// A drift-safe live materialization attempt.
@@ -231,10 +259,9 @@ pub struct GpuImage {
     pub size: wgpu::Extent3d,
     pub format: wgpu::TextureFormat,
     pub mip_level_count: u32,
+    pub sample_count: u32,
     pub usage: wgpu::TextureUsages,
     pub image_handle: ImageHandle,
-    pub texture_version: u32,
-    pub texture_identity: u64,
     pub image_version: u32,
     pub image_identity: u64,
     pub generation_id: u64,
@@ -248,8 +275,6 @@ impl GpuImage {
         queue: &wgpu::Queue,
         image: &Image,
         spec: GpuImageSpec,
-        texture_version: u32,
-        texture_identity: u64,
         image_version: u32,
         image_identity: u64,
     ) -> Self {
@@ -257,7 +282,7 @@ impl GpuImage {
             label: None,
             size: spec.extent,
             mip_level_count: spec.mip_count,
-            sample_count: 1,
+            sample_count: spec.sample_count,
             dimension: spec.dimension,
             format: spec.format,
             usage: spec.usage,
@@ -296,10 +321,9 @@ impl GpuImage {
             size: spec.extent,
             format: spec.format,
             mip_level_count: spec.mip_count,
+            sample_count: spec.sample_count,
             usage: spec.usage,
             image_handle: spec.image_handle,
-            texture_version,
-            texture_identity,
             image_version,
             image_identity,
             generation_id,
@@ -325,12 +349,17 @@ impl GpuImage {
     }
 
     #[must_use]
-    pub(crate) fn mipmap_request(&self, texture_handle: TextureHandle) -> Option<MipmapRequest> {
+    pub(crate) fn mipmap_request(
+        &self,
+        physical_id: PhysicalImageId,
+        texture_handle: TextureHandle,
+    ) -> Option<MipmapRequest> {
         if self.mipmaps_submitted() {
             return None;
         }
 
         Some(MipmapRequest::new(
+            physical_id,
             texture_handle,
             self.texture.clone(),
             self.id,
@@ -349,15 +378,20 @@ impl GpuImage {
             && self.default_view_dimension == spec.view_dimension
             && self.format == spec.format
             && self.mip_level_count == spec.mip_count
+            && self.sample_count == spec.sample_count
             && self.usage == spec.usage
     }
 
     #[inline]
     #[must_use]
-    pub(crate) const fn generation_key(&self) -> AssetTextureGenerationKey {
-        AssetTextureGenerationKey {
-            texture_id: self.id,
-            generation_id: self.generation_id,
+    pub(crate) const fn generation_key(
+        &self,
+        physical_id: PhysicalImageId,
+    ) -> PhysicalImageGenerationKey {
+        PhysicalImageGenerationKey {
+            physical: physical_id,
+            allocation: self.id,
+            generation: self.generation_id,
         }
     }
 
@@ -438,46 +472,31 @@ pub(crate) fn materialize_asset_texture_snapshot(
     image: &Image,
 ) -> AssetTextureMaterialization {
     let spec = snapshot.physical_spec();
-    let needs_recreate = resources
-        .texture_image(snapshot.texture_handle)
-        .is_none_or(|gpu_image| !gpu_image.matches_spec(spec));
-
-    if needs_recreate {
-        resources.remove_texture_image(snapshot.texture_handle);
-        let mut gpu_image = GpuImage::new(
-            device,
-            queue,
-            image,
-            spec,
-            snapshot.texture_version,
-            snapshot.texture_identity,
-            snapshot.image_version,
-            snapshot.image_identity,
-        );
-        gpu_image.last_used_frame = frame_index;
-        resources.insert_texture_image(snapshot.texture_handle, gpu_image);
-    } else if let Some(gpu_image) = resources.texture_image_mut(snapshot.texture_handle) {
-        gpu_image.update_content(
-            queue,
-            image,
-            snapshot.image_version,
-            snapshot.image_identity,
-        );
-        gpu_image.texture_version = snapshot.texture_version;
-        gpu_image.texture_identity = snapshot.texture_identity;
-        gpu_image.last_used_frame = frame_index;
-    }
+    resources.materialize_texture_image(
+        device,
+        queue,
+        frame_index,
+        snapshot.texture_handle,
+        image,
+        spec,
+        snapshot.texture_version,
+        snapshot.texture_identity,
+        snapshot.image_version,
+        snapshot.image_identity,
+    );
 
     let gpu_image = resources
         .texture_image(snapshot.texture_handle)
         .expect("asset texture missing after materialization");
     let texture = MaterializedAssetTexture {
         view: Tracked::with_id(gpu_image.default_view.clone(), gpu_image.id),
-        generation_key: gpu_image.generation_key(),
+        generation_key: resources
+            .texture_generation_key(snapshot.texture_handle)
+            .expect("asset texture missing a physical generation"),
     };
     let mipmap_request = snapshot
         .generate_mipmaps
-        .then(|| gpu_image.mipmap_request(snapshot.texture_handle))
+        .then(|| resources.texture_mipmap_request(snapshot.texture_handle))
         .flatten();
 
     // Maintain the ImageHandle-only compatibility index even when an existing
@@ -536,8 +555,7 @@ impl ResourceManager {
                 .sampler_registry
                 .lookup_index(&texture_asset.sampler)
                 .is_some_and(|idx| idx == binding.sampler_id);
-            let mut request = None;
-            let exact = if let Some(gpu_image) = self.resources.texture_image_mut(handle) {
+            let exact = if let Some(gpu_image) = self.resources.texture_image(handle) {
                 let expected_mips = requested_mip_count(
                     gpu_image.size.width,
                     gpu_image.size.height,
@@ -554,23 +572,13 @@ impl ResourceManager {
                     && binding.image_identity == observed_image_identity
                     && binding.image_handle == image_handle
                     && binding.view_id == gpu_image.id
-                    && gpu_image.texture_version == texture_version
-                    && gpu_image.texture_identity == texture_identity
                     && gpu_image.image_version == observed_image_version
                     && gpu_image.image_identity == observed_image_identity
                     && gpu_image.default_view_dimension == texture_asset.view_dimension
                     && gpu_image.mip_level_count == expected_mips
+                    && gpu_image.sample_count == 1
                     && gpu_image.usage == expected_usage;
-                if matches && sampler_match {
-                    request = texture_asset
-                        .generate_mipmaps
-                        .then(|| gpu_image.mipmap_request(handle))
-                        .flatten();
-                    gpu_image.last_used_frame = self.frame_index;
-                    true
-                } else {
-                    false
-                }
+                matches && sampler_match
             } else {
                 false
             };
@@ -582,6 +590,14 @@ impl ResourceManager {
                 if !texture_unchanged || !image_unchanged {
                     return ResourceState::Pending;
                 }
+                let request = texture_asset
+                    .generate_mipmaps
+                    .then(|| self.resources.texture_mipmap_request(handle))
+                    .flatten();
+                assert!(
+                    self.resources.touch_texture_image(handle, self.frame_index),
+                    "validated texture binding lost its physical residency"
+                );
                 self.resources
                     .touch_texture_image_alias(image_handle, handle);
                 if let Some(request) = request {
@@ -641,7 +657,7 @@ impl ResourceManager {
         }
 
         let binding = TextureBinding {
-            view_id: materialized_texture.generation_key.texture_id,
+            view_id: materialized_texture.generation_key.allocation,
             image_handle,
             sampler_id,
             texture_version,
@@ -767,6 +783,17 @@ mod tests {
         let linear_image = resources
             .get_texture_image(linear)
             .expect("linear image missing");
+        let srgb_physical = resources
+            .resources
+            .texture_image_lease(srgb)
+            .expect("sRGB lease missing")
+            .physical_id;
+        let linear_physical = resources
+            .resources
+            .texture_image_lease(linear)
+            .expect("linear lease missing")
+            .physical_id;
+        assert_ne!(srgb_physical, linear_physical);
         assert_ne!(srgb_image.id, linear_image.id);
         assert_eq!(srgb_image.format, wgpu::TextureFormat::Rgba8UnormSrgb);
         assert_eq!(srgb_image.mip_level_count, 1);
@@ -784,6 +811,12 @@ mod tests {
         let rebuilt_srgb = resources
             .get_texture_image(srgb)
             .expect("rebuilt sRGB image missing");
+        let mipped_srgb_physical = resources
+            .resources
+            .texture_image_lease(srgb)
+            .expect("rebuilt sRGB lease missing")
+            .physical_id;
+        assert_ne!(mipped_srgb_physical, srgb_physical);
         assert_ne!(rebuilt_srgb.id, old_srgb_id);
         assert_eq!(rebuilt_srgb.mip_level_count, 4);
         let mipped_srgb_id = rebuilt_srgb.id;
@@ -824,9 +857,87 @@ mod tests {
         let rebuilt_without_mips = resources
             .get_texture_image(srgb)
             .expect("sRGB no-mip image missing");
+        let no_mip_physical = resources
+            .resources
+            .texture_image_lease(srgb)
+            .expect("sRGB no-mip lease missing")
+            .physical_id;
+        assert_ne!(no_mip_physical, mipped_srgb_physical);
         assert_ne!(rebuilt_without_mips.id, mipped_srgb_id);
         assert_eq!(rebuilt_without_mips.mip_level_count, 1);
         assert!(resources.take_mipmap_requests().is_empty());
+    }
+
+    #[test]
+    fn physical_pending_queue_rejects_a_late_stale_generation() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(image_8x8());
+        let mut texture = Texture::new_2d(Some("Physical pending"), image_handle);
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+
+        assert!(matches!(
+            resources.prepare_texture(&assets, texture_handle),
+            ResourceState::Ready
+        ));
+        let mut first = resources.take_mipmap_requests();
+        assert_eq!(first.len(), 1);
+        let stale = first.pop().expect("initial mip request missing");
+        let physical_id = stale.physical_id;
+        let stale_generation = stale.generation_id;
+        let stale_after_drain = resources
+            .resources
+            .texture_mipmap_request(texture_handle)
+            .expect("second stale request missing");
+
+        let replacement = Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![17; 8 * 8 * 4]),
+        );
+        assert_eq!(assets.images.update(image_handle, replacement), Some(2));
+        assert!(matches!(
+            resources.prepare_texture(&assets, texture_handle),
+            ResourceState::Ready
+        ));
+        let current_generation = resources
+            .get_texture_image(texture_handle)
+            .expect("updated physical image missing")
+            .generation_id;
+        assert_ne!(current_generation, stale_generation);
+        assert_eq!(
+            resources
+                .resources
+                .texture_image_lease(texture_handle)
+                .expect("updated lease missing")
+                .physical_id,
+            physical_id,
+            "content updates must preserve the physical allocation"
+        );
+
+        resources.resources.queue_mipmap_request(stale);
+        let pending = resources.take_mipmap_requests();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].physical_id, physical_id);
+        assert_eq!(pending[0].generation_id, current_generation);
+
+        resources.resources.queue_mipmap_request(stale_after_drain);
+        assert!(
+            resources.take_mipmap_requests().is_empty(),
+            "a stale generation must remain rejected after the current request was drained"
+        );
     }
 
     #[test]
@@ -859,6 +970,11 @@ mod tests {
             .get_texture_image(texture_handle)
             .expect("initial GPU image missing")
             .id;
+        let first_pool_id = resources
+            .resources
+            .texture_image_lease(texture_handle)
+            .expect("initial texture lease missing")
+            .physical_id;
 
         let original_texture_uuid = assets
             .textures
@@ -898,7 +1014,13 @@ mod tests {
             assert_eq!(image.format, wgpu::TextureFormat::Rgba8Unorm);
             image.id
         };
+        let replacement_pool_id = resources
+            .resources
+            .texture_image_lease(texture_handle)
+            .expect("replacement texture lease missing")
+            .physical_id;
         assert_ne!(replacement_physical_id, first_physical_id);
+        assert_ne!(replacement_pool_id, first_pool_id);
         assert_ne!(
             replacement_binding.texture_identity,
             first_binding.texture_identity
@@ -906,7 +1028,7 @@ mod tests {
         assert_eq!(replacement_binding.sampler_id, first_binding.sampler_id);
         let requests = resources.take_mipmap_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].key().texture_id, replacement_physical_id);
+        assert_eq!(requests[0].key().allocation, replacement_physical_id);
 
         // A sampler-only same-version replacement reuses the physical view.
         // Deferred materialization cannot create the new sampler binding, so
@@ -941,6 +1063,14 @@ mod tests {
                 .expect("deferred image missing")
                 .id,
             replacement_physical_id
+        );
+        assert_eq!(
+            resources
+                .resources
+                .texture_image_lease(texture_handle)
+                .expect("deferred sampler lease missing")
+                .physical_id,
+            replacement_pool_id
         );
         assert!(
             resources.get_texture_binding(texture_handle).is_none(),
@@ -995,11 +1125,22 @@ mod tests {
             .get_texture_image(texture_handle)
             .expect("updated GPU image missing");
         assert_eq!(updated_image.id, replacement_physical_id);
+        assert_eq!(
+            resources
+                .resources
+                .texture_image_lease(texture_handle)
+                .expect("updated image lease missing")
+                .physical_id,
+            replacement_pool_id
+        );
         assert_ne!(updated_image.image_identity, replacement_image_identity);
         assert_ne!(updated_image.generation_id, replacement_generation);
         assert_eq!(updated_binding.image_version, 1);
         assert_eq!(updated_binding.image_identity, updated_image.image_identity);
-        let updated_generation_key = updated_image.generation_key();
+        let updated_generation_key = resources
+            .resources
+            .texture_generation_key(texture_handle)
+            .expect("updated texture generation missing");
         let requests = resources.take_mipmap_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].key(), updated_generation_key);
@@ -1030,6 +1171,11 @@ mod tests {
             resources.prepare_texture(&assets, stale),
             ResourceState::Ready
         ));
+        let stale_physical = resources
+            .resources
+            .texture_image_lease(stale)
+            .expect("stale lease missing")
+            .physical_id;
         resources.next_frame();
         assert!(matches!(
             resources.prepare_texture(&assets, survivor),
@@ -1039,6 +1185,11 @@ mod tests {
             .get_texture_image(survivor)
             .expect("survivor missing")
             .id;
+        let survivor_physical = resources
+            .resources
+            .texture_image_lease(survivor)
+            .expect("survivor lease missing")
+            .physical_id;
 
         // Simulate the compatibility alias having last pointed at an older
         // interpretation of the same Image. Prune must repair it to the live
@@ -1055,6 +1206,12 @@ mod tests {
         resources.prune(1);
 
         assert!(resources.get_texture_image(stale).is_none());
+        assert!(!resources.resources.contains_physical_image(stale_physical));
+        assert!(
+            resources
+                .resources
+                .contains_physical_image(survivor_physical)
+        );
         assert_eq!(
             resources
                 .get_texture_image(survivor)

@@ -53,8 +53,8 @@ pub(crate) use crate::core::gpu::environment::{
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
 pub(crate) use crate::core::gpu::material::GpuMaterial;
 pub(crate) use crate::core::gpu::texture::{
-    AssetTextureMaterialization, AssetTextureSnapshot, GpuImage, GpuImageSpec, TextureBinding,
-    materialize_asset_texture_snapshot, snapshot_asset_texture,
+    AssetTextureMaterialization, AssetTextureSnapshot, GpuImage, GpuImageSpec, PhysicalImageId,
+    TextureBinding, TextureImageLease, materialize_asset_texture_snapshot, snapshot_asset_texture,
 };
 pub use bind_group_store::{BindGroupContext, GlobalStateKey, GlobalStateResolver, GpuGlobalState};
 pub(crate) use bind_group_store::{BindGroupStore, ObjectBindGroupKey};
@@ -63,8 +63,8 @@ pub(crate) use internal_texture_registry::InternalTextureRegistry;
 
 pub use crate::core::gpu::mipmap::MipmapGenerator;
 pub(crate) use crate::core::gpu::mipmap::{
-    AssetTextureGenerationKey, MipmapBatchId, MipmapRequest, MipmapRequestBatch,
-    MipmapRequestResolver,
+    MipmapBatchId, MipmapRequest, MipmapRequestBatch, MipmapRequestResolver,
+    PhysicalImageGenerationKey,
 };
 pub use allocator::ModelBufferAllocator;
 use myth_resources::buffer::{CpuBuffer, GpuData};
@@ -79,7 +79,11 @@ pub use tracked::Tracked;
 static NEXT_GPU_RESOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn generate_gpu_resource_id() -> u64 {
-    NEXT_GPU_RESOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    NEXT_GPU_RESOURCE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("GPU resource ID space exhausted")
 }
 
 // ============================================================================

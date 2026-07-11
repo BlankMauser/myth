@@ -5,10 +5,11 @@ use slotmap::SecondaryMap;
 
 use myth_assets::{GeometryHandle, ImageHandle, MaterialHandle, TextureHandle};
 use myth_resources::buffer::BufferRef;
+use myth_resources::image::Image;
 
 use super::{
-    AssetTextureGenerationKey, EnsureResult, GpuBuffer, GpuBufferHandle, GpuGeometry, GpuImage,
-    GpuMaterial, MipmapRequest, TextureBinding,
+    EnsureResult, GpuBuffer, GpuBufferHandle, GpuGeometry, GpuImage, GpuImageSpec, GpuMaterial,
+    MipmapRequest, PhysicalImageGenerationKey, PhysicalImageId, TextureBinding, TextureImageLease,
 };
 
 /// GPU-side asset arenas and reverse indices.
@@ -19,13 +20,12 @@ use super::{
 pub(crate) struct GpuResourceStore {
     gpu_geometries: SecondaryMap<GeometryHandle, GpuGeometry>,
     gpu_materials: SecondaryMap<MaterialHandle, GpuMaterial>,
-    /// One physical image per logical `TextureHandle`.
-    ///
-    /// Two texture assets may intentionally interpret the same CPU `Image`
-    /// with different colour spaces, view dimensions, or mip policies. Keying
-    /// this table by `ImageHandle` made those incompatible specifications
-    /// overwrite each other every frame.
-    gpu_images: SecondaryMap<TextureHandle, GpuImage>,
+    /// Destructor-bearing physical image arena. The first migration stage
+    /// deliberately keeps one lease per entry; exact-spec sharing is enabled
+    /// only after mipmap ownership has been fully detached from TextureHandle.
+    physical_images: slotmap::SlotMap<PhysicalImageId, GpuImage>,
+    /// Logical TextureHandle residency pointing into the physical arena.
+    texture_image_leases: SecondaryMap<TextureHandle, TextureImageLease>,
 
     /// Compatibility lookup for callers that still only carry an ImageHandle.
     /// Exact render paths must use `texture_image(TextureHandle)` instead.
@@ -40,8 +40,9 @@ pub(crate) struct GpuResourceStore {
     buffer_index: FxHashMap<u64, GpuBufferHandle>,
 
     pending_mipmap_requests: Vec<MipmapRequest>,
-    pending_mipmap_keys: FxHashSet<AssetTextureGenerationKey>,
-    pending_mipmap_indices: FxHashMap<TextureHandle, usize>,
+    /// At most the newest content generation for one physical allocation is
+    /// retained before ownership moves into GraphStorage.
+    pending_mipmap_indices: FxHashMap<PhysicalImageId, usize>,
 }
 
 impl GpuResourceStore {
@@ -53,72 +54,79 @@ impl GpuResourceStore {
         Self {
             gpu_geometries: SecondaryMap::new(),
             gpu_materials: SecondaryMap::new(),
-            gpu_images: SecondaryMap::new(),
+            physical_images: slotmap::SlotMap::with_key(),
+            texture_image_leases: SecondaryMap::new(),
             latest_texture_for_image: SecondaryMap::new(),
             texture_bindings: SecondaryMap::new(),
             gpu_buffers,
             buffer_index,
             pending_mipmap_requests: Vec::new(),
-            pending_mipmap_keys: FxHashSet::default(),
             pending_mipmap_indices: FxHashMap::default(),
         }
     }
 
     pub(super) fn queue_mipmap_request(&mut self, request: MipmapRequest) {
-        // Only the newest physical generation of one texture asset can matter.
-        // This also prevents repeated begin_frame calls without render from
-        // retaining an unbounded chain of obsolete WGPU texture owners.
-        if let Some(&index) = self.pending_mipmap_indices.get(&request.texture_handle) {
-            let stale_key = self.pending_mipmap_requests[index].key();
-            if stale_key == request.key() {
-                self.pending_mipmap_requests[index] = request;
-                return;
-            }
-            if self.pending_mipmap_keys.contains(&request.key()) {
-                // A future physical-sharing layer may produce one generation
-                // for multiple TextureHandles. The other queued owner is
-                // sufficient; retire this handle's now-obsolete request.
-                self.remove_pending_mipmap_at(index);
-                return;
-            }
-            self.pending_mipmap_requests[index] = request;
-            self.pending_mipmap_keys.remove(&stale_key);
-            self.pending_mipmap_keys
-                .insert(self.pending_mipmap_requests[index].key());
+        let is_current_generation = self
+            .physical_images
+            .get(request.physical_id)
+            .is_some_and(|image| image.generation_key(request.physical_id) == request.key());
+        if !is_current_generation {
+            // Reject requests detached by content replacement, TTL/removal,
+            // or a SlotMap generation reuse even when the pending table has
+            // already been drained into GraphStorage.
             return;
         }
 
-        if !self.pending_mipmap_keys.insert(request.key()) {
+        // Only the newest content generation of one physical allocation can
+        // matter. TextureHandle remains diagnostic/legacy claim metadata, not
+        // the pending work's correctness identity.
+        // This also prevents repeated begin_frame calls without render from
+        // retaining an unbounded chain of obsolete WGPU texture owners.
+        if let Some(&index) = self.pending_mipmap_indices.get(&request.physical_id) {
+            let queued_generation = self.pending_mipmap_requests[index].generation_id;
+            if queued_generation > request.generation_id {
+                // A stale request may arrive after a newer coordinator result;
+                // it must never replace the newest physical generation.
+                return;
+            }
+            self.pending_mipmap_requests[index] = request;
             return;
         }
 
         let index = self.pending_mipmap_requests.len();
         self.pending_mipmap_indices
-            .insert(request.texture_handle, index);
+            .insert(request.physical_id, index);
         self.pending_mipmap_requests.push(request);
     }
 
     fn remove_pending_mipmap_at(&mut self, index: usize) -> MipmapRequest {
         let stale = self.pending_mipmap_requests.swap_remove(index);
-        self.pending_mipmap_keys.remove(&stale.key());
-        self.pending_mipmap_indices.remove(&stale.texture_handle);
+        self.pending_mipmap_indices.remove(&stale.physical_id);
         if let Some(moved) = self.pending_mipmap_requests.get(index) {
-            self.pending_mipmap_indices
-                .insert(moved.texture_handle, index);
+            self.pending_mipmap_indices.insert(moved.physical_id, index);
         }
         stale
     }
 
     pub(super) fn discard_mipmap_requests(&mut self, texture_handle: TextureHandle) {
-        let Some(index) = self.pending_mipmap_indices.remove(&texture_handle) else {
+        let Some(physical_id) = self
+            .texture_image_leases
+            .get(texture_handle)
+            .map(|lease| lease.physical_id)
+        else {
             return;
         };
-        self.remove_pending_mipmap_at(index);
+        self.discard_mipmap_request_for_physical(physical_id);
+    }
+
+    fn discard_mipmap_request_for_physical(&mut self, physical_id: PhysicalImageId) {
+        if let Some(index) = self.pending_mipmap_indices.get(&physical_id).copied() {
+            self.remove_pending_mipmap_at(index);
+        }
     }
 
     #[must_use]
     pub(super) fn take_mipmap_requests(&mut self) -> Vec<MipmapRequest> {
-        self.pending_mipmap_keys.clear();
         self.pending_mipmap_indices.clear();
         std::mem::take(&mut self.pending_mipmap_requests)
     }
@@ -173,36 +181,150 @@ impl GpuResourceStore {
     #[inline]
     #[must_use]
     pub(super) fn texture_image(&self, handle: TextureHandle) -> Option<&GpuImage> {
-        self.gpu_images.get(handle)
+        let lease = self.texture_image_leases.get(handle)?;
+        self.physical_images.get(lease.physical_id)
     }
 
     #[inline]
-    pub(super) fn texture_image_mut(&mut self, handle: TextureHandle) -> Option<&mut GpuImage> {
-        self.gpu_images.get_mut(handle)
+    #[must_use]
+    #[cfg(test)]
+    pub(super) fn texture_image_lease(&self, handle: TextureHandle) -> Option<TextureImageLease> {
+        self.texture_image_leases.get(handle).copied()
     }
 
-    #[inline]
-    pub(super) fn insert_texture_image(&mut self, handle: TextureHandle, image: GpuImage) {
-        let previous_image_handle = self
-            .gpu_images
-            .get(handle)
-            .map(|previous| previous.image_handle);
-        let image_handle = image.image_handle;
-        self.gpu_images.insert(handle, image);
-        self.latest_texture_for_image.insert(image_handle, handle);
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn contains_physical_image(&self, id: PhysicalImageId) -> bool {
+        self.physical_images.contains_key(id)
+    }
+
+    /// Create or update one TextureHandle's physical residency through the
+    /// arena/lease split. This first stage intentionally does not share entries
+    /// across handles; the API is the single acquisition point that the exact
+    /// spec index will extend in the next migration batch.
+    pub(super) fn materialize_texture_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame_index: u64,
+        handle: TextureHandle,
+        image: &Image,
+        spec: GpuImageSpec,
+        texture_version: u32,
+        texture_identity: u64,
+        image_version: u32,
+        image_identity: u64,
+    ) -> PhysicalImageId {
+        let previous_image_handle = self.texture_image(handle).map(|image| image.image_handle);
+        let reusable = self
+            .texture_image(handle)
+            .is_some_and(|gpu_image| gpu_image.matches_spec(spec));
+
+        let physical_id = if reusable {
+            self.texture_image_leases
+                .get(handle)
+                .expect("texture image exists without a lease")
+                .physical_id
+        } else {
+            self.remove_texture_image(handle);
+            let mut gpu_image =
+                GpuImage::new(device, queue, image, spec, image_version, image_identity);
+            gpu_image.last_used_frame = frame_index;
+            let physical_id = self.physical_images.insert(gpu_image);
+            self.texture_image_leases.insert(
+                handle,
+                TextureImageLease {
+                    physical_id,
+                    image_handle: spec.image_handle,
+                    texture_version,
+                    texture_identity,
+                    image_version,
+                    image_identity,
+                    last_used_frame: frame_index,
+                },
+            );
+            physical_id
+        };
+
+        if reusable {
+            let generation_before = self
+                .physical_images
+                .get(physical_id)
+                .expect("texture lease points to a missing physical image")
+                .generation_id;
+            let gpu_image = self
+                .physical_images
+                .get_mut(physical_id)
+                .expect("texture lease points to a missing physical image");
+            gpu_image.update_content(queue, image, image_version, image_identity);
+            gpu_image.last_used_frame = frame_index;
+            if gpu_image.generation_id != generation_before {
+                self.discard_mipmap_request_for_physical(physical_id);
+            }
+            let lease = self
+                .texture_image_leases
+                .get_mut(handle)
+                .expect("texture image exists without a lease");
+            lease.texture_version = texture_version;
+            lease.texture_identity = texture_identity;
+            lease.image_version = image_version;
+            lease.image_identity = image_identity;
+            lease.last_used_frame = frame_index;
+        }
+
+        self.latest_texture_for_image
+            .insert(spec.image_handle, handle);
         if let Some(previous_image_handle) = previous_image_handle
-            && previous_image_handle != image_handle
+            && previous_image_handle != spec.image_handle
         {
             self.repair_texture_image_alias(previous_image_handle);
         }
+        physical_id
+    }
+
+    pub(super) fn touch_texture_image(&mut self, handle: TextureHandle, frame_index: u64) -> bool {
+        let Some(lease) = self.texture_image_leases.get_mut(handle) else {
+            return false;
+        };
+        lease.last_used_frame = frame_index;
+        if let Some(image) = self.physical_images.get_mut(lease.physical_id) {
+            image.last_used_frame = frame_index;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[must_use]
+    pub(super) fn texture_mipmap_request(&self, handle: TextureHandle) -> Option<MipmapRequest> {
+        let lease = self.texture_image_leases.get(handle)?;
+        self.physical_images
+            .get(lease.physical_id)?
+            .mipmap_request(lease.physical_id, handle)
+    }
+
+    #[must_use]
+    pub(super) fn texture_generation_key(
+        &self,
+        handle: TextureHandle,
+    ) -> Option<PhysicalImageGenerationKey> {
+        let lease = self.texture_image_leases.get(handle)?;
+        Some(
+            self.physical_images
+                .get(lease.physical_id)?
+                .generation_key(lease.physical_id),
+        )
     }
 
     #[inline]
     pub(super) fn remove_texture_image(&mut self, handle: TextureHandle) {
         self.discard_mipmap_requests(handle);
         self.texture_bindings.remove(handle);
-        if let Some(image) = self.gpu_images.remove(handle) {
-            self.repair_texture_image_alias(image.image_handle);
+        if let Some(lease) = self.texture_image_leases.remove(handle) {
+            if let Some(image) = self.physical_images.remove(lease.physical_id) {
+                debug_assert_eq!(image.image_handle, lease.image_handle);
+            }
+            self.repair_texture_image_alias(lease.image_handle);
         }
     }
 
@@ -210,7 +332,7 @@ impl GpuResourceStore {
         if self
             .latest_texture_for_image
             .get(image_handle)
-            .and_then(|texture| self.gpu_images.get(*texture))
+            .and_then(|texture| self.texture_image(*texture))
             .is_some_and(|image| image.image_handle == image_handle)
         {
             return;
@@ -218,10 +340,13 @@ impl GpuResourceStore {
 
         self.latest_texture_for_image.remove(image_handle);
         if let Some((texture_handle, _)) = self
-            .gpu_images
+            .texture_image_leases
             .iter()
-            .filter(|(_, image)| image.image_handle == image_handle)
-            .max_by_key(|(_, image)| image.last_used_frame)
+            .filter(|(texture, _)| {
+                self.texture_image(*texture)
+                    .is_some_and(|image| image.image_handle == image_handle)
+            })
+            .max_by_key(|(_, lease)| lease.last_used_frame)
         {
             self.latest_texture_for_image
                 .insert(image_handle, texture_handle);
@@ -234,12 +359,13 @@ impl GpuResourceStore {
     pub(super) fn latest_image(&self, handle: ImageHandle) -> Option<&GpuImage> {
         self.latest_texture_for_image
             .get(handle)
-            .and_then(|texture| self.gpu_images.get(*texture))
+            .and_then(|texture| self.texture_image(*texture))
             .filter(|image| image.image_handle == handle)
             .or_else(|| {
-                self.gpu_images
-                    .values()
-                    .find(|image| image.image_handle == handle)
+                self.texture_image_leases.iter().find_map(|(texture, _)| {
+                    self.texture_image(texture)
+                        .filter(|image| image.image_handle == handle)
+                })
             })
     }
 
@@ -247,9 +373,10 @@ impl GpuResourceStore {
     #[must_use]
     pub(super) fn texture_binding(&self, handle: TextureHandle) -> Option<&TextureBinding> {
         let binding = self.texture_bindings.get(handle)?;
-        self.gpu_images
-            .get(handle)
-            .filter(|image| binding.matches_gpu_image(image))
+        let lease = self.texture_image_leases.get(handle).copied()?;
+        self.physical_images
+            .get(lease.physical_id)
+            .filter(|image| binding.matches_residency(lease, image))
             .map(|_| binding)
     }
 
@@ -288,50 +415,64 @@ impl GpuResourceStore {
         self.gpu_buffers.retain(|_, v| v.last_used_frame >= cutoff);
         self.buffer_index
             .retain(|_, h| self.gpu_buffers.contains_key(*h));
-        self.gpu_images.retain(|_, v| v.last_used_frame >= cutoff);
-        let gpu_images = &self.gpu_images;
+        let stale_textures: Vec<_> = self
+            .texture_image_leases
+            .iter()
+            .filter_map(|(handle, lease)| (lease.last_used_frame < cutoff).then_some(handle))
+            .collect();
+        for handle in stale_textures {
+            self.remove_texture_image(handle);
+        }
+        let texture_image_leases = &self.texture_image_leases;
+        let physical_images = &self.physical_images;
         self.texture_bindings.retain(|handle, binding| {
-            gpu_images
+            texture_image_leases
                 .get(handle)
-                .is_some_and(|image| binding.matches_gpu_image(image))
+                .and_then(|lease| {
+                    physical_images
+                        .get(lease.physical_id)
+                        .map(|image| (*lease, image))
+                })
+                .is_some_and(|(lease, image)| binding.matches_residency(lease, image))
         });
         self.pending_mipmap_requests.retain(|request| {
-            gpu_images
-                .get(request.texture_handle)
-                .is_some_and(|image| image.generation_key() == request.key())
+            physical_images
+                .get(request.physical_id)
+                .is_some_and(|image| image.generation_key(request.physical_id) == request.key())
         });
-        self.pending_mipmap_keys.clear();
-        self.pending_mipmap_keys
-            .extend(self.pending_mipmap_requests.iter().map(MipmapRequest::key));
         self.pending_mipmap_indices.clear();
         self.pending_mipmap_indices.extend(
             self.pending_mipmap_requests
                 .iter()
                 .enumerate()
-                .map(|(index, request)| (request.texture_handle, index)),
+                .map(|(index, request)| (request.physical_id, index)),
         );
         self.latest_texture_for_image.retain(|image, texture| {
-            self.gpu_images
+            texture_image_leases
                 .get(*texture)
+                .and_then(|lease| physical_images.get(lease.physical_id))
                 .is_some_and(|gpu_image| gpu_image.image_handle == image)
         });
 
         // Preserve the compatibility lookup when its most-recent alias was
         // evicted but another TextureHandle for the same Image remains live.
         let live_images: FxHashSet<_> = self
-            .gpu_images
-            .values()
-            .map(|image| image.image_handle)
+            .texture_image_leases
+            .keys()
+            .filter_map(|texture| self.texture_image(texture).map(|image| image.image_handle))
             .collect();
         for image_handle in live_images {
             if self.latest_texture_for_image.contains_key(image_handle) {
                 continue;
             }
             if let Some((texture_handle, _)) = self
-                .gpu_images
+                .texture_image_leases
                 .iter()
-                .filter(|(_, image)| image.image_handle == image_handle)
-                .max_by_key(|(_, image)| image.last_used_frame)
+                .filter(|(texture, _)| {
+                    self.texture_image(*texture)
+                        .is_some_and(|image| image.image_handle == image_handle)
+                })
+                .max_by_key(|(_, lease)| lease.last_used_frame)
             {
                 self.latest_texture_for_image
                     .insert(image_handle, texture_handle);

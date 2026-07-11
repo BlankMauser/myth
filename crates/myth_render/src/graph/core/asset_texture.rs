@@ -37,7 +37,7 @@ impl AssetTextureImportId {
 ///
 /// Asset handles and storage versions provide collision-free logical identity;
 /// `logical_version` additionally fingerprints the resolved descriptor. The
-/// physical [`AssetTextureGenerationKey`](crate::core::gpu::AssetTextureGenerationKey)
+/// physical [`PhysicalImageGenerationKey`](crate::core::gpu::PhysicalImageGenerationKey)
 /// is deliberately *not* used here: it does not exist until the live upload
 /// node materializes this snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
