@@ -48,7 +48,9 @@
 //! ```
 
 use crate::core::binding::GlobalBindGroupCache;
-use crate::core::gpu::{CubeSourceType, GlobalStateKey, GlobalStateResolver, Tracked};
+use crate::core::gpu::{
+    CubeSourceType, GlobalStateKey, GlobalStateResolver, MipmapRequestResolver, Tracked,
+};
 use crate::core::{ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
 use crate::graph::RenderState;
@@ -799,11 +801,17 @@ impl<'a> FrameComposer<'a> {
             let mut atmosphere_transmittance = None;
             let mut atmosphere_bake_params = None;
 
-            let (mipmap_generator, mipmap_requests) = self.ctx.mipmap_pass.split();
+            let mipmap_snapshot = self.ctx.mipmap_pass.extract(self.ctx.resource_manager);
+            let mipmap_batch = graph_ctx
+                .graph
+                .stage_mipmap_requests(mipmap_snapshot.into_requests());
+            let mipmap_generator = self.ctx.mipmap_pass.generator_mut();
 
             // ── 2c. Wire Compute + Shadow Passes ───────────────────────────
             graph_ctx.with_group("Compute", |c| {
-                MipmapFeature::add_requests_to_graph(c, mipmap_requests);
+                if let Some(batch) = mipmap_batch {
+                    MipmapFeature::add_to_graph(c, batch);
+                }
 
                 // Visual atmosphere generation is independent from Environment
                 // cache readiness. Pending optional star/moon assets therefore
@@ -1572,6 +1580,7 @@ impl<'a> FrameComposer<'a> {
                         &self.ctx.resource_manager.internal_textures,
                     ),
                     mipmap_generator,
+                    mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     global_states: GlobalStateResolver::new(&self.ctx.resource_manager.bind_groups),
                     sampler_registry: &self.ctx.resource_manager.sampler_registry,
                     system_textures: &self.ctx.resource_manager.system_textures,
@@ -1627,6 +1636,7 @@ impl<'a> FrameComposer<'a> {
                     pipeline_cache: self.ctx.pipeline_cache,
                     global_bind_group_cache: self.ctx.global_bind_group_cache,
                     mipmap_generator: &*mipmap_generator,
+                    mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     baked_lists: &baked_lists,
                     wgpu_ctx: &*self.ctx.wgpu_ctx,
                     current_timeline_index: 0,
@@ -1648,6 +1658,13 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
+            if let Some(batch) = mipmap_batch {
+                let committed = graph.commit_submitted_mipmap_batch(batch);
+                debug_assert!(
+                    committed,
+                    "live asset mipmap batch was not encoded before submit"
+                );
+            }
             let cache_publications =
                 graph.commit_submitted_persistent_resources(self.ctx.history_registry);
             self.ctx

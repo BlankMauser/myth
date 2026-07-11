@@ -4,8 +4,8 @@ use crate::core::ResourceManager;
 use crate::core::WgpuContext;
 use crate::core::binding::{BindGroupKey, GlobalBindGroupCache};
 use crate::core::gpu::{
-    BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator, SamplerRegistry,
-    SystemTextures, Tracked,
+    BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
+    MipmapRequestResolver, SamplerRegistry, SystemTextures, Tracked,
 };
 use crate::graph::frame::{BakedRenderLists, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
@@ -93,6 +93,8 @@ pub struct PrepareContext<'a> {
     /// Shared mipmap encoder state. Live producers pre-warm their required
     /// format pipeline here so execute remains command-recording only.
     pub mipmap_generator: &'a mut MipmapGenerator,
+    /// Frame-owned physical mipmap attempts addressed by Copy batch IDs.
+    pub(crate) mipmap_requests: MipmapRequestResolver<'a>,
     /// Immutable lookup capability for scene-level global binding state.
     /// Snapshots carry only a lightweight key; live feature nodes resolve the
     /// physical layout and WGSL interface through this capability on L1 miss.
@@ -1177,6 +1179,8 @@ pub struct ExecuteContext<'a> {
     /// GPU resource manager (read-only) — used by compute, post-processing,
     /// and skybox passes that have not yet been migrated to baked commands.
     pub mipmap_generator: &'a MipmapGenerator,
+    /// Frame-owned physical mipmap attempts addressed by Copy batch IDs.
+    pub(crate) mipmap_requests: MipmapRequestResolver<'a>,
 
     /// Pre-baked draw command lists with all GPU handles resolved.
     ///

@@ -53,7 +53,7 @@ pub struct GpuImage {
     pub usage: wgpu::TextureUsages,
     pub version: u32,
     pub generation_id: u64,
-    completed_mipmap_generation: Arc<AtomicU64>,
+    submitted_mipmap_generation: Arc<AtomicU64>,
     pub last_used_frame: u64,
 }
 
@@ -103,7 +103,7 @@ impl GpuImage {
         });
 
         let generation_id = generate_gpu_resource_id();
-        let completed_mipmap_generation = Arc::new(AtomicU64::new(if mip_level_count <= 1 {
+        let submitted_mipmap_generation = Arc::new(AtomicU64::new(if mip_level_count <= 1 {
             generation_id
         } else {
             0
@@ -120,16 +120,16 @@ impl GpuImage {
             usage,
             version: 0,
             generation_id,
-            completed_mipmap_generation,
+            submitted_mipmap_generation,
             last_used_frame: 0,
         }
     }
 
     #[inline]
     #[must_use]
-    pub(crate) fn mipmaps_generated(&self) -> bool {
+    pub(crate) fn mipmaps_submitted(&self) -> bool {
         self.mip_level_count <= 1
-            || self.completed_mipmap_generation.load(Ordering::Acquire) == self.generation_id
+            || self.submitted_mipmap_generation.load(Ordering::Acquire) == self.generation_id
     }
 
     #[inline]
@@ -138,21 +138,22 @@ impl GpuImage {
             return;
         }
         self.generation_id = generate_gpu_resource_id();
-        self.completed_mipmap_generation.store(0, Ordering::Release);
+        self.submitted_mipmap_generation.store(0, Ordering::Release);
     }
 
     #[must_use]
-    pub(crate) fn mipmap_request(&self) -> Option<MipmapRequest> {
-        if self.mipmaps_generated() {
+    pub(crate) fn mipmap_request(&self, image_handle: ImageHandle) -> Option<MipmapRequest> {
+        if self.mipmaps_submitted() {
             return None;
         }
 
         Some(MipmapRequest::new(
+            image_handle,
             self.texture.clone(),
             self.id,
             self.generation_id,
             self.format,
-            self.completed_mipmap_generation.clone(),
+            self.submitted_mipmap_generation.clone(),
         ))
     }
 
@@ -347,7 +348,7 @@ impl ResourceManager {
                 if version_match && image_match && sampler_match {
                     let mipmap_request = texture_asset
                         .generate_mipmaps
-                        .then(|| gpu_img.mipmap_request())
+                        .then(|| gpu_img.mipmap_request(image_handle))
                         .flatten();
                     gpu_img.last_used_frame = self.frame_index;
                     if let Some(request) = mipmap_request {
@@ -395,7 +396,7 @@ impl ResourceManager {
             let mipmap_request = self
                 .resources
                 .image(image_handle)
-                .and_then(GpuImage::mipmap_request);
+                .and_then(|image| image.mipmap_request(image_handle));
             if let Some(request) = mipmap_request {
                 self.resources.queue_mipmap_request(request);
             }

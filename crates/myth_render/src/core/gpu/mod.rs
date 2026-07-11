@@ -59,7 +59,9 @@ pub(crate) use environment_store::EnvironmentStore;
 pub(crate) use internal_texture_registry::InternalTextureRegistry;
 
 pub use crate::core::gpu::mipmap::MipmapGenerator;
-pub(crate) use crate::core::gpu::mipmap::MipmapRequest;
+pub(crate) use crate::core::gpu::mipmap::{
+    MipmapBatchId, MipmapRequest, MipmapRequestBatch, MipmapRequestResolver,
+};
 pub use allocator::ModelBufferAllocator;
 use myth_resources::buffer::{CpuBuffer, GpuData};
 pub use resource_ids::{

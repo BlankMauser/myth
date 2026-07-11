@@ -52,9 +52,23 @@ impl GpuResourceStore {
     }
 
     pub(super) fn queue_mipmap_request(&mut self, request: MipmapRequest) {
-        if self.pending_mipmap_keys.insert(request.key()) {
-            self.pending_mipmap_requests.push(request);
+        if !self.pending_mipmap_keys.insert(request.key()) {
+            return;
         }
+
+        // Only the newest physical generation of one image asset can matter.
+        // This also prevents repeated begin_frame calls without render from
+        // retaining an unbounded chain of obsolete WGPU texture owners.
+        if let Some(index) = self
+            .pending_mipmap_requests
+            .iter()
+            .position(|pending| pending.image_handle == request.image_handle)
+        {
+            let stale = self.pending_mipmap_requests.swap_remove(index);
+            self.pending_mipmap_keys.remove(&stale.key());
+        }
+
+        self.pending_mipmap_requests.push(request);
     }
 
     #[must_use]

@@ -590,8 +590,6 @@ impl Renderer {
                     needs_velocity,
                 );
             }
-
-            state.mipmap_pass.extract_and_prepare(&mut extract_ctx);
         }
 
         // ── Phase 3: Build ComposerContext ──────────────────────────────
@@ -2238,6 +2236,100 @@ mod tests {
                 .filter(|pass| pass.name == "Shadow_VP_Upload")
                 .count(),
             1,
+        );
+    }
+
+    #[test]
+    fn mipmap_generator_stays_uninitialized_without_requests() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(!state.mipmap_pass.generator_initialized());
+        assert!(!graph_contains_pass(state, "Asset_Mipmap_Generation"));
+    }
+
+    #[test]
+    fn abandoned_composer_keeps_mipmap_pending_until_submitted() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image = Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![192; 8 * 8 * 4]),
+        );
+        let image_handle = assets.images.add(image);
+        let mut texture = Texture::new_2d(Some("Mipmap Submission Test"), image_handle);
+        texture.color_space = ColorSpace::Linear;
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+        let mut scene = Scene::new();
+        scene
+            .background
+            .set_mode(BackgroundMode::planar(texture_handle, 1.0));
+        let camera = make_camera();
+
+        let composer = renderer
+            .begin_frame(
+                &mut scene,
+                camera,
+                &assets,
+                FrameTime {
+                    time: 0.0,
+                    delta_time: 1.0 / 60.0,
+                    frame_count: 0,
+                },
+            )
+            .expect("frame composer must exist");
+        drop(composer);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let gpu_image = state
+            .resource_manager
+            .get_image(image_handle)
+            .expect("begin-frame texture preparation must create the GPU image");
+        assert!(!gpu_image.mipmaps_submitted());
+        assert!(!state.mipmap_pass.generator_initialized());
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let gpu_image = state
+            .resource_manager
+            .get_image(image_handle)
+            .expect("submitted texture must remain resident");
+        assert_eq!(gpu_image.mip_level_count, 4);
+        assert!(gpu_image.mipmaps_submitted());
+        assert!(state.mipmap_pass.generator_initialized());
+        assert!(graph_contains_pass(state, "Asset_Mipmap_Generation"));
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let mipmap_position = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Mipmap_Generation")
+            .expect("mipmap pass missing from execution queue");
+        let skybox_position = execution_names
+            .iter()
+            .position(|&name| name == "Skybox_Pass")
+            .expect("texture skybox pass missing from execution queue");
+        assert!(mipmap_position < skybox_position);
+        assert!(
+            state
+                .graph_storage
+                .mipmap_batches
+                .iter()
+                .all(Option::is_none),
+            "submitted mipmap batches must release their Texture/Arc owners immediately"
         );
     }
 

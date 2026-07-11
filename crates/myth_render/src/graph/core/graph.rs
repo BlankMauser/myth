@@ -3,7 +3,7 @@ use std::collections::BinaryHeap;
 
 use rustc_hash::FxHashMap;
 
-use crate::core::gpu::Tracked;
+use crate::core::gpu::{MipmapBatchId, MipmapRequest, MipmapRequestBatch, Tracked};
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 
@@ -142,6 +142,10 @@ pub struct GraphStorage {
     /// Ordinary cache publications evaluated after DPE and applied post-submit.
     cache_commit_requests: Vec<CacheCommitRequest>,
 
+    /// Drop-bearing physical mip-generation attempts staged for this frame.
+    /// Pass nodes retain only [`MipmapBatchId`] values into these arrays.
+    pub(crate) mipmap_batches: Vec<Option<MipmapRequestBatch>>,
+
     // /// Name-based resource registry for self-wiring passes.
     // resource_registry: FxHashMap<&'static str, TextureNodeId>,
 
@@ -177,6 +181,7 @@ impl GraphStorage {
             persistent_texture_lookup: FxHashMap::default(),
             history_commit_requests: Vec::new(),
             cache_commit_requests: Vec::new(),
+            mipmap_batches: Vec::new(),
             // resource_registry: FxHashMap::default(),
             compile_stack: Vec::new(),
             compile_in_degrees: Vec::new(),
@@ -198,9 +203,32 @@ impl GraphStorage {
         self.persistent_texture_lookup.clear();
         self.history_commit_requests.clear();
         self.cache_commit_requests.clear();
+        self.mipmap_batches.clear();
         // self.resource_registry.clear();
         #[cfg(feature = "rdg_inspector")]
         self.current_group_stack.clear();
+    }
+
+    fn stage_mipmap_requests(&mut self, requests: Vec<MipmapRequest>) -> Option<MipmapBatchId> {
+        if requests.is_empty() {
+            return None;
+        }
+
+        let batch = MipmapBatchId::from_index(self.mipmap_batches.len());
+        self.mipmap_batches
+            .push(Some(MipmapRequestBatch::new(requests)));
+        Some(batch)
+    }
+
+    fn commit_submitted_mipmap_batch(&mut self, batch: MipmapBatchId) -> bool {
+        let attempt = self.mipmap_batches[batch.index()]
+            .take()
+            .expect("mipmap request batch already released");
+        if !attempt.was_encoded() {
+            return false;
+        }
+        attempt.publish_submitted();
+        true
     }
 
     /// Dumps the current Render Graph topology as a Mermaid flowchart.
@@ -483,6 +511,21 @@ impl<'a> RenderGraph<'a> {
     #[inline]
     pub(crate) fn alloc_shared_state<T>(&self, value: T) -> &'a T {
         self.arena.alloc(value)
+    }
+
+    /// Moves Drop-bearing WGPU request owners into persistent GraphStorage and
+    /// returns a Copy ID suitable for a no-drop pass node.
+    pub(crate) fn stage_mipmap_requests(
+        &mut self,
+        requests: Vec<MipmapRequest>,
+    ) -> Option<MipmapBatchId> {
+        self.storage.stage_mipmap_requests(requests)
+    }
+
+    /// Publishes generation tokens only after the batch was encoded by a live
+    /// node and the containing command buffer was submitted.
+    pub(crate) fn commit_submitted_mipmap_batch(&mut self, batch: MipmapBatchId) -> bool {
+        self.storage.commit_submitted_mipmap_batch(batch)
     }
 
     // ─── Logical Grouping (Inspector) ────────────────────────────────
@@ -1413,6 +1456,30 @@ mod tests {
     ) -> RenderGraph<'a> {
         storage.clear();
         RenderGraph::new(storage, arena)
+    }
+
+    #[test]
+    fn unencoded_mipmap_batch_is_released_without_publication() {
+        let mut storage = GraphStorage::new();
+        let batch = MipmapBatchId::from_index(0);
+        storage
+            .mipmap_batches
+            .push(Some(MipmapRequestBatch::new(Vec::new())));
+
+        assert!(!storage.commit_submitted_mipmap_batch(batch));
+        assert!(storage.mipmap_batches[batch.index()].is_none());
+    }
+
+    #[test]
+    fn encoded_mipmap_batch_is_publishable_and_released() {
+        let mut storage = GraphStorage::new();
+        let batch = MipmapBatchId::from_index(0);
+        let attempt = MipmapRequestBatch::new(Vec::new());
+        attempt.mark_encoded();
+        storage.mipmap_batches.push(Some(attempt));
+
+        assert!(storage.commit_submitted_mipmap_batch(batch));
+        assert!(storage.mipmap_batches[batch.index()].is_none());
     }
 
     #[test]
