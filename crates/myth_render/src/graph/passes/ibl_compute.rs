@@ -11,6 +11,7 @@ use std::hash::{Hash, Hasher};
 use glam::Vec3;
 use rustc_hash::{FxHashMap, FxHasher};
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, CubeSourceType, GpuEnvironment, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -747,7 +748,7 @@ impl IblComputeFeature {
                 ),
             );
 
-            let mip_states: Vec<IblMipState<'a>> = (0..snapshot.pmrem_mip_level_count)
+            let mip_states: Vec<IblMipState> = (0..snapshot.pmrem_mip_level_count)
                 .map(|mip_level| {
                     let dynamic_offset = snapshot
                         .params_stride
@@ -782,10 +783,10 @@ impl IblComputeFeature {
 }
 
 #[derive(Clone, Copy)]
-struct IblMipState<'a> {
+struct IblMipState {
     mip_level: u32,
     dynamic_offset: u32,
-    dest_bg: Option<&'a wgpu::BindGroup>,
+    dest_bg: Option<PreparedBindGroupId>,
 }
 
 struct IblComputePassNode<'a> {
@@ -794,8 +795,8 @@ struct IblComputePassNode<'a> {
     base_cube: TextureNodeId,
     pmrem: TextureNodeId,
     params_buffer: BufferNodeId,
-    source_bg: Option<&'a wgpu::BindGroup>,
-    mips: &'a mut [IblMipState<'a>],
+    source_bg: Option<PreparedBindGroupId>,
+    mips: &'a mut [IblMipState],
 }
 
 impl<'a> PassNode<'a> for IblComputePassNode<'a> {
@@ -882,7 +883,8 @@ impl<'a> PassNode<'a> for IblComputePassNode<'a> {
             .pipeline(self.snapshot.ibl_variant)
             .expect("IBL pipeline must exist after prepare");
         let pipeline = ctx.pipeline_cache.get_compute_pipeline(pipeline_id);
-        let source_bg = self.source_bg.expect("IBL source BG missing");
+        let source_bg =
+            ctx.resolve_prepared_bind_group(self.source_bg.expect("IBL source BG missing"));
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("IBL Compute"),
             timestamp_writes: None,
@@ -891,7 +893,11 @@ impl<'a> PassNode<'a> for IblComputePassNode<'a> {
 
         for mip in self.mips.iter() {
             cpass.set_bind_group(0, source_bg, &[mip.dynamic_offset]);
-            cpass.set_bind_group(1, mip.dest_bg.expect("IBL destination BG missing"), &[]);
+            cpass.set_bind_group(
+                1,
+                ctx.resolve_prepared_bind_group(mip.dest_bg.expect("IBL destination BG missing")),
+                &[],
+            );
             let mip_size = (self.snapshot.pmrem_size >> mip.mip_level).max(1);
             let group_count = mip_size.div_ceil(8);
             cpass.dispatch_workgroups(group_count, group_count, 6);

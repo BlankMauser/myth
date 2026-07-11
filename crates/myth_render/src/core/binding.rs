@@ -112,6 +112,19 @@ impl Bindings for Scene {
 /// Number of idle frames before a cached bind group is evicted.
 const BIND_GROUP_EVICTION_THRESHOLD: u64 = 10;
 
+/// Process-unique token source for frame-owned prepared-bind-group stores.
+/// Relaxed ordering is sufficient: uniqueness, not synchronization, is the
+/// contract.
+static NEXT_PREPARED_BIND_GROUP_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+
+fn next_prepared_bind_group_attempt() -> u64 {
+    NEXT_PREPARED_BIND_GROUP_ATTEMPT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("prepared bind-group graph-attempt token space exhausted")
+}
+
 /// A cached bind group entry with TTL (Time-To-Live) tracking.
 ///
 /// Records the last frame the bind group was accessed so that stale
@@ -131,14 +144,12 @@ struct CachedBindGroup {
 /// by stale bind groups (e.g. after SSAO is disabled or a resize occurs)
 /// is promptly released.
 ///
-/// # Heap-Stable Pointers
-///
-/// Entries are stored behind [`Box`] to guarantee that `&wgpu::BindGroup`
-/// references remain valid even when the backing `HashMap` resizes.  This
-/// enables the prepare phase to hand out `&'a wgpu::BindGroup` references
-/// that survive across multiple `prepare()` calls without invalidation.
+/// RDG nodes never borrow entries from this cache across phases. Live prepare
+/// clones each exact handle into its graph attempt's
+/// [`PreparedBindGroupStore`], which provides Copy IDs to nodes and owns the
+/// handles until execute or abort completes.
 pub struct GlobalBindGroupCache {
-    cache: FxHashMap<BindGroupKey, Box<CachedBindGroup>>,
+    cache: FxHashMap<BindGroupKey, CachedBindGroup>,
     current_frame: u64,
 }
 
@@ -197,10 +208,10 @@ impl GlobalBindGroupCache {
     pub fn insert(&mut self, key: BindGroupKey, bind_group: wgpu::BindGroup) {
         self.cache.insert(
             key,
-            Box::new(CachedBindGroup {
+            CachedBindGroup {
                 bg: bind_group,
                 last_accessed_frame: AtomicU64::new(self.current_frame),
-            }),
+            },
         );
     }
 
@@ -211,66 +222,12 @@ impl GlobalBindGroupCache {
         factory: impl FnOnce() -> wgpu::BindGroup,
     ) -> &wgpu::BindGroup {
         let frame = self.current_frame;
-        let entry = self.cache.entry(key).or_insert_with(|| {
-            Box::new(CachedBindGroup {
-                bg: factory(),
-                last_accessed_frame: AtomicU64::new(frame),
-            })
+        let entry = self.cache.entry(key).or_insert_with(|| CachedBindGroup {
+            bg: factory(),
+            last_accessed_frame: AtomicU64::new(frame),
         });
         entry.last_accessed_frame.store(frame, Ordering::Relaxed);
         &entry.bg
-    }
-
-    /// Ensure a bind group exists and return a pointer-stable `&'a` reference.
-    ///
-    /// Because entries are `Box`-allocated, the returned `&wgpu::BindGroup`
-    /// resides at a heap address that remains valid even if the underlying
-    /// `HashMap` is later resized by subsequent insertions.  This allows
-    /// the prepare phase to hand out frame-scoped references that survive
-    /// across multiple `prepare()` calls.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the cache is **not** garbage-collected or
-    /// cleared while the returned reference is alive.  In practice this
-    /// is guaranteed by the sequential prepare→execute pipeline: GC runs
-    /// only at frame boundaries, after all references have expired.
-    pub unsafe fn get_or_create_stable<'a>(
-        &mut self,
-        key: BindGroupKey,
-        factory: impl FnOnce() -> wgpu::BindGroup,
-    ) -> &'a wgpu::BindGroup {
-        let frame = self.current_frame;
-        let entry = self.cache.entry(key).or_insert_with(|| {
-            Box::new(CachedBindGroup {
-                bg: factory(),
-                last_accessed_frame: AtomicU64::new(frame),
-            })
-        });
-        entry.last_accessed_frame.store(frame, Ordering::Relaxed);
-        // SAFETY: Box<CachedBindGroup> places the BindGroup on the heap
-        // at a stable address.  HashMap resizing moves Box pointers but
-        // not the heap-allocated data they reference.  The entry is
-        // retained until garbage_collect() at frame boundaries.
-        let ptr = &raw const entry.bg;
-        unsafe { &*ptr }
-    }
-
-    /// Retrieve or create a bind group, returning a pointer-stable `&'a`
-    /// reference suitable for storing on a `PassNode<'a>`.
-    ///
-    /// This is the **safe entry-point** for RDG prepare-phase code.
-    /// It wraps [`Self::get_or_create_stable`] and relies on the
-    /// architectural invariant that cache entries live for the full frame.
-    pub(crate) fn get_or_create_bg<'a>(
-        &mut self,
-        key: BindGroupKey,
-        factory: impl FnOnce() -> wgpu::BindGroup,
-    ) -> &'a wgpu::BindGroup {
-        // SAFETY: Box'd entries have heap-stable addresses.  The cache is
-        // not garbage-collected until frame boundaries, after all `&'a`
-        // references have expired in the sequential prepare→execute model.
-        unsafe { self.get_or_create_stable(key, factory) }
     }
 
     /// Forcibly clears all entries.
@@ -305,6 +262,99 @@ impl GlobalBindGroupCache {
     }
 }
 
+/// Copy handle to a bind group owned by one graph attempt.
+///
+/// The process-unique 64-bit attempt token prevents a stale ID from aliasing a
+/// later frame or a different renderer even when the vector index is reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PreparedBindGroupId {
+    attempt_token: u64,
+    index: u32,
+}
+
+/// Destructor-aware, frame-scoped ownership for bind groups used by live RDG
+/// nodes.
+///
+/// The cross-frame [`GlobalBindGroupCache`] remains the reuse layer, while
+/// this store clones the exact WGPU handles needed by the current graph
+/// attempt. Pass nodes retain only [`PreparedBindGroupId`] values, so clearing
+/// or collecting the persistent cache can never invalidate an in-flight
+/// graph. The attempt token turns stale-ID reuse into a checked lookup miss.
+pub(crate) struct PreparedBindGroupStore {
+    bind_groups: Vec<wgpu::BindGroup>,
+    lookup: FxHashMap<BindGroupKey, PreparedBindGroupId>,
+    attempt_token: u64,
+}
+
+impl Default for PreparedBindGroupStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PreparedBindGroupStore {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            bind_groups: Vec::new(),
+            lookup: FxHashMap::default(),
+            attempt_token: next_prepared_bind_group_attempt(),
+        }
+    }
+
+    /// Returns the frame-local ID for `key`, cloning a cache-owned WGPU handle
+    /// only on the first use in this graph attempt.
+    pub(crate) fn get_or_create(
+        &mut self,
+        cache: &mut GlobalBindGroupCache,
+        key: BindGroupKey,
+        factory: impl FnOnce() -> wgpu::BindGroup,
+    ) -> PreparedBindGroupId {
+        if let Some(&id) = self.lookup.get(&key) {
+            debug_assert!(self.resolve(id).is_some());
+            return id;
+        }
+
+        let bind_group = cache.get_or_create(key.clone(), factory).clone();
+        let index = u32::try_from(self.bind_groups.len())
+            .expect("one graph attempt cannot prepare more than u32::MAX bind groups");
+        let id = PreparedBindGroupId {
+            attempt_token: self.attempt_token,
+            index,
+        };
+        self.bind_groups.push(bind_group);
+        let previous = self.lookup.insert(key, id);
+        debug_assert!(previous.is_none());
+        id
+    }
+
+    #[must_use]
+    pub(crate) fn resolve(&self, id: PreparedBindGroupId) -> Option<&wgpu::BindGroup> {
+        if id.attempt_token != self.attempt_token {
+            return None;
+        }
+        self.bind_groups.get(id.index as usize)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.lookup.clear();
+        self.bind_groups.clear();
+        self.attempt_token = next_prepared_bind_group_attempt();
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.bind_groups.len()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn attempt_token(&self) -> u64 {
+        self.attempt_token
+    }
+}
+
 /// Global `BindGroup` cache key
 /// Contains the unique identifier of the Layout + unique identifiers of all binding resources
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -326,5 +376,75 @@ impl BindGroupKey {
     pub fn with_resource(mut self, id: u64) -> Self {
         self.resources.push(id);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::WgpuContext;
+    use crate::settings::{RendererInitConfig, RendererSettings};
+
+    fn empty_bind_group(device: &wgpu::Device, label: &'static str) -> wgpu::BindGroup {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &[],
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &layout,
+            entries: &[],
+        })
+    }
+
+    #[test]
+    fn frame_store_deduplicates_isolates_attempts_and_survives_cache_clear() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            1,
+            1,
+            None,
+        ))
+        .expect("headless GPU context required");
+
+        let mut cache = GlobalBindGroupCache::new();
+        cache.begin_frame();
+        let mut prepared = PreparedBindGroupStore::new();
+        let key = BindGroupKey::new(1).with_resource(7);
+        let id = prepared.get_or_create(&mut cache, key.clone(), || {
+            empty_bind_group(&wgpu.device, "Prepared BindGroup A")
+        });
+        let same = prepared.get_or_create(&mut cache, key.clone(), || {
+            panic!("same-frame prepared bind group must be deduplicated")
+        });
+        assert_eq!(id, same);
+        assert_eq!(prepared.len(), 1);
+
+        let mut other_attempt = PreparedBindGroupStore::new();
+        let other_id = other_attempt.get_or_create(&mut cache, key, || {
+            panic!("the cross-frame cache already owns this bind group")
+        });
+        assert_ne!(id, other_id);
+        assert!(other_attempt.resolve(id).is_none());
+        assert!(prepared.resolve(other_id).is_none());
+
+        let frame_owned = prepared
+            .resolve(id)
+            .expect("prepared bind group must resolve")
+            .clone();
+        cache.clear();
+        assert_eq!(prepared.resolve(id), Some(&frame_owned));
+        assert!(other_attempt.resolve(other_id).is_some());
+
+        prepared.clear();
+        assert!(prepared.resolve(id).is_none());
+
+        let next = prepared.get_or_create(&mut cache, BindGroupKey::new(2), || {
+            empty_bind_group(&wgpu.device, "Prepared BindGroup B")
+        });
+        assert_ne!(id, next);
+        assert!(prepared.resolve(id).is_none());
+        assert!(prepared.resolve(next).is_some());
     }
 }

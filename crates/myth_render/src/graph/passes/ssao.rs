@@ -13,6 +13,7 @@
 
 use std::mem::size_of;
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::binding_layout::{
     depth_texture_2d, sampler, texture, texture_2d, uniform_buffer,
 };
@@ -388,8 +389,8 @@ struct SsaoRawNode<'a> {
     normal_tex: TextureNodeId,
     uniforms_buffer: BufferNodeId,
     output_tex: TextureNodeId,
-    raw_bind_group: Option<&'a wgpu::BindGroup>,
-    uniforms_bind_group: Option<&'a wgpu::BindGroup>,
+    raw_bind_group: Option<PreparedBindGroupId>,
+    uniforms_bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsaoRawNode<'a> {
@@ -440,13 +441,15 @@ impl<'a> PassNode<'a> for SsaoRawNode<'a> {
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
         pass.set_bind_group(
             1,
-            self.raw_bind_group.expect("SSAO raw BG not prepared"),
+            ctx.resolve_prepared_bind_group(self.raw_bind_group.expect("SSAO raw BG not prepared")),
             &[],
         );
         pass.set_bind_group(
             2,
-            self.uniforms_bind_group
-                .expect("SSAO uniforms BG not prepared"),
+            ctx.resolve_prepared_bind_group(
+                self.uniforms_bind_group
+                    .expect("SSAO uniforms BG not prepared"),
+            ),
             &[],
         );
         pass.draw(0..3, 0..1);
@@ -459,7 +462,7 @@ struct SsaoBlurNode<'a> {
     depth_tex: TextureNodeId,
     normal_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsaoBlurNode<'a> {
@@ -488,7 +491,11 @@ impl<'a> PassNode<'a> for SsaoBlurNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, self.bind_group.expect("SSAO blur BG not prepared"), &[]);
+        pass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSAO blur BG not prepared")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }

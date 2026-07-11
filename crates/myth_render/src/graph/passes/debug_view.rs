@@ -32,6 +32,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::CommandEncoder;
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -417,7 +418,7 @@ struct DebugViewPassNode<'a> {
     clustered_params: Option<crate::graph::core::BufferNodeId>,
     clustered_records: Option<crate::graph::core::BufferNodeId>,
     /// Transient bind group built in `prepare()`.
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    transient_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for DebugViewPassNode<'a> {
@@ -455,6 +456,7 @@ impl<'a> PassNode<'a> for DebugViewPassNode<'a> {
         let transient_bg = self
             .transient_bg
             .expect("DebugView transient BG not prepared!");
+        let transient_bg = ctx.resolve_prepared_bind_group(transient_bg);
         let pipeline_id = self
             .feature
             .pipeline_id

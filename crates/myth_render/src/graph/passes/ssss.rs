@@ -38,6 +38,7 @@
 //!   Uploaded from `AssetServer.sss_registry`.
 //! - **temp_blur TransientTexture**: `Rgba16Float`, same size as scene colour.
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::binding_layout::{depth_texture_2d, sampler, storage_buffer, texture_2d};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
@@ -386,7 +387,7 @@ struct SsssHorizontalNode<'a> {
     specular_tex: TextureNodeId,
 
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
@@ -435,7 +436,11 @@ impl<'a> PassNode<'a> for SsssHorizontalNode<'a> {
                     .expect("SSSS horizontal pipeline not prepared"),
             ),
         );
-        rpass.set_bind_group(0, self.bind_group.unwrap(), &[]);
+        let bind_group = ctx.resolve_prepared_bind_group(
+            self.bind_group
+                .expect("SSSS horizontal bind group not prepared"),
+        );
+        rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }
 }
@@ -461,7 +466,7 @@ struct SsssVerticalNode<'a> {
     specular_tex: TextureNodeId,
 
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsssVerticalNode<'a> {
@@ -507,7 +512,11 @@ impl<'a> PassNode<'a> for SsssVerticalNode<'a> {
                     .expect("SSSS vertical pipeline not prepared"),
             ),
         );
-        rpass.set_bind_group(0, self.bind_group.unwrap(), &[]);
+        let bind_group = ctx.resolve_prepared_bind_group(
+            self.bind_group
+                .expect("SSSS vertical bind group not prepared"),
+        );
+        rpass.set_bind_group(0, bind_group, &[]);
         rpass.draw(0..3, 0..1);
     }
 }

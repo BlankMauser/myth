@@ -18,6 +18,7 @@ use std::sync::{Arc, Weak};
 use glam::{Mat4, Vec3, Vec3A};
 use rustc_hash::FxHashMap;
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, GlobalStateKey, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::gaussian::{GaussianFrameBatchId, GaussianFrameCloud};
@@ -436,20 +437,20 @@ struct CloudGraphBuffers {
 }
 
 #[derive(Clone, Copy)]
-struct CloudComputeState<'a> {
+struct CloudComputeState {
     buffers: CloudGraphBuffers,
     plan: GaussianCloudPlan,
-    preprocess_bg1: Option<&'a wgpu::BindGroup>,
-    preprocess_bg2: Option<&'a wgpu::BindGroup>,
-    preprocess_bg3: Option<&'a wgpu::BindGroup>,
-    sort_bg_a_to_b: Option<&'a wgpu::BindGroup>,
-    sort_bg_b_to_a: Option<&'a wgpu::BindGroup>,
+    preprocess_bg1: Option<PreparedBindGroupId>,
+    preprocess_bg2: Option<PreparedBindGroupId>,
+    preprocess_bg3: Option<PreparedBindGroupId>,
+    sort_bg_a_to_b: Option<PreparedBindGroupId>,
+    sort_bg_b_to_a: Option<PreparedBindGroupId>,
 }
 
 #[derive(Clone, Copy)]
-struct CloudRenderState<'a> {
+struct CloudRenderState {
     buffers: CloudGraphBuffers,
-    render_bg: Option<&'a wgpu::BindGroup>,
+    render_bg: Option<PreparedBindGroupId>,
 }
 
 struct GaussianComputeResources {
@@ -1495,7 +1496,7 @@ struct GaussianComputePassNode<'a> {
     frame_index: u64,
     preprocess_pipeline: Option<ComputePipelineId>,
     sort_pipelines: Option<GaussianSortPipelines>,
-    clouds: &'a mut [CloudComputeState<'a>],
+    clouds: &'a mut [CloudComputeState],
 }
 
 impl<'a> PassNode<'a> for GaussianComputePassNode<'a> {
@@ -1613,6 +1614,15 @@ impl<'a> PassNode<'a> for GaussianComputePassNode<'a> {
 
         for cloud in self.clouds.iter() {
             let preprocess_workgroups = cloud.buffers.num_points.div_ceil(PREPROCESS_WG_SIZE);
+            let preprocess_bg1 = ctx.resolve_prepared_bind_group(
+                cloud.preprocess_bg1.expect("GS preprocess BG1 missing"),
+            );
+            let preprocess_bg2 = ctx.resolve_prepared_bind_group(
+                cloud.preprocess_bg2.expect("GS preprocess BG2 missing"),
+            );
+            let preprocess_bg3 = ctx.resolve_prepared_bind_group(
+                cloud.preprocess_bg3.expect("GS preprocess BG3 missing"),
+            );
 
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1621,21 +1631,9 @@ impl<'a> PassNode<'a> for GaussianComputePassNode<'a> {
                 });
                 cpass.set_pipeline(preprocess_pipeline);
                 cpass.set_bind_group(0, global_bind_group, &[]);
-                cpass.set_bind_group(
-                    1,
-                    cloud.preprocess_bg1.expect("GS preprocess BG1 missing"),
-                    &[],
-                );
-                cpass.set_bind_group(
-                    2,
-                    cloud.preprocess_bg2.expect("GS preprocess BG2 missing"),
-                    &[],
-                );
-                cpass.set_bind_group(
-                    3,
-                    cloud.preprocess_bg3.expect("GS preprocess BG3 missing"),
-                    &[],
-                );
+                cpass.set_bind_group(1, preprocess_bg1, &[]);
+                cpass.set_bind_group(2, preprocess_bg2, &[]);
+                cpass.set_bind_group(3, preprocess_bg3, &[]);
                 cpass.dispatch_workgroups(preprocess_workgroups, 1, 1);
             }
 
@@ -1647,12 +1645,16 @@ impl<'a> PassNode<'a> for GaussianComputePassNode<'a> {
                 std::mem::size_of::<[u32; 3]>() as u64,
             );
 
-            let sort_bg_a_to_b = cloud
-                .sort_bg_a_to_b
-                .expect("GS sort A-to-B bind group missing");
-            let sort_bg_b_to_a = cloud
-                .sort_bg_b_to_a
-                .expect("GS sort B-to-A bind group missing");
+            let sort_bg_a_to_b = ctx.resolve_prepared_bind_group(
+                cloud
+                    .sort_bg_a_to_b
+                    .expect("GS sort A-to-B bind group missing"),
+            );
+            let sort_bg_b_to_a = ctx.resolve_prepared_bind_group(
+                cloud
+                    .sort_bg_b_to_a
+                    .expect("GS sort B-to-A bind group missing"),
+            );
             let sort_dispatch = ctx.get_buffer(cloud.buffers.sort_dispatch_buf);
             let sort_internal = ctx.get_buffer(cloud.buffers.sort_internal_buf);
             let histogram_bytes = u64::try_from(
@@ -1707,7 +1709,6 @@ impl<'a> PassNode<'a> for GaussianComputePassNode<'a> {
                             1,
                         );
                     }
-
                     for level in
                         (0..cloud.buffers.sort_layout.scan_level_count.saturating_sub(1)).rev()
                     {
@@ -1757,7 +1758,7 @@ struct GaussianRenderPassNode<'a> {
     pipeline: Option<RenderPipelineId>,
     depth_format: wgpu::TextureFormat,
     msaa_samples: u32,
-    clouds: &'a mut [CloudRenderState<'a>],
+    clouds: &'a mut [CloudRenderState],
     color_target: TextureNodeId,
     resolve_target: Option<TextureNodeId>,
     depth_target: TextureNodeId,
@@ -1808,7 +1809,11 @@ impl<'a> PassNode<'a> for GaussianRenderPassNode<'a> {
         rpass.set_pipeline(render_pipeline);
 
         for cloud in self.clouds.iter() {
-            rpass.set_bind_group(0, cloud.render_bg.expect("GS render BG missing"), &[]);
+            rpass.set_bind_group(
+                0,
+                ctx.resolve_prepared_bind_group(cloud.render_bg.expect("GS render BG missing")),
+                &[],
+            );
             rpass.draw_indirect(ctx.get_buffer(cloud.buffers.draw_indirect_buf), 0);
         }
     }
@@ -1823,7 +1828,7 @@ struct GaussianCompositePassNode<'a> {
     accumulation_tex: TextureNodeId,
     composite_settings_buf: BufferNodeId,
     color_target: TextureNodeId,
-    composite_bg: Option<&'a wgpu::BindGroup>,
+    composite_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for GaussianCompositePassNode<'a> {
@@ -1867,7 +1872,11 @@ impl<'a> PassNode<'a> for GaussianCompositePassNode<'a> {
         });
 
         rpass.set_pipeline(composite_pipeline);
-        rpass.set_bind_group(0, self.composite_bg.expect("GS composite BG missing"), &[]);
+        rpass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.composite_bg.expect("GS composite BG missing")),
+            &[],
+        );
         rpass.draw(0..3, 0..1);
     }
 }

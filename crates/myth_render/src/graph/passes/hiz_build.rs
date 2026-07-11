@@ -3,6 +3,7 @@
 //! The hierarchy stores reverse-Z maximum depth in an `R32Float` mip chain so
 //! screen-space ray features can conservatively skip empty space.
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::Tracked;
 use crate::core::gpu::binding_layout::{depth_texture_2d, storage_texture, texture_2d};
 use crate::graph::composer::GraphBuilderContext;
@@ -184,18 +185,18 @@ impl HiZFeature {
 }
 
 #[derive(Clone, Copy)]
-struct HiZMipState<'a> {
+struct HiZMipState {
     mip_level: u32,
     target_size: (u32, u32),
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 struct HiZBuildNode<'a> {
     feature: &'a mut HiZFeature,
     scene_depth: TextureNodeId,
     hiz_texture: TextureNodeId,
-    init_bg: Option<&'a wgpu::BindGroup>,
-    mips: &'a mut [HiZMipState<'a>],
+    init_bg: Option<PreparedBindGroupId>,
+    mips: &'a mut [HiZMipState],
 }
 
 impl<'a> PassNode<'a> for HiZBuildNode<'a> {
@@ -287,7 +288,11 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
         });
 
         init_pass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(init_pipeline_id));
-        init_pass.set_bind_group(0, self.init_bg.expect("Hi-Z init BG missing"), &[]);
+        init_pass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.init_bg.expect("Hi-Z init BG missing")),
+            &[],
+        );
         init_pass.dispatch_workgroups(
             full_w.div_ceil(HIZ_WORKGROUP_SIZE),
             full_h.div_ceil(HIZ_WORKGROUP_SIZE),
@@ -304,7 +309,11 @@ impl<'a> PassNode<'a> for HiZBuildNode<'a> {
                 ctx.pipeline_cache
                     .get_compute_pipeline(downsample_pipeline_id),
             );
-            downsample_pass.set_bind_group(0, mip.bind_group.expect("Hi-Z mip BG missing"), &[]);
+            downsample_pass.set_bind_group(
+                0,
+                ctx.resolve_prepared_bind_group(mip.bind_group.expect("Hi-Z mip BG missing")),
+                &[],
+            );
             downsample_pass.dispatch_workgroups(
                 mip.target_size.0.div_ceil(HIZ_WORKGROUP_SIZE),
                 mip.target_size.1.div_ceil(HIZ_WORKGROUP_SIZE),

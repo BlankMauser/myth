@@ -42,6 +42,7 @@ use glam::Mat4;
 use myth_scene::light::LightKind;
 use smallvec::SmallVec;
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{Tracked, binding_layout};
 use crate::core::view::ViewTarget;
 use crate::graph::composer::GraphBuilderContext;
@@ -299,10 +300,10 @@ impl ShadowFeature {
 }
 
 /// Frame-scoped handoff from the live VP producer's prepare step to both
-/// render consumers. The cell stores only an arena-lifetime reference and
-/// owns no GPU object.
-struct ShadowPreparedState<'a> {
-    bind_group: OnceLock<&'a wgpu::BindGroup>,
+/// render consumers. The cell stores only a prepared-store ID and owns no GPU
+/// object.
+struct ShadowPreparedState {
+    bind_group: OnceLock<PreparedBindGroupId>,
 }
 
 /// Real RDG data producer for the shared per-layer VP uniform buffer.
@@ -315,7 +316,7 @@ struct ShadowVpUploadNode<'a> {
     cube_lights: &'a [ShadowLightInstance],
     uniform_stride: u32,
     buffer: BufferNodeId,
-    prepared: &'a ShadowPreparedState<'a>,
+    prepared: &'a ShadowPreparedState,
 }
 
 impl<'a> PassNode<'a> for ShadowVpUploadNode<'a> {
@@ -348,7 +349,7 @@ impl<'a> PassNode<'a> for ShadowVpUploadNode<'a> {
 struct Shadow2DPassNode<'a> {
     lights: &'a [ShadowLightInstance],
     uniform_stride: u32,
-    prepared: &'a ShadowPreparedState<'a>,
+    prepared: &'a ShadowPreparedState,
     texture_id: TextureNodeId,
 }
 
@@ -359,12 +360,13 @@ impl<'a> PassNode<'a> for Shadow2DPassNode<'a> {
         }
 
         let texture = ctx.get_texture(self.texture_id);
-        let bind_group = self
+        let bind_group_id = self
             .prepared
             .bind_group
             .get()
             .copied()
             .expect("Shadow VP bind group missing after prepare");
+        let bind_group = ctx.resolve_prepared_bind_group(bind_group_id);
 
         for (uniform_idx, shadow_light) in self.lights.iter().enumerate() {
             let layer_view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -418,7 +420,7 @@ struct ShadowCubePassNode<'a> {
     lights: &'a [ShadowLightInstance],
     uniform_base: u32,
     uniform_stride: u32,
-    prepared: &'a ShadowPreparedState<'a>,
+    prepared: &'a ShadowPreparedState,
     texture_id: TextureNodeId,
 }
 
@@ -429,12 +431,13 @@ impl<'a> PassNode<'a> for ShadowCubePassNode<'a> {
         }
 
         let texture = ctx.get_texture(self.texture_id);
-        let bind_group = self
+        let bind_group_id = self
             .prepared
             .bind_group
             .get()
             .copied()
             .expect("Shadow VP bind group missing after prepare");
+        let bind_group = ctx.resolve_prepared_bind_group(bind_group_id);
 
         for (uniform_index, shadow_light) in self.lights.iter().enumerate() {
             // Each face is a single 2D layer within the cube array texture.

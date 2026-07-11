@@ -19,6 +19,7 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, GlobalStateKey, ProceduralEnvironmentSnapshot, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -249,7 +250,7 @@ pub(crate) struct TextureSkyboxDrawState<'a> {
     input: TextureSkyboxInput,
     params_buffer: BufferNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 pub(crate) struct GradientSkyboxDrawState<'a> {
@@ -257,7 +258,7 @@ pub(crate) struct GradientSkyboxDrawState<'a> {
     snapshot: GradientSkyboxSnapshot,
     params_buffer: BufferNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 pub(crate) struct ProceduralSkyboxDrawState<'a> {
@@ -265,7 +266,7 @@ pub(crate) struct ProceduralSkyboxDrawState<'a> {
     snapshot: ProceduralSkyboxSnapshot,
     inputs: ProceduralSkyboxInputs,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 // ─── Layout Helpers ───────────────────────────────────────────────────────────
@@ -848,13 +849,13 @@ impl SkyboxFeature {
         }
     }
 
-    fn prepare_texture_draw<'frame>(
+    fn prepare_texture_draw(
         &mut self,
-        ctx: &mut PrepareContext<'frame>,
+        ctx: &mut PrepareContext<'_>,
         snapshot: TextureSkyboxSnapshot,
         input: TextureSkyboxInput,
         params_buffer: BufferNodeId,
-    ) -> Option<(RenderPipelineId, &'frame wgpu::BindGroup)> {
+    ) -> Option<(RenderPipelineId, PreparedBindGroupId)> {
         let expected_dimension = match snapshot.variant {
             SkyboxVariant::Cube => wgpu::TextureViewDimension::Cube,
             SkyboxVariant::Equirectangular | SkyboxVariant::Planar => {
@@ -960,12 +961,12 @@ impl SkyboxFeature {
         Some((pipeline_id, bind_group))
     }
 
-    fn prepare_gradient_draw<'frame>(
+    fn prepare_gradient_draw(
         &mut self,
-        ctx: &mut PrepareContext<'frame>,
+        ctx: &mut PrepareContext<'_>,
         snapshot: GradientSkyboxSnapshot,
         params_buffer: BufferNodeId,
-    ) -> (RenderPipelineId, &'frame wgpu::BindGroup) {
+    ) -> (RenderPipelineId, PreparedBindGroupId) {
         self.ensure_layout_for_variant(
             ctx.device,
             SkyboxVariant::Gradient,
@@ -1009,12 +1010,12 @@ impl SkyboxFeature {
         (pipeline_id, bind_group)
     }
 
-    fn prepare_procedural_draw<'frame>(
+    fn prepare_procedural_draw(
         &mut self,
-        ctx: &mut PrepareContext<'frame>,
+        ctx: &mut PrepareContext<'_>,
         snapshot: ProceduralSkyboxSnapshot,
         inputs: ProceduralSkyboxInputs,
-    ) -> (RenderPipelineId, &'frame wgpu::BindGroup) {
+    ) -> (RenderPipelineId, PreparedBindGroupId) {
         let starbox_kind = snapshot
             .starbox
             .map_or(ProceduralStarboxKind::None, |starbox| starbox.kind);
@@ -1220,12 +1221,7 @@ impl<'a> SkyboxDrawState<'a> {
         }
     }
 
-    pub(crate) fn draw(
-        &self,
-        pass: &mut wgpu::RenderPass<'a>,
-        global_bind_group: &'a wgpu::BindGroup,
-        pipeline_cache: &'a PipelineCache,
-    ) {
+    pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, ctx: &ExecuteContext<'_>) {
         let prepared = match self {
             // Asset readiness may change after Composer captured the logical
             // version. A failed materialization suppresses only this draw.
@@ -1250,9 +1246,9 @@ impl<'a> SkyboxDrawState<'a> {
         let Some((pipeline_id, bind_group)) = prepared else {
             return;
         };
-        pass.set_pipeline(pipeline_cache.get_render_pipeline(pipeline_id));
-        pass.set_bind_group(0, global_bind_group, &[]);
-        pass.set_bind_group(1, bind_group, &[]);
+        pass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(pipeline_id));
+        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(1, ctx.resolve_prepared_bind_group(bind_group), &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -1272,8 +1268,6 @@ impl<'a> PassNode<'a> for SkyboxPassNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.baked_lists.global_bind_group;
-
         let color_att = ctx.get_color_attachment(self.out_color, RenderTargetOps::Load, None);
         let depth_att = ctx.get_depth_stencil_attachment(self.scene_depth, 0.0);
 
@@ -1287,8 +1281,7 @@ impl<'a> PassNode<'a> for SkyboxPassNode<'a> {
         };
 
         let mut pass = encoder.begin_render_pass(&pass_desc);
-        self.draw
-            .draw(&mut pass, gpu_global_bind_group, ctx.pipeline_cache);
+        self.draw.draw(&mut pass, ctx);
     }
 }
 

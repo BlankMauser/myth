@@ -23,6 +23,7 @@
 //! pipeline below therefore acts purely as a robust fallback for the rare case
 //! where folding is impossible (e.g. a format mismatch).
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -195,7 +196,7 @@ struct PresentPassNode<'a> {
     surface_format: wgpu::TextureFormat,
     source_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    transient_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for PresentPassNode<'a> {
@@ -216,6 +217,7 @@ impl<'a> PassNode<'a> for PresentPassNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut CommandEncoder) {
         let bind_group = self.transient_bg.expect("Present BG not prepared!");
+        let bind_group = ctx.resolve_prepared_bind_group(bind_group);
         let pipeline_id = self
             .feature
             .pipeline_id

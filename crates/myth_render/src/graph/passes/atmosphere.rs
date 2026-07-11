@@ -15,6 +15,7 @@ use std::hash::{Hash, Hasher};
 
 use rustc_hash::{FxHashMap, FxHasher};
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, ProceduralEnvironmentSnapshot, Tracked, binding_layout};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -934,7 +935,7 @@ struct AtmosphereTransmittanceNode<'a> {
     expected_shader_identity: u64,
     output_tex: TextureNodeId,
     atmosphere_params: BufferNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for AtmosphereTransmittanceNode<'a> {
@@ -960,7 +961,9 @@ impl<'a> PassNode<'a> for AtmosphereTransmittanceNode<'a> {
         );
         pass.set_bind_group(
             0,
-            self.bind_group.expect("atmo transmittance bg missing"),
+            ctx.resolve_prepared_bind_group(
+                self.bind_group.expect("atmo transmittance bg missing"),
+            ),
             &[],
         );
         pass.dispatch_workgroups(
@@ -977,7 +980,7 @@ struct AtmosphereMultiScatterNode<'a> {
     transmittance: TextureNodeId,
     output_tex: TextureNodeId,
     atmosphere_params: BufferNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for AtmosphereMultiScatterNode<'a> {
@@ -1005,7 +1008,9 @@ impl<'a> PassNode<'a> for AtmosphereMultiScatterNode<'a> {
         );
         pass.set_bind_group(
             0,
-            self.bind_group.expect("atmo multi-scatter bg missing"),
+            ctx.resolve_prepared_bind_group(
+                self.bind_group.expect("atmo multi-scatter bg missing"),
+            ),
             &[],
         );
         pass.dispatch_workgroups(
@@ -1023,7 +1028,7 @@ struct AtmosphereSkyViewNode<'a> {
     multi_scatter: TextureNodeId,
     output_tex: TextureNodeId,
     atmosphere_params: BufferNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for AtmosphereSkyViewNode<'a> {
@@ -1050,7 +1055,11 @@ impl<'a> PassNode<'a> for AtmosphereSkyViewNode<'a> {
             ctx.pipeline_cache
                 .get_compute_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, self.bind_group.expect("atmo sky-view bg missing"), &[]);
+        pass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("atmo sky-view bg missing")),
+            &[],
+        );
         pass.dispatch_workgroups(SKY_VIEW_WIDTH.div_ceil(8), SKY_VIEW_HEIGHT.div_ceil(8), 1);
     }
 }
@@ -1062,7 +1071,7 @@ struct AtmosphereSkyToCubeNode<'a> {
     transmittance: TextureNodeId,
     sky_view: TextureNodeId,
     canonical_bake_params: BufferNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
@@ -1172,7 +1181,9 @@ impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
             );
             pass.set_bind_group(
                 0,
-                self.bind_group.expect("atmo sky-to-cube bg missing"),
+                ctx.resolve_prepared_bind_group(
+                    self.bind_group.expect("atmo sky-to-cube bg missing"),
+                ),
                 &[],
             );
             pass.dispatch_workgroups(dispatch, dispatch, 6);

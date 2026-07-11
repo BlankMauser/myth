@@ -17,7 +17,7 @@ pub mod gpu;
 pub mod readback;
 pub mod view;
 
-pub use binding::{Bindings, GlobalBindGroupCache};
+pub use binding::{Bindings, GlobalBindGroupCache, PreparedBindGroupId};
 pub use context::WgpuContext;
 pub use gpu::{BindGroupContext, ResourceManager};
 pub use readback::{ReadbackError, ReadbackFrame, ReadbackStream};

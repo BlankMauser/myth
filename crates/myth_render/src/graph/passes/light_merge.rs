@@ -1,3 +1,4 @@
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::Tracked;
 use crate::core::gpu::binding_layout::{storage_buffer, uniform_buffer};
 use crate::graph::composer::{GpuLightBuffers, GraphBuilderContext};
@@ -234,7 +235,7 @@ struct LightMergePassNode<'a> {
     merged_light_storage: BufferNodeId,
     merged_indirect_count: BufferNodeId,
     merged_capacity: u32,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for LightMergePassNode<'a> {
@@ -262,7 +263,9 @@ impl<'a> PassNode<'a> for LightMergePassNode<'a> {
             ctx.pipeline_cache
                 .get_compute_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, self.bind_group.expect("Light merge BG missing"), &[]);
+        let bind_group =
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("Light merge BG missing"));
+        pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(self.merged_capacity.div_ceil(LIGHT_MERGE_WG_SIZE), 1, 1);
     }
 }

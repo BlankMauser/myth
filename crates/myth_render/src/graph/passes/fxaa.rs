@@ -6,6 +6,7 @@
 //! - **`FxaaPassNode`** (ephemeral per-frame): carries lightweight IDs and
 //!   a transient bind-group slot.  Created by `FxaaFeature::add_to_graph()`.
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -184,7 +185,7 @@ struct FxaaPassNode<'a> {
     snapshot: FxaaSnapshot,
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    transient_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for FxaaPassNode<'a> {
@@ -205,6 +206,7 @@ impl<'a> PassNode<'a> for FxaaPassNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut CommandEncoder) {
         let bind_group = self.transient_bg.expect("FXAA BG not prepared!");
+        let bind_group = ctx.resolve_prepared_bind_group(bind_group);
         let pipeline_id = self
             .feature
             .pipeline_id

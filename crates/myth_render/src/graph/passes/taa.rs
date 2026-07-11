@@ -9,6 +9,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::binding_layout::{depth_texture_2d, sampler, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
@@ -355,7 +356,7 @@ struct TaaPassNode<'a> {
     params_buffer: BufferNodeId,
     extent: wgpu::Extent3d,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for TaaPassNode<'a> {
@@ -397,7 +398,9 @@ impl<'a> PassNode<'a> for TaaPassNode<'a> {
             );
             pass.set_bind_group(
                 0,
-                self.bind_group.expect("TAA bind group not prepared"),
+                ctx.resolve_prepared_bind_group(
+                    self.bind_group.expect("TAA bind group not prepared"),
+                ),
                 &[],
             );
             pass.draw(0..3, 0..1);

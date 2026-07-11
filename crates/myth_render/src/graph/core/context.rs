@@ -1,8 +1,8 @@
-use std::marker::PhantomData;
-
 use crate::core::ResourceManager;
 use crate::core::WgpuContext;
-use crate::core::binding::{BindGroupKey, GlobalBindGroupCache};
+use crate::core::binding::{
+    BindGroupKey, GlobalBindGroupCache, PreparedBindGroupId, PreparedBindGroupStore,
+};
 use crate::core::gpu::{
     BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
     MipmapRequestResolver, SamplerRegistry, SystemTextures, Tracked,
@@ -38,8 +38,6 @@ use super::{AssetTextureImportId, AssetTextureResolver};
 /// - Create / cache `wgpu::BindGroupLayout`s
 /// - Compile pipelines via [`PipelineCache`]
 /// - Upload non-transient GPU data (uniform buffers, noise textures, etc.)
-/// - Assemble cached persistent bind groups through
-///   [`ExtractContext::build_bind_group`]
 ///
 /// After this phase, Features hold only lightweight pipeline IDs.  The
 /// per-frame ephemeral `PassNode` created by `Feature::add_to_graph()`
@@ -50,7 +48,6 @@ pub struct ExtractContext<'a> {
     pub pipeline_cache: &'a mut PipelineCache,
     pub shader_manager: &'a mut ShaderManager,
     // pub sampler_registry: &'a mut SamplerRegistry,
-    pub global_bind_group_cache: &'a mut GlobalBindGroupCache,
     pub resource_manager: &'a mut ResourceManager,
     pub wgpu_ctx: &'a WgpuContext,
     pub render_lists: &'a mut RenderLists,
@@ -110,8 +107,12 @@ pub struct PrepareContext<'a> {
     pub sampler_registry: &'a SamplerRegistry,
     /// System fallback textures and Group 3 bind-group infrastructure.
     pub system_textures: &'a SystemTextures,
-    /// Mutable cache for transient bind groups with TTL eviction.
-    pub global_bind_group_cache: &'a mut GlobalBindGroupCache,
+    /// Mutable cross-frame reuse layer. Kept private so pass code cannot clear
+    /// or mutate the cache outside the prepared-bind-group builder contract.
+    pub(crate) global_bind_group_cache: &'a mut GlobalBindGroupCache,
+    /// Drop-aware ownership for the exact bind groups used by this graph
+    /// attempt. Nodes receive only generational IDs into this store.
+    pub(crate) prepared_bind_groups: &'a mut PreparedBindGroupStore,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -224,7 +225,7 @@ pub enum GraphBinding<'a> {
     CommonSampler(CommonSampler),
 }
 
-/// Fluent bind-group builder shared by feature extract code and RDG prepare.
+/// Fluent bind-group builder for live RDG prepare.
 ///
 /// The critical safety property lives in [`Self::bind_buffer`]: binding a
 /// `BufferNodeId` always resolves through [`ViewResolver::get_buffer_binding`],
@@ -232,15 +233,15 @@ pub enum GraphBinding<'a> {
 /// size. This prevents shaders from reading stale bytes past the logical end
 /// of a transient power-of-two buffer allocation.
 pub struct BindGroupBuilder<'ctx, 'frame> {
-    views: Option<&'ctx ViewResolver<'frame>>,
+    views: &'ctx ViewResolver<'frame>,
     cache: &'ctx mut GlobalBindGroupCache,
+    prepared: &'ctx mut PreparedBindGroupStore,
     device: &'ctx wgpu::Device,
     sampler_registry: &'ctx SamplerRegistry,
     layout: &'ctx wgpu::BindGroupLayout,
     label: Option<&'static str>,
     key: BindGroupKey,
     entries: Vec<wgpu::BindGroupEntry<'ctx>>,
-    _marker: PhantomData<&'frame wgpu::BindGroup>,
 }
 
 #[inline]
@@ -258,8 +259,9 @@ fn with_buffer_binding_identity(
 
 impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
     fn new(
-        views: Option<&'ctx ViewResolver<'frame>>,
+        views: &'ctx ViewResolver<'frame>,
         cache: &'ctx mut GlobalBindGroupCache,
+        prepared: &'ctx mut PreparedBindGroupStore,
         device: &'ctx wgpu::Device,
         sampler_registry: &'ctx SamplerRegistry,
         layout: &'ctx Tracked<wgpu::BindGroupLayout>,
@@ -268,13 +270,13 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
         Self {
             views,
             cache,
+            prepared,
             device,
             sampler_registry,
             layout,
             label,
             key: BindGroupKey::new(layout.id()),
             entries: Vec::with_capacity(8),
-            _marker: PhantomData,
         }
     }
 
@@ -316,9 +318,7 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
     /// Binds an RDG buffer with automatic logical-size truncation.
     #[must_use]
     pub fn bind_buffer(self, binding: u32, id: BufferNodeId) -> Self {
-        let views = self
-            .views
-            .expect("BufferNodeId binding requires PrepareContext-backed RDG views");
+        let views = self.views;
         let resource_id = views.get_physical_buffer_uid(id);
         let buffer_binding = views.get_buffer_binding(id);
         let size = buffer_binding.size;
@@ -344,9 +344,7 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
         offset: u64,
         size: wgpu::BufferSize,
     ) -> Self {
-        let views = self
-            .views
-            .expect("BufferNodeId binding requires PrepareContext-backed RDG views");
+        let views = self.views;
         let (_, resource) = resolve_buffer_resource(views.resources, id);
         let end = offset
             .checked_add(size.get())
@@ -375,9 +373,7 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
 
     #[must_use]
     pub fn bind_texture(self, binding: u32, id: TextureNodeId) -> Self {
-        let views = self
-            .views
-            .expect("TextureNodeId binding requires PrepareContext-backed RDG views");
+        let views = self.views;
         let view = views.get_texture_view(id);
         self.push_entry(binding, view.id(), wgpu::BindingResource::TextureView(view))
     }
@@ -484,12 +480,13 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
         self.push_entry(binding, resource_id, resource)
     }
 
-    /// Builds or reuses a cached bind group and returns a frame-stable
-    /// reference suitable for storing on a `PassNode<'frame>`.
+    /// Builds or reuses a cached bind group and returns a Copy ID into the
+    /// current graph attempt's destructor-aware ownership store.
     #[must_use]
-    pub fn build(self) -> &'frame wgpu::BindGroup {
+    pub fn build(self) -> PreparedBindGroupId {
         let Self {
             cache,
+            prepared,
             device,
             layout,
             label,
@@ -498,7 +495,7 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
             ..
         } = self;
 
-        cache.get_or_create_bg(key, || {
+        prepared.get_or_create(cache, key, || {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label,
                 layout,
@@ -642,11 +639,13 @@ impl<'frame> PrepareContext<'frame> {
             device,
             sampler_registry,
             global_bind_group_cache,
+            prepared_bind_groups,
             ..
         } = self;
         BindGroupBuilder::new(
-            Some(views),
+            views,
             global_bind_group_cache,
+            prepared_bind_groups,
             device,
             sampler_registry,
             layout,
@@ -668,11 +667,13 @@ impl<'frame> PrepareContext<'frame> {
             device,
             sampler_registry,
             global_bind_group_cache,
+            prepared_bind_groups,
             ..
         } = self;
         BindGroupBuilder::new(
-            Some(views),
+            views,
             global_bind_group_cache,
+            prepared_bind_groups,
             device,
             sampler_registry,
             layout,
@@ -694,33 +695,15 @@ impl<'frame> PrepareContext<'frame> {
             device,
             sampler_registry,
             global_bind_group_cache,
+            prepared_bind_groups,
             ..
         } = self;
         BindGroupBuilder::new(
-            Some(views),
+            views,
             global_bind_group_cache,
+            prepared_bind_groups,
             device,
             sampler_registry,
-            layout,
-            label,
-        )
-    }
-}
-
-impl ExtractContext<'_> {
-    /// Starts a cached bind-group build for persistent resources during
-    /// feature extract-and-prepare.
-    #[must_use]
-    pub fn build_bind_group<'ctx>(
-        &'ctx mut self,
-        layout: &'ctx Tracked<wgpu::BindGroupLayout>,
-        label: Option<&'static str>,
-    ) -> BindGroupBuilder<'ctx, 'ctx> {
-        BindGroupBuilder::new(
-            None,
-            self.global_bind_group_cache,
-            self.device,
-            self.resource_manager.sampler_registry(),
             layout,
             label,
         )
@@ -980,19 +963,19 @@ impl ViewResolver<'_> {
 
 // ─── PrepareContext Helpers ────────────────────────────────────────────────────
 
-/// Build the screen / transient bind group (Group 3), returning a
-/// pointer-stable `&'a` reference.
+/// Build the screen / transient bind group (Group 3), returning a frame-owned
+/// generational ID.
 ///
 /// Encapsulates key construction and cache lookup for the screen bind group
 /// used by Opaque, Transparent, and SimpleForward passes.
-pub fn build_screen_bind_group<'a>(
-    ctx: &mut PrepareContext<'a>,
+pub fn build_screen_bind_group(
+    ctx: &mut PrepareContext<'_>,
     transmission_input: Option<TextureNodeId>,
     ssao_input: Option<TextureNodeId>,
     shadow_input: Option<TextureNodeId>,
     shadow_cube_input: Option<TextureNodeId>,
     clustered: ClusteredScreenBindings,
-) -> &'a wgpu::BindGroup {
+) -> PreparedBindGroupId {
     let d2array_key = SubViewKey {
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
@@ -1008,6 +991,7 @@ pub fn build_screen_bind_group<'a>(
     let PrepareContext {
         views,
         global_bind_group_cache: cache,
+        prepared_bind_groups: prepared,
         device,
         system_textures: sys,
         ..
@@ -1089,7 +1073,7 @@ pub fn build_screen_bind_group<'a>(
         .with_resource(sys.blue_noise_sampler.id());
 
     if !use_clustered_layout {
-        return cache.get_or_create_bg(base_key, || {
+        return prepared.get_or_create(cache, base_key, || {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Screen BindGroup (Group 3)"),
                 layout,
@@ -1183,7 +1167,7 @@ pub fn build_screen_bind_group<'a>(
         .with_resource(cluster_records_id)
         .with_resource(cluster_light_indices_id);
 
-    cache.get_or_create_bg(key, || {
+    prepared.get_or_create(cache, key, || {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Screen BindGroup (Group 3)"),
             layout,
@@ -1268,7 +1252,7 @@ pub struct ExecuteContext<'a> {
     pub device: &'a Device,
     pub queue: &'a Queue,
     pub pipeline_cache: &'a PipelineCache,
-    pub global_bind_group_cache: &'a GlobalBindGroupCache,
+    pub(crate) prepared_bind_groups: &'a PreparedBindGroupStore,
 
     // ─── Scene Data (Phase 3: full RDG integration) ──────────────────
     /// GPU resource manager (read-only) — used by compute, post-processing,
@@ -1294,6 +1278,16 @@ pub struct ExecuteContext<'a> {
 }
 
 impl ExecuteContext<'_> {
+    /// Resolve a frame-owned bind-group ID for the duration of one execute
+    /// call. Invalid or cross-attempt IDs fail deterministically instead of
+    /// becoming dangling WGPU references.
+    #[must_use]
+    pub fn resolve_prepared_bind_group(&self, id: PreparedBindGroupId) -> &wgpu::BindGroup {
+        self.prepared_bind_groups
+            .resolve(id)
+            .expect("prepared bind-group ID does not belong to this graph attempt")
+    }
+
     #[must_use]
     pub(crate) fn asset_texture_import_id(
         &self,

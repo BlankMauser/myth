@@ -40,6 +40,7 @@ use std::mem::size_of;
 use std::sync::OnceLock;
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::binding_layout::{sampler, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
@@ -715,7 +716,7 @@ struct BloomDownsampleNode<'a> {
     input_tex: TextureNodeId,
     output_tex: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    transient_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for BloomDownsampleNode<'a> {
@@ -741,6 +742,7 @@ impl<'a> PassNode<'a> for BloomDownsampleNode<'a> {
         let transient_bg = self
             .transient_bg
             .expect("Bloom DS transient BG not prepared");
+        let transient_bg = ctx.resolve_prepared_bind_group(transient_bg);
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -775,8 +777,8 @@ struct BloomUpsampleNode<'a> {
     coarser_tex: TextureNodeId,
     output_tex: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    params_bg: Option<&'a wgpu::BindGroup>,
-    textures_bg: Option<&'a wgpu::BindGroup>,
+    params_bg: Option<PreparedBindGroupId>,
+    textures_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for BloomUpsampleNode<'a> {
@@ -810,6 +812,8 @@ impl<'a> PassNode<'a> for BloomUpsampleNode<'a> {
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let params_bg = self.params_bg.expect("Bloom US G0 not prepared");
         let textures_bg = self.textures_bg.expect("Bloom US G1 not prepared");
+        let params_bg = ctx.resolve_prepared_bind_group(params_bg);
+        let textures_bg = ctx.resolve_prepared_bind_group(textures_bg);
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::Load, None);
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -839,8 +843,8 @@ struct BloomCompositeNode<'a> {
     bloom_tex: TextureNodeId,
     output_tex: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    params_bg: Option<&'a wgpu::BindGroup>,
-    textures_bg: Option<&'a wgpu::BindGroup>,
+    params_bg: Option<PreparedBindGroupId>,
+    textures_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for BloomCompositeNode<'a> {
@@ -869,6 +873,8 @@ impl<'a> PassNode<'a> for BloomCompositeNode<'a> {
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let params_bg = self.params_bg.expect("Bloom Comp G0 not prepared");
         let textures_bg = self.textures_bg.expect("Bloom Comp G1 not prepared");
+        let params_bg = ctx.resolve_prepared_bind_group(params_bg);
+        let textures_bg = ctx.resolve_prepared_bind_group(textures_bg);
 
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

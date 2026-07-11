@@ -1,5 +1,6 @@
 use smallvec::SmallVec;
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::binding_layout;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::core::{
@@ -1483,7 +1484,7 @@ struct RuntimeBindGroupSlot<'a> {
     group: u32,
     bindings: &'a [TemplatePassBinding<'a>],
     label: Option<&'static str>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 pub struct StandardFullscreenNode<'a> {
@@ -1526,8 +1527,10 @@ impl<'a> PassNode<'a> for StandardFullscreenNode<'a> {
         for slot in &self.bind_groups[..self.bind_group_count] {
             pass.set_bind_group(
                 slot.group,
-                slot.bind_group
-                    .expect("Template fullscreen bind group was not prepared"),
+                ctx.resolve_prepared_bind_group(
+                    slot.bind_group
+                        .expect("Template fullscreen bind group was not prepared"),
+                ),
                 &[],
             );
         }
@@ -1569,8 +1572,10 @@ impl<'a> PassNode<'a> for StandardComputeNode<'a> {
         for slot in &self.bind_groups[..self.bind_group_count] {
             pass.set_bind_group(
                 slot.group,
-                slot.bind_group
-                    .expect("Template compute bind group was not prepared"),
+                ctx.resolve_prepared_bind_group(
+                    slot.bind_group
+                        .expect("Template compute bind group was not prepared"),
+                ),
                 &[],
             );
         }

@@ -9,6 +9,7 @@ use std::mem::size_of;
 use rustc_hash::FxHashMap;
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::binding_layout::{
     depth_texture_2d, sampler, texture, texture_2d, uniform_buffer,
 };
@@ -939,7 +940,7 @@ struct SsgiRawNode<'a> {
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsgiRawNode<'a> {
@@ -992,7 +993,11 @@ impl<'a> PassNode<'a> for SsgiRawNode<'a> {
                 .get_render_pipeline(self.pipeline_id.expect("SSGI raw pipeline not prepared")),
         );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
-        pass.set_bind_group(1, self.bind_group.expect("SSGI raw BG missing"), &[]);
+        pass.set_bind_group(
+            1,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSGI raw BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }
@@ -1009,7 +1014,7 @@ struct SsgiTemporalNode<'a> {
     output_indirect: TextureNodeId,
     output_meta: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsgiTemporalNode<'a> {
@@ -1049,7 +1054,11 @@ impl<'a> PassNode<'a> for SsgiTemporalNode<'a> {
                     .expect("SSGI temporal pipeline not prepared"),
             ),
         );
-        pass.set_bind_group(0, self.bind_group.expect("SSGI temporal BG missing"), &[]);
+        pass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSGI temporal BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }
@@ -1064,7 +1073,7 @@ struct SsgiAtrousNode<'a> {
     uniforms: BufferNodeId,
     output_tex: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsgiAtrousNode<'a> {
@@ -1099,7 +1108,11 @@ impl<'a> PassNode<'a> for SsgiAtrousNode<'a> {
                     .expect("SSGI A-Trous pipeline not prepared"),
             ),
         );
-        pass.set_bind_group(0, self.bind_group.expect("SSGI A-Trous BG missing"), &[]);
+        pass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSGI A-Trous BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }
@@ -1115,7 +1128,7 @@ struct SsgiMergeNode<'a> {
     output_tex: TextureNodeId,
     output_source: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsgiMergeNode<'a> {
@@ -1152,7 +1165,11 @@ impl<'a> PassNode<'a> for SsgiMergeNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.pipeline_id.expect("SSGI merge pipeline not prepared")),
         );
-        pass.set_bind_group(0, self.bind_group.expect("SSGI merge BG missing"), &[]);
+        pass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSGI merge BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }

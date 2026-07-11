@@ -4,6 +4,7 @@
 //! texture upload/resolution, custom-view creation, sampler creation, and bind
 //! group assembly are deferred until the node survives DPE.
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{
     CommonSampler, CubeSourceType, GpuEnvironment, PreparedTextureSource, Tracked, binding_layout,
 };
@@ -313,7 +314,7 @@ struct EquirectToCubePassNode<'a> {
     feature: &'a mut EquirectToCubeFeature,
     snapshot: EquirectToCubeSnapshot,
     base_cube: TextureNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for EquirectToCubePassNode<'a> {
@@ -406,8 +407,10 @@ impl<'a> PassNode<'a> for EquirectToCubePassNode<'a> {
             cpass.set_pipeline(pipeline);
             cpass.set_bind_group(
                 0,
-                self.bind_group
-                    .expect("environment source bind group must be prepared"),
+                ctx.resolve_prepared_bind_group(
+                    self.bind_group
+                        .expect("environment source bind group must be prepared"),
+                ),
                 &[],
             );
             cpass.dispatch_workgroups(group_count, group_count, 6);

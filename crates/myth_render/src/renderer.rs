@@ -532,7 +532,6 @@ impl Renderer {
                     queue: &state.wgpu_ctx.queue,
                     pipeline_cache: &mut state.pipeline_cache,
                     shader_manager: &mut state.shader_manager,
-                    global_bind_group_cache: &mut state.global_bind_group_cache,
                     resource_manager: &mut state.resource_manager,
                     wgpu_ctx: &state.wgpu_ctx,
                     render_lists: &mut state.render_lists,

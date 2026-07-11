@@ -28,6 +28,7 @@
 //! - `needs_material_data`: Whether to output the shared material MRT attachment
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::binding::PreparedBindGroupId;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
@@ -280,7 +281,7 @@ impl OpaqueFeature {
 /// textures resolved from [`SystemTextures`] fallbacks when inactive.
 /// When MSAA is active, the pass writes to a multi-sampled color target
 /// and optionally resolves to a single-sample HDR texture.
-pub struct OpaquePassNode<'a> {
+pub struct OpaquePassNode {
     // ─── RDG Resource Slots ────────────────────────────────────────
     pub color_target: TextureNodeId,
     pub depth_target: TextureNodeId,
@@ -299,10 +300,10 @@ pub struct OpaquePassNode<'a> {
     pub scene_lighting: ClusteredScreenBindings,
 
     // ─── Internal Cache ────────────────────────────────────────────
-    screen_bind_group: Option<&'a wgpu::BindGroup>,
+    screen_bind_group: Option<PreparedBindGroupId>,
 }
 
-impl OpaquePassNode<'_> {
+impl OpaquePassNode {
     #[must_use]
     pub fn new(
         color_target: TextureNodeId,
@@ -338,7 +339,7 @@ impl OpaquePassNode<'_> {
     }
 }
 
-impl<'a> PassNode<'a> for OpaquePassNode<'a> {
+impl<'a> PassNode<'a> for OpaquePassNode {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
         let bg = build_screen_bind_group(
             ctx,
@@ -405,7 +406,7 @@ impl<'a> PassNode<'a> for OpaquePassNode<'a> {
 
         pass.set_bind_group(0, gpu_global_bind_group, &[]);
 
-        let screen_bg = self.screen_bind_group.unwrap();
+        let screen_bg = ctx.resolve_prepared_bind_group(self.screen_bind_group.unwrap());
         pass.set_bind_group(3, screen_bg, &[]);
 
         submit_draw_commands(&mut pass, &ctx.baked_lists.opaque);

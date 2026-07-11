@@ -6,10 +6,10 @@ use wgpu::CommandEncoder;
 
 /// Pure GPU command recorder for a single render or compute pass.
 ///
-/// `PassNode` is intentionally minimal — it carries only lightweight IDs,
-/// borrowed references to persistent GPU resources (`&'a wgpu::BindGroup`),
-/// and transient bind-group cache keys.  All persistent GPU resources
-/// (layouts, pipelines, buffers) live in the owning `Feature`.
+/// `PassNode` is intentionally minimal — it carries lightweight IDs and
+/// borrowed POD/frame data. Destructor-bearing prepared GPU resources live in
+/// GraphStorage-owned stores, while persistent layouts, pipelines, and buffers
+/// live in the owning `Feature`.
 ///
 /// # Lifecycle
 ///
@@ -29,7 +29,8 @@ use wgpu::CommandEncoder;
 ///
 /// The lifetime parameter `'a` represents the duration of a single frame.
 /// Concrete implementations may carry frame-scoped borrowed references
-/// (e.g. `&'a wgpu::BindGroup`, `&'a [ShadowLightInstance]`) whose
+/// (e.g. `&'a [ShadowLightInstance]`) and Copy IDs for destructor-bearing
+/// prepared GPU objects. Their
 /// lifetimes are tied to either:
 ///
 /// - The [`FrameArena`](super::arena::FrameArena) that allocates the node.

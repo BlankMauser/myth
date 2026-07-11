@@ -30,6 +30,7 @@
 //!    after the Opaque resolve.
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{CommonSampler, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
@@ -212,7 +213,7 @@ struct MsaaSyncPassNode<'a> {
     snapshot: MsaaSyncSnapshot,
     src_hdr: TextureNodeId,
     dst_msaa: TextureNodeId,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    transient_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for MsaaSyncPassNode<'a> {
@@ -233,6 +234,7 @@ impl<'a> PassNode<'a> for MsaaSyncPassNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut CommandEncoder) {
         let bind_group = self.transient_bg.expect("MSAA Sync BG not prepared");
+        let bind_group = ctx.resolve_prepared_bind_group(bind_group);
         let pipeline_id = self
             .feature
             .pipeline_id

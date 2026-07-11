@@ -7,6 +7,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::core::ResourceManager;
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::{
     CommonSampler, GlobalStateKey, PreparedTextureSource, Tracked, binding_layout,
 };
@@ -335,8 +336,8 @@ struct ToneMapPassNode<'a> {
     output_tex: TextureNodeId,
     params_buffer: BufferNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    static_bg: Option<&'a wgpu::BindGroup>,
-    transient_bg: Option<&'a wgpu::BindGroup>,
+    static_bg: Option<PreparedBindGroupId>,
+    transient_bg: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for ToneMapPassNode<'a> {
@@ -391,6 +392,14 @@ impl<'a> PassNode<'a> for ToneMapPassNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+        let static_bg = ctx.resolve_prepared_bind_group(
+            self.static_bg
+                .expect("ToneMap static bind group missing after prepare"),
+        );
+        let transient_bg = ctx.resolve_prepared_bind_group(
+            self.transient_bg
+                .expect("ToneMap transient bind group missing after prepare"),
+        );
         let rtt = ctx.get_color_attachment(self.output_tex, RenderTargetOps::DontCare, None);
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ToneMap Pass"),
@@ -407,18 +416,8 @@ impl<'a> PassNode<'a> for ToneMapPassNode<'a> {
             ),
         );
         rpass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
-        rpass.set_bind_group(
-            1,
-            self.static_bg
-                .expect("ToneMap static bind group missing after prepare"),
-            &[],
-        );
-        rpass.set_bind_group(
-            2,
-            self.transient_bg
-                .expect("ToneMap transient bind group missing after prepare"),
-            &[],
-        );
+        rpass.set_bind_group(1, static_bg, &[]);
+        rpass.set_bind_group(2, transient_bg, &[]);
         rpass.draw(0..3, 0..1);
     }
 }

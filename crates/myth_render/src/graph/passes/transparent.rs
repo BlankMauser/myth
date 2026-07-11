@@ -30,6 +30,7 @@
 //!
 //! Transparent commands are sorted back-to-front for correct alpha blending.
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
@@ -146,7 +147,7 @@ impl TransparentFeature {
 
 // ─── Pass Node ─────────────────────────────────────────────────────────
 
-pub struct TransparentPassNode<'a> {
+pub struct TransparentPassNode {
     out_color: TextureNodeId,
     depth_target: TextureNodeId,
     resolve_target: Option<TextureNodeId>,
@@ -155,10 +156,10 @@ pub struct TransparentPassNode<'a> {
     shadow_input: Option<TextureNodeId>,
     shadow_cube_input: Option<TextureNodeId>,
     scene_lighting: ClusteredScreenBindings,
-    screen_bind_group: Option<&'a wgpu::BindGroup>,
+    screen_bind_group: Option<PreparedBindGroupId>,
 }
 
-impl TransparentPassNode<'_> {
+impl TransparentPassNode {
     #[must_use]
     fn new(
         _in_color: TextureNodeId,
@@ -185,7 +186,7 @@ impl TransparentPassNode<'_> {
     }
 }
 
-impl<'a> PassNode<'a> for TransparentPassNode<'a> {
+impl<'a> PassNode<'a> for TransparentPassNode {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
         let bg = build_screen_bind_group(
             ctx,
@@ -220,7 +221,7 @@ impl<'a> PassNode<'a> for TransparentPassNode<'a> {
         pass.set_bind_group(0, gpu_global_bind_group, &[]);
 
         if !ctx.baked_lists.transparent.is_empty() {
-            let screen_bg = self.screen_bind_group.unwrap();
+            let screen_bg = ctx.resolve_prepared_bind_group(self.screen_bind_group.unwrap());
             pass.set_bind_group(3, screen_bg, &[]);
 
             submit_draw_commands(&mut pass, &ctx.baked_lists.transparent);

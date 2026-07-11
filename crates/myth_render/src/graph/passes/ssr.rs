@@ -11,6 +11,7 @@ use std::mem::size_of;
 use rustc_hash::FxHashMap;
 
 use crate::HDR_TEXTURE_FORMAT;
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::binding_layout::{sampler, texture, texture_2d, uniform_buffer};
 use crate::core::gpu::{CommonSampler, GlobalStateKey, Tracked};
 use crate::graph::composer::GraphBuilderContext;
@@ -926,7 +927,7 @@ struct SsrTraceNode<'a> {
     output_reflection: TextureNodeId,
     output_diagnostic: Option<TextureNodeId>,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsrTraceNode<'a> {
@@ -988,7 +989,11 @@ impl<'a> PassNode<'a> for SsrTraceNode<'a> {
                 .get_render_pipeline(self.pipeline_id.expect("SSR trace pipeline not prepared")),
         );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
-        pass.set_bind_group(1, self.bind_group.expect("SSR trace BG missing"), &[]);
+        pass.set_bind_group(
+            1,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSR trace BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }
@@ -1007,7 +1012,7 @@ struct SsrTemporalNode<'a> {
     output_reflection: TextureNodeId,
     output_meta: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsrTemporalNode<'a> {
@@ -1049,7 +1054,11 @@ impl<'a> PassNode<'a> for SsrTemporalNode<'a> {
             ),
         );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
-        pass.set_bind_group(1, self.bind_group.expect("SSR temporal BG missing"), &[]);
+        pass.set_bind_group(
+            1,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSR temporal BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }
@@ -1063,7 +1072,7 @@ struct SsrSpatialNode<'a> {
     uniforms: BufferNodeId,
     output: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsrSpatialNode<'a> {
@@ -1096,7 +1105,11 @@ impl<'a> PassNode<'a> for SsrSpatialNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.pipeline_id.expect("SSR spatial pipeline not prepared")),
         );
-        pass.set_bind_group(0, self.bind_group.expect("SSR spatial BG missing"), &[]);
+        pass.set_bind_group(
+            0,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSR spatial BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }
@@ -1113,7 +1126,7 @@ struct SsrMergeNode<'a> {
     uniforms: BufferNodeId,
     output: TextureNodeId,
     pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SsrMergeNode<'a> {
@@ -1149,7 +1162,11 @@ impl<'a> PassNode<'a> for SsrMergeNode<'a> {
                 .get_render_pipeline(self.pipeline_id.expect("SSR merge pipeline not prepared")),
         );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
-        pass.set_bind_group(1, self.bind_group.expect("SSR merge BG missing"), &[]);
+        pass.set_bind_group(
+            1,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("SSR merge BG missing")),
+            &[],
+        );
         pass.draw(0..3, 0..1);
     }
 }

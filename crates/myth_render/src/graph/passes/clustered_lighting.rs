@@ -5,6 +5,7 @@
 //! nodes during deferred prepare; per-frame parameters use an RDG transient
 //! uniform buffer so dead-pass elimination suppresses their upload entirely.
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::Tracked;
 use crate::core::gpu::binding_layout::{storage_buffer, uniform_buffer};
 use crate::graph::composer::GpuLightBuffers;
@@ -793,7 +794,7 @@ struct ClusterDispatchArgsPassNode<'a> {
     feature: &'a mut ClusterDispatchArgsFeature,
     count_buffer: BufferNodeId,
     dispatch_args: BufferNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for ClusterDispatchArgsPassNode<'a> {
@@ -818,7 +819,9 @@ impl<'a> PassNode<'a> for ClusterDispatchArgsPassNode<'a> {
         );
         pass.set_bind_group(
             0,
-            self.bind_group.expect("Cluster dispatch args BG missing"),
+            ctx.resolve_prepared_bind_group(
+                self.bind_group.expect("Cluster dispatch args BG missing"),
+            ),
             &[],
         );
         pass.dispatch_workgroups(1, 1, 1);
@@ -832,7 +835,7 @@ struct ClusterLightViewPassNode<'a> {
     light_data_buffer: BufferNodeId,
     light_view_positions: BufferNodeId,
     indirect_dispatch_buffer: Option<BufferNodeId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
     total_light_slots: u32,
 }
 
@@ -860,7 +863,9 @@ impl<'a> PassNode<'a> for ClusterLightViewPassNode<'a> {
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
         pass.set_bind_group(
             1,
-            self.bind_group.expect("Cluster light view BG missing"),
+            ctx.resolve_prepared_bind_group(
+                self.bind_group.expect("Cluster light view BG missing"),
+            ),
             &[],
         );
         if let Some(indirect_dispatch_buffer) = self.indirect_dispatch_buffer {
@@ -886,7 +891,7 @@ struct ClusterCullPassNode<'a> {
     cluster_records: BufferNodeId,
     light_indices: BufferNodeId,
     light_index_allocator: BufferNodeId,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    bind_group: Option<PreparedBindGroupId>,
     dispatch_grid_x: u32,
     dispatch_grid_y: u32,
     dispatch_grid_z: u32,
@@ -922,7 +927,11 @@ impl<'a> PassNode<'a> for ClusterCullPassNode<'a> {
                 .get_compute_pipeline(self.feature.pipeline_id()),
         );
         pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
-        pass.set_bind_group(1, self.bind_group.expect("Cluster cull BG missing"), &[]);
+        pass.set_bind_group(
+            1,
+            ctx.resolve_prepared_bind_group(self.bind_group.expect("Cluster cull BG missing")),
+            &[],
+        );
         pass.dispatch_workgroups(
             self.dispatch_grid_x,
             self.dispatch_grid_y,

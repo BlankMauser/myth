@@ -1749,6 +1749,7 @@ impl<'a> FrameComposer<'a> {
                     sampler_registry: &self.ctx.resource_manager.sampler_registry,
                     system_textures: &self.ctx.resource_manager.system_textures,
                     global_bind_group_cache: self.ctx.global_bind_group_cache,
+                    prepared_bind_groups: &mut graph.storage.prepared_bind_groups,
                 };
 
                 for &pass_idx in &graph.storage.execution_queue {
@@ -1807,7 +1808,7 @@ impl<'a> FrameComposer<'a> {
                     device: &self.ctx.wgpu_ctx.device,
                     queue: &self.ctx.wgpu_ctx.queue,
                     pipeline_cache: self.ctx.pipeline_cache,
-                    global_bind_group_cache: self.ctx.global_bind_group_cache,
+                    prepared_bind_groups: &graph.storage.prepared_bind_groups,
                     mipmap_generator: &*mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     baked_lists: &baked_lists,

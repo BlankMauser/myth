@@ -22,6 +22,7 @@
 //!
 //! [`BasicForward`]: crate::settings::RenderPath::BasicForward
 
+use crate::core::binding::PreparedBindGroupId;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
@@ -162,7 +163,7 @@ pub struct SimpleForwardPassNode<'a> {
     pub shadow_input: Option<TextureNodeId>,
     pub shadow_cube_input: Option<TextureNodeId>,
     pub scene_lighting: ClusteredScreenBindings,
-    screen_bind_group: Option<&'a wgpu::BindGroup>,
+    screen_bind_group: Option<PreparedBindGroupId>,
 }
 
 impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
@@ -211,7 +212,7 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
 
         pass.set_bind_group(0, gpu_global_bind_group, &[]);
 
-        let screen_bg = self.screen_bind_group.unwrap();
+        let screen_bg = ctx.resolve_prepared_bind_group(self.screen_bind_group.unwrap());
         pass.set_bind_group(3, screen_bg, &[]);
 
         // 1. Opaque (front-to-back)
@@ -219,7 +220,7 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
 
         // 2. Skybox (between opaque and transparent)
         if let Some(skybox) = &self.skybox {
-            skybox.draw(&mut pass, gpu_global_bind_group, ctx.pipeline_cache);
+            skybox.draw(&mut pass, ctx);
 
             pass.set_bind_group(0, gpu_global_bind_group, &[]);
             pass.set_bind_group(3, screen_bg, &[]);

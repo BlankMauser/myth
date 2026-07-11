@@ -3,6 +3,7 @@ use std::collections::BinaryHeap;
 
 use rustc_hash::FxHashMap;
 
+use crate::core::binding::PreparedBindGroupStore;
 use crate::core::gpu::{
     AssetTextureSnapshot, MipmapBatchId, MipmapRequest, MipmapRequestBatch, Tracked,
 };
@@ -158,6 +159,10 @@ pub struct GraphStorage {
     /// Pass nodes retain only [`MipmapBatchId`] values into these arrays.
     pub(crate) mipmap_batches: Vec<Option<MipmapRequestBatch>>,
 
+    /// Destructor-aware ownership for cached bind groups used by this graph
+    /// attempt. Pass nodes carry only generational IDs into this store.
+    pub(crate) prepared_bind_groups: PreparedBindGroupStore,
+
     /// Exact Gaussian asset versions captured for this graph attempt. Arc
     /// owners live here because the frame arena intentionally skips Drop.
     #[cfg(feature = "3dgs")]
@@ -201,6 +206,7 @@ impl GraphStorage {
             cache_commit_requests: Vec::new(),
             persistent_cache_finalization: None,
             mipmap_batches: Vec::new(),
+            prepared_bind_groups: PreparedBindGroupStore::new(),
             #[cfg(feature = "3dgs")]
             gaussian_frame_batches: Vec::new(),
             // resource_registry: FxHashMap::default(),
@@ -241,6 +247,7 @@ impl GraphStorage {
     pub(crate) fn release_frame_owners(&mut self) {
         self.asset_texture_imports.clear();
         self.mipmap_batches.clear();
+        self.prepared_bind_groups.clear();
         #[cfg(feature = "3dgs")]
         self.gaussian_frame_batches.clear();
     }
@@ -549,10 +556,11 @@ impl Drop for RenderGraph<'_> {
         // never leave a callable dangling node in retained topology metadata.
         self.storage.invalidate_pass_nodes();
         // Successful submission paths have already consumed/published their
-        // owners, making this an inexpensive no-op. On panic or early abort it
-        // is the frame-attempt RAII boundary that prevents GraphStorage from
-        // pinning physical textures, mip requests, or Gaussian asset Arcs
-        // until some later frame happens to construct another graph.
+        // producer attempts; prepared bind-group clones intentionally remain
+        // owned through execute and are released here. On panic or early abort
+        // this is also the frame-attempt RAII boundary that prevents
+        // GraphStorage from pinning physical textures, mip requests, Gaussian
+        // asset Arcs, or WGPU bind groups until a later graph is constructed.
         self.storage.release_frame_owners();
     }
 }
@@ -1837,9 +1845,11 @@ mod tests {
     #[test]
     fn dropping_graph_releases_unsubmitted_frame_owners_but_keeps_topology() {
         let mut storage = GraphStorage::new();
+        let prepared_attempt;
         let mut arena = FrameArena::new();
         {
             let mut graph = begin_test_frame(&mut storage, &arena);
+            prepared_attempt = graph.storage.prepared_bind_groups.attempt_token();
             let _asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
             graph
                 .storage
@@ -1853,6 +1863,10 @@ mod tests {
 
         assert!(storage.asset_texture_imports.is_empty());
         assert!(storage.mipmap_batches.is_empty());
+        assert_ne!(
+            storage.prepared_bind_groups.attempt_token(),
+            prepared_attempt
+        );
         assert_eq!(storage.passes.len(), 1);
         assert_eq!(storage.passes[0].name, "Inspectable");
         assert!(storage.passes[0].node.is_none());
