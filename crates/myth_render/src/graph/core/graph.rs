@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::binding::PreparedBindGroupStore;
 use crate::core::gpu::{
@@ -121,6 +122,35 @@ impl PartialOrd for ReadyNode {
     }
 }
 
+/// Attempt-scoped ownership of physical mipmap encoding.
+///
+/// Logical imports and the legacy compatibility batch may independently carry
+/// requests for the same physical generation. The first node reached by the
+/// compiled serial execution queue records the commands; later nodes observe
+/// the claim and skip duplicate GPU work. Publication remains owned by the
+/// request stores and occurs only after queue submission.
+#[derive(Default)]
+pub(crate) struct MipmapEncodeCoordinator {
+    claimed: Mutex<FxHashSet<PhysicalImageGenerationKey>>,
+}
+
+impl MipmapEncodeCoordinator {
+    #[must_use]
+    pub(crate) fn try_claim(&self, generation: PhysicalImageGenerationKey) -> bool {
+        self.claimed.lock().insert(generation)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.claimed.get_mut().clear();
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.claimed.lock().is_empty()
+    }
+}
+
 /// Declarative Render Graph — persistent capacity storage.
 ///
 /// Holds the backing `Vec`s whose heap capacity is reused across frames.
@@ -159,6 +189,8 @@ pub struct GraphStorage {
     /// Drop-bearing physical mip-generation attempts staged for this frame.
     /// Pass nodes retain only [`MipmapBatchId`] values into these arrays.
     pub(crate) mipmap_batches: Vec<Option<MipmapRequestBatch>>,
+    /// Physical-generation encode claims for this graph attempt.
+    pub(crate) mipmap_encode_coordinator: MipmapEncodeCoordinator,
 
     /// Destructor-aware ownership for cached bind groups used by this graph
     /// attempt. Pass nodes carry only generational IDs into this store.
@@ -207,6 +239,7 @@ impl GraphStorage {
             cache_commit_requests: Vec::new(),
             persistent_cache_finalization: None,
             mipmap_batches: Vec::new(),
+            mipmap_encode_coordinator: MipmapEncodeCoordinator::default(),
             prepared_bind_groups: PreparedBindGroupStore::new(),
             #[cfg(feature = "3dgs")]
             gaussian_frame_batches: Vec::new(),
@@ -248,6 +281,7 @@ impl GraphStorage {
     pub(crate) fn release_frame_owners(&mut self) {
         self.asset_texture_imports.clear();
         self.mipmap_batches.clear();
+        self.mipmap_encode_coordinator.clear();
         self.prepared_bind_groups.clear();
         #[cfg(feature = "3dgs")]
         self.gaussian_frame_batches.clear();
@@ -1716,11 +1750,15 @@ impl<'a> RenderGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::WgpuContext;
+    use crate::core::gpu::PhysicalImageId;
+    use crate::core::{ResourceManager, WgpuContext};
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
     use crate::graph::{composer::GraphBuilderContext, core::context::ExecuteContext};
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use myth_assets::AssetServer;
+    use myth_resources::image::{Image, ImageDimension, PixelFormat};
+    use myth_resources::texture::Texture;
 
     fn dummy_config() -> FrameConfig {
         FrameConfig {
@@ -1740,6 +1778,82 @@ mod tests {
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
+    }
+
+    #[test]
+    fn mipmap_encode_claims_are_exact_and_attempt_scoped() {
+        let mut storage = GraphStorage::new();
+        let physical = PhysicalImageId::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001));
+        let first = PhysicalImageGenerationKey {
+            physical,
+            allocation: 11,
+            generation: 21,
+        };
+        let next_generation = PhysicalImageGenerationKey {
+            generation: 22,
+            ..first
+        };
+
+        assert!(storage.mipmap_encode_coordinator.try_claim(first));
+        assert!(!storage.mipmap_encode_coordinator.try_claim(first));
+        assert!(storage.mipmap_encode_coordinator.try_claim(next_generation));
+        assert!(!storage.mipmap_encode_coordinator.is_empty());
+
+        storage.release_frame_owners();
+        assert!(storage.mipmap_encode_coordinator.is_empty());
+        assert!(storage.mipmap_encode_coordinator.try_claim(first));
+    }
+
+    #[test]
+    fn duplicate_request_owners_share_publication_and_retry_after_attempt_release() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![255; 8 * 8 * 4]),
+        ));
+        let mut texture = Texture::new_2d(Some("duplicate mip owners"), image);
+        texture.generate_mipmaps = true;
+        let texture = assets.textures.add(texture);
+
+        resources.prepare_texture(&assets, texture);
+        let first = resources
+            .take_mipmap_requests()
+            .pop()
+            .expect("first request owner missing");
+        resources.prepare_texture(&assets, texture);
+        let second = resources
+            .take_mipmap_requests()
+            .pop()
+            .expect("second request owner missing");
+        assert_eq!(first.key(), second.key());
+        assert!(first.shares_submission_token(&second));
+
+        let mut storage = GraphStorage::new();
+        assert!(storage.mipmap_encode_coordinator.try_claim(first.key()));
+        assert!(!storage.mipmap_encode_coordinator.try_claim(second.key()));
+        first.mark_submitted();
+        assert!(
+            resources
+                .get_texture_image(texture)
+                .expect("physical texture missing")
+                .mipmaps_submitted()
+        );
+
+        storage.release_frame_owners();
+        assert!(storage.mipmap_encode_coordinator.try_claim(second.key()));
     }
 
     fn dummy_asset_snapshot() -> AssetTextureSnapshot {

@@ -5,7 +5,7 @@ use crate::core::binding::{
 };
 use crate::core::gpu::{
     BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
-    MipmapRequestResolver, SamplerRegistry, SystemTextures, Tracked,
+    MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
 use crate::graph::frame::{BakedRenderLists, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
@@ -19,6 +19,7 @@ use wgpu::{Device, Queue, TextureView};
 use super::allocator::{SubViewKey, TransientPool};
 #[cfg(feature = "3dgs")]
 use super::gaussian::GaussianFrameResolver;
+use super::graph::MipmapEncodeCoordinator;
 use super::persistent::HistoryRegistry;
 use super::types::{
     BufferNodeId, GraphResourceType, RenderTargetOps, ResourceKind, ResourceNodeId, ResourceRecord,
@@ -1260,6 +1261,9 @@ pub struct ExecuteContext<'a> {
     pub mipmap_generator: &'a MipmapGenerator,
     /// Frame-owned physical mipmap attempts addressed by Copy batch IDs.
     pub(crate) mipmap_requests: MipmapRequestResolver<'a>,
+    /// Attempt-scoped physical generation coordinator shared by logical and
+    /// compatibility mipmap nodes.
+    pub(crate) mipmap_encode_coordinator: &'a MipmapEncodeCoordinator,
 
     /// Pre-baked draw command lists with all GPU handles resolved.
     ///
@@ -1278,6 +1282,14 @@ pub struct ExecuteContext<'a> {
 }
 
 impl ExecuteContext<'_> {
+    /// Claim the right to record one physical mipmap generation in this graph
+    /// attempt. A false result means an earlier node in the serial execution
+    /// queue has already recorded the same generation.
+    #[must_use]
+    pub(crate) fn try_claim_mipmap_encoding(&self, generation: PhysicalImageGenerationKey) -> bool {
+        self.mipmap_encode_coordinator.try_claim(generation)
+    }
+
     /// Resolve a frame-owned bind-group ID for the duration of one execute
     /// call. Invalid or cross-attempt IDs fail deterministically instead of
     /// becoming dangling WGPU references.

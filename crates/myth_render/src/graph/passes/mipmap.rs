@@ -173,6 +173,9 @@ impl PassNode<'_> for AssetTextureMipmapNode {
             .expect("asset mipmap node requires an Asset TextureBacking");
         let mut generated_any = false;
         for request in ctx.asset_textures.mipmap_requests(import) {
+            if !ctx.try_claim_mipmap_encoding(request.key()) {
+                continue;
+            }
             ctx.mipmap_generator
                 .generate(ctx.device, encoder, &request.texture);
             generated_any = true;
@@ -197,6 +200,9 @@ impl PassNode<'_> for AssetMipmapNode {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         for request in ctx.mipmap_requests.requests(self.batch) {
+            if !ctx.try_claim_mipmap_encoding(request.key()) {
+                continue;
+            }
             ctx.mipmap_generator
                 .generate(ctx.device, encoder, &request.texture);
         }

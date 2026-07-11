@@ -1819,6 +1819,7 @@ impl<'a> FrameComposer<'a> {
                     prepared_bind_groups: &graph.storage.prepared_bind_groups,
                     mipmap_generator: &*mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
+                    mipmap_encode_coordinator: &graph.storage.mipmap_encode_coordinator,
                     baked_lists: &baked_lists,
                     wgpu_ctx: &*self.ctx.wgpu_ctx,
                     current_timeline_index: 0,

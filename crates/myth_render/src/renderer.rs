@@ -2546,7 +2546,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_skybox_claims_the_same_generation_queued_by_a_material() {
+    fn texture_skybox_claims_a_shared_generation_queued_by_another_handle() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let image_handle = assets.images.add(Image::new(
@@ -2557,17 +2557,22 @@ mod tests {
             PixelFormat::Rgba8Unorm,
             Some(vec![160; 8 * 8 * 4]),
         ));
-        let mut texture = Texture::new_2d(Some("Shared Material/Skybox"), image_handle);
-        texture.color_space = ColorSpace::Linear;
-        texture.generate_mipmaps = true;
-        let texture_handle = assets.textures.add(texture);
+        let mut material_texture = Texture::new_2d(Some("Shared Material"), image_handle);
+        material_texture.color_space = ColorSpace::Linear;
+        material_texture.generate_mipmaps = true;
+        let material_texture_handle = assets.textures.add(material_texture);
+        let mut skybox_texture = Texture::new_2d(Some("Shared Skybox"), image_handle);
+        skybox_texture.color_space = ColorSpace::Linear;
+        skybox_texture.generate_mipmaps = true;
+        skybox_texture.sampler.mag_filter = wgpu::FilterMode::Nearest;
+        let skybox_texture_handle = assets.textures.add(skybox_texture);
         let material = PhysicalMaterial::new(Vec4::ONE);
-        material.set_map(Some(texture_handle));
+        material.set_map(Some(material_texture_handle));
         let mut scene = Scene::new();
         scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
         scene
             .background
-            .set_mode(BackgroundMode::planar(texture_handle, 1.0));
+            .set_mode(BackgroundMode::planar(skybox_texture_handle, 1.0));
 
         render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
 
@@ -2585,13 +2590,17 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            state
-                .resource_manager
-                .get_texture_image(texture_handle)
-                .expect("shared texture must remain resident")
-                .mipmaps_submitted()
-        );
+        let material_image = state
+            .resource_manager
+            .get_texture_image(material_texture_handle)
+            .expect("material texture must remain resident");
+        let skybox_image = state
+            .resource_manager
+            .get_texture_image(skybox_texture_handle)
+            .expect("skybox texture must remain resident");
+        assert_eq!(material_image.id, skybox_image.id);
+        assert!(material_image.mipmaps_submitted());
+        assert!(skybox_image.mipmaps_submitted());
     }
 
     #[test]
