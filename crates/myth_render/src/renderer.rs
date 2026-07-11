@@ -593,15 +593,6 @@ impl Renderer {
                     needs_feature_id,
                     needs_velocity,
                 );
-
-                state.tone_map_pass.extract_and_prepare(
-                    &mut extract_ctx,
-                    scene.tone_mapping.mode,
-                    view_format,
-                    global_state_key,
-                    &scene.tone_mapping.uniforms,
-                    scene.tone_mapping.lut_texture,
-                );
             }
 
             state.mipmap_pass.extract_and_prepare(&mut extract_ctx);
@@ -1227,7 +1218,8 @@ mod tests {
 
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::AssetServer;
-    use myth_resources::texture::TextureSource;
+    use myth_resources::image::{ColorSpace, Image, ImageDimension, PixelFormat};
+    use myth_resources::texture::{Texture, TextureSource};
     use myth_scene::Scene;
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
@@ -2124,6 +2116,81 @@ mod tests {
         );
         assert!(graph_contains_pass(state, "Atmosphere_SkyToCube"));
         assert!(graph_contains_pass(state, "IBL_Compute"));
+    }
+
+    #[test]
+    fn tone_mapping_materializes_ready_3d_lut_only_in_live_prepare() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image = Image::new(
+            2,
+            2,
+            2,
+            ImageDimension::D3,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![128; 2 * 2 * 2 * 4]),
+        );
+        let image_handle = assets.images.add(image);
+        let mut texture = Texture::new_3d(Some("ToneMap Test LUT"), image_handle);
+        texture.color_space = ColorSpace::Linear;
+        let lut_handle = assets.textures.add(texture);
+        let mut scene = Scene::new();
+        scene.tone_mapping.set_lut_texture(Some(lut_handle));
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(graph_contains_pass(state, "ToneMap_Pass"));
+        assert!(state.tone_map_pass.has_lut_pipeline());
+        assert_eq!(
+            state
+                .resource_manager
+                .get_image(image_handle)
+                .expect("live ToneMap must materialize the LUT image")
+                .default_view_dimension,
+            wgpu::TextureViewDimension::D3,
+        );
+    }
+
+    #[test]
+    fn tone_mapping_rejects_non_3d_lut_without_stale_state() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image = Image::new(
+            2,
+            2,
+            2,
+            ImageDimension::D3,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![64; 2 * 2 * 2 * 4]),
+        );
+        let image_handle = assets.images.add(image);
+        let mut texture = Texture::new_3d(Some("ToneMap Previous LUT"), image_handle);
+        texture.color_space = ColorSpace::Linear;
+        let valid_lut = assets.textures.add(texture);
+        let invalid_lut = assets.checkerboard(8, 2);
+        let mut scene = Scene::new();
+        scene.tone_mapping.set_lut_texture(Some(valid_lut));
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.tone_map_pass.has_lut_pipeline());
+
+        scene.tone_mapping.set_lut_texture(Some(invalid_lut));
+        scene
+            .tone_mapping
+            .set_mode(myth_resources::tone_mapping::ToneMappingMode::Linear);
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(graph_contains_pass(state, "ToneMap_Pass"));
+        assert!(
+            state.tone_map_pass.has_base_pipeline(),
+            "an invalid replacement LUT must select the current no-LUT mode instead of reusing stale state"
+        );
     }
 
     #[test]

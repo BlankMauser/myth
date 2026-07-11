@@ -137,14 +137,25 @@ pub(super) fn snapshot_ready_asset_texture_source(
     image.dimension.hash(&mut hasher);
     image.format.hash(&mut hasher);
 
+    let image_dimension = image.dimension.to_wgpu();
     let ready = match texture.view_dimension {
+        TextureViewDimension::D1 => image_dimension == wgpu::TextureDimension::D1,
         TextureViewDimension::D2 => {
-            image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 1
+            image_dimension == wgpu::TextureDimension::D2 && image.depth == 1
         }
+        TextureViewDimension::D2Array => image_dimension == wgpu::TextureDimension::D2,
         TextureViewDimension::Cube => {
-            image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 6
+            image_dimension == wgpu::TextureDimension::D2
+                && image.depth == 6
+                && image.width == image.height
         }
-        _ => false,
+        TextureViewDimension::CubeArray => {
+            image_dimension == wgpu::TextureDimension::D2
+                && image.depth >= 6
+                && image.depth.is_multiple_of(6)
+                && image.width == image.height
+        }
+        TextureViewDimension::D3 => image_dimension == wgpu::TextureDimension::D3,
     };
 
     LogicalTextureSourceSnapshot {

@@ -1284,7 +1284,22 @@ impl<'a> FrameComposer<'a> {
                     }
 
                     // ToneMapping: HDR → LDR, into a transient target.
-                    active_color = self.ctx.tone_map_pass.add_to_graph(ctx, active_color);
+                    let snapshot = self.ctx.tone_map_pass.extract(
+                        self.ctx.resource_manager,
+                        self.ctx.assets,
+                        self.ctx.scene.tone_mapping.mode,
+                        self.frame_config.surface_format,
+                        GlobalStateKey::new(
+                            self.ctx.render_state.id,
+                            self.ctx.extracted_scene.scene_id,
+                        ),
+                        &self.ctx.scene.tone_mapping.uniforms,
+                        self.ctx.scene.tone_mapping.lut_texture,
+                    );
+                    active_color = self
+                        .ctx
+                        .tone_map_pass
+                        .add_to_graph(ctx, snapshot, active_color);
 
                     // FXAA: anti-alias the LDR result into a second transient
                     // target.
