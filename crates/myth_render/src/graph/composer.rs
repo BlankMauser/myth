@@ -874,7 +874,12 @@ impl<'a> FrameComposer<'a> {
             let ssgi_pmrem = env_dependency_pmrem;
 
             let shadow_output = if self.ctx.extracted_scene.has_shadow_casters() {
-                graph_ctx.with_group("Shadow", |c| self.ctx.shadow_pass.add_to_graph(c))
+                let snapshot = self.ctx.shadow_pass.extract(
+                    self.ctx.render_lists,
+                    self.ctx.extracted_scene,
+                    self.ctx.frame_arena,
+                );
+                graph_ctx.with_group("Shadow", |c| self.ctx.shadow_pass.add_to_graph(c, snapshot))
             } else {
                 crate::graph::passes::shadow::ShadowOutput {
                     shadow_2d: None,

@@ -474,6 +474,17 @@ impl<'a> RenderGraph<'a> {
         self.arena.alloc_slice_copy(src)
     }
 
+    /// Allocates frame-scoped shared state used to hand prepared physical
+    /// resources from a producer node to its consumers.
+    ///
+    /// The value must not require explicit teardown: the frame arena is reset
+    /// as a whole after graph execution. Pass nodes should store only a
+    /// reference to the returned value, keeping their own payloads POD.
+    #[inline]
+    pub(crate) fn alloc_shared_state<T>(&self, value: T) -> &'a T {
+        self.arena.alloc(value)
+    }
+
     // ─── Logical Grouping (Inspector) ────────────────────────────────
 
     #[cfg(feature = "rdg_inspector")]

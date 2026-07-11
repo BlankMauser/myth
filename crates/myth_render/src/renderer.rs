@@ -541,10 +541,6 @@ impl Renderer {
                 render_camera: &camera,
                 assets,
             };
-            // Always: shadow extraction. Environment source/PMREM extraction
-            // now happens inside Composer after render-target acquisition.
-            state.shadow_pass.extract_and_prepare(&mut extract_ctx);
-
             // Texture backgrounds still use the compatibility preparation path
             // for same-frame asset mip generation. Gradient and Procedural
             // Skybox preparation are deferred to their live RDG consumer.
@@ -1217,12 +1213,14 @@ mod tests {
     use super::*;
 
     use glam::{Affine3A, Quat, Vec3, Vec4};
-    use myth_assets::AssetServer;
+    use myth_assets::{AssetServer, SceneExt};
     use myth_resources::image::{ColorSpace, Image, ImageDimension, PixelFormat};
+    use myth_resources::material::PhysicalMaterial;
     use myth_resources::texture::{Texture, TextureSource};
     use myth_scene::Scene;
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
+    use myth_scene::light::Light;
 
     fn init_headless_renderer() -> Renderer {
         let mut renderer =
@@ -2190,6 +2188,56 @@ mod tests {
         assert!(
             state.tone_map_pass.has_base_pipeline(),
             "an invalid replacement LUT must select the current no-LUT mode instead of reusing stale state"
+        );
+    }
+
+    #[test]
+    fn live_mixed_shadows_prepare_one_shared_vp_upload() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let caster = scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            PhysicalMaterial::new(Vec4::new(0.7, 0.7, 0.7, 1.0)),
+            &assets,
+        );
+        scene.node(&caster).set_shadows(true, true);
+
+        let mut directional = Light::new_directional(Vec3::ONE, 1.0);
+        directional.cast_shadows = true;
+        if let Some(shadow) = directional.shadow.as_mut() {
+            shadow.map_size = 32;
+        }
+        let directional_node = scene.add_light(directional);
+        scene
+            .node(&directional_node)
+            .set_position(3.0, 4.0, 2.0)
+            .look_at(Vec3::ZERO);
+
+        let mut point = Light::new_point(Vec3::ONE, 1.0, 8.0);
+        point.cast_shadows = true;
+        if let Some(shadow) = point.shadow.as_mut() {
+            shadow.map_size = 32;
+        }
+        let point_node = scene.add_light(point);
+        scene.node(&point_node).set_position(2.0, 2.0, 2.0);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(graph_contains_pass(state, "Shadow_VP_Upload"));
+        assert!(graph_contains_pass(state, "Shadow_2D_Pass"));
+        assert!(graph_contains_pass(state, "Shadow_Cube_Pass"));
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Shadow_VP_Upload")
+                .count(),
+            1,
         );
     }
 

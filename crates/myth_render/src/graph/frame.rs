@@ -199,7 +199,6 @@ pub struct RenderLists {
     ///
     /// Each cascade of a directional light (or each spot light) gets its own queue.
     pub shadow_queues: FxHashMap<(u64, u32), Vec<ShadowRenderCommand>>,
-    pub shadow_lights: Vec<ShadowLightInstance>,
 
     /// All active render views for the current frame.
     ///
@@ -228,7 +227,6 @@ impl RenderLists {
             opaque: Vec::with_capacity(512),
             transparent: Vec::with_capacity(128),
             shadow_queues: FxHashMap::default(),
-            shadow_lights: Vec::with_capacity(16),
             active_views: Vec::with_capacity(16),
             gpu_global_bind_group: None,
             gpu_local_light_metadata_buffer: None,
@@ -243,7 +241,6 @@ impl RenderLists {
         self.opaque.clear();
         self.transparent.clear();
         self.shadow_queues.clear();
-        self.shadow_lights.clear();
         self.active_views.clear();
         self.gpu_global_bind_group = None;
         self.gpu_local_light_metadata_buffer = None;
@@ -679,7 +676,6 @@ impl RenderFrame {
     /// Write per-light shadow metadata (layer indices, cascade matrices,
     /// bias values) into the scene's light storage buffer.
     ///
-    /// Also populates `render_lists.shadow_lights` for the GPU shadow pass.
     fn update_light_shadow_metadata(
         active_views: &[crate::core::view::RenderView],
         extracted_scene: &mut ExtractedScene,
