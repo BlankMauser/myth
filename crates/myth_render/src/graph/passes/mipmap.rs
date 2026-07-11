@@ -5,10 +5,9 @@
 //! instead of submitting work during resource preparation.
 
 use crate::core::ResourceManager;
-use crate::core::gpu::{MipmapBatchId, MipmapGenerator, MipmapRequest};
+use crate::core::gpu::{MipmapBatchId, MipmapGenerator, MipmapRequest, PhysicalImageGenerationKey};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{ExecuteContext, PassNode, PrepareContext, TextureNodeId};
-use myth_assets::TextureHandle;
 
 /// Drop-bearing physical attempts captured at Composer time. The snapshot is
 /// immediately moved into GraphStorage; arena pass nodes retain only a Copy
@@ -19,17 +18,17 @@ pub(crate) struct MipmapSnapshot {
 
 impl MipmapSnapshot {
     /// Transfer an already queued physical generation to a logical asset
-    /// import. The import keeps the legacy request's side-effect obligation
-    /// until material draw consumers acquire real RDG texture edges.
+    /// import. Any TextureHandle selecting the exact shared allocation may
+    /// claim it; logical origin never participates in ownership.
     #[must_use]
-    pub(crate) fn claim_for_texture(
+    pub(crate) fn claim_for_generation(
         &mut self,
-        texture_handle: TextureHandle,
+        generation: PhysicalImageGenerationKey,
     ) -> Option<MipmapRequest> {
         let index = self
             .requests
             .iter()
-            .position(|request| request.texture_handle == texture_handle)?;
+            .position(|request| request.key() == generation)?;
         Some(self.requests.swap_remove(index))
     }
 
@@ -208,8 +207,14 @@ impl PassNode<'_> for AssetMipmapNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::WgpuContext;
+    use crate::core::gpu::snapshot_asset_texture;
     use crate::graph::core::graph::FrameConfig;
     use crate::graph::core::{FrameArena, GraphStorage, RenderGraph};
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use myth_assets::AssetServer;
+    use myth_resources::image::{Image, ImageDimension, PixelFormat};
+    use myth_resources::texture::Texture;
 
     fn frame_config() -> FrameConfig {
         FrameConfig {
@@ -240,5 +245,51 @@ mod tests {
             graph.storage.passes[graph.storage.execution_queue[0]].name,
             "Asset_Mipmap_Generation"
         );
+    }
+
+    #[test]
+    fn exact_generation_claim_is_independent_of_texture_handle() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![255; 8 * 8 * 4]),
+        ));
+        let mut producer_texture = Texture::new_2d(Some("mip producer"), image);
+        producer_texture.generate_mipmaps = true;
+        let producer = assets.textures.add(producer_texture);
+        let mut consumer_texture = Texture::new_2d(Some("mip consumer"), image);
+        consumer_texture.generate_mipmaps = true;
+        let consumer = assets.textures.add(consumer_texture);
+
+        resources.prepare_texture(&assets, producer);
+        assert!(resources.get_texture_image(producer).is_some());
+        assert!(resources.get_texture_image(consumer).is_none());
+        let consumer_snapshot =
+            snapshot_asset_texture(&assets, consumer).expect("consumer snapshot missing");
+        let generation = resources
+            .physical_generation_for_asset_snapshot(consumer_snapshot)
+            .expect("exact shared generation missing");
+        let mut snapshot = MipmapSnapshot {
+            requests: resources.take_mipmap_requests(),
+        };
+
+        let claimed = snapshot
+            .claim_for_generation(generation)
+            .expect("another handle must claim the shared physical generation");
+        assert_eq!(claimed.key(), generation);
+        assert!(snapshot.into_requests().is_empty());
     }
 }

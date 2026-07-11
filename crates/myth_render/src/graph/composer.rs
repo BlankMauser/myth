@@ -920,7 +920,14 @@ impl<'a> FrameComposer<'a> {
                 let TextureSkyboxSourcePlan::Asset(snapshot) = source else {
                     return None;
                 };
-                mipmap_snapshot.claim_for_texture(snapshot.texture_handle)
+                self.ctx
+                    .resource_manager
+                    .physical_generation_for_asset_snapshot(snapshot)
+                    .and_then(|generation| {
+                        mipmap_snapshot
+                            .claim_for_generation(generation)
+                            .map(|request| (generation, request))
+                    })
             });
             let skybox_claimed_legacy_mipmap = claimed_skybox_mipmap.is_some();
             let mipmap_batch = graph_ctx
@@ -940,9 +947,10 @@ impl<'a> FrameComposer<'a> {
                             let imported = c
                                 .graph
                                 .import_asset_texture("Skybox_Asset_Texture", snapshot);
-                            if let Some(request) = claimed_skybox_mipmap.take() {
-                                c.graph
-                                    .claim_asset_texture_mipmap_request(imported, request);
+                            if let Some((generation, request)) = claimed_skybox_mipmap.take() {
+                                c.graph.claim_asset_texture_mipmap_request(
+                                    imported, generation, request,
+                                );
                             }
                             let mip_ready = MipmapFeature::add_asset_texture_to_graph(
                                 c,

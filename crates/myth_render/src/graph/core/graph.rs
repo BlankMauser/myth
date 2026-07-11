@@ -5,7 +5,8 @@ use rustc_hash::FxHashMap;
 
 use crate::core::binding::PreparedBindGroupStore;
 use crate::core::gpu::{
-    AssetTextureSnapshot, MipmapBatchId, MipmapRequest, MipmapRequestBatch, Tracked,
+    AssetTextureSnapshot, MipmapBatchId, MipmapRequest, MipmapRequestBatch,
+    PhysicalImageGenerationKey, Tracked,
 };
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
@@ -813,6 +814,7 @@ impl<'a> RenderGraph<'a> {
     pub(crate) fn claim_asset_texture_mipmap_request(
         &mut self,
         node: TextureNodeId,
+        generation: PhysicalImageGenerationKey,
         request: MipmapRequest,
     ) {
         let import_id = self.storage.resources[node.index() as usize]
@@ -820,7 +822,7 @@ impl<'a> RenderGraph<'a> {
             .expect("mip request claim target is not an asset texture import");
         self.storage
             .asset_texture_imports
-            .claim_mipmap_request(import_id, request);
+            .claim_mipmap_request(import_id, generation, request);
     }
 
     /// Publish exact mip generations encoded by live logical asset producers.

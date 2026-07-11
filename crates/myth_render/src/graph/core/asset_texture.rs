@@ -152,6 +152,7 @@ impl AssetTextureImportStore {
     pub(crate) fn claim_mipmap_request(
         &mut self,
         id: AssetTextureImportId,
+        generation: crate::core::gpu::PhysicalImageGenerationKey,
         request: MipmapRequest,
     ) {
         let entry = self
@@ -159,8 +160,9 @@ impl AssetTextureImportStore {
             .get_mut(id.index())
             .expect("asset texture import ID is out of bounds");
         assert_eq!(
-            entry.snapshot.texture_handle, request.texture_handle,
-            "claimed mip request belongs to a different texture handle"
+            request.key(),
+            generation,
+            "claimed mip request differs from the snapshot-selected physical generation"
         );
         assert!(
             entry.claimed_mipmap_request.is_none(),
@@ -271,7 +273,9 @@ impl<'a> AssetTextureResolver<'a> {
     }
 
     /// Iterate the claimed compatibility request and the current live
-    /// materialization request, deduplicated by exact physical generation.
+    /// materialization request. A newer materialization of the same allocation
+    /// supersedes its claimed generation; distinct allocations remain separate
+    /// side-effect obligations.
     #[must_use]
     pub(crate) fn mipmap_requests(
         self,
@@ -316,17 +320,24 @@ impl<'a> Iterator for AssetTextureMipmapRequests<'a> {
             match self.next {
                 0 => {
                     self.next = 1;
-                    if let Some(claimed) = self.claimed {
+                    if let Some(claimed) = self.claimed
+                        && self.materialized.is_none_or(|materialized| {
+                            let claimed = claimed.key();
+                            let materialized = materialized.key();
+                            let same_allocation = claimed.physical == materialized.physical
+                                && claimed.allocation == materialized.allocation;
+                            if same_allocation {
+                                debug_assert!(materialized.generation >= claimed.generation);
+                            }
+                            !same_allocation
+                        })
+                    {
                         return Some(claimed);
                     }
                 }
                 1 => {
                     self.next = 2;
-                    if let Some(materialized) = self.materialized
-                        && self
-                            .claimed
-                            .is_none_or(|claimed| claimed.key() != materialized.key())
-                    {
+                    if let Some(materialized) = self.materialized {
                         return Some(materialized);
                     }
                 }
@@ -353,4 +364,79 @@ pub(crate) fn snapshot_texture_desc(snapshot: AssetTextureSnapshot) -> TextureDe
         snapshot.format,
         snapshot.usage,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{ResourceManager, WgpuContext};
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use myth_assets::AssetServer;
+    use myth_resources::image::{Image, ImageDimension, PixelFormat};
+    use myth_resources::texture::Texture;
+
+    #[test]
+    fn materialized_generation_supersedes_claimed_generation_of_same_allocation() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![255; 8 * 8 * 4]),
+        ));
+        let mut texture = Texture::new_2d(Some("superseded mip"), image_handle);
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+
+        resources.prepare_texture(&assets, texture_handle);
+        assert!(resources.get_texture_image(texture_handle).is_some());
+        let claimed = resources
+            .take_mipmap_requests()
+            .pop()
+            .expect("claimed generation missing");
+
+        assert_eq!(
+            assets.images.update(
+                image_handle,
+                Image::new(
+                    8,
+                    8,
+                    1,
+                    ImageDimension::D2,
+                    PixelFormat::Rgba8Unorm,
+                    Some(vec![9; 8 * 8 * 4]),
+                ),
+            ),
+            Some(2)
+        );
+        resources.prepare_texture(&assets, texture_handle);
+        assert!(resources.get_texture_image(texture_handle).is_some());
+        let materialized = resources
+            .take_mipmap_requests()
+            .pop()
+            .expect("materialized generation missing");
+        assert_eq!(claimed.key().physical, materialized.key().physical);
+        assert_eq!(claimed.key().allocation, materialized.key().allocation);
+        assert_ne!(claimed.key().generation, materialized.key().generation);
+
+        let attempts: Vec<_> = AssetTextureMipmapRequests {
+            claimed: Some(&claimed),
+            materialized: Some(&materialized),
+            next: 0,
+        }
+        .map(MipmapRequest::key)
+        .collect();
+        assert_eq!(attempts, vec![materialized.key()]);
+    }
 }

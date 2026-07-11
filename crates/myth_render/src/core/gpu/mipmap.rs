@@ -6,7 +6,6 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use myth_assets::TextureHandle;
 use rustc_hash::FxHashMap;
 
 use super::PhysicalImageId;
@@ -31,7 +30,6 @@ pub(crate) struct PhysicalImageGenerationKey {
 /// frame's attempts; pass nodes carry only a Copy batch ID.
 pub(crate) struct MipmapRequest {
     pub physical_id: PhysicalImageId,
-    pub texture_handle: TextureHandle,
     pub texture: wgpu::Texture,
     pub texture_id: u64,
     pub generation_id: u64,
@@ -43,7 +41,6 @@ impl MipmapRequest {
     #[must_use]
     pub(crate) fn new(
         physical_id: PhysicalImageId,
-        texture_handle: TextureHandle,
         texture: wgpu::Texture,
         texture_id: u64,
         generation_id: u64,
@@ -52,7 +49,6 @@ impl MipmapRequest {
     ) -> Self {
         Self {
             physical_id,
-            texture_handle,
             texture,
             texture_id,
             generation_id,
