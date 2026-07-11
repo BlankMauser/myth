@@ -1,6 +1,4 @@
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::Vec3;
 use wgpu::TextureViewDimension;
@@ -10,11 +8,7 @@ use myth_resources::texture::TextureSource;
 use myth_scene::background::{BackgroundMode, ProceduralSkyParams};
 use myth_scene::environment::Environment;
 
-use crate::core::gpu::{ResourceState, Tracked};
-
 use super::ResourceManager;
-
-const PROCEDURAL_IBL_SUN_UPDATE_THRESHOLD_DEGREES: f32 = 0.5;
 
 /// How the scene environment source must be converted before PMREM filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,98 +21,25 @@ pub enum CubeSourceType {
     Cubemap,
 }
 
-/// Persistent GPU environment resources owned by a scene.
+/// CPU-only description of a scene's environment source.
 ///
-/// The texture objects and tracked views stay stable across source changes so
-/// downstream bind-group caches can keep hitting without rebuilds.
-#[derive(Debug, Default)]
-struct ProceduralBakeState {
-    last_baked_sun_direction: Option<Vec3>,
-    pending_bake_sun_direction: Option<Vec3>,
-}
-
-/// Deferred environment bake completion state.
-///
-/// Graph construction only needs a lock-free dirty bit, while bake
-/// completion also has to promote the procedural sun direction that was
-/// actually rendered. Both updates happen through shared references.
-#[derive(Debug, Default)]
-pub struct EnvironmentComputeState {
-    needs_compute: AtomicBool,
-    procedural_bake: Mutex<ProceduralBakeState>,
-}
-
-impl EnvironmentComputeState {
-    #[inline]
-    #[must_use]
-    pub fn new(needs_compute: bool) -> Self {
-        Self {
-            needs_compute: AtomicBool::new(needs_compute),
-            procedural_bake: Mutex::new(ProceduralBakeState::default()),
-        }
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn needs_compute(&self) -> bool {
-        self.needs_compute.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn set_needs_compute(&self, needs_compute: bool) {
-        self.needs_compute.store(needs_compute, Ordering::Relaxed);
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn last_baked_sun_direction(&self) -> Option<Vec3> {
-        self.procedural_bake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_baked_sun_direction
-    }
-
-    #[inline]
-    pub fn set_pending_bake_sun_direction(&self, sun_direction: Option<Vec3>) {
-        self.procedural_bake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending_bake_sun_direction = sun_direction;
-    }
-
-    #[inline]
-    pub fn finish_bake(&self, source_type: CubeSourceType) {
-        let mut procedural_bake = self
-            .procedural_bake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        if source_type == CubeSourceType::Procedural {
-            procedural_bake.last_baked_sun_direction =
-                procedural_bake.pending_bake_sun_direction.take();
-        } else {
-            procedural_bake.pending_bake_sun_direction = None;
-        }
-
-        self.needs_compute.store(false, Ordering::Relaxed);
-    }
-}
-
-#[derive(Debug)]
+/// Physical base-cube/PMREM textures and their publication state belong to
+/// RDG's persistent-resource registry. Keeping only source metadata here
+/// prevents graph construction from allocating GPU resources before DPE.
+#[derive(Debug, Clone, Copy)]
 pub struct GpuEnvironment {
-    pub base_cube_texture: wgpu::Texture,
-    pub pmrem_texture: wgpu::Texture,
-    pub base_cube_view: Tracked<wgpu::TextureView>,
-    pub base_cube_storage_view: Tracked<wgpu::TextureView>,
-    pub pmrem_view: Tracked<wgpu::TextureView>,
-    pub pmrem_storage_views: Vec<Tracked<wgpu::TextureView>>,
+    pub base_cube_size: u32,
+    pub pmrem_size: u32,
+    /// Logical content fingerprint of the base environment source.
+    ///
+    /// Texture sizes are intentionally not folded into this value: the base
+    /// and PMREM persistent-cache keys own their respective size fields.
     pub source_version: u64,
-    pub compute_state: EnvironmentComputeState,
     pub source_type: CubeSourceType,
     pub source_key: Option<TextureSource>,
     pub source_ready: bool,
-    procedural_physics_hash: u64,
-    procedural_bake_hash: u64,
+    pub procedural_physics_hash: u64,
+    pub procedural_static_bake_hash: u64,
     pub last_used_frame: u64,
 }
 
@@ -126,25 +47,21 @@ impl GpuEnvironment {
     #[inline]
     #[must_use]
     pub fn env_map_max_mip_level(&self) -> f32 {
-        (self.pmrem_texture.mip_level_count() - 1) as f32
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn needs_compute(&self) -> bool {
-        self.compute_state.needs_compute()
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn pmrem_mip_view(&self, mip: u32) -> &Tracked<wgpu::TextureView> {
-        &self.pmrem_storage_views[mip as usize]
+        self.pmrem_size.max(1).ilog2() as f32
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolvedTextureSource {
+    version: u64,
+    ready: bool,
+    view_dimension: TextureViewDimension,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ResolvedEnvironmentSource {
     source_type: CubeSourceType,
-    key: Option<TextureSource>,
+    key: TextureSource,
     version: u64,
     source_ready: bool,
 }
@@ -159,44 +76,19 @@ fn hash_vec3<H: Hasher>(hasher: &mut H, value: Vec3) {
     hash_f32(hasher, value.z);
 }
 
-fn resolved_procedural_starbox_hash(
-    resource_manager: &mut ResourceManager,
+fn hash_optional_texture_source(
+    resource_manager: &ResourceManager,
     assets: &AssetServer,
-    params: &ProceduralSkyParams,
+    source: Option<TextureSource>,
 ) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
-
-    let Some(source) = params.starbox_texture else {
-        0u8.hash(&mut hasher);
-        return hasher.finish();
-    };
-
     source.hash(&mut hasher);
-
-    match source {
-        TextureSource::Asset(handle) => {
-            let state = resource_manager.prepare_texture(assets, handle);
-            match state {
-                ResourceState::Ready => {
-                    if let Some(texture) = assets.textures.get(handle) {
-                        u64::from(assets.images.get_version(texture.image).unwrap_or(0))
-                            .hash(&mut hasher);
-                    }
-                    if let Some(binding) = resource_manager.get_texture_binding(handle) {
-                        binding.view_id.hash(&mut hasher);
-                    }
-                }
-                ResourceState::Pending | ResourceState::Unknown => {
-                    0u8.hash(&mut hasher);
-                }
-            }
-        }
-        TextureSource::Attachment(id, dim) => {
-            id.hash(&mut hasher);
-            dim.hash(&mut hasher);
-        }
+    if let Some(source) = source {
+        resource_manager
+            .resolve_logical_texture_source(assets, source)
+            .version
+            .hash(&mut hasher);
     }
-
     hasher.finish()
 }
 
@@ -214,43 +106,127 @@ fn procedural_physics_hash(params: &ProceduralSkyParams) -> u64 {
     hasher.finish()
 }
 
-fn procedural_bake_hash(params: &ProceduralSkyParams, starbox_hash: u64) -> u64 {
+fn procedural_static_bake_hash(
+    params: &ProceduralSkyParams,
+    moon_texture_hash: u64,
+    starbox_hash: u64,
+) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     hash_f32(&mut hasher, params.sun_intensity);
     hash_f32(&mut hasher, params.sun_disk_size);
     hash_f32(&mut hasher, params.moon_intensity);
     hash_f32(&mut hasher, params.moon_disk_size);
+    moon_texture_hash.hash(&mut hasher);
     hash_f32(&mut hasher, params.star_intensity);
     hash_vec3(&mut hasher, params.star_axis);
     starbox_hash.hash(&mut hasher);
+    // Dynamic celestial directions and `star_rotation` are deliberately
+    // excluded. The persistent-cache coordinator throttles sun/moon motion
+    // against post-submit publication baselines instead of treating every
+    // tiny DayNight tick as a static configuration change.
     hasher.finish()
 }
 
-fn procedural_source_version(physics_hash: u64, bake_hash: u64, sun_direction: Vec3) -> u64 {
+fn procedural_source_version(
+    physics_hash: u64,
+    static_bake_hash: u64,
+    sun_direction: Vec3,
+    moon_direction: Vec3,
+) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     physics_hash.hash(&mut hasher);
-    bake_hash.hash(&mut hasher);
+    static_bake_hash.hash(&mut hasher);
     hash_vec3(&mut hasher, sun_direction);
+    hash_vec3(&mut hasher, moon_direction);
     hasher.finish()
-}
-
-fn sun_direction_requires_rebake(last_baked: Option<Vec3>, current: Vec3) -> bool {
-    let Some(last_baked) = last_baked else {
-        return true;
-    };
-
-    let threshold_cos = PROCEDURAL_IBL_SUN_UPDATE_THRESHOLD_DEGREES
-        .to_radians()
-        .cos();
-    last_baked.normalize().dot(current.normalize()) <= threshold_cos
 }
 
 impl ResourceManager {
-    /// Resolve or create the persistent GPU environment state for a scene.
+    /// Resolves the logical identity and readiness of a texture without
+    /// uploading it or otherwise interacting with the GPU.
+    fn resolve_logical_texture_source(
+        &self,
+        assets: &AssetServer,
+        source: TextureSource,
+    ) -> ResolvedTextureSource {
+        let mut hasher = rustc_hash::FxHasher::default();
+        source.hash(&mut hasher);
+
+        match source {
+            TextureSource::Asset(handle) => {
+                let Some((texture, texture_version)) = assets.textures.get_entry(handle) else {
+                    0u8.hash(&mut hasher);
+                    return ResolvedTextureSource {
+                        version: hasher.finish(),
+                        ready: false,
+                        view_dimension: TextureViewDimension::D2,
+                    };
+                };
+
+                1u8.hash(&mut hasher);
+                texture.uuid.hash(&mut hasher);
+                texture_version.hash(&mut hasher);
+                texture.image.hash(&mut hasher);
+                texture.view_dimension.hash(&mut hasher);
+                texture.color_space.hash(&mut hasher);
+
+                let Some((image, image_version)) = assets.images.get_entry(texture.image) else {
+                    0u8.hash(&mut hasher);
+                    return ResolvedTextureSource {
+                        version: hasher.finish(),
+                        ready: false,
+                        view_dimension: texture.view_dimension,
+                    };
+                };
+
+                1u8.hash(&mut hasher);
+                image.uuid.hash(&mut hasher);
+                image_version.hash(&mut hasher);
+                image.width.hash(&mut hasher);
+                image.height.hash(&mut hasher);
+                image.depth.hash(&mut hasher);
+                image.mip_level_count.hash(&mut hasher);
+                image.dimension.hash(&mut hasher);
+                image.format.hash(&mut hasher);
+
+                let view_is_compatible = match texture.view_dimension {
+                    TextureViewDimension::D2 => {
+                        image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 1
+                    }
+                    TextureViewDimension::Cube => {
+                        image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 6
+                    }
+                    _ => false,
+                };
+
+                ResolvedTextureSource {
+                    version: hasher.finish(),
+                    ready: view_is_compatible,
+                    view_dimension: texture.view_dimension,
+                }
+            }
+            TextureSource::Attachment(id, view_dimension) => {
+                // The revision changes when a stable attachment ID is rebound
+                // to new content, so cached environment data cannot silently
+                // survive an in-place producer update.
+                let revision = self.get_internal_texture_revision(id);
+                revision.hash(&mut hasher);
+                ResolvedTextureSource {
+                    version: hasher.finish(),
+                    ready: revision.is_some(),
+                    view_dimension,
+                }
+            }
+        }
+    }
+
+    /// Resolve or create the CPU environment metadata for a scene.
     ///
-    /// This stage only updates CPU-side dirty flags and guarantees stable
-    /// texture ownership. Actual cube conversion / atmosphere bake / PMREM
-    /// generation is deferred to RenderGraph pass nodes.
+    /// This method performs asset-state inspection and hashing only. It never
+    /// uploads a texture, creates a WGPU object, or mutates RDG publication
+    /// state. Sun-motion throttling belongs to the feature-owned persistent
+    /// cache domain, where it can compare against post-submit publication
+    /// truth instead of mutating this current-frame snapshot.
     pub fn resolve_gpu_environment(
         &mut self,
         scene_id: u32,
@@ -258,12 +234,8 @@ impl ResourceManager {
         environment: &Environment,
         background: &BackgroundMode,
     ) -> f32 {
-        // A solid/gradient/texture background does not imply image-based
-        // lighting. Keep an existing scene environment dormant so it can be
-        // reused if the scene enables IBL again before the cache TTL expires,
-        // but deliberately do not create it or refresh its last-used frame.
-        // `prepare_global` binds the system black cube while this path is
-        // inactive.
+        // A background alone does not imply IBL except for procedural sky.
+        // Leave dormant metadata untouched so TTL reflects actual IBL use.
         let has_active_environment =
             matches!(background, BackgroundMode::Procedural(_)) || environment.has_env_map();
         if !has_active_environment {
@@ -272,262 +244,85 @@ impl ResourceManager {
 
         let config = environment.map_config();
 
-        let needs_recreate = self
-            .environments
-            .scene_environment(scene_id)
-            .is_none_or(|gpu_env| {
-                gpu_env.base_cube_texture.width() != config.base_cube_size
-                    || gpu_env.pmrem_texture.width() != config.pmrem_size
-            });
-
-        if needs_recreate {
-            self.recreate_scene_gpu_environment(scene_id, config.base_cube_size, config.pmrem_size);
-        }
-
-        if let BackgroundMode::Procedural(params) = background {
-            // Intentionally exclude `star_rotation` from PMREM rebake hashing:
-            // the day/night system updates it every frame, and rebaking IBL at
-            // that cadence would be too expensive. Static night-sky changes and
-            // starbox asset changes still trigger rebakes through `bake_hash`.
-            let starbox_hash = resolved_procedural_starbox_hash(self, assets, params);
-            let gpu_env = self
-                .environments
-                .scene_environment_mut(scene_id)
-                .expect("scene gpu environment must exist after recreation");
-
-            gpu_env.last_used_frame = self.frame_index;
-
-            let physics_hash = procedural_physics_hash(params);
-            let bake_hash = procedural_bake_hash(params, starbox_hash);
-            let source_kind_changed = gpu_env.source_type != CubeSourceType::Procedural
-                || gpu_env.source_key.is_some()
-                || !gpu_env.source_ready;
-            let physics_changed = gpu_env.procedural_physics_hash != physics_hash;
-            let bake_changed = gpu_env.procedural_bake_hash != bake_hash;
-            let sun_changed = sun_direction_requires_rebake(
-                gpu_env.compute_state.last_baked_sun_direction(),
-                params.sun_direction,
-            );
-
-            let needs_rebake = gpu_env.needs_compute()
-                || source_kind_changed
-                || physics_changed
-                || bake_changed
-                || sun_changed;
-
-            gpu_env.source_type = CubeSourceType::Procedural;
-            gpu_env.source_key = None;
-            gpu_env.source_ready = true;
-            gpu_env.procedural_physics_hash = physics_hash;
-            gpu_env.procedural_bake_hash = bake_hash;
-
-            if needs_rebake {
-                gpu_env.source_version =
-                    procedural_source_version(physics_hash, bake_hash, params.sun_direction);
-                gpu_env
-                    .compute_state
-                    .set_pending_bake_sun_direction(Some(params.sun_direction));
-                gpu_env.compute_state.set_needs_compute(true);
+        let (source_type, source_key, source_ready, source_version, physics_hash, static_bake_hash) =
+            if let BackgroundMode::Procedural(params) = background {
+                let physics_hash = procedural_physics_hash(params);
+                let moon_texture_hash =
+                    hash_optional_texture_source(self, assets, params.moon_albedo_texture);
+                let starbox_hash =
+                    hash_optional_texture_source(self, assets, params.starbox_texture);
+                let static_bake_hash =
+                    procedural_static_bake_hash(params, moon_texture_hash, starbox_hash);
+                (
+                    CubeSourceType::Procedural,
+                    None,
+                    true,
+                    procedural_source_version(
+                        physics_hash,
+                        static_bake_hash,
+                        params.sun_direction,
+                        params.moon_direction,
+                    ),
+                    physics_hash,
+                    static_bake_hash,
+                )
             } else {
-                gpu_env.compute_state.set_pending_bake_sun_direction(None);
-            }
+                let source = *environment
+                    .source_env_map()
+                    .expect("active non-procedural environment must have a source map");
+                let logical_source = self.resolve_logical_texture_source(assets, source);
+                let (source_type, supported_dimension) = match logical_source.view_dimension {
+                    TextureViewDimension::D2 => (CubeSourceType::Equirectangular, true),
+                    TextureViewDimension::Cube => (CubeSourceType::Cubemap, true),
+                    _ => (CubeSourceType::Equirectangular, false),
+                };
+                let resolved = ResolvedEnvironmentSource {
+                    source_type,
+                    key: source,
+                    version: logical_source.version,
+                    source_ready: logical_source.ready && supported_dimension,
+                };
 
-            return gpu_env.env_map_max_mip_level();
-        }
+                (
+                    resolved.source_type,
+                    Some(resolved.key),
+                    resolved.source_ready,
+                    resolved.version,
+                    0,
+                    0,
+                )
+            };
 
-        let resolved = if let BackgroundMode::Procedural(_) = background {
-            unreachable!("procedural backgrounds are handled above")
+        if let Some(gpu_env) = self.environments.scene_environment_mut(scene_id) {
+            gpu_env.base_cube_size = config.base_cube_size.max(1);
+            gpu_env.pmrem_size = config.pmrem_size.max(1);
+            gpu_env.source_version = source_version;
+            gpu_env.source_type = source_type;
+            gpu_env.source_key = source_key;
+            gpu_env.source_ready = source_ready;
+            gpu_env.procedural_physics_hash = physics_hash;
+            gpu_env.procedural_static_bake_hash = static_bake_hash;
+            gpu_env.last_used_frame = self.frame_index;
         } else {
-            let Some(source) = environment.source_env_map().copied() else {
-                if let Some(gpu_env) = self.environments.scene_environment_mut(scene_id) {
-                    gpu_env.compute_state.set_needs_compute(false);
-                    gpu_env.source_key = None;
-                    gpu_env.source_ready = false;
-                    gpu_env.compute_state.set_pending_bake_sun_direction(None);
-                    gpu_env.last_used_frame = self.frame_index;
-                }
-                return 0.0;
-            };
-
-            let mut source_version = environment.source_version();
-            let source_ready = match &source {
-                TextureSource::Asset(handle) => {
-                    let state = self.prepare_texture(assets, *handle);
-                    let source_ready =
-                        !matches!(state, ResourceState::Pending | ResourceState::Unknown);
-
-                    if source_ready && let Some(tex) = assets.textures.get(*handle) {
-                        source_version = source_version.wrapping_shl(32)
-                            ^ u64::from(assets.images.get_version(tex.image).unwrap_or(0));
-                    }
-
-                    source_ready
-                }
-                TextureSource::Attachment(id, _) => self.get_internal_texture(*id).is_some(),
-            };
-
-            let source_type = match &source {
-                TextureSource::Asset(handle) => self.resources.texture_image(*handle).map_or(
-                    CubeSourceType::Equirectangular,
-                    |img| {
-                        if img.default_view_dimension == TextureViewDimension::D2 {
-                            CubeSourceType::Equirectangular
-                        } else {
-                            CubeSourceType::Cubemap
-                        }
-                    },
-                ),
-                TextureSource::Attachment(_, dim) => {
-                    if *dim == TextureViewDimension::D2 {
-                        CubeSourceType::Equirectangular
-                    } else {
-                        CubeSourceType::Cubemap
-                    }
-                }
-            };
-
-            ResolvedEnvironmentSource {
-                source_type,
-                key: Some(source),
-                version: source_version,
-                source_ready,
-            }
-        };
-
-        let gpu_env = self
-            .environments
-            .scene_environment_mut(scene_id)
-            .expect("scene gpu environment must exist after recreation");
-
-        gpu_env.last_used_frame = self.frame_index;
-
-        let source_changed = gpu_env.source_version != resolved.version
-            || gpu_env.source_type != resolved.source_type
-            || gpu_env.source_key != resolved.key
-            || gpu_env.source_ready != resolved.source_ready;
-
-        if source_changed {
-            gpu_env.source_version = resolved.version;
-            gpu_env.source_type = resolved.source_type;
-            gpu_env.source_key = resolved.key;
-            gpu_env.source_ready = resolved.source_ready;
-            gpu_env.compute_state.set_pending_bake_sun_direction(None);
-            gpu_env
-                .compute_state
-                .set_needs_compute(resolved.source_ready);
-        } else if !resolved.source_ready {
-            gpu_env.compute_state.set_needs_compute(false);
-            gpu_env.compute_state.set_pending_bake_sun_direction(None);
+            self.environments.insert_scene_environment(
+                scene_id,
+                GpuEnvironment {
+                    base_cube_size: config.base_cube_size.max(1),
+                    pmrem_size: config.pmrem_size.max(1),
+                    source_version,
+                    source_type,
+                    source_key,
+                    source_ready,
+                    procedural_physics_hash: physics_hash,
+                    procedural_static_bake_hash: static_bake_hash,
+                    last_used_frame: self.frame_index,
+                },
+            );
         }
 
-        gpu_env.env_map_max_mip_level()
-    }
-
-    fn recreate_scene_gpu_environment(
-        &mut self,
-        scene_id: u32,
-        base_cube_size: u32,
-        pmrem_size: u32,
-    ) {
-        if let Some(old) = self.environments.remove_scene_environment(scene_id) {
-            self.internal_textures.remove(old.base_cube_view.id());
-            self.internal_textures.remove(old.pmrem_view.id());
-        }
-
-        let base_cube_mips = (base_cube_size as f32).log2().floor() as u32 + 1;
-        let base_cube_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Scene Environment Base Cube"),
-            size: wgpu::Extent3d {
-                width: base_cube_size,
-                height: base_cube_size,
-                depth_or_array_layers: 6,
-            },
-            mip_level_count: base_cube_mips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let base_cube_view =
-            Tracked::new(base_cube_texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("Scene Environment Base Cube View"),
-                dimension: Some(TextureViewDimension::Cube),
-                ..Default::default()
-            }));
-        let base_cube_storage_view =
-            Tracked::new(base_cube_texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("Scene Environment Base Cube Mip0"),
-                dimension: Some(TextureViewDimension::D2Array),
-                base_mip_level: 0,
-                mip_level_count: Some(1),
-                base_array_layer: 0,
-                array_layer_count: Some(6),
-                usage: Some(wgpu::TextureUsages::STORAGE_BINDING),
-                ..Default::default()
-            }));
-        self.internal_textures
-            .register_direct(base_cube_view.id(), (*base_cube_view).clone());
-
-        let pmrem_mips = (pmrem_size as f32).log2().floor() as u32 + 1;
-        let pmrem_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Scene Environment PMREM"),
-            size: wgpu::Extent3d {
-                width: pmrem_size,
-                height: pmrem_size,
-                depth_or_array_layers: 6,
-            },
-            mip_level_count: pmrem_mips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let pmrem_view = Tracked::new(pmrem_texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("Scene Environment PMREM View"),
-            dimension: Some(TextureViewDimension::Cube),
-            ..Default::default()
-        }));
-        let pmrem_storage_views = (0..pmrem_mips)
-            .map(|mip| {
-                Tracked::new(pmrem_texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some("Scene Environment PMREM Mip"),
-                    format: Some(wgpu::TextureFormat::Rgba16Float),
-                    dimension: Some(TextureViewDimension::D2Array),
-                    aspect: wgpu::TextureAspect::All,
-                    base_mip_level: mip,
-                    mip_level_count: Some(1),
-                    base_array_layer: 0,
-                    array_layer_count: Some(6),
-                    usage: Some(wgpu::TextureUsages::STORAGE_BINDING),
-                }))
-            })
-            .collect();
-        self.internal_textures
-            .register_direct(pmrem_view.id(), (*pmrem_view).clone());
-
-        self.environments.insert_scene_environment(
-            scene_id,
-            GpuEnvironment {
-                base_cube_texture,
-                pmrem_texture,
-                base_cube_view,
-                base_cube_storage_view,
-                pmrem_view,
-                pmrem_storage_views,
-                source_version: u64::MAX,
-                compute_state: EnvironmentComputeState::new(true),
-                source_type: CubeSourceType::Equirectangular,
-                source_key: None,
-                source_ready: false,
-                procedural_physics_hash: u64::MAX,
-                procedural_bake_hash: u64::MAX,
-                last_used_frame: self.frame_index,
-            },
-        );
+        self.environments
+            .scene_environment(scene_id)
+            .map_or(0.0, GpuEnvironment::env_map_max_mip_level)
     }
 
     #[inline]
@@ -542,30 +337,94 @@ impl ResourceManager {
         self.environments.scene_environment_mut(scene_id)
     }
 
+    /// Returns whether the current logical source can be consumed.
+    ///
+    /// This does not report RDG persistent-cache publication state; callers
+    /// needing a usable PMREM must query that registry separately.
     #[inline]
     #[must_use]
+    #[deprecated(
+        since = "0.3.0",
+        note = "reports source readiness only; use scene_environment_source_ready or Renderer::published_environment_max_mip_level"
+    )]
     pub fn scene_environment_ready(&self, scene_id: u32) -> bool {
-        self.environments
-            .scene_environment(scene_id)
-            .is_some_and(|gpu_env| !gpu_env.needs_compute())
+        self.scene_environment_source_ready(scene_id)
     }
 
+    /// Returns whether the current logical source is available to a live
+    /// conversion node. This is intentionally distinct from post-submit PMREM
+    /// publication readiness.
     #[inline]
     #[must_use]
     pub fn scene_environment_source_ready(&self, scene_id: u32) -> bool {
         self.environments
             .scene_environment(scene_id)
-            .is_some_and(|gpu_env| match gpu_env.source_type {
-                CubeSourceType::Procedural => true,
-                _ => gpu_env.source_ready,
-            })
+            .is_some_and(|gpu_env| gpu_env.source_ready)
+    }
+
+    /// Desired maximum mip level from the current scene configuration.
+    ///
+    /// A pending replacement may still sample an older published PMREM with a
+    /// different mip count. External consumers should query publication truth
+    /// through `Renderer::published_environment_max_mip_level`.
+    #[inline]
+    #[must_use]
+    pub fn desired_environment_max_mip_level(&self, scene_id: u32) -> f32 {
+        self.environments
+            .scene_environment(scene_id)
+            .map_or(0.0, GpuEnvironment::env_map_max_mip_level)
     }
 
     #[inline]
     #[must_use]
+    #[deprecated(
+        since = "0.3.0",
+        note = "returns desired configuration, not published PMREM state; use desired_environment_max_mip_level or Renderer::published_environment_max_mip_level"
+    )]
     pub fn get_env_map_max_mip_level(&self, scene_id: u32) -> f32 {
-        self.environments
-            .scene_environment(scene_id)
-            .map_or(0.0, GpuEnvironment::env_map_max_mip_level)
+        self.desired_environment_max_mip_level(scene_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn procedural_static_bake_hash_excludes_dynamic_celestial_motion() {
+        let params = ProceduralSkyParams::golden_hour();
+        let initial = procedural_static_bake_hash(&params, 11, 22);
+
+        let mut rotated_stars = params.clone();
+        rotated_stars.star_rotation += 1.0;
+        assert_eq!(
+            procedural_static_bake_hash(&rotated_stars, 11, 22),
+            initial,
+            "continuous star rotation must not invalidate PMREM"
+        );
+
+        let mut moved_moon = params;
+        moved_moon.moon_direction = Vec3::X;
+        assert_eq!(
+            procedural_static_bake_hash(&moved_moon, 11, 22),
+            initial,
+            "continuous moon motion must be handled by the angular throttle"
+        );
+        assert_ne!(
+            procedural_static_bake_hash(&moved_moon, 12, 22),
+            initial,
+            "changing the moon texture remains a static bake invalidation"
+        );
+    }
+
+    #[test]
+    fn procedural_source_version_tracks_both_celestial_directions() {
+        let params = ProceduralSkyParams::golden_hour();
+        let initial = procedural_source_version(1, 2, params.sun_direction, params.moon_direction);
+        let moved_sun = procedural_source_version(1, 2, Vec3::X, params.moon_direction);
+        let moved_moon = procedural_source_version(1, 2, params.sun_direction, Vec3::X);
+
+        assert_ne!(initial, moved_sun);
+        assert_ne!(initial, moved_moon);
     }
 }

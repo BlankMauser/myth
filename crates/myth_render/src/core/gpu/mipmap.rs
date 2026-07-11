@@ -162,8 +162,7 @@ impl MipmapGenerator {
     /// Generate mipmaps for the given texture.
     ///
     /// **Important**: The pipeline for the texture's format must be pre-warmed
-    /// via [`ensure_pipeline`] during the prepare phase. If the pipeline is not
-    /// found, this method will create it on-the-fly (with a warning).
+    /// via [`ensure_pipeline`] during the prepare phase.
     pub fn generate(
         &self,
         device: &wgpu::Device,
@@ -176,14 +175,11 @@ impl MipmapGenerator {
         }
 
         let format = texture.format();
-        let pipeline = if let Some(p) = self.pipelines.get(&format) {
-            p.clone()
-        } else {
-            log::trace!(
-                "MipmapGenerator: pipeline not pre-warmed for {format:?}, creating on-the-fly"
-            );
-            self.create_pipeline(device, format)
-        };
+        let pipeline = self
+            .pipelines
+            .get(&format)
+            .unwrap_or_else(|| panic!("mipmap pipeline for {format:?} was not prepared"))
+            .clone();
         let layer_count = texture.depth_or_array_layers();
 
         for layer in 0..layer_count {

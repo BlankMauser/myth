@@ -24,6 +24,9 @@ use super::types::{BufferNodeId, TextureNodeId};
 /// | `scene_color` | HDR scene colour buffer | Custom post-FX |
 /// | `scene_depth` | Main depth buffer (reverse-Z) | Depth-aware FX |
 /// | `scene_hiz` | Reverse-Z Hi-Z pyramid (max-depth mip chain) | Hierarchical screen-space ray tracing |
+/// | `environment_base_cube` | Scene environment cube before prefiltering | Custom reflections / sky lighting |
+/// | `environment_pmrem` | Prefiltered scene environment cube | Custom image-based lighting |
+/// | `environment_pmrem_max_mip_level` | Max LOD of `environment_pmrem` | Roughness-to-LOD mapping |
 /// | `atmosphere_transmittance` | Atmosphere transmittance LUT | Custom lit composites |
 /// | `atmosphere_bake_params` | Atmosphere bake uniform buffer | Custom lit composites |
 /// | `surface_out` | Final swap-chain output | UI overlay |
@@ -35,6 +38,19 @@ pub struct GraphBlackboard {
     pub scene_depth: Option<TextureNodeId>,
     /// Reverse-Z Hi-Z pyramid storing the maximum depth per mip texel.
     pub scene_hiz: Option<TextureNodeId>,
+    /// Optional scene environment cube before PMREM prefiltering.
+    ///
+    /// This is the logical RDG resource, not a retained physical view. Reading
+    /// it from a custom pass keeps same-frame environment producers ordered
+    /// and lets DPE remove them when no live pass consumes the result.
+    pub environment_base_cube: Option<TextureNodeId>,
+    /// Optional prefiltered scene environment cube used for image-based
+    /// lighting. This may refer to either a previously published cache entry
+    /// or a same-frame persistent-cache writer.
+    pub environment_pmrem: Option<TextureNodeId>,
+    /// Maximum valid mip level of `environment_pmrem`. `Some(0.0)` describes
+    /// a valid 1×1 PMREM; availability must not be inferred from the value.
+    pub environment_pmrem_max_mip_level: Option<f32>,
     /// Optional atmosphere transmittance LUT for custom passes that need the
     /// same celestial-light attenuation as the main lighting path.
     pub atmosphere_transmittance: Option<TextureNodeId>,

@@ -139,6 +139,11 @@ pub struct GenerateMipmapNode {
 }
 
 impl PassNode<'_> for GenerateMipmapNode {
+    fn prepare(&mut self, ctx: &mut crate::graph::core::PrepareContext<'_>) {
+        let format = ctx.views.get_texture(self.texture).format();
+        ctx.mipmap_generator.ensure_pipeline(ctx.device, format);
+    }
+
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let view = ctx.get_texture_view(self.texture);
         ctx.mipmap_generator

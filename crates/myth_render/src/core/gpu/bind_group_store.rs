@@ -98,6 +98,13 @@ impl BindGroupStore {
             .retain(|_, v| v.last_used_frame >= cutoff);
     }
 
+    pub(super) fn remove_scene_global_states(&mut self, scene_id: u32) -> usize {
+        let before = self.global_states.len();
+        self.global_states
+            .retain(|key, _| key.scene_id() != scene_id);
+        before - self.global_states.len()
+    }
+
     #[inline]
     pub(super) fn clear_object_bind_group_caches(&mut self) {
         self.object_bind_group_cache.clear();

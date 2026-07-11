@@ -46,6 +46,7 @@ pub struct GpuImage {
     pub texture: wgpu::Texture,
     pub default_view: wgpu::TextureView,
     pub default_view_dimension: wgpu::TextureViewDimension,
+    pub dimension: wgpu::TextureDimension,
     pub size: wgpu::Extent3d,
     pub format: wgpu::TextureFormat,
     pub mip_level_count: u32,
@@ -72,12 +73,13 @@ impl GpuImage {
             depth_or_array_layers: image.depth,
         };
 
+        let dimension = image.dimension.to_wgpu();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size,
             mip_level_count,
             sample_count: 1,
-            dimension: image.dimension.to_wgpu(),
+            dimension,
             format: resolved_format,
             usage,
             view_formats: &[],
@@ -111,6 +113,7 @@ impl GpuImage {
             texture,
             default_view,
             default_view_dimension: view_dimension,
+            dimension,
             size,
             format: resolved_format,
             mip_level_count,
@@ -170,6 +173,8 @@ impl GpuImage {
         if self.size.width != image.width
             || self.size.height != image.height
             || self.size.depth_or_array_layers != image.depth
+            || self.dimension != image.dimension.to_wgpu()
+            || self.default_view_dimension != view_dimension
             || self.format != resolved_format
         {
             *self = Self::new(

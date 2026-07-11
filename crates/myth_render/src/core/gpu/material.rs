@@ -156,7 +156,12 @@ impl ResourceManager {
                     }
                 }
                 TextureSource::Attachment(id, _) => {
-                    resource_ids.push(*id);
+                    if let Some(view_id) = self.internal_textures.view_id(*id) {
+                        resource_ids.push(view_id);
+                    } else {
+                        has_pending = true;
+                        resource_ids.push(self.system_textures.black_2d.id());
+                    }
                     resource_ids.push(self.sampler_registry.default_sampler().0 as u64);
                 }
             });

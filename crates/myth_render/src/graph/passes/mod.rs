@@ -43,7 +43,7 @@ pub use fxaa::FxaaFeature;
 #[cfg(feature = "3dgs")]
 pub use gaussian_splatting::GaussianSplattingFeature;
 pub use hiz_build::HiZFeature;
-pub use ibl_compute::IblComputeFeature;
+pub use ibl_compute::{EnvironmentCacheFeature, IblComputeFeature};
 pub use mipmap::MipmapFeature;
 pub use msaa_sync::MsaaSyncFeature;
 pub use opaque::OpaqueFeature;

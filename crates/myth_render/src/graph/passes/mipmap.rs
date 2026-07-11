@@ -6,7 +6,7 @@
 
 use crate::core::gpu::{MipmapGenerator, MipmapRequest};
 use crate::graph::composer::GraphBuilderContext;
-use crate::graph::core::{ExecuteContext, ExtractContext, PassNode};
+use crate::graph::core::{ExecuteContext, ExtractContext, PassNode, PrepareContext};
 
 pub struct MipmapFeature {
     generator: MipmapGenerator,
@@ -22,25 +22,25 @@ impl MipmapFeature {
         }
     }
 
-    #[inline]
-    #[must_use]
-    pub fn generator(&self) -> &MipmapGenerator {
-        &self.generator
+    /// Physically partition static generator state from the frame-owned
+    /// request slice so graph nodes can retain the latter while live prepare
+    /// mutates only the former.
+    pub(crate) fn split(&mut self) -> (&mut MipmapGenerator, &[MipmapRequest]) {
+        (&mut self.generator, &self.requests)
     }
 
     pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext) {
         self.requests = ctx.resource_manager.take_mipmap_requests();
-        for request in &self.requests {
-            self.generator.ensure_pipeline(ctx.device, request.format);
-        }
     }
 
-    pub fn add_to_graph<'a>(&'a self, ctx: &mut GraphBuilderContext<'a, '_>) {
-        if self.requests.is_empty() {
+    pub(crate) fn add_requests_to_graph<'a>(
+        ctx: &mut GraphBuilderContext<'a, '_>,
+        requests: &'a [MipmapRequest],
+    ) {
+        if requests.is_empty() {
             return;
         }
 
-        let requests = self.requests.as_slice();
         ctx.graph.add_pass("Asset_Mipmap_Generation", |builder| {
             builder.mark_side_effect();
             (AssetMipmapNode { requests }, ())
@@ -53,6 +53,13 @@ struct AssetMipmapNode<'a> {
 }
 
 impl PassNode<'_> for AssetMipmapNode<'_> {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
+        for request in self.requests {
+            ctx.mipmap_generator
+                .ensure_pipeline(ctx.device, request.format);
+        }
+    }
+
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         for request in self.requests {
             ctx.mipmap_generator

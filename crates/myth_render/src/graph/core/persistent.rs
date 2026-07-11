@@ -283,6 +283,17 @@ struct CacheRecord {
     generation: u64,
     last_planned_serial: Option<u64>,
     last_commit_generation: Option<u64>,
+    /// Last successfully published state retained while a replacement is
+    /// staged into the same logical texture IDs. It can be restored only when
+    /// graph compilation proves that none of the replacement writers ran.
+    rollback: Option<CacheRollbackState>,
+}
+
+struct CacheRollbackState {
+    epoch: u64,
+    key: CacheKey,
+    specs: Vec<PersistentTextureSpec>,
+    last_commit_generation: Option<u64>,
 }
 
 impl CacheRecord {
@@ -296,6 +307,7 @@ impl CacheRecord {
             generation: 0,
             last_planned_serial: None,
             last_commit_generation: None,
+            rollback: None,
         }
     }
 
@@ -304,12 +316,26 @@ impl CacheRecord {
         key: CacheKey,
         specs: &[PersistentTextureSpec],
     ) -> Vec<PersistentTextureId> {
+        let member_count_unchanged = self.members.len() == specs.len();
+        if self.valid && member_count_unchanged {
+            self.rollback = Some(CacheRollbackState {
+                epoch: self.epoch,
+                key: self.key,
+                specs: self.specs.clone(),
+                last_commit_generation: self.last_commit_generation,
+            });
+        } else if !member_count_unchanged {
+            // A changed group shape allocates new logical IDs and cannot
+            // safely restore the old bank in place.
+            self.rollback = None;
+        }
+
         self.epoch = self.epoch.wrapping_add(1);
         self.valid = false;
         self.key = key;
         self.specs.clear();
         self.specs.extend_from_slice(specs);
-        let retired = if self.members.len() == specs.len() {
+        let retired = if member_count_unchanged {
             Vec::new()
         } else {
             let retired = std::mem::take(&mut self.members);
@@ -484,8 +510,12 @@ impl HistoryRegistry {
     /// with the same serial, key, and specs is idempotent and returns the same
     /// token. Advancing the serial invalidates older unsubmitted tokens without
     /// invalidating already-published contents. A key or specification change
-    /// invalidates contents, advances the entry epoch, and lazily recreates
-    /// physical textures only if a live pass touches them after DPE.
+    /// stages an invalid replacement and advances the entry epoch. Physical
+    /// textures are recreated only if a live pass touches them after DPE. If
+    /// the logical member count is unchanged and every registered resource is
+    /// completely untouched, the graph restores the last submitted state
+    /// without exposing the replacement. A member-count change retires the old
+    /// logical group immediately and therefore cannot be rolled back in place.
     pub fn plan_cache<const N: usize>(
         &mut self,
         cache_id: CacheId,
@@ -570,10 +600,119 @@ impl HistoryRegistry {
         let Some(record) = self.caches.get_mut(&cache_id) else {
             return false;
         };
+        if record.valid {
+            record.rollback = Some(CacheRollbackState {
+                epoch: record.epoch,
+                key: record.key,
+                specs: record.specs.clone(),
+                last_commit_generation: record.last_commit_generation,
+            });
+        }
         record.epoch = record.epoch.wrapping_add(1);
         record.valid = false;
         record.last_commit_generation = None;
         true
+    }
+
+    /// Restore the last published state after DPE removed every writer of the
+    /// latest replacement plan.
+    ///
+    /// This is intentionally token-checked and may only be called when no
+    /// writer ran. Reusing the same logical IDs is then safe: persistent
+    /// materialization also skipped the dead resources, so their physical
+    /// textures still contain the published contents.
+    pub(crate) fn rollback_cache(&mut self, token: CacheCommitToken) -> bool {
+        let restored = {
+            let Some(record) = self.caches.get_mut(&token.cache_id) else {
+                return false;
+            };
+            if record.valid
+                || record.key != token.key
+                || record.epoch != token.epoch
+                || record.generation != token.generation
+                || record.last_planned_serial != Some(token.attempt_serial)
+            {
+                return false;
+            }
+            let Some(rollback) = record.rollback.as_ref() else {
+                return false;
+            };
+            if rollback.specs.len() != record.members.len() {
+                return false;
+            }
+            let rollback = record
+                .rollback
+                .take()
+                .expect("rollback was validated immediately above");
+
+            record.epoch = rollback.epoch;
+            record.valid = true;
+            record.key = rollback.key;
+            record.specs = rollback.specs;
+            record.last_commit_generation = rollback.last_commit_generation;
+
+            record
+                .members
+                .iter()
+                .copied()
+                .zip(record.specs.iter().copied())
+                .collect::<Vec<_>>()
+        };
+
+        for (id, spec) in restored {
+            self.logical_specs.insert(id, spec);
+        }
+        true
+    }
+
+    /// Permanently discard the staged publication retained for rollback.
+    ///
+    /// Once any replacement member has been materialized or written, its
+    /// physical contents may no longer match the old key/specification. The
+    /// cache must remain invalid until a complete writer group publishes a new
+    /// value; a later all-dead attempt must not revive the old publication.
+    pub(crate) fn discard_cache_rollback(&mut self, token: CacheCommitToken) -> bool {
+        let Some(record) = self.caches.get_mut(&token.cache_id) else {
+            return false;
+        };
+        if record.valid
+            || record.key != token.key
+            || record.epoch != token.epoch
+            || record.generation != token.generation
+            || record.last_planned_serial != Some(token.attempt_serial)
+        {
+            return false;
+        }
+        record.rollback.take().is_some()
+    }
+
+    /// Returns whether an ordinary cache currently contains published
+    /// contents for exactly `key`.
+    #[must_use]
+    pub(crate) fn is_cache_valid(&self, cache_id: CacheId, key: CacheKey) -> bool {
+        self.caches
+            .get(&cache_id)
+            .is_some_and(|record| record.valid && record.key == key)
+    }
+
+    /// Resolve one canonical texture view from a valid ordinary cache entry.
+    ///
+    /// This read-only bridge is intended for bindings assembled before or
+    /// outside pass prepare (notably the renderer-global PMREM binding). It
+    /// never exposes invalid, stale-key, or merely planned contents.
+    #[must_use]
+    pub(crate) fn get_valid_cache_texture_view(
+        &self,
+        cache_id: CacheId,
+        key: CacheKey,
+        index: usize,
+    ) -> Option<&Tracked<wgpu::TextureView>> {
+        let record = self.caches.get(&cache_id)?;
+        if !record.valid || record.key != key {
+            return None;
+        }
+        let texture_id = *record.members.get(index)?;
+        self.textures.get(&texture_id).map(|texture| &texture.view)
     }
 
     pub fn invalidate(&mut self, set_id: HistorySetId) {
@@ -698,6 +837,7 @@ impl HistoryRegistry {
 
         record.valid = true;
         record.last_commit_generation = Some(token.generation);
+        record.rollback = None;
         Some(CachePublicationReceipt {
             cache_id: token.cache_id,
             key: token.key,

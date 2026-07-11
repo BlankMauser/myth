@@ -19,11 +19,11 @@ use crate::graph::passes::DebugViewFeature;
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
 use crate::graph::passes::{
-    AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, EquirectToCubeFeature,
-    FxaaFeature, HiZFeature, IblComputeFeature, MipmapFeature, MsaaSyncFeature, OpaqueFeature,
-    PrepassFeature, PresentFeature, ShadowFeature, SimpleForwardFeature, SkyboxFeature,
-    SsaoFeature, SsgiFeature, SsrFeature, SsssFeature, TaaFeature, ToneMappingFeature,
-    TransmissionCopyFeature, TransparentFeature,
+    AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, EnvironmentCacheFeature,
+    EquirectToCubeFeature, FxaaFeature, HiZFeature, IblComputeFeature, MipmapFeature,
+    MsaaSyncFeature, OpaqueFeature, PrepassFeature, PresentFeature, ShadowFeature,
+    SimpleForwardFeature, SkyboxFeature, SsaoFeature, SsgiFeature, SsrFeature, SsssFeature,
+    TaaFeature, ToneMappingFeature, TransmissionCopyFeature, TransparentFeature,
 };
 use myth_assets::AssetServer;
 use myth_core::Result;
@@ -136,6 +136,7 @@ struct RendererState {
 
     // Shadow + Compute passes (migrated from old system)
     pub(crate) shadow_pass: ShadowFeature,
+    pub(crate) environment_cache: EnvironmentCacheFeature,
     pub(crate) equirect_to_cube_pass: EquirectToCubeFeature,
     pub(crate) ibl_pass: IblComputeFeature,
     pub(crate) atmosphere_pass: AtmosphereFeature,
@@ -275,8 +276,9 @@ impl Renderer {
         let global_bind_group_cache = GlobalBindGroupCache::new();
 
         let shadow_pass = ShadowFeature::new(&wgpu_ctx.device);
-        let equirect_to_cube_pass = EquirectToCubeFeature::new(&wgpu_ctx.device);
-        let ibl_pass = IblComputeFeature::new(&wgpu_ctx.device);
+        let environment_cache = EnvironmentCacheFeature::new();
+        let equirect_to_cube_pass = EquirectToCubeFeature::new();
+        let ibl_pass = IblComputeFeature::new();
         let mipmap_pass = MipmapFeature::new(&wgpu_ctx.device);
 
         self.context = Some(RendererState {
@@ -314,6 +316,7 @@ impl Renderer {
             msaa_sync_pass: MsaaSyncFeature::new(),
 
             shadow_pass,
+            environment_cache,
             equirect_to_cube_pass,
             ibl_pass,
             atmosphere_pass: AtmosphereFeature::new(),
@@ -404,6 +407,25 @@ impl Renderer {
             render_path: state.wgpu_ctx.render_path,
             msaa_samples: state.wgpu_ctx.msaa_samples,
         };
+        let has_active_environment =
+            matches!(&scene.background.mode, BackgroundMode::Procedural(_))
+                || scene.environment.has_env_map();
+        let published_pmrem_view = has_active_environment
+            .then(|| {
+                state
+                    .environment_cache
+                    .published_pmrem_view(scene.id(), &state.history_registry)
+                    .cloned()
+            })
+            .flatten();
+        let published_pmrem_max_mip = has_active_environment
+            .then(|| {
+                state
+                    .environment_cache
+                    .published_pmrem_mip_level_count(scene.id(), &state.history_registry)
+                    .map(|mip_count| mip_count.saturating_sub(1) as f32)
+            })
+            .flatten();
         state.render_frame.extract_and_prepare(
             &mut state.resource_manager,
             scene,
@@ -414,6 +436,8 @@ impl Renderer {
             surface_size,
             max_extracted_lights,
             feature_config,
+            published_pmrem_view.as_ref(),
+            published_pmrem_max_mip,
         );
 
         // ── Phase 2: Cull + sort + command generation ───────────────────
@@ -491,10 +515,17 @@ impl Renderer {
 
             // let needs_normal = ssao_enabled || needs_feature_id;
             let needs_skybox = scene.background.needs_skybox_pass();
-            let uses_procedural_environment =
-                matches!(scene.background.mode, BackgroundMode::Procedural(_));
-            let has_source_environment = scene.environment.has_env_map();
-            let has_active_environment = uses_procedural_environment || has_source_environment;
+            let environment_cache_frame = state.resource_manager.frame_index();
+            let retired_environment_scenes = state
+                .environment_cache
+                .maintain(&mut state.history_registry, environment_cache_frame);
+            for retired_scene_id in retired_environment_scenes {
+                state
+                    .resource_manager
+                    .remove_scene_global_states(retired_scene_id);
+            }
+            state.atmosphere_pass.maintain(environment_cache_frame);
+
             let mut extract_ctx = ExtractContext {
                 device: &state.wgpu_ctx.device,
                 queue: &state.wgpu_ctx.queue,
@@ -509,28 +540,8 @@ impl Renderer {
                 render_camera: &camera,
                 assets,
             };
-
-            // Always: environment maintenance + shadow
-            let environment_cache_frame = extract_ctx.resource_manager.frame_index();
-            state
-                .equirect_to_cube_pass
-                .maintain(environment_cache_frame);
-            state.ibl_pass.maintain(environment_cache_frame);
-            state.atmosphere_pass.maintain(environment_cache_frame);
-            if has_source_environment && !uses_procedural_environment {
-                state
-                    .equirect_to_cube_pass
-                    .extract_and_prepare(&mut extract_ctx, scene);
-            } else {
-                state.equirect_to_cube_pass.deactivate_scene(scene.id());
-            }
-            if has_active_environment {
-                state
-                    .ibl_pass
-                    .extract_and_prepare(&mut extract_ctx, scene.id());
-            } else {
-                state.ibl_pass.deactivate_scene(scene.id());
-            }
+            // Always: shadow extraction. Environment source/PMREM extraction
+            // now happens inside Composer after render-target acquisition.
             state.shadow_pass.extract_and_prepare(&mut extract_ctx);
 
             // Procedural atmosphere (LUT + cubemap + PMREM compute)
@@ -655,6 +666,7 @@ impl Renderer {
             msaa_sync_pass: &mut state.msaa_sync_pass,
 
             shadow_pass: &mut state.shadow_pass,
+            environment_cache: &mut state.environment_cache,
             equirect_to_cube_pass: &mut state.equirect_to_cube_pass,
             ibl_pass: &mut state.ibl_pass,
             atmosphere_pass: &mut state.atmosphere_pass,
@@ -863,6 +875,24 @@ impl Renderer {
     /// Returns a reference to the GPU resource manager.
     pub fn resource_manager(&self) -> Option<&ResourceManager> {
         self.context.as_ref().map(|s| &s.resource_manager)
+    }
+
+    /// Returns the maximum mip level of the scene's currently published
+    /// environment PMREM.
+    ///
+    /// This reports persistent-cache publication truth rather than the
+    /// desired size of a pending replacement source. External graph passes
+    /// can therefore keep roughness-to-LOD mapping consistent with the
+    /// logical PMREM resource exposed through
+    /// [`GraphBlackboard`](crate::graph::core::GraphBlackboard).
+    #[must_use]
+    pub fn published_environment_max_mip_level(&self, scene_id: u32) -> Option<f32> {
+        self.context.as_ref().and_then(|state| {
+            state
+                .environment_cache
+                .published_pmrem_mip_level_count(scene_id, &state.history_registry)
+                .map(|mip_count| mip_count.saturating_sub(1) as f32)
+        })
     }
 
     pub fn dump_graph_mermaid(&self) -> Option<String> {
@@ -1249,6 +1279,21 @@ mod tests {
             .render();
     }
 
+    fn published_pmrem_view_id(state: &RendererState, scene_id: u32) -> Option<u64> {
+        state
+            .environment_cache
+            .published_pmrem_view(scene_id, &state.history_registry)
+            .map(Tracked::id)
+    }
+
+    fn graph_contains_pass(state: &RendererState, name: &str) -> bool {
+        state
+            .graph_storage
+            .passes
+            .iter()
+            .any(|pass| pass.name == name)
+    }
+
     #[test]
     fn inactive_environment_uses_black_cube_without_allocating_scene_textures() {
         let mut renderer = init_headless_renderer();
@@ -1262,7 +1307,15 @@ mod tests {
         let scene_id = scene.id();
         assert!(
             state.resource_manager.gpu_environment(scene_id).is_none(),
-            "a color background without IBL must not allocate scene environment textures"
+            "a color background without IBL must not create scene environment metadata"
+        );
+        assert!(
+            !state.environment_cache.has_scene_state(scene_id),
+            "an inactive environment must not create a logical cache domain"
+        );
+        assert!(
+            published_pmrem_view_id(state, scene_id).is_none(),
+            "an inactive environment must not materialize a persistent PMREM"
         );
 
         let global_state = state
@@ -1272,7 +1325,34 @@ mod tests {
         let resource_ids = global_state.resource_ids.as_slice();
         let black_cube_id = state.resource_manager.system_textures.black_cube.id();
         assert_eq!(black_cube_id, resource_ids[3]);
-        assert_eq!(black_cube_id, resource_ids[4]);
+    }
+
+    #[test]
+    fn one_pixel_pmrem_is_published_even_though_its_max_mip_is_zero() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(4);
+        scene.environment.set_pmrem_size(1);
+        scene.background.set_mode(BackgroundMode::procedural());
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        assert_eq!(
+            renderer.published_environment_max_mip_level(scene.id()),
+            Some(0.0),
+            "max mip zero is valid metadata for a published 1×1 PMREM"
+        );
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let global = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene.id())
+            .expect("global state missing");
+        assert_ne!(
+            global.resource_ids.as_slice()[3],
+            state.resource_manager.system_textures.black_cube.id(),
+            "PMREM availability must not be inferred from max_mip > 0"
+        );
     }
 
     #[test]
@@ -1302,8 +1382,8 @@ mod tests {
             .expect("global state missing after render");
         assert_eq!(
             global_state.resource_ids.as_slice().len(),
-            5,
-            "global fingerprint should contain only camera, environment, lights, and two environment cube identities"
+            4,
+            "global fingerprint should contain only camera, environment, lights, and the bound PMREM identity"
         );
         assert_eq!(
             global_state.binding_wgsl.matches("@group(0)").count(),
@@ -1343,32 +1423,28 @@ mod tests {
             Vec4::new(0.01, 0.02, 0.03, 1.0),
         ));
         render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-        assert!(
-            renderer
-                .context
-                .as_ref()
-                .expect("renderer state missing")
-                .resource_manager
-                .gpu_environment(scene.id())
-                .is_none(),
-            "a gradient background must not implicitly allocate IBL textures"
-        );
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert!(
+                state.resource_manager.gpu_environment(scene.id()).is_none(),
+                "a gradient background must not create IBL metadata"
+            );
+            assert!(!state.environment_cache.has_scene_state(scene.id()));
+            assert!(published_pmrem_view_id(state, scene.id()).is_none());
+        }
 
         let background_texture = assets.checkerboard(16, 2);
         scene
             .background
             .set_mode(BackgroundMode::planar(background_texture, 1.0));
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
         assert!(
-            renderer
-                .context
-                .as_ref()
-                .expect("renderer state missing")
-                .resource_manager
-                .gpu_environment(scene.id())
-                .is_none(),
-            "a background-only texture must not implicitly allocate IBL textures"
+            state.resource_manager.gpu_environment(scene.id()).is_none(),
+            "a background-only texture must not create IBL metadata"
         );
+        assert!(!state.environment_cache.has_scene_state(scene.id()));
+        assert!(published_pmrem_view_id(state, scene.id()).is_none());
     }
 
     #[test]
@@ -1384,16 +1460,19 @@ mod tests {
         render_frame(&mut renderer, &mut scene, camera, &assets, 0);
 
         let scene_id = scene.id();
-        let initial_env = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let initial_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("initial scene environment missing");
-        let initial_base_cube_id = initial_env.base_cube_view.id();
-        let initial_pmrem_id = initial_env.pmrem_view.id();
+            .expect("initial scene environment metadata missing");
+        assert_eq!(16, initial_env.base_cube_size);
+        assert_eq!(8, initial_env.pmrem_size);
+        assert!(initial_env.source_ready);
+        let initial_source_version = initial_env.source_version;
         let initial_last_used_frame = initial_env.last_used_frame;
+        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("initial persistent PMREM must be published");
+        assert!(state.environment_cache.has_scene_state(scene_id));
 
         scene
             .background
@@ -1402,16 +1481,18 @@ mod tests {
         scene.background.set_mode(BackgroundMode::procedural());
         render_frame(&mut renderer, &mut scene, camera, &assets, 2);
 
-        let reenabled_env = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let reenabled_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("re-enabled scene environment missing");
-        assert_eq!(initial_base_cube_id, reenabled_env.base_cube_view.id());
-        assert_eq!(initial_pmrem_id, reenabled_env.pmrem_view.id());
+            .expect("re-enabled scene environment metadata missing");
+        assert_eq!(initial_source_version, reenabled_env.source_version);
         assert!(reenabled_env.last_used_frame > initial_last_used_frame);
+        assert_eq!(
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id),
+            "re-enabling before TTL expiry should reuse the published PMREM view"
+        );
     }
 
     #[test]
@@ -1431,8 +1512,8 @@ mod tests {
         let source_scene_id = source_scene.id();
         {
             let state = renderer.context.as_ref().expect("renderer state missing");
-            assert!(state.equirect_to_cube_pass.has_scene_state(source_scene_id));
-            assert!(state.ibl_pass.has_scene_state(source_scene_id));
+            assert!(state.environment_cache.has_scene_state(source_scene_id));
+            assert!(published_pmrem_view_id(state, source_scene_id).is_some());
         }
 
         let mut procedural_scene = Scene::new();
@@ -1446,26 +1527,24 @@ mod tests {
         let procedural_scene_id = procedural_scene.id();
         {
             let state = renderer.context.as_ref().expect("renderer state missing");
-            assert!(state.ibl_pass.has_scene_state(procedural_scene_id));
+            assert!(state.environment_cache.has_scene_state(procedural_scene_id));
+            assert!(published_pmrem_view_id(state, procedural_scene_id).is_some());
             assert!(state.atmosphere_pass.has_scene_state(procedural_scene_id));
         }
 
-        // Advance beyond the feature-local 120-frame TTL without rendering
-        // either active scene, then render an unrelated inactive scene. The
-        // unconditional maintenance path must reclaim both abandoned domains.
-        {
-            let state = renderer.context.as_mut().expect("renderer state missing");
-            for _ in 0..120 {
-                state.resource_manager.next_frame();
-            }
-        }
-        let mut inactive_scene = Scene::new();
-        render_frame(&mut renderer, &mut inactive_scene, camera, &assets, 2);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(!state.equirect_to_cube_pass.has_scene_state(source_scene_id));
-        assert!(!state.ibl_pass.has_scene_state(source_scene_id));
-        assert!(!state.ibl_pass.has_scene_state(procedural_scene_id));
+        // Static converter/filter features no longer own scene state. The
+        // logical coordinator retires both persistent domains atomically.
+        let state = renderer.context.as_mut().expect("renderer state missing");
+        let retired = state
+            .environment_cache
+            .maintain(&mut state.history_registry, u64::MAX);
+        state.atmosphere_pass.maintain(u64::MAX);
+        assert!(retired.contains(&source_scene_id));
+        assert!(retired.contains(&procedural_scene_id));
+        assert!(!state.environment_cache.has_scene_state(source_scene_id));
+        assert!(!state.environment_cache.has_scene_state(procedural_scene_id));
+        assert!(published_pmrem_view_id(state, source_scene_id).is_none());
+        assert!(published_pmrem_view_id(state, procedural_scene_id).is_none());
         assert!(!state.atmosphere_pass.has_scene_state(procedural_scene_id));
     }
 
@@ -1486,15 +1565,31 @@ mod tests {
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 0);
 
-        let gpu_env = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let gpu_env = state
             .resource_manager
             .gpu_environment(scene.id())
-            .expect("configured environment should retain an active cache domain");
+            .expect("configured environment should retain CPU metadata");
+        assert_eq!(16, gpu_env.base_cube_size);
+        assert_eq!(8, gpu_env.pmrem_size);
         assert!(!gpu_env.source_ready);
-        assert!(!gpu_env.needs_compute());
+        assert_ne!(0, gpu_env.source_version);
+        assert_eq!(
+            state.resource_manager.frame_index(),
+            gpu_env.last_used_frame
+        );
+        assert!(state.environment_cache.has_scene_state(scene.id()));
+        assert!(published_pmrem_view_id(state, scene.id()).is_none());
+
+        let global_state = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene.id())
+            .expect("global state missing for pending environment");
+        assert_eq!(
+            state.resource_manager.system_textures.black_cube.id(),
+            global_state.resource_ids.as_slice()[3],
+            "a first-time pending source must bind the black cube"
+        );
     }
 
     #[test]
@@ -1514,10 +1609,14 @@ mod tests {
         let active_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("active scene environment missing");
+            .expect("active scene environment metadata missing");
+        assert_eq!(16, active_env.base_cube_size);
+        assert_eq!(8, active_env.pmrem_size);
+        assert!(active_env.source_ready);
         let last_active_frame = active_env.last_used_frame;
-        let base_cube_id = active_env.base_cube_view.id();
-        let pmrem_id = active_env.pmrem_view.id();
+        let active_source_version = active_env.source_version;
+        let pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("active environment must publish a PMREM");
 
         scene
             .background
@@ -1540,30 +1639,30 @@ mod tests {
             .expect("global state missing after disabling environment");
         let black_cube_id = state.resource_manager.system_textures.black_cube.id();
         assert_eq!(black_cube_id, global_state.resource_ids.as_slice()[3]);
-        assert_eq!(black_cube_id, global_state.resource_ids.as_slice()[4]);
         assert!(state.skybox_pass.current_bind_group.is_none());
         assert!(state.skybox_pass.current_pipeline.is_none());
+        assert_eq!(Some(pmrem_id), published_pmrem_view_id(state, scene_id));
+        assert!(state.environment_cache.has_scene_state(scene_id));
         assert!(
             state.atmosphere_pass.has_scene_state(scene_id),
             "procedural LUTs should remain reusable until their feature TTL expires"
         );
 
         let state = renderer.context.as_mut().expect("renderer state missing");
-        state.resource_manager.next_frame();
+        for _ in 0..121 {
+            state.resource_manager.next_frame();
+        }
+        let current_frame = state.resource_manager.frame_index();
+        let retired = state
+            .environment_cache
+            .maintain(&mut state.history_registry, current_frame);
+        assert_eq!(vec![scene_id], retired);
+        state.resource_manager.remove_scene_global_states(scene_id);
         state.resource_manager.prune(1);
         assert!(state.resource_manager.gpu_environment(scene_id).is_none());
-        assert!(
-            state
-                .resource_manager
-                .get_internal_texture(base_cube_id)
-                .is_none()
-        );
-        assert!(
-            state
-                .resource_manager
-                .get_internal_texture(pmrem_id)
-                .is_none()
-        );
+        assert!(!state.environment_cache.has_scene_state(scene_id));
+        assert!(published_pmrem_view_id(state, scene_id).is_none());
+        assert_ne!(0, active_source_version);
     }
 
     #[test]
@@ -1579,15 +1678,14 @@ mod tests {
         render_frame(&mut renderer, &mut scene, camera, &assets, 0);
 
         let scene_id = scene.id();
-        let initial_env = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let initial_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("initial scene environment missing");
-        let initial_base_cube_id = initial_env.base_cube_view.id();
-        let initial_pmrem_id = initial_env.pmrem_view.id();
+            .expect("initial scene environment metadata missing");
+        let initial_last_used_frame = initial_env.last_used_frame;
+        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("initial persistent PMREM must be published");
 
         scene
             .background
@@ -1595,9 +1693,12 @@ mod tests {
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
         {
             let state = renderer.context.as_mut().expect("renderer state missing");
-            state.resource_manager.next_frame();
-            state.resource_manager.prune(1);
-            assert!(state.resource_manager.gpu_environment(scene_id).is_none());
+            let retired = state
+                .environment_cache
+                .maintain(&mut state.history_registry, initial_last_used_frame + 121);
+            assert_eq!(vec![scene_id], retired);
+            state.resource_manager.remove_scene_global_states(scene_id);
+            assert!(!state.environment_cache.has_scene_state(scene_id));
         }
 
         scene.environment.set_base_cube_size(32);
@@ -1605,17 +1706,20 @@ mod tests {
         scene.background.set_mode(BackgroundMode::procedural());
         render_frame(&mut renderer, &mut scene, camera, &assets, 2);
 
-        let recreated_env = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let recreated_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("re-enabled scene environment missing");
-        assert_ne!(initial_base_cube_id, recreated_env.base_cube_view.id());
-        assert_ne!(initial_pmrem_id, recreated_env.pmrem_view.id());
-        assert_eq!(32, recreated_env.base_cube_texture.width());
-        assert_eq!(16, recreated_env.pmrem_texture.width());
+            .expect("re-enabled scene environment metadata missing");
+        assert_eq!(32, recreated_env.base_cube_size);
+        assert_eq!(16, recreated_env.pmrem_size);
+        assert!(recreated_env.source_ready);
+        assert!(recreated_env.last_used_frame > initial_last_used_frame);
+        assert_ne!(
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id),
+            "a retired domain must materialize a new PMREM using the current configuration"
+        );
     }
 
     #[test]
@@ -1632,32 +1736,127 @@ mod tests {
         render_frame(&mut renderer, &mut scene, camera, &assets, 0);
 
         let scene_id = scene.id();
-        let initial_env = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let initial_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("initial scene environment missing");
-        let initial_base_cube_id = initial_env.base_cube_view.id();
-        let initial_pmrem_id = initial_env.pmrem_view.id();
+            .expect("initial scene environment metadata missing");
+        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("initial persistent PMREM must be published");
         let initial_source_version = initial_env.source_version;
+        let initial_last_used_frame = initial_env.last_used_frame;
 
         let second_source = assets.checkerboard(32, 4);
         scene.environment.set_env_map(Some(second_source));
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
 
-        let switched_env = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let switched_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("switched scene environment missing");
-        assert_eq!(Some(second_source.into()), switched_env.source_key);
+            .expect("switched scene environment metadata missing");
+        assert_eq!(16, switched_env.base_cube_size);
+        assert_eq!(8, switched_env.pmrem_size);
+        assert!(switched_env.source_ready);
         assert_ne!(initial_source_version, switched_env.source_version);
-        assert_eq!(initial_base_cube_id, switched_env.base_cube_view.id());
-        assert_eq!(initial_pmrem_id, switched_env.pmrem_view.id());
+        assert!(switched_env.last_used_frame > initial_last_used_frame);
+        assert_eq!(
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id),
+            "a same-spec source switch should reuse the physical PMREM view"
+        );
+    }
+
+    #[test]
+    fn dirty_internal_environment_attachment_republishes_without_reallocating_pmrem() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        let attachment_id = 0xCAFE_BABE;
+
+        {
+            let state = renderer.context.as_mut().expect("renderer state missing");
+            let texture = state
+                .wgpu_ctx
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Environment Attachment Revision Test"),
+                    size: wgpu::Extent3d {
+                        width: 4,
+                        height: 4,
+                        depth_or_array_layers: 6,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("Environment Attachment Revision Test Cube View"),
+                dimension: Some(wgpu::TextureViewDimension::Cube),
+                ..Default::default()
+            });
+            state
+                .resource_manager
+                .register_internal_texture_direct(attachment_id, view);
+        }
+        scene
+            .environment
+            .set_env_map(Some(TextureSource::Attachment(
+                attachment_id,
+                wgpu::TextureViewDimension::Cube,
+            )));
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let scene_id = scene.id();
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let initial_source_version = state
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("environment metadata missing")
+            .source_version;
+        let initial_revision = state
+            .resource_manager
+            .get_internal_texture_revision(attachment_id)
+            .expect("attachment revision missing");
+        let initial_pmrem_id =
+            published_pmrem_view_id(state, scene_id).expect("initial PMREM must be published");
+
+        let state = renderer.context.as_mut().expect("renderer state missing");
+        assert!(
+            state
+                .resource_manager
+                .mark_internal_texture_dirty(attachment_id)
+        );
+        let dirty_revision = state
+            .resource_manager
+            .get_internal_texture_revision(attachment_id)
+            .expect("dirty attachment revision missing");
+        assert_ne!(initial_revision, dirty_revision);
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_ne!(
+            initial_source_version,
+            state
+                .resource_manager
+                .gpu_environment(scene_id)
+                .expect("updated environment metadata missing")
+                .source_version,
+            "an in-place attachment update must invalidate derived environment contents"
+        );
+        assert_eq!(
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id),
+            "content-only attachment updates should reuse the PMREM allocation"
+        );
     }
 
     #[test]
@@ -1665,6 +1864,8 @@ mod tests {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
         scene.background.set_mode(BackgroundMode::procedural());
         let camera = make_camera();
 
@@ -1681,9 +1882,11 @@ mod tests {
         let first_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after first render");
-        let first_base_cube_id = first_env.base_cube_view.id();
-        let first_pmrem_id = first_env.pmrem_view.id();
+            .expect("scene environment metadata missing after first render");
+        let first_source_version = first_env.source_version;
+        let first_last_used_frame = first_env.last_used_frame;
+        let first_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("first persistent PMREM must be published");
 
         if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
             params.set_sun_intensity(25.0);
@@ -1701,20 +1904,20 @@ mod tests {
         let updated_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after procedural update");
+            .expect("scene environment metadata missing after procedural update");
 
         assert_eq!(
             first_bind_group_id, global_state.bind_group_id,
             "procedural parameter changes should not rebuild the global bind group"
         );
+        assert_eq!(16, updated_env.base_cube_size);
+        assert_eq!(8, updated_env.pmrem_size);
+        assert!(updated_env.source_ready);
+        assert_ne!(first_source_version, updated_env.source_version);
+        assert!(updated_env.last_used_frame > first_last_used_frame);
         assert_eq!(
-            first_base_cube_id,
-            updated_env.base_cube_view.id(),
-            "procedural parameter changes should keep the persistent base cube view stable"
-        );
-        assert_eq!(
-            first_pmrem_id,
-            updated_env.pmrem_view.id(),
+            Some(first_pmrem_id),
+            published_pmrem_view_id(state, scene_id),
             "procedural parameter changes should keep the persistent PMREM view stable"
         );
     }
@@ -1724,6 +1927,8 @@ mod tests {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
         scene.background.set_mode(BackgroundMode::procedural());
         let camera = make_camera();
 
@@ -1740,12 +1945,14 @@ mod tests {
         let first_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after first render");
-        let first_base_cube_id = first_env.base_cube_view.id();
-        let first_pmrem_id = first_env.pmrem_view.id();
+            .expect("scene environment metadata missing after first render");
+        let first_source_version = first_env.source_version;
+        let first_last_used_frame = first_env.last_used_frame;
+        let first_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("first persistent PMREM must be published");
 
-        scene.environment.set_base_cube_size(256);
-        scene.environment.set_pmrem_size(128);
+        scene.environment.set_base_cube_size(32);
+        scene.environment.set_pmrem_size(16);
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
 
@@ -1757,49 +1964,56 @@ mod tests {
         let resized_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after resize");
+            .expect("scene environment metadata missing after resize");
 
         assert_ne!(
             first_bind_group_id, global_state.bind_group_id,
             "environment map resizing should rebuild the global bind group"
         );
         assert_ne!(
-            first_base_cube_id,
-            resized_env.base_cube_view.id(),
-            "base cube resize should recreate the persistent base cube view"
-        );
-        assert_ne!(
-            first_pmrem_id,
-            resized_env.pmrem_view.id(),
+            Some(first_pmrem_id),
+            published_pmrem_view_id(state, scene_id),
             "PMREM resize should recreate the persistent PMREM view"
         );
-        assert_eq!(256, resized_env.base_cube_texture.width());
-        assert_eq!(128, resized_env.pmrem_texture.width());
+        assert_eq!(32, resized_env.base_cube_size);
+        assert_eq!(16, resized_env.pmrem_size);
+        assert!(resized_env.source_ready);
+        assert_eq!(first_source_version, resized_env.source_version);
+        assert!(resized_env.last_used_frame > first_last_used_frame);
     }
 
     #[test]
-    fn small_sun_rotation_does_not_rebake_procedural_environment() {
+    fn small_day_night_step_does_not_rebake_procedural_environment() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
         scene.background.set_mode(BackgroundMode::procedural());
         let camera = make_camera();
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 0);
 
         let scene_id = scene.id();
-        let initial_source_version = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let initial_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after first render")
-            .source_version;
+            .expect("scene environment metadata missing after first render");
+        let initial_source_version = initial_env.source_version;
+        let initial_last_used_frame = initial_env.last_used_frame;
+        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("initial persistent PMREM must be published");
+        let render_state_id = state.render_frame.render_state.id;
+        let initial_bind_group_id = state
+            .resource_manager
+            .get_global_state(render_state_id, scene_id)
+            .expect("global state missing after first render")
+            .bind_group_id;
 
-        let initial_sun_direction =
+        let (initial_sun_direction, initial_moon_direction) =
             if let BackgroundMode::Procedural(params) = &scene.background.mode {
-                params.sun_direction
+                (params.sun_direction, params.moon_direction)
             } else {
                 panic!("expected procedural background");
             };
@@ -1807,43 +2021,63 @@ mod tests {
         if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
             let slight_rotation = Quat::from_rotation_x(0.1_f32.to_radians());
             params.set_sun_direction((slight_rotation * initial_sun_direction).normalize());
+            params.set_moon_direction((slight_rotation * initial_moon_direction).normalize());
         }
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
 
-        let after_small_rotation = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let after_small_rotation = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after small sun rotation")
-            .source_version;
+            .expect("scene environment metadata missing after small sun rotation");
+        let after_small_source_version = after_small_rotation.source_version;
+        let after_small_bind_group_id = state
+            .resource_manager
+            .get_global_state(render_state_id, scene_id)
+            .expect("global state missing after small sun rotation")
+            .bind_group_id;
 
+        assert_ne!(
+            initial_source_version, after_small_source_version,
+            "the CPU snapshot must still describe the current celestial directions"
+        );
+        assert!(after_small_rotation.last_used_frame > initial_last_used_frame);
         assert_eq!(
-            initial_source_version, after_small_rotation,
-            "sub-threshold sun motion should not trigger a procedural environment rebake"
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id)
+        );
+        assert_eq!(initial_bind_group_id, after_small_bind_group_id);
+        assert!(
+            !graph_contains_pass(state, "Atmosphere_SkyToCube")
+                && !graph_contains_pass(state, "IBL_Compute"),
+            "sub-threshold sun/moon motion must not schedule base or PMREM rewrites"
         );
 
         if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
             let larger_rotation = Quat::from_rotation_x(1.0_f32.to_radians());
-            params.set_sun_direction((larger_rotation * initial_sun_direction).normalize());
+            params.set_moon_direction((larger_rotation * initial_moon_direction).normalize());
         }
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 2);
 
-        let after_large_rotation = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let after_large_rotation = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after large sun rotation")
-            .source_version;
-
+            .expect("scene environment metadata missing after large sun rotation");
         assert_ne!(
-            after_small_rotation, after_large_rotation,
-            "sun motion beyond the bake threshold should trigger a procedural environment rebake"
+            after_small_source_version,
+            after_large_rotation.source_version
+        );
+        assert_eq!(
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id)
+        );
+        assert!(
+            graph_contains_pass(state, "Atmosphere_SkyToCube")
+                && graph_contains_pass(state, "IBL_Compute"),
+            "moon motion beyond the threshold should rewrite base and PMREM in the same physical views"
         );
     }
 
@@ -1852,20 +2086,23 @@ mod tests {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
         scene.background.set_mode(BackgroundMode::procedural());
         let camera = make_camera();
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 0);
 
         let scene_id = scene.id();
-        let initial_source_version = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let initial_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after first render")
-            .source_version;
+            .expect("scene environment metadata missing after first render");
+        let initial_source_version = initial_env.source_version;
+        let initial_last_used_frame = initial_env.last_used_frame;
+        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("initial persistent PMREM must be published");
 
         let starbox = assets.checkerboard(32, 8);
         if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
@@ -1875,18 +2112,22 @@ mod tests {
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
 
-        let updated_source_version = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let updated_env = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene gpu environment missing after starbox update")
-            .source_version;
+            .expect("scene environment metadata missing after starbox update");
 
         assert_ne!(
-            initial_source_version, updated_source_version,
+            initial_source_version, updated_env.source_version,
             "adding a procedural starbox should trigger an environment rebake"
         );
+        assert!(updated_env.last_used_frame > initial_last_used_frame);
+        assert_eq!(
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id)
+        );
+        assert!(graph_contains_pass(state, "Atmosphere_SkyToCube"));
+        assert!(graph_contains_pass(state, "IBL_Compute"));
     }
 }

@@ -46,7 +46,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) use crate::core::gpu::buffer::GpuBuffer;
 pub use crate::core::gpu::buffer::{BufferUploadContext, GpuBufferHandle};
 pub(crate) use crate::core::gpu::environment::CubeSourceType;
-pub(crate) use crate::core::gpu::environment::EnvironmentComputeState;
 pub(crate) use crate::core::gpu::environment::GpuEnvironment;
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
 pub(crate) use crate::core::gpu::material::GpuMaterial;
@@ -205,7 +204,7 @@ impl ResourceManager {
         }
         let cutoff = self.frame_index - ttl_frames;
 
-        self.environments.prune(cutoff, &mut self.internal_textures);
+        self.environments.prune(cutoff);
         self.resources.prune(cutoff);
         self.bind_groups.prune(cutoff);
     }

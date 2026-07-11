@@ -1,374 +1,375 @@
 //! Environment source conversion pass.
 //!
-//! Converts a scene environment source into the persistent scene-owned base
-//! cubemap. All bind groups in this pass are static because they only reference
-//! persistent source/destination views, so they are prepared during the
-//! feature extract stage rather than in the node execute stage.
+//! The feature extracts only CPU-side source identity. Pipeline compilation,
+//! texture upload/resolution, custom-view creation, sampler creation, and bind
+//! group assembly are deferred until the node survives DPE.
 
-use rustc_hash::FxHashMap;
-
-use crate::core::ResourceManager;
-use crate::core::gpu::{CubeSourceType, EnvironmentComputeState, Tracked};
+use crate::core::gpu::{CommonSampler, CubeSourceType, GpuEnvironment, Tracked, binding_layout};
 use crate::graph::composer::GraphBuilderContext;
-use crate::graph::core::TextureNodeId;
-use crate::graph::core::context::{ExecuteContext, ExtractContext};
-use crate::graph::core::node::PassNode;
+use crate::graph::core::{ExecuteContext, PassNode, PrepareContext, TextureNodeId};
 use crate::pipeline::{
     ComputePipelineId, ComputePipelineKey, ShaderCompilationOptions, ShaderSource,
 };
-use myth_resources::texture::{TextureSampler, TextureSource};
-use myth_scene::Scene;
+use myth_resources::texture::TextureSource;
 
-const EQUIRECT_SAMPLER_KEY: TextureSampler = TextureSampler {
-    address_mode_u: wgpu::AddressMode::Repeat,
-    address_mode_v: wgpu::AddressMode::ClampToEdge,
-    address_mode_w: wgpu::AddressMode::ClampToEdge,
-    mag_filter: wgpu::FilterMode::Linear,
-    min_filter: wgpu::FilterMode::Linear,
-    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-    lod_min_clamp: 0.0,
-    lod_max_clamp: 32.0,
-    compare: None,
-    anisotropy_clamp: Some(1),
-    border_color: None,
-};
-
-const CUBEMAP_SAMPLER_KEY: TextureSampler = TextureSampler::LINEAR_CLAMP;
-const SCENE_CACHE_TTL: u64 = 120;
-
-pub struct ResolvedSourceView<'a> {
-    pub view: &'a wgpu::TextureView,
-    pub view_id: u64,
+/// CPU-only description of one source-to-base-cube conversion.
+#[derive(Debug, Clone, Copy)]
+pub struct EquirectToCubeSnapshot {
+    pub(crate) source: TextureSource,
+    pub(crate) source_type: CubeSourceType,
+    /// L1 identity used by the logical base-cache key for this conversion.
+    pub(crate) producer_shader_identity: u64,
 }
 
-struct SceneSourceConvertState {
-    source_type: CubeSourceType,
-    source_view_id: u64,
-    dest_view_id: u64,
-    bind_group: wgpu::BindGroup,
-    last_used_frame: u64,
-}
-
+/// Cross-frame static state for environment source conversion.
 pub struct EquirectToCubeFeature {
     equirect_pipeline_id: Option<ComputePipelineId>,
+    equirect_pipeline_shader_identity: Option<u64>,
     cubemap_pipeline_id: Option<ComputePipelineId>,
-    equirect_layout: Tracked<wgpu::BindGroupLayout>,
-    cubemap_layout: Tracked<wgpu::BindGroupLayout>,
-    scene_states: FxHashMap<u32, SceneSourceConvertState>,
+    cubemap_pipeline_shader_identity: Option<u64>,
+    equirect_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    cubemap_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    equirect_sampler: Option<Tracked<wgpu::Sampler>>,
+}
+
+impl Default for EquirectToCubeFeature {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EquirectToCubeFeature {
     #[must_use]
-    pub fn new(device: &wgpu::Device) -> Self {
-        let equirect_layout = Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Environment EquirectToCube BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            view_dimension: wgpu::TextureViewDimension::D2Array,
-                        },
-                        count: None,
-                    },
-                ],
-            },
-        ));
-
-        let cubemap_layout = Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Environment CubeToCube BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::Cube,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            view_dimension: wgpu::TextureViewDimension::D2Array,
-                        },
-                        count: None,
-                    },
-                ],
-            },
-        ));
-
+    pub const fn new() -> Self {
         Self {
             equirect_pipeline_id: None,
+            equirect_pipeline_shader_identity: None,
             cubemap_pipeline_id: None,
-            equirect_layout,
-            cubemap_layout,
-            scene_states: FxHashMap::default(),
+            cubemap_pipeline_shader_identity: None,
+            equirect_layout: None,
+            cubemap_layout: None,
+            equirect_sampler: None,
         }
     }
 
-    pub fn extract_and_prepare(&mut self, ctx: &mut ExtractContext, scene: &Scene) {
-        self.ensure_pipelines(ctx);
-
-        let scene_id = scene.id();
-        let Some(gpu_env) = ctx.resource_manager.gpu_environment(scene_id) else {
-            self.scene_states.remove(&scene_id);
-            return;
-        };
-
-        let Some(source) = scene.environment.source_env_map() else {
-            self.scene_states.remove(&scene_id);
-            return;
-        };
-
-        let Some(resolved_source) = Self::resolve_source_view(ctx.resource_manager, source) else {
-            self.scene_states.remove(&scene_id);
-            return;
-        };
-
-        let source_type = gpu_env.source_type;
-        if self.layout_and_sampler(source_type).is_none() {
-            self.scene_states.remove(&scene_id);
-            return;
-        }
-
-        let source_view = resolved_source.view.clone();
-        let source_view_id = resolved_source.view_id;
-        let dest_view = gpu_env.base_cube_storage_view.clone();
-        let dest_view_id = dest_view.id();
-        let frame_index = ctx.resource_manager.frame_index();
-        let needs_rebuild = self.scene_states.get(&scene_id).is_none_or(|state| {
-            state.source_type != source_type
-                || state.source_view_id != source_view_id
-                || state.dest_view_id != dest_view_id
-        });
-
-        if needs_rebuild {
-            let layout = self
-                .layout_and_sampler(source_type)
-                .expect("procedural atmosphere should not reach source conversion");
-
-            let sampler_id = match source_type {
-                CubeSourceType::Equirectangular => ctx
-                    .resource_manager
-                    .get_or_create_sampler(EQUIRECT_SAMPLER_KEY),
-                CubeSourceType::Cubemap => ctx
-                    .resource_manager
-                    .get_or_create_sampler(CUBEMAP_SAMPLER_KEY),
-                CubeSourceType::Procedural => unreachable!(),
-            };
-
-            let bind_group = ctx
-                .build_bind_group(layout, Some("Environment Source Convert BG"))
-                .bind_texture_view_with_id(0, &source_view, source_view_id)
-                .bind_sampler_by_id(1, sampler_id)
-                .bind_tracked_texture_view(2, &dest_view)
-                .build()
-                .clone();
-            self.scene_states.insert(
-                scene_id,
-                SceneSourceConvertState {
-                    source_type,
-                    source_view_id,
-                    dest_view_id,
-                    bind_group,
-                    last_used_frame: frame_index,
-                },
-            );
-        } else if let Some(state) = self.scene_states.get_mut(&scene_id) {
-            state.last_used_frame = frame_index;
-        }
-    }
-
-    /// Drop scene-local conversion bindings when source-driven IBL is
-    /// disabled. Those bind groups retain the persistent base-cube view, so
-    /// keeping them alive would delay physical reclamation after the
-    /// `GpuEnvironment` cache entry expires.
-    pub(crate) fn deactivate_scene(&mut self, scene_id: u32) {
-        self.scene_states.remove(&scene_id);
-    }
-
-    /// Prune abandoned scene domains even when the currently rendered scene
-    /// does not use source-driven IBL.
-    pub(crate) fn maintain(&mut self, current_frame: u64) {
-        self.prune_scene_states(current_frame);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_scene_state(&self, scene_id: u32) -> bool {
-        self.scene_states.contains_key(&scene_id)
-    }
-
-    pub fn resolve_source_view<'a>(
-        resource_manager: &'a ResourceManager,
-        source: &TextureSource,
-    ) -> Option<ResolvedSourceView<'a>> {
-        match source {
-            TextureSource::Asset(handle) => {
-                resource_manager
-                    .get_texture_binding(*handle)
-                    .and_then(|binding| {
-                        resource_manager.get_image(binding.image_handle).map(|img| {
-                            ResolvedSourceView {
-                                view: &img.default_view,
-                                view_id: binding.view_id,
-                            }
-                        })
-                    })
-            }
-            TextureSource::Attachment(id, _) => resource_manager
-                .get_internal_texture(*id)
-                .map(|view| ResolvedSourceView { view, view_id: *id }),
-        }
-    }
-
-    fn ensure_pipelines(&mut self, ctx: &mut ExtractContext) {
-        if self.equirect_pipeline_id.is_some() && self.cubemap_pipeline_id.is_some() {
-            return;
-        }
-
-        let options = ShaderCompilationOptions::default();
-        let compilation_options = wgpu::PipelineCompilationOptions::default();
-
-        let (equirect_module, equirect_hash) = ctx.shader_manager.get_or_compile(
-            ctx.device,
-            ShaderSource::File("entry/utility/equirect_to_cube"),
-            &options,
-        );
-        let equirect_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Environment EquirectToCube PL"),
-                bind_group_layouts: &[Some(&self.equirect_layout)],
-                immediate_size: 0,
-            });
-        self.equirect_pipeline_id = Some(ctx.pipeline_cache.get_or_create_compute(
-            ctx.device,
-            equirect_module,
-            &equirect_layout,
-            &ComputePipelineKey::new(equirect_hash).with_compilation_options(&compilation_options),
-            &compilation_options,
-            "Environment EquirectToCube Pipeline",
-        ));
-
-        let (cubemap_module, cubemap_hash) = ctx.shader_manager.get_or_compile(
-            ctx.device,
-            ShaderSource::File("entry/utility/cube_to_cube"),
-            &options,
-        );
-        let cubemap_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Environment CubeToCube PL"),
-                bind_group_layouts: &[Some(&self.cubemap_layout)],
-                immediate_size: 0,
-            });
-        self.cubemap_pipeline_id = Some(ctx.pipeline_cache.get_or_create_compute(
-            ctx.device,
-            cubemap_module,
-            &cubemap_layout,
-            &ComputePipelineKey::new(cubemap_hash).with_compilation_options(&compilation_options),
-            &compilation_options,
-            "Environment CubeToCube Pipeline",
-        ));
-    }
-
-    fn layout_and_sampler(
+    /// Extract a lightweight source snapshot without touching the GPU.
+    #[must_use]
+    #[allow(clippy::unused_self)] // Keep the uniform Feature::extract API.
+    pub(crate) fn extract(
         &self,
-        source_type: CubeSourceType,
-    ) -> Option<&Tracked<wgpu::BindGroupLayout>> {
-        match source_type {
-            CubeSourceType::Equirectangular => Some(&self.equirect_layout),
-            CubeSourceType::Cubemap => Some(&self.cubemap_layout),
-            CubeSourceType::Procedural => None,
-        }
-    }
-
-    fn prune_scene_states(&mut self, current_frame: u64) {
-        self.scene_states.retain(|_, state| {
-            current_frame.saturating_sub(state.last_used_frame) <= SCENE_CACHE_TTL
-        });
-    }
-
-    pub fn add_to_graph<'a>(
-        &'a self,
-        ctx: &mut GraphBuilderContext<'a, '_>,
-        scene_id: u32,
-        source_type: CubeSourceType,
-        base_cube: TextureNodeId,
-        environment_compute: Option<&'a EnvironmentComputeState>,
-    ) -> Option<TextureNodeId> {
-        if !environment_compute.is_some_and(EnvironmentComputeState::needs_compute) {
+        gpu_env: &GpuEnvironment,
+        producer_shader_identity: u64,
+    ) -> Option<EquirectToCubeSnapshot> {
+        if !gpu_env.source_ready || gpu_env.source_type == CubeSourceType::Procedural {
             return None;
         }
 
-        let pipeline_id = match source_type {
-            CubeSourceType::Equirectangular => self.equirect_pipeline_id,
-            CubeSourceType::Cubemap => self.cubemap_pipeline_id,
-            CubeSourceType::Procedural => None,
-        };
+        Some(EquirectToCubeSnapshot {
+            source: gpu_env.source_key?,
+            source_type: gpu_env.source_type,
+            producer_shader_identity,
+        })
+    }
 
-        let state = self
-            .scene_states
-            .get(&scene_id)
-            .expect("scene source conversion state must be prepared before graph build");
-
+    /// Insert a conversion writer for an invalid base-cube cache plan.
+    ///
+    /// The caller owns cache validity decisions. Reaching this method means
+    /// the conversion must run if the node remains live.
+    pub fn add_to_graph<'a>(
+        &'a mut self,
+        ctx: &mut GraphBuilderContext<'a, '_>,
+        snapshot: EquirectToCubeSnapshot,
+        base_cube: TextureNodeId,
+    ) -> TextureNodeId {
         ctx.graph.add_pass("Environment_Source_Convert", |builder| {
             builder.write_texture(base_cube);
             let node = EquirectToCubePassNode {
+                feature: self,
+                snapshot,
                 base_cube,
-                pipeline_id,
-                bind_group: &state.bind_group,
+                bind_group: None,
             };
             (node, ())
         });
 
-        Some(base_cube)
+        base_cube
+    }
+
+    /// Ensure only the variant selected by this live node.
+    fn prepare_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        source_type: CubeSourceType,
+        producer_shader_identity: u64,
+    ) {
+        match source_type {
+            CubeSourceType::Equirectangular => {
+                self.prepare_equirect_resources(ctx, producer_shader_identity);
+            }
+            CubeSourceType::Cubemap => {
+                self.prepare_cubemap_resources(ctx, producer_shader_identity);
+            }
+            CubeSourceType::Procedural => {
+                panic!("procedural atmosphere must not use source conversion")
+            }
+        }
+    }
+
+    fn prepare_equirect_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        expected_shader_identity: u64,
+    ) {
+        if self.equirect_layout.is_none() {
+            self.equirect_layout = Some(Self::create_layout(
+                ctx.device,
+                "Environment EquirectToCube BGL",
+                wgpu::TextureViewDimension::D2,
+            ));
+        }
+
+        if self.equirect_sampler.is_none() {
+            self.equirect_sampler = Some(Tracked::new(ctx.device.create_sampler(
+                &wgpu::SamplerDescriptor {
+                    label: Some("Environment Equirect Sampler"),
+                    address_mode_u: wgpu::AddressMode::Repeat,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                    lod_min_clamp: 0.0,
+                    lod_max_clamp: 32.0,
+                    compare: None,
+                    anisotropy_clamp: 1,
+                    border_color: None,
+                },
+            )));
+        }
+
+        if self.equirect_pipeline_id.is_none()
+            || self.equirect_pipeline_shader_identity != Some(expected_shader_identity)
+        {
+            assert_eq!(
+                ctx.shader_manager.pipeline_shader_hash(
+                    ShaderSource::File("entry/utility/equirect_to_cube"),
+                    &ShaderCompilationOptions::default(),
+                ),
+                expected_shader_identity,
+                "environment cache key and equirect pipeline shader identity diverged",
+            );
+            let pipeline_id = Self::create_pipeline(
+                ctx,
+                self.equirect_layout
+                    .as_ref()
+                    .expect("equirect layout must exist"),
+                ShaderSource::File("entry/utility/equirect_to_cube"),
+                "Environment EquirectToCube PL",
+                "Environment EquirectToCube Pipeline",
+            );
+            self.equirect_pipeline_id = Some(pipeline_id);
+            self.equirect_pipeline_shader_identity = Some(expected_shader_identity);
+        }
+    }
+
+    fn prepare_cubemap_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        expected_shader_identity: u64,
+    ) {
+        if self.cubemap_layout.is_none() {
+            self.cubemap_layout = Some(Self::create_layout(
+                ctx.device,
+                "Environment CubeToCube BGL",
+                wgpu::TextureViewDimension::Cube,
+            ));
+        }
+
+        if self.cubemap_pipeline_id.is_none()
+            || self.cubemap_pipeline_shader_identity != Some(expected_shader_identity)
+        {
+            assert_eq!(
+                ctx.shader_manager.pipeline_shader_hash(
+                    ShaderSource::File("entry/utility/cube_to_cube"),
+                    &ShaderCompilationOptions::default(),
+                ),
+                expected_shader_identity,
+                "environment cache key and cube pipeline shader identity diverged",
+            );
+            let pipeline_id = Self::create_pipeline(
+                ctx,
+                self.cubemap_layout
+                    .as_ref()
+                    .expect("cubemap layout must exist"),
+                ShaderSource::File("entry/utility/cube_to_cube"),
+                "Environment CubeToCube PL",
+                "Environment CubeToCube Pipeline",
+            );
+            self.cubemap_pipeline_id = Some(pipeline_id);
+            self.cubemap_pipeline_shader_identity = Some(expected_shader_identity);
+        }
+    }
+
+    fn create_layout(
+        device: &wgpu::Device,
+        label: &'static str,
+        source_dimension: wgpu::TextureViewDimension,
+    ) -> Tracked<wgpu::BindGroupLayout> {
+        Tracked::new(
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries: &[
+                    binding_layout::texture(
+                        0,
+                        wgpu::ShaderStages::COMPUTE,
+                        wgpu::TextureSampleType::Float { filterable: true },
+                        source_dimension,
+                        false,
+                    ),
+                    binding_layout::sampler(
+                        1,
+                        wgpu::ShaderStages::COMPUTE,
+                        wgpu::SamplerBindingType::Filtering,
+                    ),
+                    binding_layout::storage_texture(
+                        2,
+                        wgpu::ShaderStages::COMPUTE,
+                        wgpu::StorageTextureAccess::WriteOnly,
+                        wgpu::TextureFormat::Rgba16Float,
+                        wgpu::TextureViewDimension::D2Array,
+                    ),
+                ],
+            }),
+        )
+    }
+
+    fn create_pipeline(
+        ctx: &mut PrepareContext<'_>,
+        layout: &Tracked<wgpu::BindGroupLayout>,
+        shader: ShaderSource<'static>,
+        layout_label: &'static str,
+        pipeline_label: &'static str,
+    ) -> ComputePipelineId {
+        let (module, shader_hash) = ctx.shader_manager.get_or_compile(
+            ctx.device,
+            shader,
+            &ShaderCompilationOptions::default(),
+        );
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(layout_label),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+        let compilation_options = wgpu::PipelineCompilationOptions::default();
+
+        ctx.pipeline_cache.get_or_create_compute(
+            ctx.device,
+            module,
+            &pipeline_layout,
+            &ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options),
+            &compilation_options,
+            pipeline_label,
+        )
+    }
+
+    fn layout(&self, source_type: CubeSourceType) -> &Tracked<wgpu::BindGroupLayout> {
+        match source_type {
+            CubeSourceType::Equirectangular => self
+                .equirect_layout
+                .as_ref()
+                .expect("equirect layout must exist after prepare"),
+            CubeSourceType::Cubemap => self
+                .cubemap_layout
+                .as_ref()
+                .expect("cubemap layout must exist after prepare"),
+            CubeSourceType::Procedural => {
+                panic!("procedural atmosphere must not use source conversion")
+            }
+        }
+    }
+
+    fn pipeline_id(&self, source_type: CubeSourceType) -> ComputePipelineId {
+        match source_type {
+            CubeSourceType::Equirectangular => self
+                .equirect_pipeline_id
+                .expect("equirect pipeline must exist after prepare"),
+            CubeSourceType::Cubemap => self
+                .cubemap_pipeline_id
+                .expect("cubemap pipeline must exist after prepare"),
+            CubeSourceType::Procedural => {
+                panic!("procedural atmosphere must not use source conversion")
+            }
+        }
     }
 }
 
 struct EquirectToCubePassNode<'a> {
+    feature: &'a mut EquirectToCubeFeature,
+    snapshot: EquirectToCubeSnapshot,
     base_cube: TextureNodeId,
-    pipeline_id: Option<ComputePipelineId>,
-    bind_group: &'a wgpu::BindGroup,
+    bind_group: Option<&'a wgpu::BindGroup>,
 }
 
-impl PassNode<'_> for EquirectToCubePassNode<'_> {
-    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let pipeline = ctx.pipeline_cache.get_compute_pipeline(
-            self.pipeline_id
-                .expect("environment source pipeline must exist"),
+impl<'a> PassNode<'a> for EquirectToCubePassNode<'a> {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.feature.prepare_resources(
+            ctx,
+            self.snapshot.source_type,
+            self.snapshot.producer_shader_identity,
         );
+        ctx.mipmap_generator
+            .ensure_pipeline(ctx.device, wgpu::TextureFormat::Rgba16Float);
+
+        let (source_view, source_view_id) = ctx
+            .uploads
+            .resolve_texture_source(ctx.assets, self.snapshot.source)
+            .expect("environment source was ready during extraction");
+        let base_cube_uid = ctx.views.get_physical_texture_uid(self.base_cube);
+        let storage_view =
+            ctx.views
+                .get_texture(self.base_cube)
+                .create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("Environment Base Cube Mip 0 Storage View"),
+                    format: Some(wgpu::TextureFormat::Rgba16Float),
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    aspect: wgpu::TextureAspect::All,
+                    base_mip_level: 0,
+                    mip_level_count: Some(1),
+                    base_array_layer: 0,
+                    array_layer_count: Some(6),
+                    usage: Some(wgpu::TextureUsages::STORAGE_BINDING),
+                });
+
+        let builder = ctx
+            .build_bind_group(
+                self.feature.layout(self.snapshot.source_type),
+                Some("Environment Source Convert BG"),
+            )
+            .bind_texture_view_with_id(0, &source_view, source_view_id);
+        let builder = match self.snapshot.source_type {
+            CubeSourceType::Equirectangular => builder.bind_tracked_sampler(
+                1,
+                self.feature
+                    .equirect_sampler
+                    .as_ref()
+                    .expect("equirect sampler must exist after prepare"),
+            ),
+            CubeSourceType::Cubemap => builder.bind_common_sampler(1, CommonSampler::LinearClamp),
+            CubeSourceType::Procedural => unreachable!(),
+        };
+        self.bind_group = Some(
+            builder
+                .bind_texture_view_with_id(2, &storage_view, base_cube_uid)
+                .build(),
+        );
+    }
+
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+        let pipeline = ctx
+            .pipeline_cache
+            .get_compute_pipeline(self.feature.pipeline_id(self.snapshot.source_type));
         let group_count = ctx.get_texture(self.base_cube).width().div_ceil(8);
 
         {
@@ -377,7 +378,12 @@ impl PassNode<'_> for EquirectToCubePassNode<'_> {
                 timestamp_writes: None,
             });
             cpass.set_pipeline(pipeline);
-            cpass.set_bind_group(0, self.bind_group, &[]);
+            cpass.set_bind_group(
+                0,
+                self.bind_group
+                    .expect("environment source bind group must be prepared"),
+                &[],
+            );
             cpass.dispatch_workgroups(group_count, group_count, 6);
         }
 

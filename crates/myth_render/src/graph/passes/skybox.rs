@@ -583,13 +583,13 @@ impl SkyboxFeature {
                 })
             }
             TextureSource::Attachment(id, dim) => {
-                resource_manager
-                    .get_internal_texture(*id)
-                    .map(|view| ResolvedTextureView {
-                        view,
-                        view_dimension: *dim,
-                        resource_key: *id,
-                    })
+                let view = resource_manager.get_internal_texture(*id)?;
+                let view_id = resource_manager.get_internal_texture_view_id(*id)?;
+                Some(ResolvedTextureView {
+                    view,
+                    view_dimension: *dim,
+                    resource_key: view_id,
+                })
             }
         }
     }

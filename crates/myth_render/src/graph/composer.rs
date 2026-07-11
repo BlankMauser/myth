@@ -63,16 +63,16 @@ use crate::graph::extracted::SceneFeatures;
 use crate::graph::frame::{PreparedSkyboxDraw, RenderLists};
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
+use crate::graph::passes::ibl_compute::EnvironmentCacheSnapshot;
 use crate::graph::passes::utils::add_msaa_resolve_pass;
 use crate::graph::passes::{
     AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, ClusteredLightingInputs,
-    EquirectToCubeFeature, FxaaFeature, HiZFeature, IblComputeFeature, MipmapFeature,
-    MsaaSyncFeature, OpaqueFeature, PrepassFeature, PresentFeature, ShadowFeature,
+    EnvironmentCacheFeature, EquirectToCubeFeature, FxaaFeature, HiZFeature, IblComputeFeature,
+    MipmapFeature, MsaaSyncFeature, OpaqueFeature, PrepassFeature, PresentFeature, ShadowFeature,
     SimpleForwardFeature, SkyboxFeature, SsaoFeature, SsgiFeature, SsrFeature, SsssFeature,
     TaaFeature, ToneMappingFeature, TransmissionCopyFeature, TransparentFeature,
 };
-use crate::pipeline::PipelineCache;
-use crate::pipeline::ShaderManager;
+use crate::pipeline::{PipelineCache, ShaderCompilationOptions, ShaderManager, ShaderSource};
 use crate::renderer::FrameTime;
 use crate::settings::RendererSettings;
 use myth_assets::AssetServer;
@@ -144,6 +144,7 @@ pub struct ComposerContext<'a> {
 
     // Shadow + Compute
     pub shadow_pass: &'a mut ShadowFeature,
+    pub environment_cache: &'a mut EnvironmentCacheFeature,
     pub equirect_to_cube_pass: &'a mut EquirectToCubeFeature,
     pub ibl_pass: &'a mut IblComputeFeature,
     pub atmosphere_pass: &'a mut AtmosphereFeature,
@@ -219,13 +220,6 @@ impl GraphBuilderContext<'_, '_> {
     }
 }
 
-struct SceneEnvironmentGraphResources<'a> {
-    base_cube: crate::graph::core::TextureNodeId,
-    pmrem: crate::graph::core::TextureNodeId,
-    source_type: CubeSourceType,
-    compute_state: Option<&'a crate::core::gpu::EnvironmentComputeState>,
-}
-
 #[derive(Clone, Copy)]
 pub struct GpuLightBuffers {
     pub light_metadata: BufferNodeId,
@@ -268,34 +262,6 @@ fn import_scene_lighting(
         light_storage,
         indirect_count_buffer: None,
     }
-}
-
-fn base_cube_desc(texture: &wgpu::Texture) -> TextureDesc {
-    TextureDesc::new(
-        texture.width(),
-        texture.height(),
-        6,
-        texture.mip_level_count(),
-        1,
-        wgpu::TextureDimension::D2,
-        crate::HDR_TEXTURE_FORMAT,
-        wgpu::TextureUsages::STORAGE_BINDING
-            | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::RENDER_ATTACHMENT,
-    )
-}
-
-fn pmrem_desc(texture: &wgpu::Texture) -> TextureDesc {
-    TextureDesc::new(
-        texture.width(),
-        texture.height(),
-        6,
-        texture.mip_level_count(),
-        1,
-        wgpu::TextureDimension::D2,
-        crate::HDR_TEXTURE_FORMAT,
-        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-    )
 }
 
 /// Frame Composer
@@ -635,45 +601,111 @@ impl<'a> FrameComposer<'a> {
 
         {
             let scene_id = self.ctx.scene.id();
-            let scene_gpu_environment = if has_active_environment {
-                self.ctx
-                    .resource_manager
-                    .environments
-                    .scene_environment(scene_id)
-            } else {
-                None
-            };
+            let scene_gpu_environment = has_active_environment
+                .then(|| self.ctx.resource_manager.gpu_environment(scene_id).copied())
+                .flatten();
+            let environment_shader_identities = scene_gpu_environment.map(|environment| {
+                let shader_options = ShaderCompilationOptions::default();
+                let base_shader_identity = match environment.source_type {
+                    CubeSourceType::Procedural => self
+                        .ctx
+                        .atmosphere_pass
+                        .procedural_base_shader_identity(scene_id),
+                    CubeSourceType::Equirectangular => {
+                        self.ctx.shader_manager.pipeline_shader_hash(
+                            ShaderSource::File("entry/utility/equirect_to_cube"),
+                            &shader_options,
+                        )
+                    }
+                    CubeSourceType::Cubemap => self.ctx.shader_manager.pipeline_shader_hash(
+                        ShaderSource::File("entry/utility/cube_to_cube"),
+                        &shader_options,
+                    ),
+                };
+                let ibl_shader_identity = self
+                    .ctx
+                    .shader_manager
+                    .pipeline_shader_hash(ShaderSource::File("entry/utility/ibl"), &shader_options);
 
-            let scene_environment_resources =
-                scene_gpu_environment.map(|gpu_env| SceneEnvironmentGraphResources {
-                    base_cube: graph_ctx.graph.import_external_resource(
-                        "Scene_Environment_BaseCube",
-                        base_cube_desc(&gpu_env.base_cube_texture),
-                        &gpu_env.base_cube_view,
-                    ),
-                    pmrem: graph_ctx.graph.import_external_resource(
-                        "Scene_Environment_PMREM",
-                        pmrem_desc(&gpu_env.pmrem_texture),
-                        &gpu_env.pmrem_view,
-                    ),
-                    source_type: gpu_env.source_type,
-                    compute_state: gpu_env.source_ready.then_some(&gpu_env.compute_state),
+                (base_shader_identity, ibl_shader_identity)
+            });
+            let source_conversion_snapshot = scene_gpu_environment
+                .zip(environment_shader_identities)
+                .and_then(|(environment, (base_shader_identity, _))| {
+                    self.ctx
+                        .equirect_to_cube_pass
+                        .extract(&environment, base_shader_identity)
+                });
+            let environment_cache_snapshot = scene_gpu_environment
+                .zip(environment_shader_identities)
+                .map(
+                    |(environment, (base_shader_identity, ibl_shader_identity))| {
+                        let (procedural_sun, procedural_moon) =
+                            match &self.ctx.scene.background.mode {
+                                myth_scene::background::BackgroundMode::Procedural(params) => {
+                                    (Some(params.sun_direction), Some(params.moon_direction))
+                                }
+                                _ => (None, None),
+                            };
+
+                        self.ctx.environment_cache.extract(
+                            self.ctx.history_registry,
+                            scene_id,
+                            &environment,
+                            self.ctx.resource_manager.frame_index(),
+                            base_shader_identity,
+                            ibl_shader_identity,
+                            procedural_sun,
+                            procedural_moon,
+                            self.ctx
+                                .wgpu_ctx
+                                .device
+                                .limits()
+                                .min_uniform_buffer_offset_alignment,
+                        )
+                    },
+                );
+
+            let environment_base = environment_cache_snapshot
+                .and_then(EnvironmentCacheSnapshot::base_texture)
+                .map(|texture| {
+                    graph_ctx
+                        .graph
+                        .import_persistent_texture("Scene_Environment_BaseCube", texture)
+                });
+            let environment_pmrem = environment_cache_snapshot
+                .and_then(EnvironmentCacheSnapshot::pmrem_texture)
+                .map(|texture| {
+                    let node = graph_ctx
+                        .graph
+                        .import_persistent_texture("Scene_Environment_PMREM", texture);
+                    let valid = environment_cache_snapshot
+                        .and_then(|snapshot| snapshot.pmrem_plan)
+                        .is_some_and(|plan| plan.valid);
+                    (node, texture, valid)
                 });
 
-            // let mut env_dependency_base = None;
-            let mut env_dependency_pmrem = None;
+            let env_dependency_pmrem = environment_pmrem.map(|(node, _, _)| node);
+            let environment_pmrem_max_mip_level = environment_cache_snapshot
+                .filter(|snapshot| snapshot.pmrem_plan.is_some())
+                .map(|snapshot| snapshot.pmrem_mip_level_count.saturating_sub(1) as f32);
             let mut procedural_skybox_dependencies = [None, None];
             let mut atmosphere_transmittance = None;
             let mut atmosphere_bake_params = None;
 
+            let (mipmap_generator, mipmap_requests) = self.ctx.mipmap_pass.split();
+
             // ── 2c. Wire Compute + Shadow Passes ───────────────────────────
             graph_ctx.with_group("Compute", |c| {
-                self.ctx.mipmap_pass.add_to_graph(c);
+                MipmapFeature::add_requests_to_graph(c, mipmap_requests);
 
-                if let (Some(env), Some(gpu_env)) =
-                    (scene_environment_resources.as_ref(), scene_gpu_environment)
+                if let (Some(snapshot), Some(base_cube)) =
+                    (environment_cache_snapshot, environment_base)
                 {
-                    match env.source_type {
+                    let base_plan = snapshot
+                        .base_plan
+                        .expect("ready environment cache snapshot must plan a base cube");
+                    match snapshot.source_type {
                         CubeSourceType::Procedural => {
                             if let myth_scene::background::BackgroundMode::Procedural(params) =
                                 &self.ctx.scene.background.mode
@@ -682,50 +714,40 @@ impl<'a> FrameComposer<'a> {
                                     c,
                                     scene_id,
                                     params,
-                                    env.base_cube,
-                                    &gpu_env.base_cube_storage_view,
-                                    env.compute_state,
+                                    base_cube,
+                                    base_plan.commit.is_some(),
                                 );
                                 procedural_skybox_dependencies =
                                     atmosphere_output.skybox_dependencies();
                                 atmosphere_transmittance = Some(atmosphere_output.transmittance);
                                 atmosphere_bake_params = Some(atmosphere_output.bake_params);
-                                // env_dependency_base = atmosphere_output.baked_base_cube;
-                                env_dependency_pmrem = self
-                                    .ctx
-                                    .ibl_pass
-                                    .add_to_graph(
-                                        c,
-                                        scene_id,
-                                        env.base_cube,
-                                        env.pmrem,
-                                        env.source_type,
-                                        env.compute_state,
-                                    )
-                                    .updated_pmrem;
+                                if let Some(token) = base_plan.commit {
+                                    c.graph.register_cache_commit(token, &[base_cube]);
+                                }
                             }
                         }
                         CubeSourceType::Equirectangular | CubeSourceType::Cubemap => {
-                            self.ctx.equirect_to_cube_pass.add_to_graph(
-                                c,
-                                scene_id,
-                                env.source_type,
-                                env.base_cube,
-                                env.compute_state,
-                            );
-                            env_dependency_pmrem = self
-                                .ctx
-                                .ibl_pass
-                                .add_to_graph(
+                            if let Some(token) = base_plan.commit {
+                                self.ctx.equirect_to_cube_pass.add_to_graph(
                                     c,
-                                    scene_id,
-                                    env.base_cube,
-                                    env.pmrem,
-                                    env.source_type,
-                                    env.compute_state,
-                                )
-                                .updated_pmrem;
+                                    source_conversion_snapshot.expect(
+                                        "ready texture environment must have a source snapshot",
+                                    ),
+                                    base_cube,
+                                );
+                                c.graph.register_cache_commit(token, &[base_cube]);
+                            }
                         }
+                    }
+
+                    if let (Some(pmrem_plan), Some((pmrem, _, _))) =
+                        (snapshot.pmrem_plan, environment_pmrem)
+                        && let Some(token) = pmrem_plan.commit
+                    {
+                        self.ctx
+                            .ibl_pass
+                            .add_to_graph(c, snapshot, base_cube, pmrem);
+                        c.graph.register_cache_commit(token, &[pmrem]);
                     }
                 }
             });
@@ -733,7 +755,7 @@ impl<'a> FrameComposer<'a> {
             // SSGI samples the actual scene PMREM. If IBL recomputes it this
             // frame, reading the same graph resource creates the dependency;
             // without an environment, Raw prepare binds the system black cube.
-            let ssgi_pmrem = scene_environment_resources.as_ref().map(|env| env.pmrem);
+            let ssgi_pmrem = env_dependency_pmrem;
 
             let shadow_output = if self.ctx.extracted_scene.has_shadow_casters() {
                 graph_ctx.with_group("Shadow", |c| self.ctx.shadow_pass.add_to_graph(c))
@@ -1100,6 +1122,9 @@ impl<'a> FrameComposer<'a> {
                         scene_color: Some(active_color),
                         scene_depth: Some(scene_depth),
                         scene_hiz,
+                        environment_base_cube: environment_base,
+                        environment_pmrem: env_dependency_pmrem,
+                        environment_pmrem_max_mip_level,
                         atmosphere_transmittance,
                         atmosphere_bake_params,
                         surface_out,
@@ -1309,6 +1334,9 @@ impl<'a> FrameComposer<'a> {
                     scene_color: bb_scene_color,
                     scene_depth: bb_scene_depth,
                     scene_hiz: bb_scene_hiz,
+                    environment_base_cube: environment_base,
+                    environment_pmrem: env_dependency_pmrem,
+                    environment_pmrem_max_mip_level,
                     atmosphere_transmittance,
                     atmosphere_bake_params,
                     surface_out: current_surface,
@@ -1330,6 +1358,52 @@ impl<'a> FrameComposer<'a> {
                 &self.ctx.wgpu_ctx.device,
             );
 
+            // Group 0 keeps a stable layout/WGSL interface, but its PMREM
+            // physical view is selected only after DPE has decided whether a
+            // same-frame cache writer is live and materialized. The graph read
+            // edge on `env_dependency_pmrem` orders that writer before every
+            // scene pass using this refreshed bind group.
+            let pmrem_override = environment_pmrem.and_then(|(node, texture, valid)| {
+                let live = graph.storage.resources[node.index() as usize].first_use != usize::MAX;
+                if !(valid || live)
+                    || !self
+                        .ctx
+                        .history_registry
+                        .is_texture_materialized(texture.id)
+                {
+                    return None;
+                }
+                Some(self.ctx.history_registry.get_texture_view(texture.id))
+            });
+            let desired_pmrem_id = pmrem_override.map_or(
+                self.ctx.resource_manager.system_textures.black_cube.id(),
+                Tracked::id,
+            );
+            let global_state_matches = self
+                .ctx
+                .resource_manager
+                .get_global_state(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id)
+                .and_then(|state| state.resource_ids.as_slice().get(3))
+                .is_some_and(|&id| id == desired_pmrem_id);
+            if !global_state_matches {
+                self.ctx
+                    .resource_manager
+                    .prepare_global_with_pmrem_override(
+                        self.ctx.assets,
+                        self.ctx.extracted_scene,
+                        self.ctx.render_state,
+                        pmrem_override,
+                    );
+            }
+            self.ctx.render_lists.gpu_global_bind_group = Some(
+                self.ctx
+                    .resource_manager
+                    .get_global_state(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id)
+                    .expect("global state missing after PMREM refresh")
+                    .bind_group
+                    .clone(),
+            );
+
             // ─── 3a. RDG Prepare: live-pass deferred preparation ───────────
             //
             // Only the swapchain surface is truly external — all other textures
@@ -1346,12 +1420,15 @@ impl<'a> FrameComposer<'a> {
                     queue: &self.ctx.wgpu_ctx.queue,
                     pipeline_cache: self.ctx.pipeline_cache,
                     shader_manager: self.ctx.shader_manager,
+                    assets: self.ctx.assets,
                     uploads: crate::core::gpu::BufferUploadContext::new(
                         &self.ctx.wgpu_ctx.device,
                         &self.ctx.wgpu_ctx.queue,
                         self.ctx.resource_manager.frame_index,
                         &mut self.ctx.resource_manager.resources,
+                        &self.ctx.resource_manager.internal_textures,
                     ),
+                    mipmap_generator,
                     global_states: GlobalStateResolver::new(&self.ctx.resource_manager.bind_groups),
                     sampler_registry: &self.ctx.resource_manager.sampler_registry,
                     system_textures: &self.ctx.resource_manager.system_textures,
@@ -1406,7 +1483,7 @@ impl<'a> FrameComposer<'a> {
                     queue: &self.ctx.wgpu_ctx.queue,
                     pipeline_cache: self.ctx.pipeline_cache,
                     global_bind_group_cache: self.ctx.global_bind_group_cache,
-                    mipmap_generator: self.ctx.mipmap_pass.generator(),
+                    mipmap_generator: &*mipmap_generator,
                     baked_lists: &baked_lists,
                     wgpu_ctx: &*self.ctx.wgpu_ctx,
                     current_timeline_index: 0,
@@ -1428,8 +1505,11 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
-            let _cache_publications =
+            let cache_publications =
                 graph.commit_submitted_persistent_resources(self.ctx.history_registry);
+            self.ctx
+                .environment_cache
+                .observe_publications(&cache_publications);
             graph.run_after_submit_hooks();
         };
 

@@ -22,7 +22,7 @@ use myth_resources::{BindingResource, ResourceBuilder, WgslStructName};
 
 use super::{
     BindGroupContext, GlobalStateKey, GpuGlobalState, ModelBufferAllocator, ObjectBindGroupKey,
-    ResourceManager, generate_gpu_resource_id,
+    ResourceManager, Tracked, generate_gpu_resource_id,
 };
 
 static NEXT_GLOBAL_STATE_ID: AtomicU32 = AtomicU32::new(0);
@@ -57,8 +57,9 @@ impl ResourceManager {
 
     /// Register an internally generated texture (e.g. Render Target)
     ///
-    /// These textures do not need CPU upload, have no version control,
-    /// and their lifetime is managed by the caller.
+    /// These textures do not need CPU upload and their lifetime is managed by
+    /// the caller. Registration advances a logical content revision so
+    /// derived caches can detect rebinding under a stable ID.
     /// Typically called before a `RenderPass` executes.
     ///
     /// Suitable for: Pass-private resources where the Pass itself holds and maintains ID stability.
@@ -90,6 +91,37 @@ impl ResourceManager {
     #[must_use]
     pub fn get_internal_texture(&self, id: u64) -> Option<&wgpu::TextureView> {
         self.internal_textures.get(id)
+    }
+
+    /// Returns the logical content revision of an internal attachment.
+    ///
+    /// Re-registering the same stable attachment ID advances this revision,
+    /// allowing derived persistent caches to invalidate without depending on
+    /// a physical `TextureView` identity.
+    #[inline]
+    #[must_use]
+    pub fn get_internal_texture_revision(&self, id: u64) -> Option<u64> {
+        self.internal_textures.revision(id)
+    }
+
+    /// Returns the physical view identity used by bind-group fingerprints.
+    ///
+    /// Unlike the logical attachment ID and content revision, this changes
+    /// only when the registered `TextureView` itself is replaced.
+    #[inline]
+    #[must_use]
+    pub fn get_internal_texture_view_id(&self, id: u64) -> Option<u64> {
+        self.internal_textures.view_id(id)
+    }
+
+    /// Notify derived-cache users that an attachment was modified in place.
+    ///
+    /// Re-registering a view advances the revision automatically. Call this
+    /// only when commands overwrite the same registered physical view without
+    /// replacing it, so environment conversion and other derived caches do not
+    /// reuse stale contents.
+    pub fn mark_internal_texture_dirty(&mut self, id: u64) -> bool {
+        self.internal_textures.mark_content_dirty(id)
     }
 
     /// Unified helper method for retrieving `TextureView`
@@ -282,6 +314,22 @@ impl ResourceManager {
         layout: &wgpu::BindGroupLayout,
         builder: &ResourceBuilder,
     ) -> (wgpu::BindGroup, u64) {
+        self.create_bind_group_with_texture_view_override(layout, builder, None)
+    }
+
+    /// Creates a bind group while optionally replacing one texture binding
+    /// with a directly borrowed view.
+    ///
+    /// The override only affects the physical bind-group entry. Layout and
+    /// WGSL generation continue to use the binding description collected by
+    /// [`ResourceBuilder`], so switching between a fallback/source texture and
+    /// an RDG-owned persistent view does not change the shader interface.
+    fn create_bind_group_with_texture_view_override(
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        builder: &ResourceBuilder,
+        texture_view_override: Option<(&str, &wgpu::TextureView)>,
+    ) -> (wgpu::BindGroup, u64) {
         let mut entries = Vec::new();
         let mut binding_index = 0u32;
 
@@ -309,19 +357,29 @@ impl ResourceManager {
                 }
                 BindingResource::Texture(source_opt) => {
                     // 1. Texture view entry
-                    let view = if let Some(source) = source_opt {
-                        self.get_texture_view(source)
-                    } else if let BindingDesc::Texture { view_dimension, .. } = &b.desc {
-                        match view_dimension {
-                            wgpu::TextureViewDimension::D2Array => {
-                                &self.system_textures.depth_d2array
-                            }
-                            wgpu::TextureViewDimension::Cube => &self.system_textures.black_cube,
-                            _ => &self.system_textures.black_2d,
-                        }
-                    } else {
-                        &self.system_textures.black_2d
-                    };
+                    let view = texture_view_override
+                        .filter(|(name, _)| *name == b.name)
+                        .map_or_else(
+                            || {
+                                if let Some(source) = source_opt {
+                                    self.get_texture_view(source)
+                                } else if let BindingDesc::Texture { view_dimension, .. } = &b.desc
+                                {
+                                    match view_dimension {
+                                        wgpu::TextureViewDimension::D2Array => {
+                                            &self.system_textures.depth_d2array
+                                        }
+                                        wgpu::TextureViewDimension::Cube => {
+                                            &self.system_textures.black_cube
+                                        }
+                                        _ => &self.system_textures.black_2d,
+                                    }
+                                } else {
+                                    &self.system_textures.black_2d
+                                }
+                            },
+                            |(_, view)| view,
+                        );
                     entries.push(wgpu::BindGroupEntry {
                         binding: binding_index,
                         resource: wgpu::BindingResource::TextureView(view),
@@ -393,10 +451,30 @@ impl ResourceManager {
         extracted_scene: &ExtractedScene,
         render_state: &RenderState,
     ) -> u32 {
+        self.prepare_global_with_pmrem_override(assets, extracted_scene, render_state, None)
+    }
+
+    /// Rebuilds or reuses the current scene global state with an optional
+    /// directly borrowed PMREM view.
+    ///
+    /// This is the post-materialization entry point for an RDG-owned PMREM:
+    /// passing the same tracked view keeps the existing bind group, while a
+    /// different view identity rebuilds the bind group without changing the
+    /// stable [`GlobalStateKey`], global state ID, layout, or WGSL interface.
+    /// The view is bound directly and is never registered in
+    /// `InternalTextureRegistry`.
+    pub fn prepare_global_with_pmrem_override(
+        &mut self,
+        assets: &AssetServer,
+        extracted_scene: &ExtractedScene,
+        render_state: &RenderState,
+        pmrem_override: Option<&Tracked<wgpu::TextureView>>,
+    ) -> u32 {
         let has_active_environment = matches!(
             extracted_scene.background,
             myth_scene::background::BackgroundMode::Procedural(_)
         ) || extracted_scene.envvironment.has_env_map();
+        let pmrem_override = has_active_environment.then_some(pmrem_override).flatten();
 
         // === Ensure: upload all buffers, obtain physical resource IDs ===
         let (_, camera_result) = self.ensure_buffer(render_state.uniforms());
@@ -405,32 +483,22 @@ impl ResourceManager {
         let (_, scene_uniform_result) =
             self.ensure_buffer(&extracted_scene.environment_uniforms_buffer);
 
-        // Resolve environment texture IDs from the scene cache. Inactive
-        // environments intentionally have no cache entry (or may retain a
-        // dormant entry until TTL expiry), so their bindings always use the
-        // system black cube.
-        let (processed_env_map_id, pmrem_map_id) = if has_active_environment {
-            self.gpu_environment(extracted_scene.scene_id).map_or(
-                (
-                    self.system_textures.black_cube.id(),
-                    self.system_textures.black_cube.id(),
-                ),
-                |gpu_env| (gpu_env.base_cube_view.id(), gpu_env.pmrem_view.id()),
-            )
+        // RDG persistent storage is the sole owner of scene PMREM textures.
+        // Before a cache has published (or when IBL is inactive), the stable
+        // system black cube preserves the same layout and WGSL interface.
+        let pmrem_map_id = if has_active_environment {
+            pmrem_override.map_or(self.system_textures.black_cube.id(), Tracked::id)
         } else {
-            (
-                self.system_textures.black_cube.id(),
-                self.system_textures.black_cube.id(),
-            )
+            self.system_textures.black_cube.id()
         };
 
         // === Collect: gather all resource IDs ===
-        let mut current_ids = super::ResourceIdSet::with_capacity(5);
-        current_ids.push(camera_result.resource_id);
-        current_ids.push(scene_uniform_result.resource_id);
-        current_ids.push(directional_light_result.resource_id);
-        current_ids.push(processed_env_map_id);
-        current_ids.push(pmrem_map_id);
+        let current_ids = global_resource_ids(
+            camera_result.resource_id,
+            scene_uniform_result.resource_id,
+            directional_light_result.resource_id,
+            pmrem_map_id,
+        );
 
         let state_id = GlobalStateKey::new(render_state.id, extracted_scene.scene_id);
 
@@ -443,7 +511,14 @@ impl ResourceManager {
         }
 
         // === Rebind: fingerprint mismatch, rebuild BindGroup ===
-        self.create_global_state(assets, state_id, render_state, extracted_scene, current_ids)
+        self.create_global_state(
+            assets,
+            state_id,
+            render_state,
+            extracted_scene,
+            current_ids,
+            pmrem_override,
+        )
     }
 
     fn create_global_state(
@@ -453,17 +528,22 @@ impl ResourceManager {
         render_state: &RenderState,
         extracted_scene: &ExtractedScene,
         resource_ids: super::ResourceIdSet,
+        pmrem_override: Option<&Tracked<wgpu::TextureView>>,
     ) -> u32 {
         let mut builder = ResourceBuilder::new();
         render_state.define_bindings(&mut builder);
 
         // Build scene bindings (environment uniforms, lights, env textures)
-        self.define_global_scene_bindings(&mut builder, extracted_scene);
+        Self::define_global_scene_bindings(&mut builder, extracted_scene);
 
         self.prepare_binding_resources(assets, &builder.bindings);
         let layout_entries = builder.generate_layout_entries();
         let (layout, layout_id) = self.get_or_create_layout(&layout_entries);
-        let (bind_group, bind_group_id) = self.create_bind_group(&layout, &builder);
+        let (bind_group, bind_group_id) = self.create_bind_group_with_texture_view_override(
+            &layout,
+            &builder,
+            pmrem_override.map(|view| ("pmrem_map", &**view)),
+        );
 
         let new_id = if let Some(existing) = self.bind_groups.global_state(state_id) {
             existing.id
@@ -491,7 +571,6 @@ impl ResourceManager {
     /// This replaces the old `Scene::define_bindings`, resolving environment
     /// textures from `ResourceManager`'s caches instead of `Environment`.
     fn define_global_scene_bindings<'a>(
-        &self,
         builder: &mut ResourceBuilder<'a>,
         extracted_scene: &'a ExtractedScene,
     ) {
@@ -519,53 +598,9 @@ impl ResourceManager {
             Some(WgslStructName::Name("Struct_lights".to_string())),
         );
 
-        // Resolve env_map from GpuEnvironment cache
-        // let env_map_source = if matches!(
-        //     extracted_scene.background,
-        //     myth_scene::background::BackgroundMode::Procedural(_)
-        // ) || extracted_scene.envvironment.has_env_map()
-        // {
-        //     self.gpu_environment(extracted_scene.scene_id).map_or_else(
-        //         || TextureHandle::dummy_env_map().into(),
-        //         |gpu_env| {
-        //             TextureSource::Attachment(
-        //                 gpu_env.base_cube_view.id(),
-        //                 wgpu::TextureViewDimension::Cube,
-        //             )
-        //         },
-        //     )
-        // } else {
-        //     TextureHandle::dummy_env_map().into()
-        // };
-
-        // builder.add_texture(
-        //     "env_map",
-        //     Some(env_map_source),
-        //     wgpu::TextureSampleType::Float { filterable: true },
-        //     wgpu::TextureViewDimension::Cube,
-        //     wgpu::ShaderStages::FRAGMENT,
-        // );
-
-        // Resolve pmrem_map from GpuEnvironment cache
-        let pmrem_source = if matches!(
-            extracted_scene.background,
-            myth_scene::background::BackgroundMode::Procedural(_)
-        ) || extracted_scene.envvironment.has_env_map()
-        {
-            self.gpu_environment(extracted_scene.scene_id)
-                .map(|gpu_env| {
-                    TextureSource::Attachment(
-                        gpu_env.pmrem_view.id(),
-                        wgpu::TextureViewDimension::Cube,
-                    )
-                })
-        } else {
-            None
-        };
-
         builder.add_texture(
             "pmrem_map",
-            pmrem_source,
+            None::<TextureSource>,
             wgpu::TextureSampleType::Float { filterable: true },
             wgpu::TextureViewDimension::Cube,
             wgpu::ShaderStages::FRAGMENT,
@@ -575,5 +610,42 @@ impl ResourceManager {
     pub fn get_global_state(&self, render_state_id: u32, scene_id: u32) -> Option<&GpuGlobalState> {
         let state_id = GlobalStateKey::new(render_state_id, scene_id);
         self.bind_groups.global_state(state_id)
+    }
+
+    /// Drop every cached Group 0 state that still retains resources from one
+    /// retired scene environment domain.
+    pub(crate) fn remove_scene_global_states(&mut self, scene_id: u32) -> usize {
+        self.bind_groups.remove_scene_global_states(scene_id)
+    }
+}
+
+/// Builds the global bind-group fingerprint in binding dependency order.
+///
+/// The base environment cube is deliberately absent: it has no binding in
+/// the current global shader interface and therefore must not invalidate the
+/// global bind group.
+fn global_resource_ids(
+    camera_id: u64,
+    environment_id: u64,
+    directional_lights_id: u64,
+    pmrem_id: u64,
+) -> super::ResourceIdSet {
+    let mut ids = super::ResourceIdSet::with_capacity(4);
+    ids.push(camera_id);
+    ids.push(environment_id);
+    ids.push(directional_lights_id);
+    ids.push(pmrem_id);
+    ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::global_resource_ids;
+
+    #[test]
+    fn global_fingerprint_contains_only_bound_resource_identities() {
+        let ids = global_resource_ids(11, 22, 33, 44);
+
+        assert_eq!(ids.as_slice(), &[11, 22, 33, 44]);
     }
 }

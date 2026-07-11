@@ -19,20 +19,27 @@
 //! consumers (e.g. `ResourceIdSet` fingerprints) that the physical resource has
 //! changed and dependent `BindGroup`s must be rebuilt.
 
-use super::{EnsureResult, ResourceManager, generate_gpu_resource_id};
+use myth_assets::AssetServer;
 use myth_resources::buffer::BufferRef;
+use myth_resources::texture::TextureSource;
 
-/// Narrow post-compile capability for persistent CPU→GPU buffer uploads.
+use super::{
+    EnsureResult, GpuImage, InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
+};
+
+/// Narrow post-compile capability for persistent CPU→GPU uploads and texture
+/// source resolution.
 ///
-/// This context borrows only the buffer resource store, leaving environment,
-/// texture, sampler, and system-resource partitions available to graph nodes
-/// for the rest of the frame. It is the deferred-prepare counterpart of the
-/// monolithic [`ResourceManager`] buffer API.
+/// This context borrows the GPU resource store plus an immutable internal
+/// texture registry. It can update persistent buffers, materialize a ready
+/// asset texture, or resolve an attachment without exposing the monolithic
+/// [`ResourceManager`] to live pass preparation.
 pub struct BufferUploadContext<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     frame_index: u64,
     resources: &'a mut super::GpuResourceStore,
+    internal_textures: &'a InternalTextureRegistry,
 }
 
 impl<'a> BufferUploadContext<'a> {
@@ -41,12 +48,14 @@ impl<'a> BufferUploadContext<'a> {
         queue: &'a wgpu::Queue,
         frame_index: u64,
         resources: &'a mut super::GpuResourceStore,
+        internal_textures: &'a InternalTextureRegistry,
     ) -> Self {
         Self {
             device,
             queue,
             frame_index,
             resources,
+            internal_textures,
         }
     }
 
@@ -90,6 +99,72 @@ impl<'a> BufferUploadContext<'a> {
     #[allow(dead_code)]
     pub(crate) fn get_gpu_buffer(&self, handle: GpuBufferHandle) -> Option<&GpuBuffer> {
         self.resources.buffer(handle)
+    }
+
+    /// Materialize and resolve one texture source during live-node prepare.
+    ///
+    /// Asset decoding readiness is decided during the CPU-only snapshot stage;
+    /// this method performs the deferred GPU upload only after DPE has kept the
+    /// source-conversion node alive. The returned view is cloned deliberately
+    /// so callers can release the mutable upload borrow before assembling a
+    /// bind group from the other `PrepareContext` partitions.
+    pub(crate) fn resolve_texture_source(
+        &mut self,
+        assets: &AssetServer,
+        source: TextureSource,
+    ) -> Option<(wgpu::TextureView, u64)> {
+        match source {
+            TextureSource::Asset(handle) => {
+                let texture_asset = assets.textures.get(handle)?;
+                let image_handle = texture_asset.image;
+                let (image, image_version) = assets.images.get_entry(image_handle)?;
+                let resolved_format = texture_asset.resolve_wgpu_format(image.format);
+                let required_usage =
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+
+                let needs_recreate = self.resources.image(image_handle).is_none_or(|gpu_image| {
+                    gpu_image.default_view_dimension != texture_asset.view_dimension
+                        || gpu_image.dimension != image.dimension.to_wgpu()
+                        || gpu_image.format != resolved_format
+                        || !gpu_image.usage.contains(required_usage)
+                });
+
+                if needs_recreate {
+                    self.resources.remove_image(image_handle);
+                    let mut gpu_image = GpuImage::new(
+                        self.device,
+                        self.queue,
+                        &image,
+                        resolved_format,
+                        texture_asset.view_dimension,
+                        1,
+                        required_usage,
+                    );
+                    gpu_image.version = image_version;
+                    gpu_image.last_used_frame = self.frame_index;
+                    self.resources.insert_image(image_handle, gpu_image);
+                } else if let Some(gpu_image) = self.resources.image_mut(image_handle) {
+                    gpu_image.update(
+                        self.device,
+                        self.queue,
+                        &image,
+                        resolved_format,
+                        texture_asset.view_dimension,
+                        image_version,
+                    );
+                    gpu_image.last_used_frame = self.frame_index;
+                }
+
+                self.resources
+                    .image(image_handle)
+                    .map(|gpu_image| (gpu_image.default_view.clone(), gpu_image.id))
+            }
+            TextureSource::Attachment(id, _) => {
+                let view = self.internal_textures.get(id)?.clone();
+                let view_id = self.internal_textures.view_id(id)?;
+                Some((view, view_id))
+            }
+        }
     }
 }
 

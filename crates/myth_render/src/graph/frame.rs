@@ -474,6 +474,8 @@ impl RenderFrame {
         surface_size: (u32, u32),
         max_extracted_lights: usize,
         feature_config: RenderFrameFeatureConfig,
+        published_pmrem_view: Option<&Tracked<wgpu::TextureView>>,
+        published_pmrem_max_mip: Option<f32>,
     ) {
         use crate::core::view::RenderView;
 
@@ -492,12 +494,17 @@ impl RenderFrame {
         self.resolve_scene_feature_variants(scene, feature_config);
 
         // ── 3. Resolve GPU environment ─────────────────────────────────
-        let env_max_mip = resource_manager.resolve_gpu_environment(
+        let desired_env_max_mip = resource_manager.resolve_gpu_environment(
             scene.id(),
             assets,
             &scene.environment,
             &scene.background.mode,
         );
+        let env_max_mip = if resource_manager.scene_environment_source_ready(scene.id()) {
+            desired_env_max_mip
+        } else {
+            published_pmrem_max_mip.unwrap_or(desired_env_max_mip)
+        };
         self.extracted_scene.prepare_gpu_scene_inputs(env_max_mip);
 
         // ── 4. Build shadow views (pure math) ──────────────────────────
@@ -536,7 +543,12 @@ impl RenderFrame {
             resource_manager.frame_index(),
             surface_size,
         );
-        resource_manager.prepare_global(assets, &self.extracted_scene, &self.render_state);
+        resource_manager.prepare_global_with_pmrem_override(
+            assets,
+            &self.extracted_scene,
+            &self.render_state,
+            published_pmrem_view,
+        );
         resource_manager.ensure_buffer(&self.extracted_scene.local_light_metadata_buffer);
         resource_manager.ensure_buffer(&self.extracted_scene.local_light_storage_buffer);
         render_lists.gpu_local_light_metadata_buffer = tracked_cpu_buffer(

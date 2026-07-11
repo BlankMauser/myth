@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustc_hash::FxHashMap;
 
-use crate::core::gpu::{CommonSampler, EnvironmentComputeState, ResourceState, Tracked};
+use crate::core::gpu::{CommonSampler, ResourceState, Tracked};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassNode, PrepareContext,
@@ -68,6 +68,12 @@ impl AtmosphereStarboxKind {
 struct AtmosphereSkyToCubePipelineKey {
     starbox_kind: AtmosphereStarboxKind,
     moon_texture: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AtmosphereComputePipelineState {
+    id: ComputePipelineId,
+    shader_identity: u64,
 }
 
 impl AtmosphereSkyToCubePipelineKey {
@@ -178,6 +184,16 @@ impl GpuBakeParams {
     }
 }
 
+fn atmosphere_upload_hash(
+    atmosphere_params: &GpuAtmosphereParams,
+    bake_params: &GpuBakeParams,
+) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(bytemuck::bytes_of(atmosphere_params));
+    hasher.write(bytemuck::bytes_of(bake_params));
+    hasher.finish()
+}
+
 struct AtmosphereSceneState {
     atmosphere_params_buffer: Tracked<wgpu::Buffer>,
     bake_params_buffer: Tracked<wgpu::Buffer>,
@@ -189,7 +205,7 @@ struct AtmosphereSceneState {
     sky_view_view: Tracked<wgpu::TextureView>,
     physics_hash: u64,
     physics_dirty: AtomicBool,
-    uploaded_version: AtomicU64,
+    uploaded_params_hash: AtomicU64,
     last_used_frame: u64,
     starbox: Option<ResolvedAtmosphereStarbox>,
     moon_texture: ResolvedAtmosphereMoonTexture,
@@ -244,11 +260,11 @@ impl AtmosphereSceneState {
     fn update_if_needed(
         &self,
         queue: &wgpu::Queue,
-        version: u64,
+        params_hash: u64,
         atmosphere_params: &GpuAtmosphereParams,
         bake_params: &GpuBakeParams,
     ) {
-        if self.uploaded_version.load(Ordering::Relaxed) == version {
+        if self.uploaded_params_hash.load(Ordering::Relaxed) == params_hash {
             return;
         }
 
@@ -258,15 +274,17 @@ impl AtmosphereSceneState {
             bytemuck::bytes_of(atmosphere_params),
         );
         queue.write_buffer(&self.bake_params_buffer, 0, bytemuck::bytes_of(bake_params));
-        self.uploaded_version.store(version, Ordering::Relaxed);
+        self.uploaded_params_hash
+            .store(params_hash, Ordering::Relaxed);
     }
 }
 
 pub struct AtmosphereFeature {
-    transmittance_pipeline: Option<ComputePipelineId>,
-    multi_scatter_pipeline: Option<ComputePipelineId>,
-    sky_view_pipeline: Option<ComputePipelineId>,
-    sky_to_cube_pipelines: FxHashMap<AtmosphereSkyToCubePipelineKey, ComputePipelineId>,
+    transmittance_pipeline: Option<AtmosphereComputePipelineState>,
+    multi_scatter_pipeline: Option<AtmosphereComputePipelineState>,
+    sky_view_pipeline: Option<AtmosphereComputePipelineState>,
+    sky_to_cube_pipelines:
+        FxHashMap<AtmosphereSkyToCubePipelineKey, AtmosphereComputePipelineState>,
     transmittance_layout: Option<Tracked<wgpu::BindGroupLayout>>,
     multi_scatter_layout: Option<Tracked<wgpu::BindGroupLayout>>,
     sky_view_layout: Option<Tracked<wgpu::BindGroupLayout>>,
@@ -337,18 +355,56 @@ impl AtmosphereFeature {
             })
     }
 
+    /// Identity of the complete shader chain that produces a procedural base
+    /// cube for this scene. The logical cache key must describe the pipelines
+    /// that will actually execute, including the selected starbox/moon variant.
+    #[must_use]
+    pub(crate) fn procedural_base_shader_identity(&self, scene_id: u32) -> u64 {
+        let pipeline_key = self.sky_to_cube_pipeline_key(scene_id);
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.transmittance_pipeline
+            .expect("atmosphere transmittance pipeline must be prepared")
+            .shader_identity
+            .hash(&mut hasher);
+        self.multi_scatter_pipeline
+            .expect("atmosphere multi-scatter pipeline must be prepared")
+            .shader_identity
+            .hash(&mut hasher);
+        self.sky_view_pipeline
+            .expect("atmosphere sky-view pipeline must be prepared")
+            .shader_identity
+            .hash(&mut hasher);
+        pipeline_key.hash(&mut hasher);
+        self.sky_to_cube_pipelines
+            .get(&pipeline_key)
+            .expect("selected atmosphere sky-to-cube pipeline must be prepared")
+            .shader_identity
+            .hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn sky_to_cube_pipeline_key(&self, scene_id: u32) -> AtmosphereSkyToCubePipelineKey {
+        let state = self
+            .scene_states
+            .get(&scene_id)
+            .expect("scene atmosphere state must be prepared");
+        AtmosphereSkyToCubePipelineKey {
+            starbox_kind: state
+                .starbox
+                .as_ref()
+                .map_or(AtmosphereStarboxKind::None, |starbox| starbox.kind),
+            moon_texture: state.moon_texture.enabled,
+        }
+    }
+
     pub(crate) fn add_to_graph<'a>(
         &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
         scene_id: u32,
         params: &ProceduralSkyParams,
         base_cube: TextureNodeId,
-        base_cube_storage_view: &'a Tracked<wgpu::TextureView>,
-        environment_compute: Option<&'a EnvironmentComputeState>,
+        bake_environment: bool,
     ) -> AtmosphereGraphOutput {
-        let bake_environment =
-            environment_compute.is_some_and(EnvironmentComputeState::needs_compute);
-
         let state = self
             .scene_states
             .get(&scene_id)
@@ -363,30 +419,27 @@ impl AtmosphereFeature {
 
         let transmittance_pipeline_id = self
             .transmittance_pipeline
-            .expect("atmosphere transmittance pipeline must exist");
+            .expect("atmosphere transmittance pipeline must exist")
+            .id;
         let multi_scatter_pipeline_id = self
             .multi_scatter_pipeline
-            .expect("atmosphere multi scatter pipeline must exist");
+            .expect("atmosphere multi scatter pipeline must exist")
+            .id;
         let sky_view_pipeline_id = self
             .sky_view_pipeline
-            .expect("atmosphere sky view pipeline must exist");
-        let sky_to_cube_kind = state
-            .starbox
-            .as_ref()
-            .map_or(AtmosphereStarboxKind::None, |starbox| starbox.kind);
-        let sky_to_cube_pipeline_key = AtmosphereSkyToCubePipelineKey {
-            starbox_kind: sky_to_cube_kind,
-            moon_texture: state.moon_texture.enabled,
-        };
+            .expect("atmosphere sky view pipeline must exist")
+            .id;
+        let sky_to_cube_pipeline_key = self.sky_to_cube_pipeline_key(scene_id);
+        let sky_to_cube_kind = sky_to_cube_pipeline_key.starbox_kind;
         let sky_to_cube_pipeline_id = self
             .sky_to_cube_pipelines
             .get(&sky_to_cube_pipeline_key)
-            .copied()
-            .expect("atmosphere sky-to-cube pipeline must exist");
+            .expect("atmosphere sky-to-cube pipeline must exist")
+            .id;
 
         let gpu_params = GpuAtmosphereParams::from_scene(params);
         let bake_params = GpuBakeParams::from_scene(params);
-        let params_version = params.version();
+        let params_hash = atmosphere_upload_hash(&gpu_params, &bake_params);
         let transmittance_layout = self
             .transmittance_layout
             .as_ref()
@@ -450,7 +503,7 @@ impl AtmosphereFeature {
                     let node = AtmosphereTransmittanceNode {
                         output_tex: output,
                         atmosphere_params_buf,
-                        params_version,
+                        params_hash,
                         gpu_params,
                         bake_params,
                         state,
@@ -481,7 +534,7 @@ impl AtmosphereFeature {
                         transmittance_tex: transmittance,
                         output_tex: output,
                         atmosphere_params_buf,
-                        params_version,
+                        params_hash,
                         gpu_params,
                         bake_params,
                         state,
@@ -513,7 +566,7 @@ impl AtmosphereFeature {
                     multi_scatter_tex: multi_scatter,
                     output_tex: output,
                     atmosphere_params_buf,
-                    params_version,
+                    params_hash,
                     gpu_params,
                     bake_params,
                     state,
@@ -528,20 +581,28 @@ impl AtmosphereFeature {
                 ctx.graph.add_pass("Atmosphere_SkyToCube", |builder| {
                     builder.read_texture(transmittance);
                     builder.read_texture(sky_view);
-                    builder.read_buffer(bake_params_buf);
+                    let environment_bake_params_buf = builder
+                        .create_buffer("Atmosphere_Environment_Bake_Params", bake_params_desc);
                     builder.write_texture(base_cube);
                     let node = AtmosphereSkyToCubeNode {
                         base_cube,
                         transmittance_tex: transmittance,
                         sky_view_tex: sky_view,
-                        bake_params_buf,
-                        params_version,
+                        bake_params_buf: environment_bake_params_buf,
+                        params_hash,
                         gpu_params,
                         bake_params,
+                        environment_bake_params: GpuBakeParams {
+                            // Environment lighting is baked in a canonical
+                            // star-field orientation. Visual sky rotation is
+                            // applied independently by the skybox path and
+                            // must not invalidate PMREM every frame.
+                            star_rotation: 0.0,
+                            ..bake_params
+                        },
                         state,
                         pipeline_id: sky_to_cube_pipeline_id,
                         layout: sky_to_cube_layout,
-                        base_cube_storage_view,
                         starbox: state.starbox.as_ref(),
                         moon_texture: &state.moon_texture,
                         bind_group: None,
@@ -646,7 +707,7 @@ impl AtmosphereFeature {
                 sky_view_view,
                 physics_hash: u64::MAX,
                 physics_dirty: AtomicBool::new(true),
-                uploaded_version: AtomicU64::new(u64::MAX),
+                uploaded_params_hash: AtomicU64::new(u64::MAX),
                 last_used_frame: frame_index,
                 starbox: None,
                 moon_texture: ResolvedAtmosphereMoonTexture::fallback(ctx),
@@ -723,9 +784,10 @@ impl AtmosphereFeature {
             TextureSource::Attachment(id, dimension) => {
                 let kind = AtmosphereStarboxKind::from_view_dimension(*dimension)?;
                 let view = ctx.resource_manager.get_internal_texture(*id)?.clone();
+                let view_id = ctx.resource_manager.get_internal_texture_view_id(*id)?;
                 Some(ResolvedAtmosphereStarbox {
                     view,
-                    resource_id: *id,
+                    resource_id: view_id,
                     kind,
                 })
             }
@@ -761,9 +823,10 @@ impl AtmosphereFeature {
                 }
 
                 let view = ctx.resource_manager.get_internal_texture(*id)?.clone();
+                let view_id = ctx.resource_manager.get_internal_texture_view_id(*id)?;
                 Some(ResolvedAtmosphereMoonTexture {
                     view,
-                    resource_id: *id,
+                    resource_id: view_id,
                     enabled: true,
                 })
             }
@@ -930,75 +993,104 @@ impl AtmosphereFeature {
     }
 
     fn ensure_pipelines(&mut self, ctx: &mut ExtractContext) {
-        if self.transmittance_pipeline.is_some() {
-            return;
-        }
-
         let opts = ShaderCompilationOptions::default();
         let compilation_options = wgpu::PipelineCompilationOptions::default();
+        let mut physics_pipeline_changed = false;
 
-        let (trans_module, trans_hash) = ctx.shader_manager.get_or_compile(
-            ctx.device,
-            ShaderSource::File("entry/utility/atmosphere/transmittance_lut"),
-            &opts,
-        );
-        let trans_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Atmo Transmittance PL"),
-                bind_group_layouts: &[Some(self.transmittance_layout.as_deref().unwrap())],
-                immediate_size: 0,
+        let trans_source = ShaderSource::File("entry/utility/atmosphere/transmittance_lut");
+        let trans_identity = ctx.shader_manager.pipeline_shader_hash(trans_source, &opts);
+        if self
+            .transmittance_pipeline
+            .is_none_or(|state| state.shader_identity != trans_identity)
+        {
+            physics_pipeline_changed |= self.transmittance_pipeline.is_some();
+            let (trans_module, trans_hash) =
+                ctx.shader_manager
+                    .get_or_compile(ctx.device, trans_source, &opts);
+            let trans_layout = ctx
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Atmo Transmittance PL"),
+                    bind_group_layouts: &[Some(self.transmittance_layout.as_deref().unwrap())],
+                    immediate_size: 0,
+                });
+            let id = ctx.pipeline_cache.get_or_create_compute(
+                ctx.device,
+                trans_module,
+                &trans_layout,
+                &ComputePipelineKey::new(trans_hash).with_compilation_options(&compilation_options),
+                &compilation_options,
+                "Atmo Transmittance Pipeline",
+            );
+            self.transmittance_pipeline = Some(AtmosphereComputePipelineState {
+                id,
+                shader_identity: trans_identity,
             });
-        self.transmittance_pipeline = Some(ctx.pipeline_cache.get_or_create_compute(
-            ctx.device,
-            trans_module,
-            &trans_layout,
-            &ComputePipelineKey::new(trans_hash).with_compilation_options(&compilation_options),
-            &compilation_options,
-            "Atmo Transmittance Pipeline",
-        ));
+        }
 
-        let (multi_module, multi_hash) = ctx.shader_manager.get_or_compile(
-            ctx.device,
-            ShaderSource::File("entry/utility/atmosphere/multi_scatter_lut"),
-            &opts,
-        );
-        let multi_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Atmo Multi-Scatter PL"),
-                bind_group_layouts: &[Some(self.multi_scatter_layout.as_deref().unwrap())],
-                immediate_size: 0,
+        let multi_source = ShaderSource::File("entry/utility/atmosphere/multi_scatter_lut");
+        let multi_identity = ctx.shader_manager.pipeline_shader_hash(multi_source, &opts);
+        if self
+            .multi_scatter_pipeline
+            .is_none_or(|state| state.shader_identity != multi_identity)
+        {
+            physics_pipeline_changed |= self.multi_scatter_pipeline.is_some();
+            let (multi_module, multi_hash) =
+                ctx.shader_manager
+                    .get_or_compile(ctx.device, multi_source, &opts);
+            let multi_layout = ctx
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Atmo Multi-Scatter PL"),
+                    bind_group_layouts: &[Some(self.multi_scatter_layout.as_deref().unwrap())],
+                    immediate_size: 0,
+                });
+            let id = ctx.pipeline_cache.get_or_create_compute(
+                ctx.device,
+                multi_module,
+                &multi_layout,
+                &ComputePipelineKey::new(multi_hash).with_compilation_options(&compilation_options),
+                &compilation_options,
+                "Atmo Multi-Scatter Pipeline",
+            );
+            self.multi_scatter_pipeline = Some(AtmosphereComputePipelineState {
+                id,
+                shader_identity: multi_identity,
             });
-        self.multi_scatter_pipeline = Some(ctx.pipeline_cache.get_or_create_compute(
-            ctx.device,
-            multi_module,
-            &multi_layout,
-            &ComputePipelineKey::new(multi_hash).with_compilation_options(&compilation_options),
-            &compilation_options,
-            "Atmo Multi-Scatter Pipeline",
-        ));
+        }
 
-        let (sky_view_module, sky_view_hash) = ctx.shader_manager.get_or_compile(
-            ctx.device,
-            ShaderSource::File("entry/utility/atmosphere/sky_view_lut"),
-            &opts,
-        );
-        let sky_view_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Atmo Sky-View PL"),
-                bind_group_layouts: &[Some(self.sky_view_layout.as_deref().unwrap())],
-                immediate_size: 0,
+        let sky_view_source = ShaderSource::File("entry/utility/atmosphere/sky_view_lut");
+        let sky_view_identity = ctx
+            .shader_manager
+            .pipeline_shader_hash(sky_view_source, &opts);
+        if self
+            .sky_view_pipeline
+            .is_none_or(|state| state.shader_identity != sky_view_identity)
+        {
+            let (sky_view_module, sky_view_hash) =
+                ctx.shader_manager
+                    .get_or_compile(ctx.device, sky_view_source, &opts);
+            let sky_view_layout =
+                ctx.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Atmo Sky-View PL"),
+                        bind_group_layouts: &[Some(self.sky_view_layout.as_deref().unwrap())],
+                        immediate_size: 0,
+                    });
+            let id = ctx.pipeline_cache.get_or_create_compute(
+                ctx.device,
+                sky_view_module,
+                &sky_view_layout,
+                &ComputePipelineKey::new(sky_view_hash)
+                    .with_compilation_options(&compilation_options),
+                &compilation_options,
+                "Atmo Sky-View Pipeline",
+            );
+            self.sky_view_pipeline = Some(AtmosphereComputePipelineState {
+                id,
+                shader_identity: sky_view_identity,
             });
-        self.sky_view_pipeline = Some(ctx.pipeline_cache.get_or_create_compute(
-            ctx.device,
-            sky_view_module,
-            &sky_view_layout,
-            &ComputePipelineKey::new(sky_view_hash).with_compilation_options(&compilation_options),
-            &compilation_options,
-            "Atmo Sky-View Pipeline",
-        ));
+        }
 
         for starbox_kind in [
             AtmosphereStarboxKind::None,
@@ -1012,9 +1104,20 @@ impl AtmosphereFeature {
                 };
                 let mut sky_to_cube_opts = ShaderCompilationOptions::default();
                 pipeline_key.apply_shader_defines(&mut sky_to_cube_opts.defines);
+                let sky_to_cube_source = ShaderSource::File("entry/utility/atmosphere/sky_to_cube");
+                let shader_identity = ctx
+                    .shader_manager
+                    .pipeline_shader_hash(sky_to_cube_source, &sky_to_cube_opts);
+                if self
+                    .sky_to_cube_pipelines
+                    .get(&pipeline_key)
+                    .is_some_and(|state| state.shader_identity == shader_identity)
+                {
+                    continue;
+                }
                 let (sky_to_cube_module, sky_to_cube_hash) = ctx.shader_manager.get_or_compile(
                     ctx.device,
-                    ShaderSource::File("entry/utility/atmosphere/sky_to_cube"),
+                    sky_to_cube_source,
                     &sky_to_cube_opts,
                 );
                 let sky_to_cube_bind_group_layout: &wgpu::BindGroupLayout =
@@ -1035,7 +1138,19 @@ impl AtmosphereFeature {
                     &compilation_options,
                     "Atmo Sky-to-Cube Pipeline",
                 );
-                self.sky_to_cube_pipelines.insert(pipeline_key, pipeline);
+                self.sky_to_cube_pipelines.insert(
+                    pipeline_key,
+                    AtmosphereComputePipelineState {
+                        id: pipeline,
+                        shader_identity,
+                    },
+                );
+            }
+        }
+
+        if physics_pipeline_changed {
+            for state in self.scene_states.values() {
+                state.physics_dirty.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -1131,7 +1246,7 @@ trait AtmosphereNodeState {
 struct AtmosphereTransmittanceNode<'a> {
     output_tex: TextureNodeId,
     atmosphere_params_buf: BufferNodeId,
-    params_version: u64,
+    params_hash: u64,
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
@@ -1144,7 +1259,7 @@ impl AtmosphereNodeState for AtmosphereTransmittanceNode<'_> {
     fn update_params(&self, ctx: &PrepareContext<'_>) {
         self.state.update_if_needed(
             ctx.queue,
-            self.params_version,
+            self.params_hash,
             &self.gpu_params,
             &self.bake_params,
         );
@@ -1186,7 +1301,7 @@ struct AtmosphereMultiScatterNode<'a> {
     transmittance_tex: TextureNodeId,
     output_tex: TextureNodeId,
     atmosphere_params_buf: BufferNodeId,
-    params_version: u64,
+    params_hash: u64,
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
@@ -1199,7 +1314,7 @@ impl AtmosphereNodeState for AtmosphereMultiScatterNode<'_> {
     fn update_params(&self, ctx: &PrepareContext<'_>) {
         self.state.update_if_needed(
             ctx.queue,
-            self.params_version,
+            self.params_hash,
             &self.gpu_params,
             &self.bake_params,
         );
@@ -1246,7 +1361,7 @@ struct AtmosphereSkyViewNode<'a> {
     multi_scatter_tex: TextureNodeId,
     output_tex: TextureNodeId,
     atmosphere_params_buf: BufferNodeId,
-    params_version: u64,
+    params_hash: u64,
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
@@ -1259,7 +1374,7 @@ impl AtmosphereNodeState for AtmosphereSkyViewNode<'_> {
     fn update_params(&self, ctx: &PrepareContext<'_>) {
         self.state.update_if_needed(
             ctx.queue,
-            self.params_version,
+            self.params_hash,
             &self.gpu_params,
             &self.bake_params,
         );
@@ -1297,13 +1412,13 @@ struct AtmosphereSkyToCubeNode<'a> {
     transmittance_tex: TextureNodeId,
     sky_view_tex: TextureNodeId,
     bake_params_buf: BufferNodeId,
-    params_version: u64,
+    params_hash: u64,
     gpu_params: GpuAtmosphereParams,
     bake_params: GpuBakeParams,
+    environment_bake_params: GpuBakeParams,
     state: &'a AtmosphereSceneState,
     pipeline_id: ComputePipelineId,
     layout: &'a Tracked<wgpu::BindGroupLayout>,
-    base_cube_storage_view: &'a Tracked<wgpu::TextureView>,
     starbox: Option<&'a ResolvedAtmosphereStarbox>,
     moon_texture: &'a ResolvedAtmosphereMoonTexture,
     bind_group: Option<&'a wgpu::BindGroup>,
@@ -1313,7 +1428,7 @@ impl AtmosphereNodeState for AtmosphereSkyToCubeNode<'_> {
     fn update_params(&self, ctx: &PrepareContext<'_>) {
         self.state.update_if_needed(
             ctx.queue,
-            self.params_version,
+            self.params_hash,
             &self.gpu_params,
             &self.bake_params,
         );
@@ -1323,6 +1438,28 @@ impl AtmosphereNodeState for AtmosphereSkyToCubeNode<'_> {
 impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
         self.update_params(ctx);
+        ctx.mipmap_generator
+            .ensure_pipeline(ctx.device, wgpu::TextureFormat::Rgba16Float);
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.bake_params_buf),
+            0,
+            bytemuck::bytes_of(&self.environment_bake_params),
+        );
+
+        let base_cube_storage_view =
+            Tracked::new(ctx.views.get_texture(self.base_cube).create_view(
+                &wgpu::TextureViewDescriptor {
+                    label: Some("Scene Environment Base Cube Mip0"),
+                    format: Some(wgpu::TextureFormat::Rgba16Float),
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    aspect: wgpu::TextureAspect::All,
+                    base_mip_level: 0,
+                    mip_level_count: Some(1),
+                    base_array_layer: 0,
+                    array_layer_count: Some(6),
+                    usage: Some(wgpu::TextureUsages::STORAGE_BINDING),
+                },
+            ));
 
         let label = if self.starbox.is_some() {
             Some("Atmo Sky-to-Cube BG + Moon + Starbox")
@@ -1335,7 +1472,7 @@ impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
             .bind_texture(0, self.sky_view_tex)
             .bind_common_sampler(1, CommonSampler::LinearClamp)
             .bind_buffer(2, self.bake_params_buf)
-            .bind_tracked_texture_view(3, self.base_cube_storage_view)
+            .bind_tracked_texture_view(3, &base_cube_storage_view)
             .bind_texture(4, self.transmittance_tex)
             .bind_texture_view_with_id(5, &self.moon_texture.view, self.moon_texture.resource_id);
 
@@ -1367,5 +1504,35 @@ impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
 
         ctx.mipmap_generator
             .generate(ctx.device, encoder, ctx.get_texture(self.base_cube));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_hash_tracks_direct_public_parameter_mutation() {
+        let params = ProceduralSkyParams::golden_hour();
+        let initial_version = params.version();
+        let initial_hash = atmosphere_upload_hash(
+            &GpuAtmosphereParams::from_scene(&params),
+            &GpuBakeParams::from_scene(&params),
+        );
+
+        let mut modified = params;
+        modified.rayleigh_scale_height += 1.0;
+        assert_eq!(
+            initial_version,
+            modified.version(),
+            "this regression specifically covers public fields that bypass setters"
+        );
+        assert_ne!(
+            initial_hash,
+            atmosphere_upload_hash(
+                &GpuAtmosphereParams::from_scene(&modified),
+                &GpuBakeParams::from_scene(&modified),
+            ),
+        );
     }
 }

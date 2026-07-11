@@ -708,8 +708,12 @@ impl<'a> RenderGraph<'a> {
             .storage
             .cache_commit_requests
             .iter()
-            .find(|request| request.token == token)
+            .find(|request| request.token.cache_id == token.cache_id)
         {
+            assert_eq!(
+                existing.token, token,
+                "cache ID registered with conflicting commit tokens"
+            );
             let same_set = existing.required_writes.len() == required_writes.len()
                 && existing
                     .required_writes
@@ -894,12 +898,32 @@ impl<'a> RenderGraph<'a> {
 
         let mut receipts = SmallVec::new();
         for request in &self.storage.cache_commit_requests {
-            let all_writers_live = request.required_writes.iter().all(|id| {
-                self.storage.resources[id.index() as usize]
-                    .producer
-                    .is_some_and(|producer| self.storage.passes[producer].reference_count > 0)
-            });
-            if !all_writers_live {
+            let all_resources_untouched = request
+                .required_writes
+                .iter()
+                .all(|id| self.storage.resources[id.index() as usize].first_use == usize::MAX);
+            let live_writers = request
+                .required_writes
+                .iter()
+                .filter(|id| {
+                    self.storage.resources[id.index() as usize]
+                        .producer
+                        .is_some_and(|producer| self.storage.passes[producer].reference_count > 0)
+                })
+                .count();
+            if live_writers == 0 && all_resources_untouched {
+                // A dead replacement did not materialize or write its logical
+                // textures, so the last submitted publication remains safe to
+                // expose as a fallback.
+                registry.rollback_cache(request.token);
+                continue;
+            }
+            if live_writers != request.required_writes.len() {
+                // A partial writer group may already have modified shared
+                // physical members. Even with zero writers, a live reader may
+                // have materialized a changed specification and destroyed the
+                // old backing. Either case permanently forfeits rollback.
+                registry.discard_cache_rollback(request.token);
                 continue;
             }
 
@@ -913,6 +937,12 @@ impl<'a> RenderGraph<'a> {
                 })
                 .collect();
             let receipt = registry.commit_cache(request.token, &written_textures);
+            if receipt.is_none() {
+                // Keep release builds safe if a stale token or mismatched
+                // writer set reaches this point: live writers forfeited any
+                // right to restore the previous physical contents.
+                registry.discard_cache_rollback(request.token);
+            }
             debug_assert!(receipt.is_some(), "stale persistent cache commit token");
             receipts.extend(receipt);
         }
@@ -2043,6 +2073,203 @@ mod tests {
     }
 
     #[test]
+    fn dead_cache_replacement_restores_the_last_publication() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let published_key = CacheKey::new(1);
+        let replacement_key = CacheKey::new(2);
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let published = registry.plan_cache(cache, published_key, [spec], 1);
+        assert!(
+            registry
+                .commit_cache(
+                    published.commit.expect("initial cache needs a token"),
+                    &[published.textures[0].id],
+                )
+                .is_some()
+        );
+        let replacement = registry.plan_cache(cache, replacement_key, [spec], 2);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.import_persistent_texture("Replacement", replacement.textures[0]);
+        graph.add_pass("DeadReplacement", |builder| {
+            builder.write_texture(texture);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            replacement.commit.expect("replacement cache needs a token"),
+            &[texture],
+        );
+        graph.compile_topology();
+
+        assert!(graph.storage.execution_queue.is_empty());
+        assert!(
+            graph
+                .commit_submitted_persistent_resources(&mut registry)
+                .is_empty()
+        );
+        assert!(registry.is_cache_valid(cache, published_key));
+        let restored = registry.plan_cache(cache, published_key, [spec], 3);
+        assert!(restored.valid);
+        assert_eq!(restored.textures, published.textures);
+        assert!(
+            registry
+                .commit_cache(
+                    replacement.commit.expect("replacement cache needs a token"),
+                    &[replacement.textures[0].id],
+                )
+                .is_none(),
+            "the rolled-back replacement token must remain stale"
+        );
+    }
+
+    #[test]
+    fn partial_cache_replacement_cannot_be_rolled_back_by_a_later_dead_attempt() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let published_key = CacheKey::new(1);
+        let replacement_key = CacheKey::new(2);
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let published = registry.plan_cache(cache, published_key, [spec, spec], 1);
+        assert!(
+            registry
+                .commit_cache(
+                    published.commit.expect("initial cache needs a token"),
+                    &published.textures.map(|texture| texture.id),
+                )
+                .is_some()
+        );
+
+        let replacement = registry.plan_cache(cache, replacement_key, [spec, spec], 2);
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let replacement_a =
+                graph.import_persistent_texture("ReplacementA", replacement.textures[0]);
+            let replacement_b =
+                graph.import_persistent_texture("ReplacementB", replacement.textures[1]);
+            let output = graph.register_texture("Output", dummy_desc(), true);
+            graph.add_pass("LiveReplacementWriter", |builder| {
+                builder.write_texture(replacement_a);
+                (MockExec, ())
+            });
+            graph.add_pass("DeadReplacementWriter", |builder| {
+                builder.write_texture(replacement_b);
+                (MockExec, ())
+            });
+            graph.add_pass("ConsumeReplacement", |builder| {
+                builder.read_texture(replacement_a);
+                builder.write_texture(output);
+                (MockExec, ())
+            });
+            graph.register_cache_commit(
+                replacement.commit.expect("replacement needs a token"),
+                &[replacement_a, replacement_b],
+            );
+            graph.compile_topology();
+            assert!(
+                graph
+                    .commit_submitted_persistent_resources(&mut registry)
+                    .is_empty()
+            );
+        }
+
+        let dead_attempt = registry.plan_cache(cache, replacement_key, [spec, spec], 3);
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let replacement_a =
+                graph.import_persistent_texture("ReplacementA", dead_attempt.textures[0]);
+            let replacement_b =
+                graph.import_persistent_texture("ReplacementB", dead_attempt.textures[1]);
+            graph.add_pass("DeadReplacementWriter", |builder| {
+                builder.write_texture(replacement_a);
+                builder.write_texture(replacement_b);
+                (MockExec, ())
+            });
+            graph.register_cache_commit(
+                dead_attempt.commit.expect("invalid cache needs a token"),
+                &[replacement_a, replacement_b],
+            );
+            graph.compile_topology();
+            assert!(graph.storage.execution_queue.is_empty());
+            assert!(
+                graph
+                    .commit_submitted_persistent_resources(&mut registry)
+                    .is_empty()
+            );
+        }
+
+        assert!(!registry.is_cache_valid(cache, published_key));
+        assert!(
+            !registry
+                .plan_cache(cache, replacement_key, [spec, spec], 4)
+                .valid
+        );
+    }
+
+    #[test]
+    fn live_reader_of_an_invalid_replacement_forfeits_rollback() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let published_key = CacheKey::new(1);
+        let replacement_key = CacheKey::new(2);
+        let published_spec = PersistentTextureSpec::default_view(dummy_desc());
+        let published = registry.plan_cache(cache, published_key, [published_spec], 1);
+        assert!(
+            registry
+                .commit_cache(
+                    published.commit.expect("initial cache needs a token"),
+                    &[published.textures[0].id],
+                )
+                .is_some()
+        );
+
+        let replacement_desc = TextureDesc::new_2d(
+            2,
+            2,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let replacement_spec = PersistentTextureSpec::default_view(replacement_desc);
+        let replacement = registry.plan_cache(cache, replacement_key, [replacement_spec], 2);
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let replacement_texture =
+            graph.import_persistent_texture("Replacement", replacement.textures[0]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+        graph.add_pass("ReadInvalidReplacement", |builder| {
+            builder.read_texture(replacement_texture);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            replacement.commit.expect("replacement needs a token"),
+            &[replacement_texture],
+        );
+        graph.compile_topology();
+
+        assert_ne!(
+            graph.storage.resources[replacement_texture.index() as usize].first_use,
+            usize::MAX
+        );
+        assert!(
+            graph
+                .commit_submitted_persistent_resources(&mut registry)
+                .is_empty()
+        );
+        assert!(!registry.is_cache_valid(cache, published_key));
+        assert!(
+            !registry
+                .plan_cache(cache, replacement_key, [replacement_spec], 3)
+                .valid
+        );
+    }
+
+    #[test]
     fn demanded_cache_writer_publishes_after_submit_with_typed_receipt() {
         let mut registry = HistoryRegistry::new();
         let cache = registry.create_cache();
@@ -2218,6 +2445,29 @@ mod tests {
         let token = plan.commit.expect("invalid cache needs a token");
         graph.register_cache_commit(token, &[cache_a, cache_b]);
         graph.register_cache_commit(token, &[cache_a]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cache ID registered with conflicting commit tokens")]
+    fn one_graph_rejects_multiple_attempt_tokens_for_the_same_cache() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let first = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
+        let second = registry.plan_cache(cache, CacheKey::new(1), [spec], 2);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.import_persistent_texture("Cache", second.textures[0]);
+        graph.register_cache_commit(
+            first.commit.expect("first attempt needs a token"),
+            &[texture],
+        );
+        graph.register_cache_commit(
+            second.commit.expect("second attempt needs a token"),
+            &[texture],
+        );
     }
 
     #[test]

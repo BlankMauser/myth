@@ -4,7 +4,8 @@ use myth_render::{
     HDR_TEXTURE_FORMAT, Renderer,
     core::gpu::{CommonSampler, Tracked},
     graph::core::{
-        BufferNodeId, GraphBlackboard, RenderGraph, RenderPassBuilder, RenderTargetOps,
+        BufferDesc, BufferNodeId, ExecuteContext, GraphBlackboard, PassNode, PrepareContext,
+        RenderGraph, RenderPassBuilder, RenderTargetOps, StandardFullscreenNode,
         TemplateFullscreenPass, TextureDesc, TextureNodeId,
     },
     pipeline::ShaderCompilationOptions,
@@ -107,7 +108,7 @@ fn environment_max_mip_level() -> f32 {
 }
 
 fn use_scene_environment_reflections() -> bool {
-    return u_ocean.light_direction.w > 0.5 && environment_max_mip_level() > 0.0;
+    return u_ocean.light_direction.w > 0.5;
 }
 
 fn sample_environment_cube(direction: vec3<f32>) -> vec3<f32> {
@@ -122,10 +123,6 @@ fn sample_environment_cube(direction: vec3<f32>) -> vec3<f32> {
 
 fn sample_environment_pmrem(direction: vec3<f32>, roughness: f32) -> vec3<f32> {
     let max_mip = environment_max_mip_level();
-    if (max_mip <= 0.0) {
-        return vec3<f32>(0.0);
-    }
-
     let dir = normalize(direction);
     let lod = clamp(roughness * max_mip, 0.0, max_mip);
     return textureSampleLevel(
@@ -605,11 +602,25 @@ struct OceanUniforms {
     ambient_color: [f32; 4],
 }
 
-#[derive(Clone)]
-struct OceanEnvironmentState {
-    base_cube_view: Tracked<wgpu::TextureView>,
-    pmrem_view: Tracked<wgpu::TextureView>,
-    max_mip_level: f32,
+struct OceanSurfaceNode<'a> {
+    inner: StandardFullscreenNode<'a>,
+    uniforms: BufferNodeId,
+    uniform_snapshot: OceanUniforms,
+}
+
+impl<'a> PassNode<'a> for OceanSurfaceNode<'a> {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.uniforms),
+            0,
+            bytemuck::bytes_of(&self.uniform_snapshot),
+        );
+        self.inner.prepare(ctx);
+    }
+
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+        self.inner.execute(ctx, encoder);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -828,7 +839,7 @@ pub struct OceanRenderer {
     composite_passes: OceanQualityPasses,
     resolve_pass: TemplateFullscreenPass,
     composite_resolve_pass: TemplateFullscreenPass,
-    uniforms: Tracked<wgpu::Buffer>,
+    uniform_snapshot: OceanUniforms,
     pub settings: OceanSettings,
     time: f32,
     preset: OceanPreset,
@@ -839,7 +850,6 @@ pub struct OceanRenderer {
     fallback_cube_view: Tracked<wgpu::TextureView>,
     fallback_atmosphere_transmittance_view: Tracked<wgpu::TextureView>,
     fallback_atmosphere_bake_params: Tracked<wgpu::Buffer>,
-    environment: Option<OceanEnvironmentState>,
 }
 
 impl OceanRenderer {
@@ -892,7 +902,7 @@ impl OceanRenderer {
                 })
                 .build(renderer);
 
-        let wgpu_ctx = renderer
+        renderer
             .wgpu_ctx()
             .expect("renderer must be initialized before ocean helper setup");
         let fallback_cube_view = renderer
@@ -913,19 +923,12 @@ impl OceanRenderer {
             .system_textures
             .atmosphere_bake_params
             .clone();
-        let uniforms = Tracked::new(wgpu_ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Ocean Surface Uniforms"),
-            size: std::mem::size_of::<OceanUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        }));
-
         Self {
             surface_passes,
             composite_passes,
             resolve_pass,
             composite_resolve_pass,
-            uniforms,
+            uniform_snapshot: OceanUniforms::zeroed(),
             settings: OceanSettings::reference(),
             time: 0.0,
             preset: OceanPreset::Reference,
@@ -936,7 +939,6 @@ impl OceanRenderer {
             fallback_cube_view,
             fallback_atmosphere_transmittance_view,
             fallback_atmosphere_bake_params,
-            environment: None,
         }
     }
 
@@ -1006,7 +1008,6 @@ impl OceanRenderer {
     pub fn sync_gpu(&mut self, renderer: &Renderer, width: u32, height: u32) {
         let camera = OceanCameraState::reference(self.time);
         let lighting = self.reference_lighting_state();
-        self.environment = None;
         self.sync_gpu_with_state(renderer, width, height, camera, lighting);
     }
 
@@ -1019,35 +1020,27 @@ impl OceanRenderer {
     ) {
         let camera = self.resolve_camera_state(scene);
         let lighting = self.resolve_lighting_state(scene);
-        self.environment = Self::resolve_environment_state(renderer, scene.id());
         self.sync_gpu_with_state(renderer, width, height, camera, lighting);
     }
 
     fn sync_gpu_with_state(
-        &self,
+        &mut self,
         renderer: &Renderer,
         width: u32,
         height: u32,
         camera: OceanCameraState,
         lighting: OceanLightingState,
     ) {
-        let Some(wgpu_ctx) = renderer.wgpu_ctx() else {
+        if renderer.wgpu_ctx().is_none() {
             return;
-        };
+        }
 
         let (render_width, render_height) = self.render_dimensions(width, height);
-        let environment_max_mip_level = self
-            .environment
-            .as_ref()
-            .map_or(0.0, |environment| environment.max_mip_level);
-        let environment_reflections_enabled = if self.light_source
-            == OceanLightSource::ProceduralSky
-            && environment_max_mip_level > 0.0
-        {
-            1.0
-        } else {
-            0.0
-        };
+        // Exact environment availability and mip metadata are graph-build
+        // outputs. Graph construction patches these two fields into a
+        // per-node snapshot that is uploaded only by live-node prepare.
+        let environment_max_mip_level = 0.0;
+        let environment_reflections_enabled = 0.0;
         let uniforms = self.settings.to_uniforms(
             render_width,
             render_height,
@@ -1057,9 +1050,7 @@ impl OceanRenderer {
             environment_max_mip_level,
             environment_reflections_enabled,
         );
-        wgpu_ctx
-            .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        self.uniform_snapshot = uniforms;
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -1338,19 +1329,6 @@ impl OceanRenderer {
         }
     }
 
-    fn resolve_environment_state(
-        renderer: &Renderer,
-        scene_id: u32,
-    ) -> Option<OceanEnvironmentState> {
-        let resource_manager = renderer.resource_manager()?;
-        let gpu_environment = resource_manager.gpu_environment(scene_id)?;
-        Some(OceanEnvironmentState {
-            base_cube_view: gpu_environment.base_cube_view.clone(),
-            pmrem_view: gpu_environment.pmrem_view.clone(),
-            max_mip_level: resource_manager.get_env_map_max_mip_level(scene_id),
-        })
-    }
-
     fn dominant_procedural_sky_light(params: &ProceduralSkyParams) -> ([f32; 3], [f32; 3], f32) {
         let sun_direction = params.sun_direction.normalize_or_zero();
         let moon_direction = params.moon_direction.normalize_or_zero();
@@ -1467,6 +1445,26 @@ impl OceanRenderer {
             .build(renderer)
     }
 
+    fn graph_uniform_snapshot(
+        &self,
+        environment_base_cube: Option<TextureNodeId>,
+        environment_pmrem: Option<TextureNodeId>,
+        environment_pmrem_max_mip_level: Option<f32>,
+    ) -> OceanUniforms {
+        let mut uniforms = self.uniform_snapshot;
+        let environment_available = environment_base_cube.is_some()
+            && environment_pmrem.is_some()
+            && environment_pmrem_max_mip_level.is_some();
+        uniforms.light_direction[3] =
+            if environment_available && self.light_source == OceanLightSource::ProceduralSky {
+                1.0
+            } else {
+                0.0
+            };
+        uniforms.ambient_color[3] = environment_pmrem_max_mip_level.unwrap_or(0.0);
+        uniforms
+    }
+
     fn add_surface_pass<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -1474,24 +1472,37 @@ impl OceanRenderer {
         height: u32,
         pass_name: &'static str,
         texture_name: &'static str,
+        environment_base_cube: Option<TextureNodeId>,
+        environment_pmrem: Option<TextureNodeId>,
+        environment_pmrem_max_mip_level: Option<f32>,
         atmosphere_transmittance: Option<TextureNodeId>,
         atmosphere_bake_params: Option<BufferNodeId>,
     ) -> TextureNodeId {
         let out_desc = Self::output_desc(width, height);
         let pass = self.surface_passes.get(self.quality);
-        let uniforms = &self.uniforms;
         let fallback_cube_view = &self.fallback_cube_view;
         let fallback_atmosphere_transmittance_view = &self.fallback_atmosphere_transmittance_view;
         let fallback_atmosphere_bake_params = &self.fallback_atmosphere_bake_params;
-        let environment = self.environment.as_ref();
-        let environment_cube_view = environment
-            .map(|environment| &environment.base_cube_view)
-            .unwrap_or(fallback_cube_view);
-        let environment_pmrem_view = environment
-            .map(|environment| &environment.pmrem_view)
-            .unwrap_or(fallback_cube_view);
+        let uniform_snapshot = self.graph_uniform_snapshot(
+            environment_base_cube,
+            environment_pmrem,
+            environment_pmrem_max_mip_level,
+        );
 
         graph.add_pass(pass_name, |builder| {
+            let uniforms = builder.create_buffer(
+                "Ocean_Surface_Uniforms",
+                BufferDesc::new(
+                    std::mem::size_of::<OceanUniforms>() as u64,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                ),
+            );
+            if let Some(environment_base_cube) = environment_base_cube {
+                builder.read_texture(environment_base_cube);
+            }
+            if let Some(environment_pmrem) = environment_pmrem {
+                builder.read_texture(environment_pmrem);
+            }
             if let Some(transmittance) = atmosphere_transmittance {
                 builder.read_texture(transmittance);
             }
@@ -1499,17 +1510,25 @@ impl OceanRenderer {
                 builder.read_buffer(bake_params);
             }
             let out = builder.create_texture(texture_name, out_desc);
-            let node = pass.build_node(
+            let inner = pass.build_node(
                 builder,
                 pass_name,
                 out,
                 RenderTargetOps::DontCare,
                 Some(pass_name),
                 |bindings| {
-                    bindings.bind_tracked_buffer(0, 0, uniforms);
-                    bindings.bind_tracked_texture_view(0, 4, environment_cube_view);
+                    bindings.bind_buffer(0, 0, uniforms);
+                    if let Some(environment_base_cube) = environment_base_cube {
+                        bindings.bind_texture(0, 4, environment_base_cube);
+                    } else {
+                        bindings.bind_tracked_texture_view(0, 4, fallback_cube_view);
+                    }
                     bindings.bind_common_sampler(0, 5, CommonSampler::LinearClamp);
-                    bindings.bind_tracked_texture_view(0, 6, environment_pmrem_view);
+                    if let Some(environment_pmrem) = environment_pmrem {
+                        bindings.bind_texture(0, 6, environment_pmrem);
+                    } else {
+                        bindings.bind_tracked_texture_view(0, 6, fallback_cube_view);
+                    }
                     if let Some(transmittance) = atmosphere_transmittance {
                         bindings.bind_texture(1, 0, transmittance);
                     } else {
@@ -1526,6 +1545,11 @@ impl OceanRenderer {
                     }
                 },
             );
+            let node = OceanSurfaceNode {
+                inner,
+                uniforms,
+                uniform_snapshot,
+            };
             (node, out)
         })
     }
@@ -1537,6 +1561,19 @@ impl OceanRenderer {
         width: u32,
         height: u32,
     ) -> GraphBlackboard {
+        let environment_reflections = self.light_source == OceanLightSource::ProceduralSky
+            && blackboard.environment_base_cube.is_some()
+            && blackboard.environment_pmrem.is_some()
+            && blackboard.environment_pmrem_max_mip_level.is_some();
+        let environment_base_cube = environment_reflections
+            .then_some(blackboard.environment_base_cube)
+            .flatten();
+        let environment_pmrem = environment_reflections
+            .then_some(blackboard.environment_pmrem)
+            .flatten();
+        let environment_pmrem_max_mip_level = environment_reflections
+            .then_some(blackboard.environment_pmrem_max_mip_level)
+            .flatten();
         let ocean_color = if self.uses_scaled_surface() {
             let (render_width, render_height) = self.render_dimensions(width, height);
             let low_res_ocean = self.add_surface_pass(
@@ -1545,6 +1582,9 @@ impl OceanRenderer {
                 render_height,
                 "Ocean_Standalone_Scaled_Surface",
                 "Ocean_Surface_HDR_Scaled",
+                environment_base_cube,
+                environment_pmrem,
+                environment_pmrem_max_mip_level,
                 None,
                 None,
             );
@@ -1574,6 +1614,9 @@ impl OceanRenderer {
                 height,
                 "Ocean_Standalone",
                 "Ocean_Surface_HDR",
+                environment_base_cube,
+                environment_pmrem,
+                environment_pmrem_max_mip_level,
                 None,
                 None,
             )
@@ -1594,6 +1637,19 @@ impl OceanRenderer {
     ) -> GraphBlackboard {
         let atmosphere_transmittance = blackboard.atmosphere_transmittance;
         let atmosphere_bake_params = blackboard.atmosphere_bake_params;
+        let environment_reflections = self.light_source == OceanLightSource::ProceduralSky
+            && blackboard.environment_base_cube.is_some()
+            && blackboard.environment_pmrem.is_some()
+            && blackboard.environment_pmrem_max_mip_level.is_some();
+        let environment_base_cube = environment_reflections
+            .then_some(blackboard.environment_base_cube)
+            .flatten();
+        let environment_pmrem = environment_reflections
+            .then_some(blackboard.environment_pmrem)
+            .flatten();
+        let environment_pmrem_max_mip_level = environment_reflections
+            .then_some(blackboard.environment_pmrem_max_mip_level)
+            .flatten();
         let (Some(scene_color), Some(scene_depth)) =
             (blackboard.scene_color, blackboard.scene_depth)
         else {
@@ -1608,6 +1664,9 @@ impl OceanRenderer {
                 render_height,
                 "Ocean_Composite_Scaled_Surface",
                 "Ocean_Composite_HDR_Scaled",
+                environment_base_cube,
+                environment_pmrem,
+                environment_pmrem_max_mip_level,
                 atmosphere_transmittance,
                 atmosphere_bake_params,
             );
@@ -1638,22 +1697,32 @@ impl OceanRenderer {
         } else {
             let out_desc = Self::output_desc(width, height);
             let pass = self.composite_passes.get(self.quality);
-            let uniforms = &self.uniforms;
             let fallback_cube_view = &self.fallback_cube_view;
             let fallback_atmosphere_transmittance_view =
                 &self.fallback_atmosphere_transmittance_view;
             let fallback_atmosphere_bake_params = &self.fallback_atmosphere_bake_params;
-            let environment = self.environment.as_ref();
-            let environment_cube_view = environment
-                .map(|environment| &environment.base_cube_view)
-                .unwrap_or(fallback_cube_view);
-            let environment_pmrem_view = environment
-                .map(|environment| &environment.pmrem_view)
-                .unwrap_or(fallback_cube_view);
+            let uniform_snapshot = self.graph_uniform_snapshot(
+                environment_base_cube,
+                environment_pmrem,
+                environment_pmrem_max_mip_level,
+            );
 
             graph.add_pass("Ocean_Composite", |builder| {
+                let uniforms = builder.create_buffer(
+                    "Ocean_Composite_Uniforms",
+                    BufferDesc::new(
+                        std::mem::size_of::<OceanUniforms>() as u64,
+                        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    ),
+                );
                 builder.read_texture(scene_color);
                 builder.read_texture(scene_depth);
+                if let Some(environment_base_cube) = environment_base_cube {
+                    builder.read_texture(environment_base_cube);
+                }
+                if let Some(environment_pmrem) = environment_pmrem {
+                    builder.read_texture(environment_pmrem);
+                }
                 if let Some(transmittance) = atmosphere_transmittance {
                     builder.read_texture(transmittance);
                 }
@@ -1661,20 +1730,28 @@ impl OceanRenderer {
                     builder.read_buffer(bake_params);
                 }
                 let out = builder.create_texture("Ocean_Composite_HDR", out_desc);
-                let node = pass.build_node(
+                let inner = pass.build_node(
                     builder,
                     "Ocean Composite Pass",
                     out,
                     RenderTargetOps::DontCare,
                     Some("Ocean Composite BG"),
                     |bindings| {
-                        bindings.bind_tracked_buffer(0, 0, uniforms);
+                        bindings.bind_buffer(0, 0, uniforms);
                         bindings.bind_texture(0, 1, scene_color);
                         bindings.bind_common_sampler(0, 2, CommonSampler::LinearClamp);
                         bindings.bind_texture(0, 3, scene_depth);
-                        bindings.bind_tracked_texture_view(0, 4, environment_cube_view);
+                        if let Some(environment_base_cube) = environment_base_cube {
+                            bindings.bind_texture(0, 4, environment_base_cube);
+                        } else {
+                            bindings.bind_tracked_texture_view(0, 4, fallback_cube_view);
+                        }
                         bindings.bind_common_sampler(0, 5, CommonSampler::LinearClamp);
-                        bindings.bind_tracked_texture_view(0, 6, environment_pmrem_view);
+                        if let Some(environment_pmrem) = environment_pmrem {
+                            bindings.bind_texture(0, 6, environment_pmrem);
+                        } else {
+                            bindings.bind_tracked_texture_view(0, 6, fallback_cube_view);
+                        }
                         if let Some(transmittance) = atmosphere_transmittance {
                             bindings.bind_texture(1, 0, transmittance);
                         } else {
@@ -1691,6 +1768,11 @@ impl OceanRenderer {
                         }
                     },
                 );
+                let node = OceanSurfaceNode {
+                    inner,
+                    uniforms,
+                    uniform_snapshot,
+                };
                 (node, out)
             })
         };

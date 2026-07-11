@@ -1,8 +1,8 @@
 //! Environment - Pure data structure
 //!
 //! Describes IBL/skybox configuration.
-//! Internal GPU textures (processed cube map and PMREM) are managed
-//! by `ResourceManager` and are **not** stored here.
+//! Internal GPU textures (processed cube map and PMREM) are owned by the
+//! renderer's logical persistent-cache registry and are **not** stored here.
 
 use myth_resources::texture::TextureSource;
 

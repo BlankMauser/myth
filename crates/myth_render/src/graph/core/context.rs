@@ -84,9 +84,15 @@ pub struct PrepareContext<'a> {
     pub pipeline_cache: &'a mut PipelineCache,
     /// Shader-module cache used by lazy pipeline preparation.
     pub shader_manager: &'a mut ShaderManager,
-    /// Narrow persistent-buffer upload capability. This borrows only the
-    /// ResourceManager's resource-store partition.
+    /// CPU asset storage used by live nodes that defer GPU materialization of
+    /// an already-resolved logical asset until after DPE.
+    pub assets: &'a AssetServer,
+    /// Narrow persistent upload/source-resolution capability. This does not
+    /// expose the monolithic ResourceManager to pass preparation.
     pub uploads: BufferUploadContext<'a>,
+    /// Shared mipmap encoder state. Live producers pre-warm their required
+    /// format pipeline here so execute remains command-recording only.
+    pub mipmap_generator: &'a mut MipmapGenerator,
     /// Immutable lookup capability for scene-level global binding state.
     /// Snapshots carry only a lightweight key; live feature nodes resolve the
     /// physical layout and WGSL interface through this capability on L1 miss.
@@ -293,6 +299,48 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
         let resource_id = views.get_physical_buffer_uid(id);
         let resource = wgpu::BindingResource::Buffer(views.get_buffer_binding(id));
         self.push_entry(binding, resource_id, resource)
+    }
+
+    /// Binds a logical RDG buffer range.
+    ///
+    /// This is primarily used by dynamic uniform bindings: the bind group
+    /// describes one element while `set_bind_group` supplies the aligned
+    /// per-dispatch offset. Range metadata participates in the cache key, so
+    /// two bindings of the same physical allocation cannot alias incorrectly.
+    #[must_use]
+    pub fn bind_buffer_range(
+        mut self,
+        binding: u32,
+        id: BufferNodeId,
+        offset: u64,
+        size: wgpu::BufferSize,
+    ) -> Self {
+        let views = self
+            .views
+            .expect("BufferNodeId binding requires PrepareContext-backed RDG views");
+        let (_, resource) = resolve_buffer_resource(views.resources, id);
+        let end = offset
+            .checked_add(size.get())
+            .expect("RDG buffer binding range overflow");
+        assert!(
+            end <= resource.buffer_desc().logical_size,
+            "RDG buffer binding range exceeds logical resource size"
+        );
+
+        self.key = self
+            .key
+            .with_resource(views.get_physical_buffer_uid(id))
+            .with_resource(offset)
+            .with_resource(size.get());
+        self.entries.push(wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: views.get_buffer(id),
+                offset,
+                size: Some(size),
+            }),
+        });
+        self
     }
 
     #[must_use]
