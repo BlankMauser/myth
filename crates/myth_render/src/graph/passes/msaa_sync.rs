@@ -147,6 +147,7 @@ impl MsaaSyncFeature {
                     mask: !0,
                     alpha_to_coverage_enabled: false,
                 }),
+                topology: wgpu::PrimitiveTopology::TriangleList,
             };
 
             let id = ctx.pipeline_cache.get_or_create_fullscreen(

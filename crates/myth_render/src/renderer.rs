@@ -561,27 +561,6 @@ impl Renderer {
                 state.skybox_pass.deactivate();
             }
 
-            // Gaussian Splatting
-            #[cfg(feature = "3dgs")]
-            {
-                let mut cloud_entries = Vec::new();
-                for (node_handle, cloud_handle) in &scene.gaussian_clouds {
-                    let Some(node) = scene.get_node(node_handle) else {
-                        continue;
-                    };
-                    if !node.visible {
-                        continue;
-                    }
-                    if let Some(cloud) = assets.gaussian_clouds.get(*cloud_handle) {
-                        let world_matrix = glam::Mat4::from(*node.world_matrix());
-                        cloud_entries.push((*cloud_handle, cloud, world_matrix));
-                    }
-                }
-                state
-                    .gaussian_splatting_pass
-                    .extract_and_prepare(&mut extract_ctx, &cloud_entries);
-            }
-
             if is_hf {
                 state.prepass.extract_and_prepare(
                     &mut extract_ctx,
@@ -673,6 +652,10 @@ impl Renderer {
             // is touched for every active camera, so with the same TTL it can
             // never expire while an associated feature history remains live.
             let current_frame = state.resource_manager.frame_index();
+            #[cfg(feature = "3dgs")]
+            let gaussian_clouds = state
+                .gaussian_splatting_pass
+                .garbage_collect(current_frame, TEMPORAL_DOMAIN_TTL_FRAMES);
             let taa_domains = state.taa_pass.garbage_collect(
                 &mut state.history_registry,
                 current_frame,
@@ -697,6 +680,10 @@ impl Renderer {
                 log::debug!(
                     "Temporal GC: retired {taa_domains} TAA, {ssr_domains} SSR, {ssgi_domains} SSGI, and {view_domains} previous-view domains"
                 );
+            }
+            #[cfg(feature = "3dgs")]
+            if gaussian_clouds > 0 {
+                log::debug!("Gaussian GC: retired {gaussian_clouds} persistent cloud uploads");
             }
         }
     }
@@ -996,6 +983,7 @@ impl Renderer {
                 .collect(),
             depth_stencil: depth_stencil.map(DepthStencilKey::from),
             multisample: MultisampleKey::from(multisample),
+            topology: wgpu::PrimitiveTopology::TriangleList,
         };
 
         let pipeline_id = state.pipeline_cache.get_or_create_fullscreen(
@@ -1212,6 +1200,8 @@ mod tests {
 
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::{AssetServer, SceneExt};
+    #[cfg(feature = "3dgs")]
+    use myth_resources::gaussian_splat::{GaussianCloud, GaussianSHCoefficients, GaussianSplat};
     use myth_resources::image::{ColorSpace, Image, ImageDimension, PixelFormat};
     use myth_resources::material::PhysicalMaterial;
     use myth_resources::texture::{Texture, TextureSource};
@@ -1232,6 +1222,40 @@ mod tests {
         let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
         camera.update_view_projection(&Affine3A::from_translation(Vec3::new(0.0, 0.0, 5.0)));
         camera.extract_render_camera()
+    }
+
+    #[cfg(feature = "3dgs")]
+    fn pack_half2(left: f32, right: f32) -> u32 {
+        u32::from(half::f16::from_f32(left).to_bits())
+            | (u32::from(half::f16::from_f32(right).to_bits()) << 16)
+    }
+
+    #[cfg(feature = "3dgs")]
+    fn tiny_gaussian_cloud() -> GaussianCloud {
+        GaussianCloud {
+            gaussians: vec![GaussianSplat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                opacity: pack_half2(0.8, 0.0),
+                sh_idx: 0,
+                cov: [
+                    pack_half2(0.01, 0.0),
+                    pack_half2(0.0, 0.01),
+                    pack_half2(0.0, 0.01),
+                ],
+            }],
+            sh_coefficients: vec![GaussianSHCoefficients { data: [0; 24] }],
+            sh_degree: 0,
+            num_points: 1,
+            aabb_min: Vec3::splat(-0.5),
+            aabb_max: Vec3::splat(0.5),
+            center: Vec3::ZERO,
+            mip_splatting: false,
+            kernel_size: 0.3,
+            color_space: ColorSpace::Linear,
+            opacity_compensation: 1.0,
+        }
     }
 
     fn render_frame(
@@ -1269,6 +1293,200 @@ mod tests {
             .passes
             .iter()
             .any(|pass| pass.name == name)
+    }
+
+    #[cfg(feature = "3dgs")]
+    #[test]
+    fn gaussian_extract_is_cpu_only_and_keeps_all_gpu_caches_cold() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
+        let mut scene = Scene::new();
+        scene.add_gaussian_cloud("extract-only-a", cloud);
+        scene.add_gaussian_cloud("extract-only-b", cloud);
+        let camera = make_camera();
+
+        let state = renderer.context.as_mut().expect("renderer state missing");
+        assert!(state.gaussian_splatting_pass.cache_is_empty());
+        let extract =
+            state
+                .gaussian_splatting_pass
+                .extract(&scene, &assets, &camera, &state.wgpu_ctx.device);
+
+        let extract = extract.expect("the visible loaded cloud must be extracted");
+        assert_eq!(
+            extract.asset_count(),
+            1,
+            "two instances of one exact asset version share one frame owner"
+        );
+        assert_eq!(extract.plan_asset_indices(), [0, 0]);
+        assert_eq!(extract.asset_version(0), 1);
+        assert!(
+            state.gaussian_splatting_pass.cache_is_empty(),
+            "extract must not create layouts, pipelines, or cloud GPU buffers"
+        );
+    }
+
+    #[cfg(feature = "3dgs")]
+    #[test]
+    fn live_gaussian_prepare_reuses_static_and_cloud_caches_until_ttl_expires() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
+        let mut scene = Scene::new();
+        scene.add_gaussian_cloud("live-cache", cloud);
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let (first_static, first_cloud, first_last_used) = {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert!(graph_contains_pass(state, "GS_Compute"));
+            assert!(graph_contains_pass(state, "GS_Render"));
+            assert!(graph_contains_pass(state, "GS_Composite"));
+            assert!(state.gaussian_splatting_pass.static_cache_is_initialized());
+            assert_eq!(state.gaussian_splatting_pass.cloud_cache_len(), 1);
+            assert!(
+                state
+                    .graph_storage
+                    .gaussian_frame_batches
+                    .iter()
+                    .all(Option::is_none),
+                "exact-version asset owners must be released after live prepare"
+            );
+            (
+                state.gaussian_splatting_pass.static_cache_identity(),
+                state
+                    .gaussian_splatting_pass
+                    .cloud_cache_identity(cloud)
+                    .expect("live prepare must upload the cloud"),
+                state
+                    .gaussian_splatting_pass
+                    .cloud_last_used_frame(cloud)
+                    .expect("live cloud must record its frame"),
+            )
+        };
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let state = renderer.context.as_mut().expect("renderer state missing");
+        assert_eq!(
+            state.gaussian_splatting_pass.static_cache_identity(),
+            first_static,
+            "a stable second frame must reuse every Gaussian layout and pipeline"
+        );
+        assert_eq!(
+            state.gaussian_splatting_pass.cloud_cache_identity(cloud),
+            Some(first_cloud),
+            "a stable asset version must reuse both persistent cloud buffers"
+        );
+        let second_last_used = state
+            .gaussian_splatting_pass
+            .cloud_last_used_frame(cloud)
+            .expect("second live prepare must touch the cloud");
+        assert!(second_last_used > first_last_used);
+
+        const TEST_TTL: u64 = 3;
+        assert_eq!(
+            state
+                .gaussian_splatting_pass
+                .garbage_collect(second_last_used + TEST_TTL, TEST_TTL),
+            0,
+            "age == TTL remains live"
+        );
+        assert_eq!(state.gaussian_splatting_pass.cloud_cache_len(), 1);
+        assert_eq!(
+            state
+                .gaussian_splatting_pass
+                .garbage_collect(second_last_used + TEST_TTL + 1, TEST_TTL),
+            1,
+            "age == TTL + 1 retires the persistent upload"
+        );
+        assert_eq!(state.gaussian_splatting_pass.cloud_cache_len(), 0);
+        assert!(
+            state.gaussian_splatting_pass.static_cache_is_initialized(),
+            "cloud TTL must not evict cross-cloud static pipelines"
+        );
+    }
+
+    #[cfg(feature = "3dgs")]
+    #[test]
+    fn gaussian_same_handle_same_version_replacement_rebuilds_only_cloud_buffers() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
+        let mut scene = Scene::new();
+        scene.add_gaussian_cloud("exact-identity", cloud);
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let (first_static, first_cloud) = {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            (
+                state.gaussian_splatting_pass.static_cache_identity(),
+                state
+                    .gaussian_splatting_pass
+                    .cloud_cache_identity(cloud)
+                    .expect("first live prepare must upload the cloud"),
+            )
+        };
+        assert_eq!(assets.gaussian_clouds.get_version(cloud), Some(1));
+        assert_eq!(first_cloud.0, 1);
+
+        // `insert_ready` replaces the Arc stored behind an existing handle but
+        // deliberately initializes its numeric version to 1 again. The weak
+        // exact-asset identity must therefore participate in the L1 key.
+        assets
+            .gaussian_clouds
+            .insert_ready(cloud, tiny_gaussian_cloud());
+        assert_eq!(assets.gaussian_clouds.get_version(cloud), Some(1));
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let second_cloud = state
+            .gaussian_splatting_pass
+            .cloud_cache_identity(cloud)
+            .expect("replacement asset must remain resident after prepare");
+        assert_eq!(second_cloud.0, 1);
+        assert_eq!(
+            state.gaussian_splatting_pass.static_cache_identity(),
+            first_static,
+            "an asset-only replacement must preserve static layouts and pipelines"
+        );
+        assert_ne!(
+            (second_cloud.1, second_cloud.2),
+            (first_cloud.1, first_cloud.2),
+            "same handle/version with a new Arc identity must rebuild both raw cloud buffers"
+        );
+    }
+
+    #[cfg(feature = "3dgs")]
+    #[test]
+    fn basic_forward_with_gaussian_scene_does_not_initialize_gaussian_resources() {
+        let mut renderer = Renderer::new(
+            RendererInitConfig::default(),
+            RendererSettings {
+                path: RenderPath::BasicForward,
+                ..RendererSettings::default()
+            },
+        );
+        pollster::block_on(renderer.init_headless(128, 128, None))
+            .expect("headless renderer init failed");
+        let assets = AssetServer::new();
+        let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
+        let mut scene = Scene::new();
+        scene.add_gaussian_cloud("basic-forward", cloud);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.gaussian_splatting_pass.cache_is_empty());
+        assert!(!graph_contains_pass(state, "GS_Compute"));
+        assert!(!graph_contains_pass(state, "GS_Render"));
+        assert!(!graph_contains_pass(state, "GS_Composite"));
+        assert!(state.graph_storage.gaussian_frame_batches.is_empty());
     }
 
     #[test]

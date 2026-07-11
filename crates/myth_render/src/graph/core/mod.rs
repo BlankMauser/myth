@@ -3,6 +3,8 @@ pub mod arena;
 pub mod blackboard;
 pub mod builder;
 pub mod context;
+#[cfg(feature = "3dgs")]
+pub(crate) mod gaussian;
 pub mod graph;
 pub mod node;
 pub mod persistent;

@@ -213,8 +213,9 @@ pub struct GraphicsPipelineKey {
 
 /// L2 cache key for non-material render pipelines.
 ///
-/// Covers fullscreen / post-processing passes **and** Skybox.
-/// Primitive state is hardcoded to standard fullscreen-triangle values.
+/// Covers fullscreen / post-processing passes **and** other no-vertex-buffer
+/// utility passes such as Skybox. The standard constructor uses a triangle
+/// list, while callers that emit strips can specialize the primitive topology.
 ///
 /// The `shader_hash` is an xxh3-128 of the final WGSL source code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -230,6 +231,8 @@ pub struct FullscreenPipelineKey {
     /// Multisample configuration.
     /// Skybox needs MSAA-aware pipelines; pure post-process passes pass 1×.
     pub multisample: MultisampleKey,
+    /// Primitive topology for no-vertex-buffer draws.
+    pub topology: wgpu::PrimitiveTopology,
 }
 
 impl FullscreenPipelineKey {
@@ -248,6 +251,7 @@ impl FullscreenPipelineKey {
             color_targets,
             depth_stencil,
             multisample: MultisampleKey::from(wgpu::MultisampleState::default()),
+            topology: wgpu::PrimitiveTopology::TriangleList,
         }
     }
 
@@ -259,6 +263,13 @@ impl FullscreenPipelineKey {
         self.compilation_hash = hash_pipeline_compilation_options(options);
         self
     }
+
+    /// Specialize the primitive topology for a no-vertex-buffer utility pass.
+    #[must_use]
+    pub const fn with_topology(mut self, topology: wgpu::PrimitiveTopology) -> Self {
+        self.topology = topology;
+        self
+    }
 }
 
 /// L2 cache key for compute pipelines.
@@ -268,6 +279,8 @@ pub struct ComputePipelineKey {
     pub shader_hash: u128,
     /// Hash of pipeline compilation options such as overridable constants.
     pub compilation_hash: u64,
+    /// Static WGSL compute entry point selected by this pipeline.
+    pub entry_point: &'static str,
 }
 
 impl ComputePipelineKey {
@@ -276,6 +289,7 @@ impl ComputePipelineKey {
         Self {
             shader_hash,
             compilation_hash: 0,
+            entry_point: "main",
         }
     }
 
@@ -285,6 +299,13 @@ impl ComputePipelineKey {
         options: &wgpu::PipelineCompilationOptions<'_>,
     ) -> Self {
         self.compilation_hash = hash_pipeline_compilation_options(options);
+        self
+    }
+
+    /// Select a static WGSL compute entry point.
+    #[must_use]
+    pub const fn with_entry_point(mut self, entry_point: &'static str) -> Self {
+        self.entry_point = entry_point;
         self
     }
 }
@@ -340,7 +361,18 @@ pub fn hash_pipeline_compilation_options(options: &wgpu::PipelineCompilationOpti
 
 #[cfg(test)]
 mod tests {
-    use super::FullscreenPipelineKey;
+    use super::{ComputePipelineKey, FullscreenPipelineKey};
+
+    #[test]
+    fn compute_key_distinguishes_entry_points() {
+        let default = ComputePipelineKey::new(7);
+
+        assert_eq!(default.entry_point, "main");
+        assert_ne!(
+            default.clone().with_entry_point("calculate_histogram"),
+            default.with_entry_point("prefix_histogram"),
+        );
+    }
 
     #[test]
     fn fullscreen_key_distinguishes_override_constants() {
@@ -359,6 +391,18 @@ mod tests {
         assert_ne!(
             base.clone().with_compilation_options(&disabled_options),
             base.with_compilation_options(&enabled_options),
+        );
+    }
+
+    #[test]
+    fn fullscreen_key_distinguishes_primitive_topology() {
+        let base = FullscreenPipelineKey::fullscreen(7, smallvec::smallvec![], None);
+
+        assert_eq!(base.topology, wgpu::PrimitiveTopology::TriangleList);
+        assert_ne!(
+            base.clone()
+                .with_topology(wgpu::PrimitiveTopology::TriangleList),
+            base.with_topology(wgpu::PrimitiveTopology::TriangleStrip),
         );
     }
 }

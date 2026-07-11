@@ -417,6 +417,7 @@ impl TemplatePassDescriptor {
                 .collect(),
             depth_stencil: depth_stencil.map(DepthStencilKey::from),
             multisample: MultisampleKey::from(multisample),
+            topology: wgpu::PrimitiveTopology::TriangleList,
         };
         let pipeline_id = ctx.pipeline_cache.get_or_create_fullscreen(
             ctx.device,

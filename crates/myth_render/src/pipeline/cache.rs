@@ -415,8 +415,8 @@ impl PipelineCache {
     /// The caller must supply the pre-created `pipeline_layout` because
     /// bind-group layouts vary widely across post-processing passes.
     ///
-    /// Primitive state is hardcoded to standard fullscreen-triangle values:
-    /// `TriangleList`, no culling, CCW, no vertex buffers.
+    /// Primitive state uses the topology selected by the canonical key with
+    /// no culling, CCW front faces, and no vertex buffers.
     pub fn get_or_create_fullscreen(
         &mut self,
         device: &wgpu::Device,
@@ -524,7 +524,7 @@ impl PipelineCache {
                 compilation_options: compilation_options.clone(),
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
+                topology: canonical_key.topology,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
                 ..Default::default()
@@ -674,7 +674,7 @@ impl PipelineCache {
             label: Some(label),
             layout: Some(pipeline_layout),
             module: shader_module,
-            entry_point: Some("main"),
+            entry_point: Some(canonical_key.entry_point),
             compilation_options: compilation_options.clone(),
             cache: None,
         });

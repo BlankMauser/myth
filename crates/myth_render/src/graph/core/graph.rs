@@ -6,6 +6,8 @@ use rustc_hash::FxHashMap;
 use crate::core::gpu::{MipmapBatchId, MipmapRequest, MipmapRequestBatch, Tracked};
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
+#[cfg(feature = "3dgs")]
+use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
 
 use super::builder::PassBuilder;
 use super::node::{NodeSlot, PassNode, PassRecord};
@@ -146,6 +148,11 @@ pub struct GraphStorage {
     /// Pass nodes retain only [`MipmapBatchId`] values into these arrays.
     pub(crate) mipmap_batches: Vec<Option<MipmapRequestBatch>>,
 
+    /// Exact Gaussian asset versions captured for this graph attempt. Arc
+    /// owners live here because the frame arena intentionally skips Drop.
+    #[cfg(feature = "3dgs")]
+    pub(crate) gaussian_frame_batches: Vec<Option<GaussianFrameBatch>>,
+
     // /// Name-based resource registry for self-wiring passes.
     // resource_registry: FxHashMap<&'static str, TextureNodeId>,
 
@@ -182,6 +189,8 @@ impl GraphStorage {
             history_commit_requests: Vec::new(),
             cache_commit_requests: Vec::new(),
             mipmap_batches: Vec::new(),
+            #[cfg(feature = "3dgs")]
+            gaussian_frame_batches: Vec::new(),
             // resource_registry: FxHashMap::default(),
             compile_stack: Vec::new(),
             compile_in_degrees: Vec::new(),
@@ -204,6 +213,8 @@ impl GraphStorage {
         self.history_commit_requests.clear();
         self.cache_commit_requests.clear();
         self.mipmap_batches.clear();
+        #[cfg(feature = "3dgs")]
+        self.gaussian_frame_batches.clear();
         // self.resource_registry.clear();
         #[cfg(feature = "rdg_inspector")]
         self.current_group_stack.clear();
@@ -229,6 +240,28 @@ impl GraphStorage {
         }
         attempt.publish_submitted();
         true
+    }
+
+    #[cfg(feature = "3dgs")]
+    fn stage_gaussian_frame_batch(
+        &mut self,
+        clouds: Vec<GaussianFrameCloud>,
+    ) -> Option<GaussianFrameBatchId> {
+        if clouds.is_empty() {
+            return None;
+        }
+
+        let batch = GaussianFrameBatchId::from_index(self.gaussian_frame_batches.len());
+        self.gaussian_frame_batches
+            .push(Some(GaussianFrameBatch::new(clouds)));
+        Some(batch)
+    }
+
+    #[cfg(feature = "3dgs")]
+    fn release_gaussian_frame_batch(&mut self, batch: GaussianFrameBatchId) {
+        self.gaussian_frame_batches[batch.index()]
+            .take()
+            .expect("Gaussian frame batch already released");
     }
 
     /// Dumps the current Render Graph topology as a Mermaid flowchart.
@@ -526,6 +559,23 @@ impl<'a> RenderGraph<'a> {
     /// node and the containing command buffer was submitted.
     pub(crate) fn commit_submitted_mipmap_batch(&mut self, batch: MipmapBatchId) -> bool {
         self.storage.commit_submitted_mipmap_batch(batch)
+    }
+
+    /// Moves exact-version Gaussian asset owners into destructible graph
+    /// storage. Pass nodes retain only the returned Copy ID.
+    #[cfg(feature = "3dgs")]
+    pub(crate) fn stage_gaussian_frame_batch(
+        &mut self,
+        clouds: Vec<GaussianFrameCloud>,
+    ) -> Option<GaussianFrameBatchId> {
+        self.storage.stage_gaussian_frame_batch(clouds)
+    }
+
+    /// Releases the CPU asset Arc owners as soon as all live preparations have
+    /// consumed them; execute uses only prepared GPU resources and bind groups.
+    #[cfg(feature = "3dgs")]
+    pub(crate) fn release_gaussian_frame_batch(&mut self, batch: GaussianFrameBatchId) {
+        self.storage.release_gaussian_frame_batch(batch);
     }
 
     // ─── Logical Grouping (Inspector) ────────────────────────────────

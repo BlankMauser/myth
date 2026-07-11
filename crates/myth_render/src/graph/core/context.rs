@@ -17,6 +17,8 @@ use myth_scene::RenderCamera;
 use wgpu::{Device, Queue, TextureView};
 
 use super::allocator::{SubViewKey, TransientPool};
+#[cfg(feature = "3dgs")]
+use super::gaussian::GaussianFrameResolver;
 use super::persistent::HistoryRegistry;
 use super::types::{
     BufferNodeId, GraphResourceType, RenderTargetOps, ResourceKind, ResourceNodeId, ResourceRecord,
@@ -95,6 +97,10 @@ pub struct PrepareContext<'a> {
     pub mipmap_generator: &'a mut MipmapGenerator,
     /// Frame-owned physical mipmap attempts addressed by Copy batch IDs.
     pub(crate) mipmap_requests: MipmapRequestResolver<'a>,
+    /// Exact-version Gaussian CPU assets owned by GraphStorage for this
+    /// attempt. Available only to live Gaussian preparation.
+    #[cfg(feature = "3dgs")]
+    pub(crate) gaussian_frames: GaussianFrameResolver<'a>,
     /// Immutable lookup capability for scene-level global binding state.
     /// Snapshots carry only a lightweight key; live feature nodes resolve the
     /// physical layout and WGSL interface through this capability on L1 miss.
@@ -235,6 +241,19 @@ pub struct BindGroupBuilder<'ctx, 'frame> {
     _marker: PhantomData<&'frame wgpu::BindGroup>,
 }
 
+#[inline]
+fn with_buffer_binding_identity(
+    key: BindGroupKey,
+    resource_id: u64,
+    offset: u64,
+    size: Option<wgpu::BufferSize>,
+) -> BindGroupKey {
+    key.with_resource(resource_id)
+        .with_resource(offset)
+        .with_resource(u64::from(size.is_some()))
+        .with_resource(size.map_or(0, wgpu::BufferSize::get))
+}
+
 impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
     fn new(
         views: Option<&'ctx ViewResolver<'frame>>,
@@ -299,8 +318,14 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
             .views
             .expect("BufferNodeId binding requires PrepareContext-backed RDG views");
         let resource_id = views.get_physical_buffer_uid(id);
-        let resource = wgpu::BindingResource::Buffer(views.get_buffer_binding(id));
-        self.push_entry(binding, resource_id, resource)
+        let buffer_binding = views.get_buffer_binding(id);
+        let size = buffer_binding.size;
+        let resource = wgpu::BindingResource::Buffer(buffer_binding);
+        let mut this = self;
+        this.key = with_buffer_binding_identity(this.key, resource_id, 0, size);
+        this.entries
+            .push(wgpu::BindGroupEntry { binding, resource });
+        this
     }
 
     /// Binds a logical RDG buffer range.
@@ -329,11 +354,12 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
             "RDG buffer binding range exceeds logical resource size"
         );
 
-        self.key = self
-            .key
-            .with_resource(views.get_physical_buffer_uid(id))
-            .with_resource(offset)
-            .with_resource(size.get());
+        self.key = with_buffer_binding_identity(
+            self.key,
+            views.get_physical_buffer_uid(id),
+            offset,
+            Some(size),
+        );
         self.entries.push(wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -356,20 +382,21 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
 
     #[must_use]
     pub fn bind_tracked_buffer_with_size(
-        self,
+        mut self,
         binding: u32,
         buffer: &'ctx Tracked<wgpu::Buffer>,
         size: Option<wgpu::BufferSize>,
     ) -> Self {
-        self.push_entry(
+        self.key = with_buffer_binding_identity(self.key, buffer.id(), 0, size);
+        self.entries.push(wgpu::BindGroupEntry {
             binding,
-            buffer.id(),
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer,
                 offset: 0,
                 size,
             }),
-        )
+        });
+        self
     }
 
     #[must_use]
@@ -396,16 +423,17 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
     }
 
     #[must_use]
-    pub fn bind_raw_buffer(self, binding: u32, raw: RawBufferBinding<'ctx>) -> Self {
-        self.push_entry(
+    pub fn bind_raw_buffer(mut self, binding: u32, raw: RawBufferBinding<'ctx>) -> Self {
+        self.key = with_buffer_binding_identity(self.key, raw.resource_id, 0, raw.size);
+        self.entries.push(wgpu::BindGroupEntry {
             binding,
-            raw.resource_id,
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: raw.buffer,
                 offset: 0,
                 size: raw.size,
             }),
-        )
+        });
+        self
     }
 
     #[must_use]
@@ -1509,5 +1537,25 @@ impl ExecuteContext<'_> {
             depth_ops: Some(wgpu::Operations { load, store }),
             stencil_ops: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_buffer_binding_identity;
+    use crate::core::binding::BindGroupKey;
+
+    #[test]
+    fn buffer_binding_key_tracks_logical_range() {
+        let base = BindGroupKey::new(17);
+        let small = with_buffer_binding_identity(base.clone(), 23, 0, wgpu::BufferSize::new(256));
+        let large = with_buffer_binding_identity(base.clone(), 23, 0, wgpu::BufferSize::new(512));
+        let shifted =
+            with_buffer_binding_identity(base.clone(), 23, 256, wgpu::BufferSize::new(256));
+        let whole = with_buffer_binding_identity(base, 23, 0, None);
+
+        assert_ne!(small, large);
+        assert_ne!(small, shifted);
+        assert_ne!(small, whole);
     }
 }

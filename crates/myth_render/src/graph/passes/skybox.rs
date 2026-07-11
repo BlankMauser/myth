@@ -690,6 +690,7 @@ impl SkyboxFeature {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             }),
+            topology: wgpu::PrimitiveTopology::TriangleList,
         };
 
         let pipeline_id = pipeline_cache.get_or_create_fullscreen(

@@ -56,6 +56,8 @@ use crate::graph::ExtractedScene;
 use crate::graph::RenderState;
 use crate::graph::core::ClusteredScreenBindings;
 use crate::graph::core::GraphStorage;
+#[cfg(feature = "3dgs")]
+use crate::graph::core::gaussian::GaussianFrameResolver;
 use crate::graph::core::graph::FrameConfig;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GraphBlackboard, HistoryRegistry,
@@ -522,6 +524,31 @@ impl<'a> FrameComposer<'a> {
         let taa_enabled = self.ctx.camera.aa_mode.is_taa();
         let needs_normal = ssao_enabled || ssgi_enabled || needs_feature_id || dbg_needs_normal;
         let needs_velocity = taa_enabled || ssgi_enabled || ssr_enabled || dbg_needs_velocity;
+
+        #[cfg(feature = "3dgs")]
+        let gaussian_snapshot = if is_high_fidelity {
+            self.ctx
+                .gaussian_splatting_pass
+                .extract(
+                    self.ctx.scene,
+                    self.ctx.assets,
+                    &self.ctx.camera,
+                    &self.ctx.wgpu_ctx.device,
+                )
+                .map(|extract| {
+                    GaussianSplattingFeature::stage_snapshot(
+                        &mut graph_ctx,
+                        extract,
+                        GlobalStateKey::new(
+                            self.ctx.render_state.id,
+                            self.ctx.extracted_scene.scene_id,
+                        ),
+                        self.ctx.resource_manager.frame_index(),
+                    )
+                })
+        } else {
+            None
+        };
 
         let taa_snapshot = if taa_enabled {
             let settings = self
@@ -1209,11 +1236,12 @@ impl<'a> FrameComposer<'a> {
                         }
 
                         #[cfg(feature = "3dgs")]
-                        {
+                        if let Some(snapshot) = gaussian_snapshot {
                             // 7a. Gaussian Splatting
                             c.with_group("3D_Gaussian_Splatting", |c| {
                                 active_color = self.ctx.gaussian_splatting_pass.add_to_graph(
                                     c,
+                                    snapshot,
                                     active_color,
                                     opaque_out.active_depth,
                                 );
@@ -1581,6 +1609,10 @@ impl<'a> FrameComposer<'a> {
                     ),
                     mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
+                    #[cfg(feature = "3dgs")]
+                    gaussian_frames: GaussianFrameResolver::new(
+                        &graph.storage.gaussian_frame_batches,
+                    ),
                     global_states: GlobalStateResolver::new(&self.ctx.resource_manager.bind_groups),
                     sampler_registry: &self.ctx.resource_manager.sampler_registry,
                     system_textures: &self.ctx.resource_manager.system_textures,
@@ -1591,6 +1623,11 @@ impl<'a> FrameComposer<'a> {
                     let pass = graph.storage.passes[pass_idx].get_pass_mut();
                     pass.prepare(&mut prepare_ctx);
                 }
+            }
+
+            #[cfg(feature = "3dgs")]
+            if let Some(snapshot) = gaussian_snapshot {
+                graph.release_gaussian_frame_batch(snapshot.batch_id());
             }
 
             // ─── 3c. Bake render commands ──────────────────────────────────
