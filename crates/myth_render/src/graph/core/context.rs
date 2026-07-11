@@ -1691,20 +1691,18 @@ mod tests {
     fn unavailable_asset_import_is_unallocated_and_has_no_sub_view() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
-        let asset = {
-            let mut graph = RenderGraph::new(&mut storage, &arena);
-            graph.import_asset_texture("Unavailable_Asset", unavailable_asset_snapshot())
-        };
-        let import = storage.resources[asset.index() as usize]
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Unavailable_Asset", unavailable_asset_snapshot());
+        let import = graph.storage.resources[asset.index() as usize]
             .asset_texture_import_id()
             .unwrap();
-        let asset_textures = storage.asset_texture_imports.resolver();
+        let asset_textures = graph.storage.asset_texture_imports.resolver();
         asset_textures.materialize(import, AssetTextureMaterialization::unavailable());
 
         let histories = HistoryRegistry::new();
         let mut pool = TransientPool::new();
         let views = ViewResolver {
-            resources: &storage.resources,
+            resources: &graph.storage.resources,
             pool: &mut pool,
             persistent_resources: &histories,
             asset_textures,
@@ -1712,7 +1710,7 @@ mod tests {
 
         assert!(!views.is_resource_allocated(asset));
         assert!(!is_graph_resource_allocated(
-            &storage.resources,
+            &graph.storage.resources,
             &histories,
             asset_textures,
             asset,

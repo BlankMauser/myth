@@ -148,6 +148,11 @@ pub struct GraphStorage {
     history_commit_requests: Vec<HistoryCommitRequest>,
     /// Ordinary cache publications evaluated after DPE and applied post-submit.
     cache_commit_requests: Vec<CacheCommitRequest>,
+    /// `None` until canonical ordinary-cache rollback eligibility has been
+    /// finalized after DPE; `Some` records whether any participating invalid
+    /// cache member was touched by a live pass. The phase is idempotent for one
+    /// graph attempt.
+    persistent_cache_finalization: Option<bool>,
 
     /// Drop-bearing physical mip-generation attempts staged for this frame.
     /// Pass nodes retain only [`MipmapBatchId`] values into these arrays.
@@ -194,6 +199,7 @@ impl GraphStorage {
             asset_texture_imports: AssetTextureImportStore::new(),
             history_commit_requests: Vec::new(),
             cache_commit_requests: Vec::new(),
+            persistent_cache_finalization: None,
             mipmap_batches: Vec::new(),
             #[cfg(feature = "3dgs")]
             gaussian_frame_batches: Vec::new(),
@@ -216,15 +222,35 @@ impl GraphStorage {
         self.resources.clear();
         self.execution_queue.clear();
         self.persistent_texture_lookup.clear();
-        self.asset_texture_imports.clear();
         self.history_commit_requests.clear();
         self.cache_commit_requests.clear();
-        self.mipmap_batches.clear();
-        #[cfg(feature = "3dgs")]
-        self.gaussian_frame_batches.clear();
+        self.persistent_cache_finalization = None;
+        self.release_frame_owners();
         // self.resource_registry.clear();
         #[cfg(feature = "rdg_inspector")]
         self.current_group_stack.clear();
+    }
+
+    /// Immediately releases Drop-bearing owners captured by one graph attempt.
+    ///
+    /// Topology and execution records intentionally remain available after a
+    /// successful frame for inspection. Keeping owner cleanup separate from
+    /// [`Self::clear`] also lets the engine's frame-attempt guard release
+    /// abandoned WGPU and asset owners during unwinding instead of retaining
+    /// them until the next graph is constructed.
+    pub(crate) fn release_frame_owners(&mut self) {
+        self.asset_texture_imports.clear();
+        self.mipmap_batches.clear();
+        #[cfg(feature = "3dgs")]
+        self.gaussian_frame_batches.clear();
+    }
+
+    /// Invalidates arena-backed runtime nodes while retaining pure topology
+    /// metadata for inspection after the frame finishes.
+    fn invalidate_pass_nodes(&mut self) {
+        for pass in &mut self.passes {
+            pass.node = None;
+        }
     }
 
     fn stage_mipmap_requests(&mut self, requests: Vec<MipmapRequest>) -> Option<MipmapBatchId> {
@@ -516,6 +542,21 @@ pub struct RenderGraph<'a> {
     arena: &'a FrameArena,
 }
 
+impl Drop for RenderGraph<'_> {
+    fn drop(&mut self) {
+        // NodeSlot erases the arena lifetime behind a raw trait-object pointer.
+        // Remove every slot at the graph boundary so resetting FrameArena can
+        // never leave a callable dangling node in retained topology metadata.
+        self.storage.invalidate_pass_nodes();
+        // Successful submission paths have already consumed/published their
+        // owners, making this an inexpensive no-op. On panic or early abort it
+        // is the frame-attempt RAII boundary that prevents GraphStorage from
+        // pinning physical textures, mip requests, or Gaussian asset Arcs
+        // until some later frame happens to construct another graph.
+        self.storage.release_frame_owners();
+    }
+}
+
 impl<'a> RenderGraph<'a> {
     /// Creates a new per-frame render graph view.
     ///
@@ -524,6 +565,22 @@ impl<'a> RenderGraph<'a> {
     pub fn new(storage: &'a mut GraphStorage, arena: &'a FrameArena) -> Self {
         storage.clear();
         Self { storage, arena }
+    }
+
+    /// Explicitly ends this graph attempt and releases its arena-backed nodes
+    /// and Drop-bearing frame owners.
+    ///
+    /// Calling `finish` is equivalent to `drop(graph)`, but makes the lifetime
+    /// boundary clear when code needs to borrow a Feature again after building
+    /// or executing the graph.
+    pub fn finish(self) {}
+
+    #[inline]
+    fn assert_topology_mutable(&self) {
+        assert!(
+            self.storage.persistent_cache_finalization.is_none(),
+            "render graph topology is frozen after persistent cache finalization"
+        );
     }
 
     /// Allocates a copy of `src` on the per-frame arena.
@@ -617,6 +674,7 @@ impl<'a> RenderGraph<'a> {
         is_output_root: bool,
         version: u32,
     ) -> ErasedResourceNodeId {
+        self.assert_topology_mutable();
         let id = ErasedResourceNodeId::new(self.storage.resources.len() as u32, version);
         self.storage.resources.push(ResourceRecord {
             name,
@@ -711,6 +769,7 @@ impl<'a> RenderGraph<'a> {
         name: &'static str,
         snapshot: AssetTextureSnapshot,
     ) -> TextureNodeId {
+        self.assert_topology_mutable();
         let desc = snapshot_texture_desc(snapshot);
         if let Some(id) = self.storage.asset_texture_imports.find(snapshot) {
             let entry = self.storage.asset_texture_imports.entry(id);
@@ -773,6 +832,7 @@ impl<'a> RenderGraph<'a> {
     where
         T: Into<PersistentTextureRef>,
     {
+        self.assert_topology_mutable();
         let texture = texture.into();
         if let Some(&existing) = self.storage.persistent_texture_lookup.get(&texture.id) {
             assert_eq!(
@@ -800,17 +860,83 @@ impl<'a> RenderGraph<'a> {
         id
     }
 
+    /// Finalize ordinary-cache rollback eligibility after DPE and before any
+    /// persistent texture can be materialized for this attempt.
+    ///
+    /// An entirely untouched replacement is the only case where the previous
+    /// submitted publication is still known to match the physical backing. As
+    /// soon as any member is touched by a live reader or writer, prepare may
+    /// recreate or overwrite that backing. Rollback is therefore forfeited
+    /// before entering prepare, even if the attempt later aborts before queue
+    /// submission.
+    pub(crate) fn finalize_persistent_cache_attempts_after_dpe(
+        &mut self,
+        registry: &mut HistoryRegistry,
+    ) -> bool {
+        if let Some(any_cache_member_touched) = self.storage.persistent_cache_finalization {
+            return any_cache_member_touched;
+        }
+
+        let imported_touches: SmallVec<[(PersistentTextureId, bool); 8]> = self
+            .storage
+            .persistent_texture_lookup
+            .iter()
+            .map(|(&id, import)| {
+                (
+                    id,
+                    self.storage.resources[import.node.index() as usize].first_use != usize::MAX,
+                )
+            })
+            .collect();
+
+        let registered_requests: SmallVec<
+            [(CacheCommitToken, SmallVec<[PersistentTextureId; 4]>); 4],
+        > = self
+            .storage
+            .cache_commit_requests
+            .iter()
+            .map(|request| {
+                let required_writes = request
+                    .required_writes
+                    .iter()
+                    .map(|id| {
+                        self.storage.resources[id.index() as usize]
+                            .persistent_texture_id()
+                            .expect("validated cache writer lost persistent backing")
+                    })
+                    .collect();
+                (request.token, required_writes)
+            })
+            .collect();
+        let any_cache_member_touched = registry.finalize_cache_attempts_after_dpe(
+            &imported_touches,
+            registered_requests
+                .iter()
+                .map(|(token, writes)| (*token, writes.as_slice())),
+        );
+        self.storage.persistent_cache_finalization = Some(any_cache_member_touched);
+        any_cache_member_touched
+    }
+
     /// Materialize only logical persistent imports touched by live passes.
     ///
     /// The per-frame import side table retains the complete requested view
     /// specification without inflating every [`ResourceRecord`]. Both the graph
     /// descriptor and registry's current logical specification are validated
-    /// before physical creation.
+    /// before physical creation. Ordinary-cache rollback is finalized first so
+    /// an abort after any allocation can never revive stale metadata around a
+    /// replacement physical texture.
+    ///
+    /// Call this after [`Self::compile`] (or [`Self::compile_topology`]) and
+    /// before prepare/execute/submission. The first call freezes graph topology;
+    /// repeated calls in the same attempt are idempotent.
     pub fn materialize_live_persistent_textures(
-        &self,
+        &mut self,
         registry: &mut HistoryRegistry,
         device: &Device,
     ) {
+        self.finalize_persistent_cache_attempts_after_dpe(registry);
+
         for (&id, import) in &self.storage.persistent_texture_lookup {
             let resource = &self.storage.resources[import.node.index() as usize];
             if resource.first_use == usize::MAX {
@@ -832,6 +958,7 @@ impl<'a> RenderGraph<'a> {
         token: HistoryCommitToken,
         required_writes: &[TextureNodeId],
     ) {
+        self.assert_topology_mutable();
         assert!(
             !required_writes.is_empty(),
             "history commit requires writers"
@@ -862,6 +989,7 @@ impl<'a> RenderGraph<'a> {
         token: CacheCommitToken,
         required_writes: &[TextureNodeId],
     ) {
+        self.assert_topology_mutable();
         assert!(!required_writes.is_empty(), "cache commit requires writers");
         assert!(
             required_writes
@@ -977,6 +1105,7 @@ impl<'a> RenderGraph<'a> {
         N: PassNode<'a> + 'a,
         F: FnOnce(&mut PassBuilder<'_, 'a>) -> (N, Out),
     {
+        self.assert_topology_mutable();
         // Static assertion to enforce that N does not implement Drop and does not contain heap data.
         // This ensures that PassNodes are safe to allocate on the FrameArena without needing to run destructors.
         let () = <N as AssertNoDrop>::VALID;
@@ -1011,6 +1140,7 @@ impl<'a> RenderGraph<'a> {
     }
 
     pub fn compile_topology(&mut self) {
+        self.assert_topology_mutable();
         self.fold_simple_passes();
         self.build_physical_dependencies();
         self.cull_dead_passes();
@@ -1068,17 +1198,22 @@ impl<'a> RenderGraph<'a> {
     /// pointers in graph storage; callers may use those receipts to update
     /// feature-local bookkeeping after submission.
     pub(crate) fn commit_submitted_persistent_resources(
-        &self,
+        &mut self,
         registry: &mut HistoryRegistry,
     ) -> SmallVec<[CachePublicationReceipt; 4]> {
+        if self.storage.persistent_cache_finalization.is_none() {
+            let any_cache_member_touched =
+                self.finalize_persistent_cache_attempts_after_dpe(registry);
+            assert!(
+                !any_cache_member_touched,
+                "live persistent cache members must be finalized before post-submit publication"
+            );
+        }
+
         self.commit_submitted_histories(registry);
 
         let mut receipts = SmallVec::new();
         for request in &self.storage.cache_commit_requests {
-            let all_resources_untouched = request
-                .required_writes
-                .iter()
-                .all(|id| self.storage.resources[id.index() as usize].first_use == usize::MAX);
             let live_writers = request
                 .required_writes
                 .iter()
@@ -1088,19 +1223,10 @@ impl<'a> RenderGraph<'a> {
                         .is_some_and(|producer| self.storage.passes[producer].reference_count > 0)
                 })
                 .count();
-            if live_writers == 0 && all_resources_untouched {
-                // A dead replacement did not materialize or write its logical
-                // textures, so the last submitted publication remains safe to
-                // expose as a fallback.
-                registry.rollback_cache(request.token);
-                continue;
-            }
             if live_writers != request.required_writes.len() {
-                // A partial writer group may already have modified shared
-                // physical members. Even with zero writers, a live reader may
-                // have materialized a changed specification and destroyed the
-                // old backing. Either case permanently forfeits rollback.
-                registry.discard_cache_rollback(request.token);
+                // DPE-time finalization already resolved rollback before any
+                // persistent materialization. Submission only publishes a
+                // complete live writer group; every other shape stays invalid.
                 continue;
             }
 
@@ -1113,15 +1239,10 @@ impl<'a> RenderGraph<'a> {
                         .expect("validated cache writer lost persistent backing")
                 })
                 .collect();
-            let receipt = registry.commit_cache(request.token, &written_textures);
-            if receipt.is_none() {
-                // Keep release builds safe if a stale token or mismatched
-                // writer set reaches this point: live writers forfeited any
-                // right to restore the previous physical contents.
-                registry.discard_cache_rollback(request.token);
-            }
-            debug_assert!(receipt.is_some(), "stale persistent cache commit token");
-            receipts.extend(receipt);
+            let receipt = registry
+                .commit_cache(request.token, &written_textures)
+                .expect("live persistent cache commit token or writer group is invalid");
+            receipts.push(receipt);
         }
         receipts
     }
@@ -1575,7 +1696,9 @@ impl<'a> RenderGraph<'a> {
     /// arena-backed pass nodes.
     pub(crate) fn run_after_submit_hooks(&mut self) {
         for &pass_idx in &self.storage.execution_queue {
-            self.storage.passes[pass_idx].get_pass_mut().after_submit();
+            // SAFETY: The graph still owns the live FrameArena and this loop
+            // visits each DPE-live pass sequentially after submission.
+            unsafe { self.storage.passes[pass_idx].get_pass_mut() }.after_submit();
         }
     }
 }
@@ -1583,9 +1706,11 @@ impl<'a> RenderGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::WgpuContext;
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
     use crate::graph::{composer::GraphBuilderContext, core::context::ExecuteContext};
+    use crate::settings::{RendererInitConfig, RendererSettings};
 
     fn dummy_config() -> FrameConfig {
         FrameConfig {
@@ -1707,6 +1832,32 @@ mod tests {
         assert!(!graph.storage.asset_texture_imports.is_empty());
         assert_eq!(graph.commit_submitted_asset_texture_mipmaps(), 0);
         assert!(graph.storage.asset_texture_imports.is_empty());
+    }
+
+    #[test]
+    fn dropping_graph_releases_unsubmitted_frame_owners_but_keeps_topology() {
+        let mut storage = GraphStorage::new();
+        let mut arena = FrameArena::new();
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let _asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+            graph
+                .storage
+                .mipmap_batches
+                .push(Some(MipmapRequestBatch::new(Vec::new())));
+            graph.add_pass("Inspectable", |_builder| (MockExec, ()));
+
+            assert!(!graph.storage.asset_texture_imports.is_empty());
+            assert_eq!(graph.storage.mipmap_batches.len(), 1);
+        }
+
+        assert!(storage.asset_texture_imports.is_empty());
+        assert!(storage.mipmap_batches.is_empty());
+        assert_eq!(storage.passes.len(), 1);
+        assert_eq!(storage.passes[0].name, "Inspectable");
+        assert!(storage.passes[0].node.is_none());
+        arena.reset();
+        assert!(storage.passes[0].node.is_none());
     }
 
     #[test]
@@ -2526,6 +2677,8 @@ mod tests {
         graph.compile_topology();
 
         assert!(graph.storage.execution_queue.is_empty());
+        // Intentionally exercise the all-untouched post-submit compatibility
+        // path: it may finalize and restore because no cache member was live.
         assert!(
             graph
                 .commit_submitted_persistent_resources(&mut registry)
@@ -2591,6 +2744,7 @@ mod tests {
                 &[replacement_a, replacement_b],
             );
             graph.compile_topology();
+            graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
             assert!(
                 graph
                     .commit_submitted_persistent_resources(&mut registry)
@@ -2615,6 +2769,7 @@ mod tests {
                 &[replacement_a, replacement_b],
             );
             graph.compile_topology();
+            graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
             assert!(graph.storage.execution_queue.is_empty());
             assert!(
                 graph
@@ -2723,6 +2878,307 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "writer set does not match canonical members")]
+    fn cache_finalization_rejects_a_writer_set_that_omits_a_live_member() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let published_key = CacheKey::new(1);
+        let replacement_key = CacheKey::new(2);
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let published = registry.plan_cache(cache, published_key, [spec, spec], 1);
+        assert!(
+            registry
+                .commit_cache(
+                    published.commit.expect("initial cache needs a token"),
+                    &published.textures.map(|texture| texture.id),
+                )
+                .is_some()
+        );
+        let replacement = registry.plan_cache(cache, replacement_key, [spec, spec], 2);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let reported_writer =
+            graph.import_persistent_texture("ReportedWriter", replacement.textures[0]);
+        let omitted_live_member =
+            graph.import_persistent_texture("OmittedLiveMember", replacement.textures[1]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+        graph.add_pass("DeadReportedWriter", |builder| {
+            builder.write_texture(reported_writer);
+            (MockExec, ())
+        });
+        graph.add_pass("ReadOmittedMember", |builder| {
+            builder.read_texture(omitted_live_member);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            replacement.commit.expect("replacement needs a token"),
+            &[reported_writer],
+        );
+        graph.compile_topology();
+
+        assert_eq!(
+            graph.storage.resources[reported_writer.index() as usize].first_use,
+            usize::MAX
+        );
+        assert_ne!(
+            graph.storage.resources[omitted_live_member.index() as usize].first_use,
+            usize::MAX
+        );
+        graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
+    }
+
+    #[test]
+    #[should_panic(expected = "topology is frozen after persistent cache finalization")]
+    fn topology_mutation_after_cache_finalization_is_rejected() {
+        let mut registry = HistoryRegistry::new();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        graph.compile_topology();
+        assert!(!graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
+
+        graph.add_pass("TooLate", |_builder| (MockExec, ()));
+    }
+
+    #[test]
+    #[should_panic(expected = "topology is frozen after persistent cache finalization")]
+    fn cache_commit_registration_after_finalization_is_rejected() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let plan = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.import_persistent_texture("Cache", plan.textures[0]);
+        graph.compile_topology();
+        assert!(!graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
+
+        graph.register_cache_commit(
+            plan.commit.expect("invalid cache needs a token"),
+            &[texture],
+        );
+    }
+
+    #[test]
+    fn aborted_live_descriptor_replacement_cannot_be_revived_by_a_later_dead_attempt() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            2,
+            2,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let published_key = CacheKey::new(1);
+        let replacement_key = CacheKey::new(2);
+        let published_spec = PersistentTextureSpec::default_view(dummy_desc());
+        let published = registry.plan_cache(cache, published_key, [published_spec], 1);
+        registry.materialize_texture(
+            &wgpu.device,
+            "Published",
+            published.textures[0].id,
+            published_spec,
+        );
+        assert!(
+            registry
+                .commit_cache(
+                    published.commit.expect("initial cache needs a token"),
+                    &[published.textures[0].id],
+                )
+                .is_some()
+        );
+
+        let replacement_desc = TextureDesc::new_2d(
+            2,
+            2,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let replacement_spec = PersistentTextureSpec::default_view(replacement_desc);
+        let replacement = registry.plan_cache(cache, replacement_key, [replacement_spec], 2);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let replacement_texture =
+                graph.import_persistent_texture("Replacement", replacement.textures[0]);
+            let output = graph.register_texture("Output", dummy_desc(), true);
+            graph.add_pass("PopulateReplacement", |builder| {
+                builder.write_texture(replacement_texture);
+                (MockExec, ())
+            });
+            graph.add_pass("ConsumeReplacement", |builder| {
+                builder.read_texture(replacement_texture);
+                builder.write_texture(output);
+                (MockExec, ())
+            });
+            graph.register_cache_commit(
+                replacement.commit.expect("replacement needs a token"),
+                &[replacement_texture],
+            );
+            graph.compile_topology();
+            graph.materialize_live_persistent_textures(&mut registry, &wgpu.device);
+
+            assert_ne!(
+                graph.storage.resources[replacement_texture.index() as usize].first_use,
+                usize::MAX
+            );
+            assert_eq!(
+                registry
+                    .get_texture_view(replacement.textures[0].id)
+                    .texture()
+                    .width(),
+                2,
+                "live materialization must replace A's one-pixel physical backing with B"
+            );
+            // Simulate an abort after physical materialization by deliberately
+            // skipping command submission/publication.
+        }
+
+        assert!(!registry.is_cache_valid(cache, published_key));
+        assert_eq!(
+            registry
+                .get_texture_view(replacement.textures[0].id)
+                .texture()
+                .width(),
+            2,
+            "dead follow-up must leave B's physical backing paired with invalid metadata"
+        );
+        assert!(!registry.is_cache_valid(cache, replacement_key));
+
+        let dead_attempt = registry.plan_cache(cache, replacement_key, [replacement_spec], 3);
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let replacement_texture =
+                graph.import_persistent_texture("Replacement", dead_attempt.textures[0]);
+            graph.add_pass("DeadReplacement", |builder| {
+                builder.write_texture(replacement_texture);
+                (MockExec, ())
+            });
+            graph.register_cache_commit(
+                dead_attempt.commit.expect("invalid cache needs a token"),
+                &[replacement_texture],
+            );
+            graph.compile_topology();
+            graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
+            assert!(graph.storage.execution_queue.is_empty());
+        }
+
+        assert!(
+            !registry
+                .plan_cache(cache, replacement_key, [replacement_spec], 4)
+                .valid,
+            "an all-dead follow-up must not restore the overwritten publication"
+        );
+        assert!(!registry.is_cache_valid(cache, published_key));
+    }
+
+    #[test]
+    fn unregistered_live_replacement_forfeits_rollback_and_finalization_is_idempotent() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let published_key = CacheKey::new(1);
+        let replacement_key = CacheKey::new(2);
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let published = registry.plan_cache(cache, published_key, [spec], 1);
+        assert!(
+            registry
+                .commit_cache(
+                    published.commit.expect("initial cache needs a token"),
+                    &[published.textures[0].id],
+                )
+                .is_some()
+        );
+        let replacement = registry.plan_cache(cache, replacement_key, [spec], 2);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let replacement_texture =
+                graph.import_persistent_texture("Replacement", replacement.textures[0]);
+            let output = graph.register_texture("Output", dummy_desc(), true);
+            graph.add_pass("ReadUnregisteredReplacement", |builder| {
+                builder.read_texture(replacement_texture);
+                builder.write_texture(output);
+                (MockExec, ())
+            });
+            graph.compile_topology();
+
+            assert!(graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
+            assert!(
+                graph.finalize_persistent_cache_attempts_after_dpe(&mut registry),
+                "repeated finalization must return the stored phase result"
+            );
+            assert_eq!(graph.storage.persistent_cache_finalization, Some(true));
+        }
+
+        assert!(!registry.is_cache_valid(cache, published_key));
+        assert!(!registry.is_cache_valid(cache, replacement_key));
+
+        let dead_attempt = registry.plan_cache(cache, replacement_key, [spec], 3);
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let replacement_texture =
+                graph.import_persistent_texture("Replacement", dead_attempt.textures[0]);
+            graph.add_pass("DeadUnregisteredReplacement", |builder| {
+                builder.write_texture(replacement_texture);
+                (MockExec, ())
+            });
+            graph.compile_topology();
+            assert!(!graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
+            assert!(graph.storage.execution_queue.is_empty());
+        }
+
+        assert!(
+            !registry.plan_cache(cache, replacement_key, [spec], 4).valid,
+            "a later dead attempt must not restore an unregistered touched replacement"
+        );
+        assert!(!registry.is_cache_valid(cache, published_key));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "live persistent cache members must be finalized before post-submit publication"
+    )]
+    fn post_submit_rejects_a_live_cache_that_skipped_pre_materialization_finalization() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let spec = PersistentTextureSpec::default_view(dummy_desc());
+        let plan = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.import_persistent_texture("Cache", plan.textures[0]);
+        let output = graph.register_texture("Output", dummy_desc(), true);
+        graph.add_pass("Populate", |builder| {
+            builder.write_texture(texture);
+            (MockExec, ())
+        });
+        graph.add_pass("Consume", |builder| {
+            builder.read_texture(texture);
+            builder.write_texture(output);
+            (MockExec, ())
+        });
+        graph.register_cache_commit(
+            plan.commit.expect("invalid cache needs a token"),
+            &[texture],
+        );
+        graph.compile_topology();
+
+        graph.commit_submitted_persistent_resources(&mut registry);
+    }
+
+    #[test]
     fn demanded_cache_writer_publishes_after_submit_with_typed_receipt() {
         let mut registry = HistoryRegistry::new();
         let cache = registry.create_cache();
@@ -2753,6 +3209,7 @@ mod tests {
         graph.register_cache_commit(token, &[cache_a, cache_b]);
         graph.register_cache_commit(token, &[cache_b, cache_a]);
         graph.compile_topology();
+        graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
 
         let receipts = graph.commit_submitted_persistent_resources(&mut registry);
         assert_eq!(
@@ -2806,6 +3263,7 @@ mod tests {
             &[missing_texture],
         );
         graph.compile_topology();
+        graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
 
         assert!(
             graph
@@ -2871,6 +3329,7 @@ mod tests {
             &[refresh_a, refresh_b],
         );
         graph.compile_topology();
+        graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
 
         assert!(
             graph

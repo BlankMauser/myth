@@ -76,6 +76,7 @@ mod tests {
     use glam::Vec3;
 
     use super::*;
+    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph};
     use myth_resources::image::ColorSpace;
 
     fn empty_cloud() -> GaussianCloud {
@@ -115,6 +116,30 @@ mod tests {
         }
 
         batches[0].take();
+        assert_eq!(Arc::strong_count(&retained), 1);
+    }
+
+    #[test]
+    fn render_graph_drop_releases_exact_asset_owner() {
+        let handle = GaussianCloudHandle::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001));
+        let retained = Arc::new(empty_cloud());
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            let batch = graph
+                .stage_gaussian_frame_batch(vec![GaussianFrameCloud {
+                    handle,
+                    version: 7,
+                    asset: retained.clone(),
+                }])
+                .expect("Gaussian frame batch must be staged");
+            assert_eq!(batch.index(), 0);
+            assert_eq!(Arc::strong_count(&retained), 2);
+        }
+
+        assert!(storage.gaussian_frame_batches.is_empty());
         assert_eq!(Arc::strong_count(&retained), 1);
     }
 }

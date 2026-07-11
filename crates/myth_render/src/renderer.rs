@@ -385,6 +385,10 @@ impl Renderer {
         let state = self.context.as_mut()?;
 
         // ── Frame Arena Lifecycle ───────────────────────────────────────
+        // Invalidate every raw NodeSlot before resetting the arena that owns
+        // its pointee. This also makes an abandoned Composer or a later surface
+        // acquisition failure leave an empty, safe graph inspection state.
+        state.graph_storage.clear();
         // Reset the arena in O(1) — all previous PassNodes are trivially
         // forgotten (no Drop needed).
         state.frame_arena.reset();

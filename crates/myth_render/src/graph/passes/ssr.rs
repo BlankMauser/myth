@@ -1589,6 +1589,8 @@ mod tests {
         );
         assert!(followup.valid);
 
+        graph.finish();
+
         // Building and compiling a live graph must not eagerly create GPU state.
         assert!(feature.raw.pipelines.is_empty());
         assert!(feature.temporal.pipeline_id.is_none());

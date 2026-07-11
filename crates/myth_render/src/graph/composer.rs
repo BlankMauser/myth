@@ -1752,7 +1752,10 @@ impl<'a> FrameComposer<'a> {
                 };
 
                 for &pass_idx in &graph.storage.execution_queue {
-                    let pass = graph.storage.passes[pass_idx].get_pass_mut();
+                    // SAFETY: RenderGraph still owns the live FrameArena and
+                    // the execution queue is traversed sequentially, so this
+                    // pass has no competing mutable reference.
+                    let pass = unsafe { graph.storage.passes[pass_idx].get_pass_mut() };
                     pass.prepare(&mut prepare_ctx);
                 }
             }
@@ -1817,8 +1820,9 @@ impl<'a> FrameComposer<'a> {
                     execute_ctx.current_timeline_index = timeline_index;
                     #[cfg(debug_assertions)]
                     encoder.push_debug_group(graph.storage.passes[pass_idx].name);
-                    graph.storage.passes[pass_idx]
-                        .get_pass_mut()
+                    // SAFETY: The graph/arena remain alive for the complete
+                    // execute phase and each queue entry is visited serially.
+                    unsafe { graph.storage.passes[pass_idx].get_pass_mut() }
                         .execute(&execute_ctx, &mut encoder);
                     #[cfg(debug_assertions)]
                     encoder.pop_debug_group();
@@ -1844,10 +1848,9 @@ impl<'a> FrameComposer<'a> {
             graph.run_after_submit_hooks();
         };
 
-        // RenderGraph intentionally has no Drop implementation; consuming it
-        // here ends its storage borrow and all access to the raw external-view
-        // pointer before the tracked view is released.
-        #[allow(clippy::drop_non_drop)]
+        // Dropping the graph invalidates its arena-backed node slots, releases
+        // frame-attempt owners, and ends the raw external-view borrow before
+        // the tracked surface view is released.
         drop(graph);
         drop(surface_view_tracked);
 

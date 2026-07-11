@@ -1692,6 +1692,8 @@ mod tests {
         graph.commit_submitted_histories(&mut histories);
         assert_eq!(followup_validity(&mut histories, snapshot), (true, true));
 
+        graph.finish();
+
         // Building and compiling a live graph must not eagerly create GPU state.
         assert!(feature.raw.pipelines.is_empty());
         assert!(feature.temporal.pipeline_id.is_none());

@@ -285,7 +285,8 @@ struct CacheRecord {
     last_commit_generation: Option<u64>,
     /// Last successfully published state retained while a replacement is
     /// staged into the same logical texture IDs. It can be restored only when
-    /// graph compilation proves that none of the replacement writers ran.
+    /// graph compilation proves that none of the replacement resources were
+    /// touched by a live reader or writer.
     rollback: Option<CacheRollbackState>,
 }
 
@@ -614,13 +615,102 @@ impl HistoryRegistry {
         true
     }
 
-    /// Restore the last published state after DPE removed every writer of the
-    /// latest replacement plan.
+    /// Finalize every invalid ordinary cache represented by this graph after
+    /// DPE and before any logical member can be materialized.
     ///
-    /// This is intentionally token-checked and may only be called when no
-    /// writer ran. Reusing the same logical IDs is then safe: persistent
-    /// materialization also skipped the dead resources, so their physical
-    /// textures still contain the published contents.
+    /// Cache membership comes exclusively from registry-owned
+    /// [`CacheRecord::members`]. `imported_touches` may contain history IDs and
+    /// members from multiple caches; an invalid cache participates when at
+    /// least one of its canonical members was imported. Missing canonical
+    /// members are necessarily untouched.
+    ///
+    /// Registered publication requests are validation inputs only. Every token
+    /// must still identify the current invalid attempt and its writer set must
+    /// exactly equal the canonical member group. Rollback/discard decisions do
+    /// not depend on a request being registered.
+    ///
+    /// Returns whether any canonical member of a participating invalid cache
+    /// was touched by a live reader or writer.
+    pub(crate) fn finalize_cache_attempts_after_dpe<'a>(
+        &mut self,
+        imported_touches: &[(PersistentTextureId, bool)],
+        registered_requests: impl IntoIterator<Item = (CacheCommitToken, &'a [PersistentTextureId])>,
+    ) -> bool {
+        for (token, required_writes) in registered_requests {
+            let record = self
+                .caches
+                .get(&token.cache_id)
+                .expect("persistent cache finalization token targets an unknown cache");
+            assert!(
+                !record.valid
+                    && record.key == token.key
+                    && record.epoch == token.epoch
+                    && record.generation == token.generation
+                    && record.last_planned_serial == Some(token.attempt_serial),
+                "persistent cache finalization token is stale"
+            );
+            assert!(
+                required_writes.len() == record.members.len()
+                    && record
+                        .members
+                        .iter()
+                        .all(|member| required_writes.contains(member)),
+                "persistent cache commit writer set does not match canonical members"
+            );
+        }
+
+        let mut actions = Vec::new();
+        let mut any_cache_member_touched = false;
+        for (&cache_id, record) in &self.caches {
+            if record.valid {
+                continue;
+            }
+
+            let mut any_member_imported = false;
+            let mut any_member_touched = false;
+            for &(id, touched) in imported_touches {
+                if record.members.contains(&id) {
+                    any_member_imported = true;
+                    any_member_touched |= touched;
+                }
+            }
+            if !any_member_imported {
+                continue;
+            }
+
+            let attempt_serial = record
+                .last_planned_serial
+                .expect("imported invalid cache has no planned attempt");
+            actions.push((
+                CacheCommitToken {
+                    cache_id,
+                    key: record.key,
+                    epoch: record.epoch,
+                    generation: record.generation,
+                    attempt_serial,
+                },
+                any_member_touched,
+            ));
+            any_cache_member_touched |= any_member_touched;
+        }
+
+        for (token, any_member_touched) in actions {
+            if any_member_touched {
+                self.discard_cache_rollback(token);
+            } else {
+                self.rollback_cache(token);
+            }
+        }
+        any_cache_member_touched
+    }
+
+    /// Restore the last published state after DPE left every resource in the
+    /// latest replacement plan completely untouched.
+    ///
+    /// This is intentionally token-checked and may only be called when no live
+    /// reader or writer touched a member. Reusing the same logical IDs is then
+    /// safe: persistent materialization also skips the resources, so their
+    /// physical textures still contain the published contents.
     pub(crate) fn rollback_cache(&mut self, token: CacheCommitToken) -> bool {
         let restored = {
             let Some(record) = self.caches.get_mut(&token.cache_id) else {
@@ -737,15 +827,6 @@ impl HistoryRegistry {
         spec: PersistentTextureSpec,
     ) {
         self.assert_texture_spec_is_current(id, spec);
-        // A live import can replace or overwrite this backing before submission.
-        // Forfeit rollback now, including unregistered readers and attempts that
-        // abort during prepare/execute, so a later dead attempt cannot revive
-        // metadata for physical contents that may already have changed.
-        for cache in self.caches.values_mut() {
-            if !cache.valid && cache.members.contains(&id) {
-                cache.rollback = None;
-            }
-        }
         let needs_recreate = self
             .textures
             .get(&id)

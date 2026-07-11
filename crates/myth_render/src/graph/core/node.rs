@@ -174,12 +174,14 @@ impl PassRecord {
     /// # Safety
     ///
     /// The returned reference is derived from a raw pointer stored in
-    /// [`NodeSlot`].  Callers must ensure no aliasing mutable references
-    /// exist.  In practice, the sequential prepare→execute→after-submit pipeline
-    /// guarantees this.
+    /// [`NodeSlot`]. Callers must ensure the owning [`RenderGraph`] and
+    /// [`FrameArena`](super::arena::FrameArena) remain alive, the returned
+    /// reference does not escape that graph attempt, and no aliasing mutable
+    /// references exist. In practice, the sequential
+    /// prepare→execute→after-submit pipeline guarantees these conditions.
     #[inline]
     #[allow(clippy::transmute_ptr_to_ptr)]
-    pub fn get_pass_mut<'a>(&mut self) -> &mut (dyn PassNode<'a> + 'a) {
+    pub(crate) unsafe fn get_pass_mut<'a>(&mut self) -> &mut (dyn PassNode<'a> + 'a) {
         let slot = self.node.as_ref().expect("PassRecord node not set");
         // SAFETY: The pointer was set by `add_pass`
         // and remains valid until `arena.reset()`.
