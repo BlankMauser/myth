@@ -49,7 +49,8 @@
 
 use crate::core::binding::GlobalBindGroupCache;
 use crate::core::gpu::{
-    CubeSourceType, GlobalStateKey, GlobalStateResolver, MipmapRequestResolver, Tracked,
+    AssetTextureSnapshot, CubeSourceType, GlobalStateKey, GlobalStateResolver,
+    MipmapRequestResolver, Tracked, snapshot_asset_texture,
 };
 use crate::core::{ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
@@ -68,7 +69,7 @@ use crate::graph::frame::RenderLists;
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
 use crate::graph::passes::ibl_compute::EnvironmentCacheSnapshot;
-use crate::graph::passes::skybox::ProceduralSkyboxInputs;
+use crate::graph::passes::skybox::{ProceduralSkyboxInputs, TextureSkyboxInput};
 use crate::graph::passes::utils::add_msaa_resolve_pass;
 use crate::graph::passes::{
     AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, ClusteredLightingInputs,
@@ -81,8 +82,10 @@ use crate::pipeline::{PipelineCache, ShaderCompilationOptions, ShaderManager, Sh
 use crate::renderer::FrameTime;
 use crate::settings::RendererSettings;
 use myth_assets::AssetServer;
+use myth_resources::texture::TextureSource;
 use myth_resources::uniforms::LightBufferMetadata;
 use myth_scene::Scene;
+use myth_scene::background::BackgroundMapping;
 use myth_scene::camera::RenderCamera;
 
 fn present_then_reconfigure_if_needed<T>(
@@ -223,6 +226,41 @@ impl GraphBuilderContext<'_, '_> {
     pub const fn scene_local_light_count(&self) -> u32 {
         self.scene_local_light_count
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TextureSkyboxSourcePlan {
+    Asset(AssetTextureSnapshot),
+    Attachment {
+        source: TextureSource,
+        logical_version: u64,
+    },
+}
+
+#[inline]
+fn skybox_mapping_accepts(
+    mapping: BackgroundMapping,
+    view_dimension: wgpu::TextureViewDimension,
+) -> bool {
+    matches!(
+        (mapping, view_dimension),
+        (BackgroundMapping::Cube, wgpu::TextureViewDimension::Cube)
+            | (
+                BackgroundMapping::Equirectangular | BackgroundMapping::Planar,
+                wgpu::TextureViewDimension::D2
+            )
+    )
+}
+
+#[inline]
+fn asset_skybox_format_supported(device: &wgpu::Device, snapshot: AssetTextureSnapshot) -> bool {
+    let features = snapshot
+        .format
+        .guaranteed_format_features(device.features());
+    features
+        .flags
+        .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
+        && features.allowed_usages.contains(snapshot.usage)
 }
 
 #[derive(Clone, Copy)]
@@ -626,6 +664,54 @@ impl<'a> FrameComposer<'a> {
         } else {
             self.frame_config.surface_format
         };
+        let texture_skybox_plan = if needs_skybox
+            && let myth_scene::background::BackgroundMode::Texture {
+                source, mapping, ..
+            } = &self.ctx.scene.background.mode
+        {
+            let logical = self
+                .ctx
+                .resource_manager
+                .snapshot_texture_source(self.ctx.assets, *source);
+            if logical.ready && skybox_mapping_accepts(*mapping, logical.view_dimension) {
+                let source_plan = match *source {
+                    TextureSource::Asset(handle) => snapshot_asset_texture(self.ctx.assets, handle)
+                        .filter(|&snapshot| {
+                            asset_skybox_format_supported(&self.ctx.wgpu_ctx.device, snapshot)
+                        })
+                        .and_then(|snapshot| {
+                            debug_assert_eq!(
+                                snapshot.logical_version, logical.version,
+                                "asset Skybox snapshots must share one logical identity"
+                            );
+                            (snapshot.logical_version == logical.version)
+                                .then_some(TextureSkyboxSourcePlan::Asset(snapshot))
+                        }),
+                    TextureSource::Attachment(_, _) => Some(TextureSkyboxSourcePlan::Attachment {
+                        source: *source,
+                        logical_version: logical.version,
+                    }),
+                };
+                source_plan.map(|source_plan| {
+                    (
+                        self.ctx.skybox_pass.extract_texture(
+                            &self.ctx.scene.background.uniforms,
+                            *mapping,
+                            logical.version,
+                            skybox_global_state_key,
+                            skybox_color_format,
+                            self.frame_config.depth_format,
+                            self.frame_config.msaa_samples,
+                        ),
+                        source_plan,
+                    )
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let gradient_skybox_snapshot = matches!(
             &self.ctx.scene.background.mode,
             myth_scene::background::BackgroundMode::Gradient { .. }
@@ -825,10 +911,18 @@ impl<'a> FrameComposer<'a> {
                 .filter(|snapshot| snapshot.pmrem_plan.is_some())
                 .map(|snapshot| snapshot.pmrem_mip_level_count.saturating_sub(1) as f32);
             let mut procedural_skybox_inputs = None;
+            let mut texture_skybox_input = None;
             let mut atmosphere_transmittance = None;
             let mut atmosphere_bake_params = None;
 
-            let mipmap_snapshot = self.ctx.mipmap_pass.extract(self.ctx.resource_manager);
+            let mut mipmap_snapshot = self.ctx.mipmap_pass.extract(self.ctx.resource_manager);
+            let mut claimed_skybox_mipmap = texture_skybox_plan.and_then(|(_, source)| {
+                let TextureSkyboxSourcePlan::Asset(snapshot) = source else {
+                    return None;
+                };
+                mipmap_snapshot.claim_for_texture(snapshot.texture_handle)
+            });
+            let skybox_claimed_legacy_mipmap = claimed_skybox_mipmap.is_some();
             let mipmap_batch = graph_ctx
                 .graph
                 .stage_mipmap_requests(mipmap_snapshot.into_requests());
@@ -838,6 +932,34 @@ impl<'a> FrameComposer<'a> {
             graph_ctx.with_group("Compute", |c| {
                 if let Some(batch) = mipmap_batch {
                     MipmapFeature::add_to_graph(c, batch);
+                }
+
+                if let Some((_, source)) = texture_skybox_plan {
+                    texture_skybox_input = Some(match source {
+                        TextureSkyboxSourcePlan::Asset(snapshot) => {
+                            let imported = c
+                                .graph
+                                .import_asset_texture("Skybox_Asset_Texture", snapshot);
+                            if let Some(request) = claimed_skybox_mipmap.take() {
+                                c.graph
+                                    .claim_asset_texture_mipmap_request(imported, request);
+                            }
+                            let mip_ready = MipmapFeature::add_asset_texture_to_graph(
+                                c,
+                                imported,
+                                snapshot.mip_count > 1,
+                                skybox_claimed_legacy_mipmap,
+                            );
+                            TextureSkyboxInput::Graph(mip_ready)
+                        }
+                        TextureSkyboxSourcePlan::Attachment {
+                            source,
+                            logical_version,
+                        } => TextureSkyboxInput::Attachment {
+                            source,
+                            logical_version,
+                        },
+                    });
                 }
 
                 // Visual atmosphere generation is independent from Environment
@@ -1126,7 +1248,11 @@ impl<'a> FrameComposer<'a> {
 
                         // 5. Skybox
                         if needs_skybox {
-                            let draw = if let Some(snapshot) = procedural_skybox_snapshot {
+                            let draw = if let Some((snapshot, _)) = texture_skybox_plan {
+                                texture_skybox_input.map(|input| {
+                                    self.ctx.skybox_pass.texture_draw_request(snapshot, input)
+                                })
+                            } else if let Some(snapshot) = procedural_skybox_snapshot {
                                 procedural_skybox_inputs.map(|inputs| {
                                     self.ctx
                                         .skybox_pass
@@ -1135,7 +1261,7 @@ impl<'a> FrameComposer<'a> {
                             } else if let Some(snapshot) = gradient_skybox_snapshot {
                                 Some(self.ctx.skybox_pass.gradient_draw_request(snapshot))
                             } else {
-                                self.ctx.skybox_pass.prepared_draw_request()
+                                None
                             };
                             if let Some(draw) = draw {
                                 active_color =
@@ -1472,7 +1598,11 @@ impl<'a> FrameComposer<'a> {
                         atmosphere_bake_params,
                     };
                     let skybox = if needs_skybox {
-                        if let Some(snapshot) = procedural_skybox_snapshot {
+                        if let Some((snapshot, _)) = texture_skybox_plan {
+                            texture_skybox_input.map(|input| {
+                                self.ctx.skybox_pass.texture_draw_request(snapshot, input)
+                            })
+                        } else if let Some(snapshot) = procedural_skybox_snapshot {
                             procedural_skybox_inputs.map(|inputs| {
                                 self.ctx
                                     .skybox_pass
@@ -1481,7 +1611,7 @@ impl<'a> FrameComposer<'a> {
                         } else if let Some(snapshot) = gradient_skybox_snapshot {
                             Some(self.ctx.skybox_pass.gradient_draw_request(snapshot))
                         } else {
-                            self.ctx.skybox_pass.prepared_draw_request()
+                            None
                         }
                     } else {
                         None
@@ -1595,6 +1725,7 @@ impl<'a> FrameComposer<'a> {
                         resources: &graph.storage.resources,
                         pool: self.ctx.transient_pool,
                         persistent_resources: self.ctx.history_registry,
+                        asset_textures: graph.storage.asset_texture_imports.resolver(),
                     },
                     device: &self.ctx.wgpu_ctx.device,
                     queue: &self.ctx.wgpu_ctx.queue,
@@ -1669,6 +1800,7 @@ impl<'a> FrameComposer<'a> {
                     resources: &graph.storage.resources,
                     pool: self.ctx.transient_pool,
                     persistent_resources: self.ctx.history_registry,
+                    asset_textures: graph.storage.asset_texture_imports.resolver(),
                     device: &self.ctx.wgpu_ctx.device,
                     queue: &self.ctx.wgpu_ctx.queue,
                     pipeline_cache: self.ctx.pipeline_cache,
@@ -1696,6 +1828,7 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
+            graph.commit_submitted_asset_texture_mipmaps();
             if let Some(batch) = mipmap_batch {
                 let committed = graph.commit_submitted_mipmap_batch(batch);
                 debug_assert!(

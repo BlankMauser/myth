@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod arena;
+mod asset_texture;
 pub mod blackboard;
 pub mod builder;
 pub mod context;
@@ -13,6 +14,8 @@ pub mod types;
 
 pub use allocator::{SubViewKey, TransientPool};
 pub use arena::FrameArena;
+pub use asset_texture::AssetTextureImportId;
+pub(crate) use asset_texture::AssetTextureResolver;
 pub use blackboard::{CustomPassHook, GraphBlackboard, HookStage};
 pub use builder::PassBuilder;
 pub use context::{

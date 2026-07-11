@@ -65,7 +65,7 @@ impl TextureRegistry {
                 continue;
             };
 
-            let Some(gpu_image) = resource_manager.get_image(binding.image_handle) else {
+            let Some(gpu_image) = resource_manager.get_texture_image(*handle) else {
                 renderer.use_placeholder_texture(texture.id);
                 texture.key = None;
                 continue;

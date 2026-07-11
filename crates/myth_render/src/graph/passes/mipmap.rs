@@ -7,7 +7,8 @@
 use crate::core::ResourceManager;
 use crate::core::gpu::{MipmapBatchId, MipmapGenerator, MipmapRequest};
 use crate::graph::composer::GraphBuilderContext;
-use crate::graph::core::{ExecuteContext, PassNode, PrepareContext};
+use crate::graph::core::{ExecuteContext, PassNode, PrepareContext, TextureNodeId};
+use myth_assets::TextureHandle;
 
 /// Drop-bearing physical attempts captured at Composer time. The snapshot is
 /// immediately moved into GraphStorage; arena pass nodes retain only a Copy
@@ -17,6 +18,21 @@ pub(crate) struct MipmapSnapshot {
 }
 
 impl MipmapSnapshot {
+    /// Transfer an already queued physical generation to a logical asset
+    /// import. The import keeps the legacy request's side-effect obligation
+    /// until material draw consumers acquire real RDG texture edges.
+    #[must_use]
+    pub(crate) fn claim_for_texture(
+        &mut self,
+        texture_handle: TextureHandle,
+    ) -> Option<MipmapRequest> {
+        let index = self
+            .requests
+            .iter()
+            .position(|request| request.texture_handle == texture_handle)?;
+        Some(self.requests.swap_remove(index))
+    }
+
     #[must_use]
     pub(crate) fn into_requests(self) -> Vec<MipmapRequest> {
         self.requests
@@ -51,18 +67,120 @@ impl MipmapFeature {
 
     pub(crate) fn add_to_graph(ctx: &mut GraphBuilderContext<'_, '_>, batch: MipmapBatchId) {
         ctx.graph.add_pass("Asset_Mipmap_Generation", |builder| {
-            // Asset textures are not logical RDG imports yet, so this producer
-            // remains an explicit side effect until every sampling consumer can
-            // declare a real per-texture dependency.
+            // Legacy material textures are not logical RDG imports yet, so
+            // this compatibility producer remains an explicit side effect
+            // until DrawPlan gives every sampling consumer a real edge.
             builder.mark_side_effect();
             (AssetMipmapNode { batch }, ())
         });
+    }
+
+    /// Build the first-class logical asset texture chain.
+    ///
+    /// `Asset_Texture_Upload` produces the imported base level in live
+    /// prepare. When the source requests mips, the second node mutates that
+    /// logical version into `MipReady`; a sampling consumer that reads the
+    /// returned alias therefore orders upload, generation, and draw without a
+    /// synthetic side-effect edge.
+    ///
+    /// A request claimed from the legacy material queue keeps the mip node as
+    /// a side effect until DrawPlan gives those material consumers real asset
+    /// texture reads. The Skybox-only path remains fully cullable.
+    pub(crate) fn add_asset_texture_to_graph(
+        ctx: &mut GraphBuilderContext<'_, '_>,
+        imported: TextureNodeId,
+        needs_mipmaps: bool,
+        claimed_legacy_request: bool,
+    ) -> TextureNodeId {
+        let base_ready = ctx.graph.add_pass("Asset_Texture_Upload", |builder| {
+            builder.write_texture(imported);
+            (AssetTextureUploadNode { texture: imported }, imported)
+        });
+
+        if !needs_mipmaps && !claimed_legacy_request {
+            return base_ready;
+        }
+
+        let mip_ready = ctx
+            .graph
+            .add_pass("Asset_Texture_Mipmap_Generation", |builder| {
+                let output = builder.mutate_texture(base_ready, "Asset_Texture_MipReady");
+                if claimed_legacy_request {
+                    builder.mark_side_effect();
+                }
+                (
+                    AssetTextureMipmapNode {
+                        texture: base_ready,
+                    },
+                    output,
+                )
+            });
+
+        if needs_mipmaps { mip_ready } else { base_ready }
     }
 
     #[cfg(test)]
     #[must_use]
     pub(crate) fn generator_initialized(&self) -> bool {
         self.generator.is_initialized()
+    }
+}
+
+/// Live producer for one exact CPU-only asset texture snapshot.
+///
+/// The node is deliberately POD. Drop-bearing views and mip requests are
+/// written into the GraphStorage-owned import slot.
+struct AssetTextureUploadNode {
+    texture: TextureNodeId,
+}
+
+impl PassNode<'_> for AssetTextureUploadNode {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
+        let import = ctx
+            .views
+            .asset_texture_import_id(self.texture)
+            .expect("asset upload node requires an Asset TextureBacking");
+        let snapshot = ctx.views.asset_textures.snapshot(import);
+        let materialization = ctx.uploads.materialize_asset_texture(ctx.assets, snapshot);
+        ctx.views
+            .asset_textures
+            .materialize(import, materialization);
+    }
+
+    fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+}
+
+/// Generates every exact physical request owned by one asset import and
+/// publishes those generations only after submission.
+struct AssetTextureMipmapNode {
+    texture: TextureNodeId,
+}
+
+impl PassNode<'_> for AssetTextureMipmapNode {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
+        let import = ctx
+            .views
+            .asset_texture_import_id(self.texture)
+            .expect("asset mipmap node requires an Asset TextureBacking");
+        for request in ctx.views.asset_textures.mipmap_requests(import) {
+            ctx.mipmap_generator
+                .ensure_pipeline(ctx.device, request.format);
+        }
+    }
+
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
+        let import = ctx
+            .asset_texture_import_id(self.texture)
+            .expect("asset mipmap node requires an Asset TextureBacking");
+        let mut generated_any = false;
+        for request in ctx.asset_textures.mipmap_requests(import) {
+            ctx.mipmap_generator
+                .generate(ctx.device, encoder, &request.texture);
+            generated_any = true;
+        }
+        if generated_any {
+            ctx.asset_textures.mark_mipmaps_encoded(import);
+        }
     }
 }
 

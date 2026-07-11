@@ -2,11 +2,16 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::FxHashMap;
 use slotmap::{Key, SlotMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use uuid::Uuid;
 
 use myth_resources::ImageHandle;
 use myth_resources::image::{DynamicImageError, Image};
+
+/// Process-wide exact identity for a loaded asset allocation. Keeping this
+/// global (rather than per `AssetStorage`) also distinguishes two AssetServer
+/// instances whose slot handles and public versions happen to coincide.
+static NEXT_LOADED_ASSET_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 /// Failure modes for zero-allocation dynamic image updates in [`AssetStorage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +46,13 @@ pub struct AssetEntry<T> {
     pub asset: Arc<T>,
     /// Monotonically increasing counter. Starts at 1 on first insert.
     pub version: u32,
+    /// Process-wide monotonic identity of this particular loaded `Arc`.
+    ///
+    /// Unlike `version`, this never intentionally resets to `1` when a
+    /// reserved/failed slot is populated again. Render backends can therefore
+    /// distinguish two replacement assets that occupy the same handle and
+    /// happen to expose the same numeric version.
+    pub identity: u64,
 }
 
 impl<T> std::ops::Deref for AssetEntry<T> {
@@ -154,6 +166,11 @@ impl<H: Key, T> AssetStorage<H, T> {
         }
     }
 
+    #[inline]
+    fn allocate_identity() -> u64 {
+        NEXT_LOADED_ASSET_IDENTITY.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Returns the global mutation epoch.
     #[inline]
     pub fn global_version(&self) -> u32 {
@@ -168,6 +185,7 @@ impl<H: Key, T> AssetStorage<H, T> {
         let slot = AssetSlot::Loaded(AssetEntry {
             asset: Arc::new(asset.into()),
             version: 1,
+            identity: Self::allocate_identity(),
         });
         self.global_version.fetch_add(1, Ordering::Relaxed);
         guard.map.insert(slot)
@@ -189,6 +207,7 @@ impl<H: Key, T> AssetStorage<H, T> {
                 *slot = AssetSlot::Loaded(AssetEntry {
                     asset: Arc::new(asset.into()),
                     version: 1,
+                    identity: Self::allocate_identity(),
                 });
                 self.global_version.fetch_add(1, Ordering::Relaxed);
             }
@@ -198,6 +217,7 @@ impl<H: Key, T> AssetStorage<H, T> {
         let slot = AssetSlot::Loaded(AssetEntry {
             asset: Arc::new(asset.into()),
             version: 1,
+            identity: Self::allocate_identity(),
         });
         let handle = guard.map.insert(slot);
         guard.lookup.insert(uuid, handle);
@@ -243,6 +263,7 @@ impl<H: Key, T> AssetStorage<H, T> {
             *slot = AssetSlot::Loaded(AssetEntry {
                 asset: Arc::new(asset.into()),
                 version: 1,
+                identity: Self::allocate_identity(),
             });
             self.global_version.fetch_add(1, Ordering::Relaxed);
         }
@@ -267,6 +288,7 @@ impl<H: Key, T> AssetStorage<H, T> {
         if let Some(AssetSlot::Loaded(entry)) = guard.map.get_mut(handle) {
             entry.asset = Arc::new(asset.into());
             entry.version += 1;
+            entry.identity = Self::allocate_identity();
             self.global_version.fetch_add(1, Ordering::Relaxed);
             Some(entry.version)
         } else {
@@ -301,11 +323,37 @@ impl<H: Key, T> AssetStorage<H, T> {
         }
     }
 
+    /// Gets the loaded resource, its public content version, and the exact
+    /// identity of the currently stored `Arc`.
+    ///
+    /// The identity closes the ABA gap for systems that may observe an asset
+    /// being repopulated under the same handle with a version reset to `1`.
+    pub fn get_entry_with_identity(&self, handle: H) -> Option<(Arc<T>, u32, u64)> {
+        let guard = self.inner.read();
+        match guard.map.get(handle) {
+            Some(AssetSlot::Loaded(entry)) => {
+                Some((entry.asset.clone(), entry.version, entry.identity))
+            }
+            _ => None,
+        }
+    }
+
     /// Gets just the version of a loaded resource.
     pub fn get_version(&self, handle: H) -> Option<u32> {
         let guard = self.inner.read();
         match guard.map.get(handle) {
             Some(AssetSlot::Loaded(entry)) => Some(entry.version),
+            _ => None,
+        }
+    }
+
+    /// Gets the public content version and exact loaded identity without
+    /// cloning the asset `Arc`.
+    #[inline]
+    pub fn get_version_and_identity(&self, handle: H) -> Option<(u32, u64)> {
+        let guard = self.inner.read();
+        match guard.map.get(handle) {
+            Some(AssetSlot::Loaded(entry)) => Some((entry.version, entry.identity)),
             _ => None,
         }
     }
@@ -437,7 +485,90 @@ impl AssetStorage<ImageHandle, Image> {
             .map_err(DynamicImageUpdateError::Update)?;
 
         entry.version = entry.version.wrapping_add(1);
+        if entry.version == 0 {
+            // Dynamic updates intentionally keep the same Arc allocation. On
+            // the extremely rare public-version wrap, advance exact identity
+            // so `(version, identity)` still cannot ABA against old GPU state.
+            entry.identity = Self::allocate_identity();
+        }
         self.global_version.fetch_add(1, Ordering::Relaxed);
         Ok(entry.version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use myth_resources::image::{ImageDimension, PixelFormat};
+
+    use super::*;
+
+    fn dynamic_image(value: u8) -> Image {
+        Image::new_dynamic(
+            2,
+            2,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            vec![value; 16],
+        )
+    }
+
+    #[test]
+    fn loaded_identity_distinguishes_replacements_from_in_place_updates() {
+        let storage = AssetStorage::<ImageHandle, Image>::new();
+        let handle = storage.add(dynamic_image(1));
+        let (_, first_version, first_identity) = storage
+            .get_entry_with_identity(handle)
+            .expect("initial image missing");
+        assert_eq!(first_version, 1);
+
+        assert_eq!(storage.update(handle, dynamic_image(2)), Some(2));
+        let (_, updated_version, updated_identity) = storage
+            .get_entry_with_identity(handle)
+            .expect("updated image missing");
+        assert_eq!(updated_version, 2);
+        assert_ne!(updated_identity, first_identity);
+
+        storage.insert_ready(handle, dynamic_image(3));
+        let (_, reloaded_version, reloaded_identity) = storage
+            .get_entry_with_identity(handle)
+            .expect("reloaded image missing");
+        assert_eq!(reloaded_version, 1);
+        assert_ne!(reloaded_identity, updated_identity);
+
+        storage
+            .update_dynamic_data(handle, &[4; 16])
+            .expect("dynamic update failed");
+        let (_, dynamic_version, dynamic_identity) = storage
+            .get_entry_with_identity(handle)
+            .expect("dynamic image missing");
+        assert_eq!(dynamic_version, 2);
+        assert_eq!(dynamic_identity, reloaded_identity);
+
+        {
+            let mut guard = storage.inner.write();
+            guard
+                .map
+                .get_mut(handle)
+                .and_then(AssetSlot::as_loaded_mut)
+                .expect("dynamic image slot missing")
+                .version = u32::MAX;
+        }
+        storage
+            .update_dynamic_data(handle, &[5; 16])
+            .expect("wrapping dynamic update failed");
+        let (_, wrapped_version, wrapped_identity) = storage
+            .get_entry_with_identity(handle)
+            .expect("wrapped dynamic image missing");
+        assert_eq!(wrapped_version, 0);
+        assert_ne!(wrapped_identity, dynamic_identity);
+
+        let other_storage = AssetStorage::<ImageHandle, Image>::new();
+        let other_handle = other_storage.add(dynamic_image(5));
+        let (_, other_version, other_identity) = other_storage
+            .get_entry_with_identity(other_handle)
+            .expect("other storage image missing");
+        assert_eq!(other_version, 1);
+        assert_ne!(other_identity, dynamic_identity);
     }
 }

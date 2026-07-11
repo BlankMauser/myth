@@ -52,7 +52,10 @@ pub(crate) use crate::core::gpu::environment::{
 };
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
 pub(crate) use crate::core::gpu::material::GpuMaterial;
-pub(crate) use crate::core::gpu::texture::{GpuImage, ResourceState, TextureBinding};
+pub(crate) use crate::core::gpu::texture::{
+    AssetTextureMaterialization, AssetTextureSnapshot, GpuImage, GpuImageSpec, TextureBinding,
+    materialize_asset_texture_snapshot, snapshot_asset_texture,
+};
 pub use bind_group_store::{BindGroupContext, GlobalStateKey, GlobalStateResolver, GpuGlobalState};
 pub(crate) use bind_group_store::{BindGroupStore, ObjectBindGroupKey};
 pub(crate) use environment_store::EnvironmentStore;
@@ -60,7 +63,8 @@ pub(crate) use internal_texture_registry::InternalTextureRegistry;
 
 pub use crate::core::gpu::mipmap::MipmapGenerator;
 pub(crate) use crate::core::gpu::mipmap::{
-    MipmapBatchId, MipmapRequest, MipmapRequestBatch, MipmapRequestResolver,
+    AssetTextureGenerationKey, MipmapBatchId, MipmapRequest, MipmapRequestBatch,
+    MipmapRequestResolver,
 };
 pub use allocator::ModelBufferAllocator;
 use myth_resources::buffer::{CpuBuffer, GpuData};

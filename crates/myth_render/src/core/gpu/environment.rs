@@ -116,20 +116,24 @@ pub(super) fn snapshot_ready_asset_texture_source(
     source: TextureSource,
     texture: &Texture,
     texture_version: u32,
+    texture_identity: u64,
     image: &Image,
     image_version: u32,
+    image_identity: u64,
 ) -> LogicalTextureSourceSnapshot {
     let mut hasher = rustc_hash::FxHasher::default();
     source.hash(&mut hasher);
     1u8.hash(&mut hasher);
     texture.uuid.hash(&mut hasher);
     texture_version.hash(&mut hasher);
+    texture_identity.hash(&mut hasher);
     texture.image.hash(&mut hasher);
     texture.view_dimension.hash(&mut hasher);
     texture.color_space.hash(&mut hasher);
     1u8.hash(&mut hasher);
     image.uuid.hash(&mut hasher);
     image_version.hash(&mut hasher);
+    image_identity.hash(&mut hasher);
     image.width.hash(&mut hasher);
     image.height.hash(&mut hasher);
     image.depth.hash(&mut hasher);
@@ -256,7 +260,9 @@ impl ResourceManager {
 
         match source {
             TextureSource::Asset(handle) => {
-                let Some((texture, texture_version)) = assets.textures.get_entry(handle) else {
+                let Some((texture, texture_version, texture_identity)) =
+                    assets.textures.get_entry_with_identity(handle)
+                else {
                     0u8.hash(&mut hasher);
                     return LogicalTextureSourceSnapshot {
                         version: hasher.finish(),
@@ -265,10 +271,13 @@ impl ResourceManager {
                     };
                 };
 
-                let Some((image, image_version)) = assets.images.get_entry(texture.image) else {
+                let Some((image, image_version, image_identity)) =
+                    assets.images.get_entry_with_identity(texture.image)
+                else {
                     1u8.hash(&mut hasher);
                     texture.uuid.hash(&mut hasher);
                     texture_version.hash(&mut hasher);
+                    texture_identity.hash(&mut hasher);
                     texture.image.hash(&mut hasher);
                     texture.view_dimension.hash(&mut hasher);
                     texture.color_space.hash(&mut hasher);
@@ -284,8 +293,10 @@ impl ResourceManager {
                     source,
                     &texture,
                     texture_version,
+                    texture_identity,
                     &image,
                     image_version,
+                    image_identity,
                 )
             }
             TextureSource::Attachment(id, _) => {

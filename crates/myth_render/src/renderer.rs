@@ -465,14 +465,9 @@ impl Renderer {
         // their persistent resources here. Migrated features capture snapshots
         // in FrameComposer and materialize resources only in live PassNodes.
         {
-            use crate::HDR_TEXTURE_FORMAT;
             use crate::graph::core::context::ExtractContext;
 
-            let view_format = state.wgpu_ctx.surface_view_format;
             let is_hf = state.wgpu_ctx.render_path.supports_post_processing();
-            let scene_id_val = scene.id();
-            let render_state_id = state.render_frame.render_state.id;
-            let global_state_key = (render_state_id, scene_id_val);
 
             let ssao_enabled = scene.ssao.enabled && is_hf;
             let ssgi_enabled = state
@@ -527,41 +522,21 @@ impl Renderer {
                 .atmosphere_pass
                 .maintain(&mut state.history_registry, environment_cache_frame);
 
-            let mut extract_ctx = ExtractContext {
-                device: &state.wgpu_ctx.device,
-                queue: &state.wgpu_ctx.queue,
-                pipeline_cache: &mut state.pipeline_cache,
-                shader_manager: &mut state.shader_manager,
-                global_bind_group_cache: &mut state.global_bind_group_cache,
-                resource_manager: &mut state.resource_manager,
-                wgpu_ctx: &state.wgpu_ctx,
-                render_lists: &mut state.render_lists,
-                extracted_scene: &state.render_frame.extracted_scene,
-                render_state: &state.render_frame.render_state,
-                render_camera: &camera,
-                assets,
-            };
-            // Texture backgrounds still use the compatibility preparation path
-            // for same-frame asset mip generation. Gradient and Procedural
-            // Skybox preparation are deferred to their live RDG consumer.
-            if matches!(&scene.background.mode, BackgroundMode::Texture { .. }) {
-                let color_format = if is_hf {
-                    HDR_TEXTURE_FORMAT
-                } else {
-                    view_format
-                };
-                state.skybox_pass.extract_and_prepare(
-                    &mut extract_ctx,
-                    &scene.background.mode,
-                    &scene.background.uniforms,
-                    global_state_key,
-                    color_format,
-                );
-            } else {
-                state.skybox_pass.deactivate();
-            }
-
             if is_hf {
+                let mut extract_ctx = ExtractContext {
+                    device: &state.wgpu_ctx.device,
+                    queue: &state.wgpu_ctx.queue,
+                    pipeline_cache: &mut state.pipeline_cache,
+                    shader_manager: &mut state.shader_manager,
+                    global_bind_group_cache: &mut state.global_bind_group_cache,
+                    resource_manager: &mut state.resource_manager,
+                    wgpu_ctx: &state.wgpu_ctx,
+                    render_lists: &mut state.render_lists,
+                    extracted_scene: &state.render_frame.extracted_scene,
+                    render_state: &state.render_frame.render_state,
+                    render_camera: &camera,
+                    assets,
+                };
                 state.prepass.extract_and_prepare(
                     &mut extract_ctx,
                     needs_normal,
@@ -1780,8 +1755,7 @@ mod tests {
             .expect("global state missing after disabling environment");
         let black_cube_id = state.resource_manager.system_textures.black_cube.id();
         assert_eq!(black_cube_id, global_state.resource_ids.as_slice()[3]);
-        assert!(state.skybox_pass.current_bind_group.is_none());
-        assert!(state.skybox_pass.current_pipeline.is_none());
+        assert!(!graph_contains_pass(state, "Skybox_Pass"));
         assert_eq!(Some(pmrem_id), published_pmrem_view_id(state, scene_id));
         assert!(state.environment_cache.has_scene_state(scene_id));
         assert!(
@@ -2415,7 +2389,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_composer_keeps_mipmap_pending_until_submitted() {
+    fn abandoned_composer_does_not_materialize_texture_or_publish_mipmaps() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let image = Image::new(
@@ -2452,11 +2426,10 @@ mod tests {
         drop(composer);
 
         let state = renderer.context.as_ref().expect("renderer state missing");
-        let gpu_image = state
-            .resource_manager
-            .get_image(image_handle)
-            .expect("begin-frame texture preparation must create the GPU image");
-        assert!(!gpu_image.mipmaps_submitted());
+        assert!(
+            state.resource_manager.get_image(image_handle).is_none(),
+            "dropping Composer before graph build must not materialize the texture"
+        );
         assert!(!state.mipmap_pass.generator_initialized());
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
@@ -2469,21 +2442,30 @@ mod tests {
         assert_eq!(gpu_image.mip_level_count, 4);
         assert!(gpu_image.mipmaps_submitted());
         assert!(state.mipmap_pass.generator_initialized());
-        assert!(graph_contains_pass(state, "Asset_Mipmap_Generation"));
+        assert!(graph_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(graph_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
         let execution_names: Vec<_> = state
             .graph_storage
             .execution_queue
             .iter()
             .map(|&index| state.graph_storage.passes[index].name)
             .collect();
+        let upload_position = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Upload")
+            .expect("asset upload pass missing from execution queue");
         let mipmap_position = execution_names
             .iter()
-            .position(|&name| name == "Asset_Mipmap_Generation")
+            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
             .expect("mipmap pass missing from execution queue");
         let skybox_position = execution_names
             .iter()
             .position(|&name| name == "Skybox_Pass")
             .expect("texture skybox pass missing from execution queue");
+        assert!(upload_position < mipmap_position);
         assert!(mipmap_position < skybox_position);
         assert!(
             state
@@ -2492,6 +2474,120 @@ mod tests {
                 .iter()
                 .all(Option::is_none),
             "submitted mipmap batches must release their Texture/Arc owners immediately"
+        );
+        assert!(
+            state.graph_storage.asset_texture_imports.is_empty(),
+            "submitted asset imports must release their view/request owners immediately"
+        );
+    }
+
+    #[test]
+    fn basic_forward_texture_skybox_consumes_the_live_mip_ready_import() {
+        let mut renderer = Renderer::new(
+            RendererInitConfig::default(),
+            RendererSettings {
+                path: RenderPath::BasicForward,
+                ..RendererSettings::default()
+            },
+        );
+        pollster::block_on(renderer.init_headless(128, 128, None))
+            .expect("headless renderer init failed");
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![96; 8 * 8 * 4]),
+        ));
+        let mut texture = Texture::new_2d(Some("BasicForward Skybox"), image_handle);
+        texture.color_space = ColorSpace::Linear;
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+        let mut scene = Scene::new();
+        scene
+            .background
+            .set_mode(BackgroundMode::planar(texture_handle, 1.0));
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let image = state
+            .resource_manager
+            .get_texture_image(texture_handle)
+            .expect("live BasicForward skybox must materialize its texture");
+        assert_eq!(image.mip_level_count, 4);
+        assert!(image.mipmaps_submitted());
+        assert!(!graph_contains_pass(state, "Skybox_Pass"));
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let upload = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Upload")
+            .expect("asset upload pass missing");
+        let mipmap = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
+            .expect("asset mipmap pass missing");
+        let forward = execution_names
+            .iter()
+            .position(|&name| name == "SimpleForward_Pass")
+            .expect("BasicForward pass missing");
+        assert!(upload < mipmap && mipmap < forward);
+        assert!(state.graph_storage.asset_texture_imports.is_empty());
+    }
+
+    #[test]
+    fn texture_skybox_claims_the_same_generation_queued_by_a_material() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![160; 8 * 8 * 4]),
+        ));
+        let mut texture = Texture::new_2d(Some("Shared Material/Skybox"), image_handle);
+        texture.color_space = ColorSpace::Linear;
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+        let material = PhysicalMaterial::new(Vec4::ONE);
+        material.set_map(Some(texture_handle));
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
+        scene
+            .background
+            .set_mode(BackgroundMode::planar(texture_handle, 1.0));
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(
+            !graph_contains_pass(state, "Asset_Mipmap_Generation"),
+            "the logical import must claim the legacy request instead of encoding it twice"
+        );
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Texture_Mipmap_Generation")
+                .count(),
+            1
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_texture_image(texture_handle)
+                .expect("shared texture must remain resident")
+                .mipmaps_submitted()
         );
     }
 

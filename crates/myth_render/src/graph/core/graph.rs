@@ -3,12 +3,15 @@ use std::collections::BinaryHeap;
 
 use rustc_hash::FxHashMap;
 
-use crate::core::gpu::{MipmapBatchId, MipmapRequest, MipmapRequestBatch, Tracked};
+use crate::core::gpu::{
+    AssetTextureSnapshot, MipmapBatchId, MipmapRequest, MipmapRequestBatch, Tracked,
+};
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
 
+use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
 use super::node::{NodeSlot, PassNode, PassRecord};
 use super::persistent::{
@@ -139,6 +142,8 @@ pub struct GraphStorage {
 
     /// Per-frame logical import deduplication for persistent textures.
     persistent_texture_lookup: FxHashMap<PersistentTextureId, PersistentTextureImport>,
+    /// Logical asset roots and destructible live-prepare materialization slots.
+    pub(crate) asset_texture_imports: AssetTextureImportStore,
     /// Grouped history publications evaluated after DPE and applied post-submit.
     history_commit_requests: Vec<HistoryCommitRequest>,
     /// Ordinary cache publications evaluated after DPE and applied post-submit.
@@ -186,6 +191,7 @@ impl GraphStorage {
             resources: Vec::new(),
             execution_queue: Vec::new(),
             persistent_texture_lookup: FxHashMap::default(),
+            asset_texture_imports: AssetTextureImportStore::new(),
             history_commit_requests: Vec::new(),
             cache_commit_requests: Vec::new(),
             mipmap_batches: Vec::new(),
@@ -210,6 +216,7 @@ impl GraphStorage {
         self.resources.clear();
         self.execution_queue.clear();
         self.persistent_texture_lookup.clear();
+        self.asset_texture_imports.clear();
         self.history_commit_requests.clear();
         self.cache_commit_requests.clear();
         self.mipmap_batches.clear();
@@ -692,6 +699,71 @@ impl<'a> RenderGraph<'a> {
         ))
     }
 
+    /// Import one exact CPU-only asset snapshot as an external, non-root
+    /// texture. A producer registered before its consumers must declare
+    /// `builder.write_texture(node)` and fill the import's frame slot from its
+    /// live prepare step.
+    ///
+    /// Repeated imports of the same logical snapshot return the same graph
+    /// root. No asset lookup, upload, or WGPU allocation happens here.
+    pub(crate) fn import_asset_texture(
+        &mut self,
+        name: &'static str,
+        snapshot: AssetTextureSnapshot,
+    ) -> TextureNodeId {
+        let desc = snapshot_texture_desc(snapshot);
+        if let Some(id) = self.storage.asset_texture_imports.find(snapshot) {
+            let entry = self.storage.asset_texture_imports.entry(id);
+            assert_eq!(
+                entry.snapshot, snapshot,
+                "asset texture import key collided with a different snapshot"
+            );
+            assert_eq!(
+                self.storage.resources[entry.node.index() as usize].texture_desc(),
+                desc,
+                "asset texture imported with conflicting graph descriptors"
+            );
+            return entry.node;
+        }
+
+        let import_id = self.storage.asset_texture_imports.next_id();
+        let node = ResourceNodeId::from_erased(self.register_resource_with_root(
+            name,
+            ResourceKind::asset_texture(desc, import_id),
+            true,
+            false,
+            0,
+        ));
+        self.storage
+            .asset_texture_imports
+            .insert(import_id, node, snapshot);
+        node
+    }
+
+    /// Attach a request drained from the legacy eager queue to this logical
+    /// import. The request remains independently owned even if live snapshot
+    /// materialization later fails because the CPU asset version drifted.
+    pub(crate) fn claim_asset_texture_mipmap_request(
+        &mut self,
+        node: TextureNodeId,
+        request: MipmapRequest,
+    ) {
+        let import_id = self.storage.resources[node.index() as usize]
+            .asset_texture_import_id()
+            .expect("mip request claim target is not an asset texture import");
+        self.storage
+            .asset_texture_imports
+            .claim_mipmap_request(import_id, request);
+    }
+
+    /// Publish exact mip generations encoded by live logical asset producers.
+    /// Call only after submitting the containing command buffer.
+    pub(crate) fn commit_submitted_asset_texture_mipmaps(&mut self) -> usize {
+        self.storage
+            .asset_texture_imports
+            .commit_submitted_mipmaps()
+    }
+
     /// Import a logical persistent texture without requiring a physical view.
     ///
     /// Repeated imports of the same ID in one frame return the same graph root.
@@ -942,6 +1014,7 @@ impl<'a> RenderGraph<'a> {
         self.fold_simple_passes();
         self.build_physical_dependencies();
         self.cull_dead_passes();
+        self.validate_live_asset_texture_dependencies();
         self.topological_sort();
 
         self.compute_resource_lifetimes();
@@ -1108,14 +1181,21 @@ impl<'a> RenderGraph<'a> {
             let src_root_idx = self.resolve_alias_root(src_idx);
             let dst_root_idx = self.resolve_alias_root(dst_idx);
 
-            // Persistent resources have logical bank identity and submit-time
-            // publication semantics. Contracting either endpoint would reroute
-            // the physical write without updating the history commit record.
+            // Persistent and asset resources have logical identity and
+            // materialization/publication semantics. Contracting either
+            // endpoint would reroute the physical write without updating its
+            // import side table.
             if self.storage.resources[src_root_idx]
                 .persistent_texture_id()
                 .is_some()
                 || self.storage.resources[dst_root_idx]
                     .persistent_texture_id()
+                    .is_some()
+                || self.storage.resources[src_root_idx]
+                    .asset_texture_import_id()
+                    .is_some()
+                || self.storage.resources[dst_root_idx]
+                    .asset_texture_import_id()
                     .is_some()
             {
                 continue;
@@ -1210,6 +1290,41 @@ impl<'a> RenderGraph<'a> {
                         .physical_dependencies
                         .push(producer_idx);
                 }
+            }
+        }
+    }
+
+    /// A logical asset has no physical view until its live producer prepares
+    /// it. Catch missing or late producers during topology compilation instead
+    /// of allowing a resolver panic deep in prepare/execute.
+    fn validate_live_asset_texture_dependencies(&self) {
+        for (pass_idx, pass) in self.storage.passes.iter().enumerate() {
+            if pass.reference_count == 0 {
+                continue;
+            }
+            for read in &pass.reads {
+                let read_idx = read.index() as usize;
+                let root_idx = self.resolve_alias_root(read_idx);
+                if self.storage.resources[root_idx]
+                    .asset_texture_import_id()
+                    .is_none()
+                {
+                    continue;
+                }
+                let producer = self.storage.resources[read_idx]
+                    .producer
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "live pass '{}' reads asset texture '{}' without a producer",
+                            pass.name, self.storage.resources[read_idx].name
+                        )
+                    });
+                assert!(
+                    producer < pass_idx && self.storage.passes[producer].reference_count > 0,
+                    "asset texture producer '{}' must be registered before live consumer '{}'",
+                    self.storage.passes[producer].name,
+                    pass.name
+                );
             }
         }
     }
@@ -1492,11 +1607,189 @@ mod tests {
         )
     }
 
+    fn dummy_asset_snapshot() -> AssetTextureSnapshot {
+        AssetTextureSnapshot {
+            texture_handle: myth_assets::TextureHandle::system_reserved(7),
+            image_handle: myth_assets::ImageHandle::default(),
+            texture_version: 3,
+            texture_identity: 33,
+            image_version: 5,
+            image_identity: 55,
+            logical_version: 0xA55E_7001,
+            extent: wgpu::Extent3d {
+                width: 8,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            dimension: wgpu::TextureDimension::D2,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            mip_count: 4,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            generate_mipmaps: true,
+        }
+    }
+
     // ─── Shared Mock Pass Type ───────────────────────────────────────
 
     struct MockExec;
-    impl<'a> PassNode<'a> for MockExec {
+    impl PassNode<'_> for MockExec {
         fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    #[test]
+    fn asset_texture_import_is_deduplicated_and_not_an_output_root() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let snapshot = dummy_asset_snapshot();
+
+        let first = graph.import_asset_texture("Asset", snapshot);
+        let repeated = graph.import_asset_texture("AssetAgain", snapshot);
+
+        assert_eq!(first, repeated);
+        assert_eq!(
+            graph.storage.asset_texture_imports.resolver().node(
+                graph.storage.resources[first.index() as usize]
+                    .asset_texture_import_id()
+                    .unwrap()
+            ),
+            first
+        );
+        let resource = &graph.storage.resources[first.index() as usize];
+        assert!(resource.is_external);
+        assert!(!resource.is_output_root);
+        assert_eq!(resource.texture_desc(), snapshot_texture_desc(snapshot));
+    }
+
+    #[test]
+    fn dead_asset_upload_is_eliminated_without_a_consumer() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        graph.add_pass("Asset_Upload", |builder| {
+            builder.write_texture(asset);
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        assert!(graph.storage.execution_queue.is_empty());
+        assert_eq!(graph.storage.passes[0].reference_count, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reads asset texture 'Asset' without a producer")]
+    fn live_asset_import_requires_an_upload_producer() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(asset);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+    }
+
+    #[test]
+    fn submitted_asset_import_commit_releases_frame_slots() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let _asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+
+        assert!(!graph.storage.asset_texture_imports.is_empty());
+        assert_eq!(graph.commit_submitted_asset_texture_mipmaps(), 0);
+        assert!(graph.storage.asset_texture_imports.is_empty());
+    }
+
+    #[test]
+    fn live_asset_consumer_retains_its_upload_producer() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        graph.add_pass("Asset_Upload", |builder| {
+            builder.write_texture(asset);
+            (MockExec, ())
+        });
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(asset);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(live, ["Asset_Upload", "Asset_Consumer"]);
+    }
+
+    #[test]
+    fn asset_texture_import_supports_base_to_mip_ready_aliasing() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let mip_ready = graph.add_pass("Asset_Mipmap", |builder| {
+            let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
+            (MockExec, output)
+        });
+
+        let root_import = graph.storage.resources[asset.index() as usize]
+            .asset_texture_import_id()
+            .unwrap();
+        assert_eq!(
+            graph.resolve_alias_root(mip_ready.index() as usize),
+            asset.index() as usize
+        );
+        assert_eq!(
+            graph.storage.resources[graph.resolve_alias_root(mip_ready.index() as usize)]
+                .asset_texture_import_id(),
+            Some(root_import)
+        );
+    }
+
+    #[test]
+    fn mip_ready_consumer_retains_asset_upload_and_mipmap_nodes() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        graph.add_pass("Asset_Upload", |builder| {
+            builder.write_texture(asset);
+            (MockExec, ())
+        });
+        let mip_ready = graph.add_pass("Asset_Mipmap", |builder| {
+            let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
+            (MockExec, output)
+        });
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(mip_ready);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(live, ["Asset_Upload", "Asset_Mipmap", "Asset_Consumer"]);
     }
 
     /// Helper: create a fresh RenderGraph for a test frame.
@@ -2729,6 +3022,41 @@ mod tests {
 
         graph.commit_submitted_histories(&mut histories);
         assert!(histories.plan_set(set, [dummy_desc()], 2, false).valid);
+    }
+
+    #[test]
+    fn pure_forwarding_does_not_contract_an_asset_texture_source() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let snapshot = dummy_asset_snapshot();
+        let asset = graph.import_asset_texture("Asset", snapshot);
+        let surface = graph.register_texture("Surface", snapshot_texture_desc(snapshot), true);
+
+        graph.add_pass("Asset_Upload", |builder| {
+            builder.write_texture(asset);
+            (MockExec, ())
+        });
+        graph.add_pass("Present", |builder| {
+            builder.read_texture(asset);
+            let output = builder.replace_texture(surface, "Surface_Present");
+            builder.mark_pure_forwarding();
+            (MockExec, output)
+        });
+        graph.compile_topology();
+
+        let names: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(names, ["Asset_Upload", "Present"]);
+        assert!(
+            graph.storage.resources[asset.index() as usize]
+                .alias_of
+                .is_none()
+        );
     }
 
     #[test]

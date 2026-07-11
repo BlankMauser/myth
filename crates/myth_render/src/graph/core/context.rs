@@ -24,6 +24,7 @@ use super::types::{
     BufferNodeId, GraphResourceType, RenderTargetOps, ResourceKind, ResourceNodeId, ResourceRecord,
     TextureNodeId,
 };
+use super::{AssetTextureImportId, AssetTextureResolver};
 
 // ─── Extract Context (Feature Pre-RDG Phase) ────────────────────────────────
 
@@ -138,6 +139,7 @@ pub struct ViewResolver<'a> {
     pub resources: &'a [ResourceRecord],
     pub pool: &'a mut TransientPool,
     pub persistent_resources: &'a HistoryRegistry,
+    pub(crate) asset_textures: AssetTextureResolver<'a>,
 }
 
 #[inline]
@@ -758,7 +760,34 @@ fn resolve_buffer_resource(
     (root_id, res)
 }
 
+#[inline]
+fn is_graph_resource_allocated<T: GraphResourceType>(
+    resources: &[ResourceRecord],
+    persistent_resources: &HistoryRegistry,
+    asset_textures: AssetTextureResolver<'_>,
+    id: ResourceNodeId<T>,
+) -> bool {
+    let root_id = resolve_root_id(resources, id);
+    let res = &resources[root_id.index() as usize];
+    if let Some(id) = res.asset_texture_import_id() {
+        return asset_textures.view(id).is_some();
+    }
+    if let Some(id) = res.persistent_texture_id() {
+        return persistent_resources.is_texture_materialized(id);
+    }
+    res.is_external || res.physical_index.is_some()
+}
+
 impl ViewResolver<'_> {
+    #[must_use]
+    pub(crate) fn asset_texture_import_id(
+        &self,
+        id: TextureNodeId,
+    ) -> Option<AssetTextureImportId> {
+        let (_, res) = resolve_texture_resource(self.resources, id);
+        res.asset_texture_import_id()
+    }
+
     /// Resolve a virtual [`TextureNodeId`] to its physical [`Tracked<TextureView>`].
     ///
     /// For external resources, the view is looked up in `external_resources`.
@@ -768,6 +797,12 @@ impl ViewResolver<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.asset_texture_import_id() {
+                return self
+                    .asset_textures
+                    .view(id)
+                    .expect("live asset texture producer did not materialize its view");
+            }
             if let Some(id) = res.persistent_texture_id() {
                 return self.persistent_resources.get_texture_view(id);
             }
@@ -778,6 +813,30 @@ impl ViewResolver<'_> {
         } else {
             let physical_index = res.physical_index.expect("No physical memory!");
             self.pool.get_tracked_view(physical_index)
+        }
+    }
+
+    /// Resolve a tracked view without panicking when a drifted logical asset
+    /// snapshot deliberately produced no physical view.
+    #[must_use]
+    pub fn try_get_tracked_texture_view(
+        &self,
+        id: TextureNodeId,
+    ) -> Option<&Tracked<wgpu::TextureView>> {
+        let (_, res) = resolve_texture_resource(self.resources, id);
+
+        if res.is_external {
+            if let Some(id) = res.asset_texture_import_id() {
+                return self.asset_textures.view(id);
+            }
+            if let Some(id) = res.persistent_texture_id() {
+                return Some(self.persistent_resources.get_texture_view(id));
+            }
+            let ptr = res.external_texture_ptr()?;
+            Some(unsafe { &*ptr })
+        } else {
+            res.physical_index
+                .map(|physical_index| self.pool.get_tracked_view(physical_index))
         }
     }
 
@@ -818,6 +877,10 @@ impl ViewResolver<'_> {
         key: &SubViewKey,
     ) -> &Tracked<wgpu::TextureView> {
         let (_, res) = resolve_texture_resource(self.resources, id);
+        assert!(
+            res.asset_texture_import_id().is_none(),
+            "asset texture sub-views require an explicit GraphStorage-owned view slot"
+        );
         let physical_index = res.physical_index.expect("No physical memory!");
         self.pool.get_or_create_sub_view(physical_index, key)
     }
@@ -829,6 +892,9 @@ impl ViewResolver<'_> {
         key: &SubViewKey,
     ) -> Option<&Tracked<wgpu::TextureView>> {
         let (_, res) = resolve_texture_resource(self.resources, id);
+        if res.asset_texture_import_id().is_some() {
+            return None;
+        }
         let physical_index = res.physical_index.expect("No physical memory!");
         self.pool.get_sub_view(physical_index, key)
     }
@@ -903,12 +969,12 @@ impl ViewResolver<'_> {
     #[inline]
     #[must_use]
     pub fn is_resource_allocated<T: GraphResourceType>(&self, id: ResourceNodeId<T>) -> bool {
-        let root_id = resolve_root_id(self.resources, id);
-        let res = &self.resources[root_id.index() as usize];
-        if let Some(id) = res.persistent_texture_id() {
-            return self.persistent_resources.is_texture_materialized(id);
-        }
-        res.is_external || res.physical_index.is_some()
+        is_graph_resource_allocated(
+            self.resources,
+            self.persistent_resources,
+            self.asset_textures,
+            id,
+        )
     }
 }
 
@@ -1198,6 +1264,7 @@ pub struct ExecuteContext<'a> {
     pub resources: &'a [ResourceRecord],
     pub pool: &'a TransientPool,
     pub persistent_resources: &'a HistoryRegistry,
+    pub(crate) asset_textures: AssetTextureResolver<'a>,
     pub device: &'a Device,
     pub queue: &'a Queue,
     pub pipeline_cache: &'a PipelineCache,
@@ -1227,6 +1294,15 @@ pub struct ExecuteContext<'a> {
 }
 
 impl ExecuteContext<'_> {
+    #[must_use]
+    pub(crate) fn asset_texture_import_id(
+        &self,
+        id: TextureNodeId,
+    ) -> Option<AssetTextureImportId> {
+        let (_, res) = resolve_texture_resource(self.resources, id);
+        res.asset_texture_import_id()
+    }
+
     /// Resolve a virtual [`TextureNodeId`] to its physical [`TextureView`].
     ///
     /// For external resources, the view is looked up in `external_views`.
@@ -1236,6 +1312,12 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.asset_texture_import_id() {
+                return self
+                    .asset_textures
+                    .view(id)
+                    .expect("live asset texture producer did not materialize its view");
+            }
             if let Some(id) = res.persistent_texture_id() {
                 return self.persistent_resources.get_texture_view(id);
             }
@@ -1257,6 +1339,12 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.asset_texture_import_id() {
+                return self
+                    .asset_textures
+                    .view(id)
+                    .expect("live asset texture producer did not materialize its view");
+            }
             if let Some(id) = res.persistent_texture_id() {
                 return self.persistent_resources.get_texture_view(id);
             }
@@ -1282,6 +1370,13 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.asset_texture_import_id() {
+                return self
+                    .asset_textures
+                    .view(id)
+                    .expect("live asset texture producer did not materialize its view")
+                    .texture();
+            }
             if let Some(id) = res.persistent_texture_id() {
                 return self.persistent_resources.get_texture_view(id).texture();
             }
@@ -1309,6 +1404,9 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.asset_texture_import_id() {
+                return self.asset_textures.view(id).map(|view| &**view);
+            }
             if let Some(id) = res.persistent_texture_id() {
                 return Some(&**self.persistent_resources.get_texture_view(id));
             }
@@ -1325,6 +1423,9 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_texture_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.asset_texture_import_id() {
+                return self.asset_textures.view(id).map(|view| &**view);
+            }
             if let Some(id) = res.persistent_texture_id() {
                 return Some(&**self.persistent_resources.get_texture_view(id));
             }
@@ -1409,12 +1510,12 @@ impl ExecuteContext<'_> {
     #[inline]
     #[must_use]
     pub fn is_resource_allocated<T: GraphResourceType>(&self, id: ResourceNodeId<T>) -> bool {
-        let root_id = resolve_root_id(self.resources, id);
-        let res = &self.resources[root_id.index() as usize];
-        if let Some(id) = res.persistent_texture_id() {
-            return self.persistent_resources.is_texture_materialized(id);
-        }
-        res.is_external || res.physical_index.is_some()
+        is_graph_resource_allocated(
+            self.resources,
+            self.persistent_resources,
+            self.asset_textures,
+            id,
+        )
     }
 
     /// Construct a `wgpu::RenderPassColorAttachment` with explicit load
@@ -1542,8 +1643,35 @@ impl ExecuteContext<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::with_buffer_binding_identity;
+    use super::{ViewResolver, is_graph_resource_allocated, with_buffer_binding_identity};
     use crate::core::binding::BindGroupKey;
+    use crate::core::gpu::{AssetTextureMaterialization, AssetTextureSnapshot};
+    use crate::graph::core::{
+        FrameArena, GraphStorage, HistoryRegistry, RenderGraph, SubViewKey, TransientPool,
+    };
+
+    fn unavailable_asset_snapshot() -> AssetTextureSnapshot {
+        AssetTextureSnapshot {
+            texture_handle: myth_assets::TextureHandle::system_reserved(9),
+            image_handle: myth_assets::ImageHandle::default(),
+            texture_version: 1,
+            texture_identity: 11,
+            image_version: 2,
+            image_identity: 22,
+            logical_version: 3,
+            extent: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            dimension: wgpu::TextureDimension::D2,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            mip_count: 1,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            generate_mipmaps: false,
+        }
+    }
 
     #[test]
     fn buffer_binding_key_tracks_logical_range() {
@@ -1557,5 +1685,39 @@ mod tests {
         assert_ne!(small, large);
         assert_ne!(small, shifted);
         assert_ne!(small, whole);
+    }
+
+    #[test]
+    fn unavailable_asset_import_is_unallocated_and_has_no_sub_view() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let asset = {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            graph.import_asset_texture("Unavailable_Asset", unavailable_asset_snapshot())
+        };
+        let import = storage.resources[asset.index() as usize]
+            .asset_texture_import_id()
+            .unwrap();
+        let asset_textures = storage.asset_texture_imports.resolver();
+        asset_textures.materialize(import, AssetTextureMaterialization::unavailable());
+
+        let histories = HistoryRegistry::new();
+        let mut pool = TransientPool::new();
+        let views = ViewResolver {
+            resources: &storage.resources,
+            pool: &mut pool,
+            persistent_resources: &histories,
+            asset_textures,
+        };
+
+        assert!(!views.is_resource_allocated(asset));
+        assert!(!is_graph_resource_allocated(
+            &storage.resources,
+            &histories,
+            asset_textures,
+            asset,
+        ));
+        assert!(views.try_get_tracked_texture_view(asset).is_none());
+        assert!(views.get_sub_view(asset, &SubViewKey::default()).is_none());
     }
 }

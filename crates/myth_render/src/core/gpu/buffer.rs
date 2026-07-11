@@ -25,7 +25,9 @@ use myth_resources::texture::TextureSource;
 
 use super::environment::{snapshot_attachment_texture_source, snapshot_ready_asset_texture_source};
 use super::{
-    EnsureResult, GpuImage, InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
+    AssetTextureMaterialization, AssetTextureSnapshot, EnsureResult, GpuImage, GpuImageSpec,
+    InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
+    materialize_asset_texture_snapshot,
 };
 
 /// Narrow post-compile capability for persistent CPU→GPU uploads and texture
@@ -114,6 +116,72 @@ impl<'a> BufferUploadContext<'a> {
         self.resources.buffer(handle)
     }
 
+    /// Materialize the exact CPU-only asset snapshot selected during graph
+    /// construction. Version drift is a normal unavailable result; no stale
+    /// physical view is published under the old logical identity.
+    pub(crate) fn materialize_asset_texture(
+        &mut self,
+        assets: &AssetServer,
+        snapshot: AssetTextureSnapshot,
+    ) -> AssetTextureMaterialization {
+        let Some((texture, texture_version, texture_identity)) = assets
+            .textures
+            .get_entry_with_identity(snapshot.texture_handle)
+        else {
+            return AssetTextureMaterialization::unavailable();
+        };
+        if texture_version != snapshot.texture_version
+            || texture_identity != snapshot.texture_identity
+            || texture.image != snapshot.image_handle
+        {
+            return AssetTextureMaterialization::unavailable();
+        }
+        let Some((image, image_version, image_identity)) =
+            assets.images.get_entry_with_identity(snapshot.image_handle)
+        else {
+            return AssetTextureMaterialization::unavailable();
+        };
+        let Some(current_snapshot) = super::snapshot_asset_texture(assets, snapshot.texture_handle)
+        else {
+            return AssetTextureMaterialization::unavailable();
+        };
+        if image_version != snapshot.image_version
+            || image_identity != snapshot.image_identity
+            || current_snapshot != snapshot
+        {
+            return AssetTextureMaterialization::unavailable();
+        }
+
+        let materialized = materialize_asset_texture_snapshot(
+            self.resources,
+            self.device,
+            self.queue,
+            self.frame_index,
+            snapshot,
+            &image,
+        );
+
+        let texture_unchanged = assets
+            .textures
+            .get_entry_with_identity(snapshot.texture_handle)
+            .is_some_and(|(current, version, identity)| {
+                version == snapshot.texture_version
+                    && identity == snapshot.texture_identity
+                    && current.image == snapshot.image_handle
+            });
+        let image_unchanged = assets
+            .images
+            .get_entry_with_identity(snapshot.image_handle)
+            .is_some_and(|(_, version, identity)| {
+                version == snapshot.image_version && identity == snapshot.image_identity
+            });
+        if !texture_unchanged || !image_unchanged {
+            return AssetTextureMaterialization::unavailable();
+        }
+
+        materialized
+    }
+
     /// Materialize and resolve one texture source during live-node prepare.
     ///
     /// Asset decoding readiness is decided during the CPU-only snapshot stage.
@@ -130,15 +198,19 @@ impl<'a> BufferUploadContext<'a> {
     ) -> Option<PreparedTextureSource> {
         match source {
             TextureSource::Asset(handle) => {
-                let (texture_asset, texture_version) = assets.textures.get_entry(handle)?;
+                let (texture_asset, texture_version, texture_identity) =
+                    assets.textures.get_entry_with_identity(handle)?;
                 let image_handle = texture_asset.image;
-                let (image, image_version) = assets.images.get_entry(image_handle)?;
+                let (image, image_version, image_identity) =
+                    assets.images.get_entry_with_identity(image_handle)?;
                 let logical = snapshot_ready_asset_texture_source(
                     source,
                     &texture_asset,
                     texture_version,
+                    texture_identity,
                     &image,
                     image_version,
+                    image_identity,
                 );
                 if !logical.ready || logical.version != expected_logical_version {
                     return None;
@@ -147,36 +219,53 @@ impl<'a> BufferUploadContext<'a> {
                 let required_usage =
                     wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
 
-                let needs_recreate = self.resources.image(image_handle).is_none_or(|gpu_image| {
-                    gpu_image.default_view_dimension != texture_asset.view_dimension
-                        || gpu_image.dimension != image.dimension.to_wgpu()
-                        || gpu_image.format != resolved_format
-                        || !gpu_image.usage.contains(required_usage)
-                });
+                // Source-conversion shaders sample level zero explicitly. Keep
+                // an existing full mip allocation when compatible, but create
+                // only a base-level allocation for a source used solely here.
+                let base_spec = GpuImageSpec {
+                    image_handle,
+                    extent: wgpu::Extent3d {
+                        width: image.width,
+                        height: image.height,
+                        depth_or_array_layers: image.depth,
+                    },
+                    format: resolved_format,
+                    dimension: image.dimension.to_wgpu(),
+                    view_dimension: texture_asset.view_dimension,
+                    mip_count: 1,
+                    usage: required_usage,
+                };
+
+                let needs_recreate = self
+                    .resources
+                    .texture_image(handle)
+                    .is_none_or(|gpu_image| {
+                        gpu_image.image_handle != base_spec.image_handle
+                            || gpu_image.size != base_spec.extent
+                            || gpu_image.default_view_dimension != base_spec.view_dimension
+                            || gpu_image.dimension != base_spec.dimension
+                            || gpu_image.format != base_spec.format
+                            || !gpu_image.usage.contains(required_usage)
+                    });
 
                 if needs_recreate {
-                    self.resources.remove_image(image_handle);
+                    self.resources.remove_texture_image(handle);
                     let mut gpu_image = GpuImage::new(
                         self.device,
                         self.queue,
                         &image,
-                        resolved_format,
-                        texture_asset.view_dimension,
-                        1,
-                        required_usage,
-                    );
-                    gpu_image.version = image_version;
-                    gpu_image.last_used_frame = self.frame_index;
-                    self.resources.insert_image(image_handle, gpu_image);
-                } else if let Some(gpu_image) = self.resources.image_mut(image_handle) {
-                    gpu_image.update(
-                        self.device,
-                        self.queue,
-                        &image,
-                        resolved_format,
-                        texture_asset.view_dimension,
+                        base_spec,
+                        texture_version,
+                        texture_identity,
                         image_version,
+                        image_identity,
                     );
+                    gpu_image.last_used_frame = self.frame_index;
+                    self.resources.insert_texture_image(handle, gpu_image);
+                } else if let Some(gpu_image) = self.resources.texture_image_mut(handle) {
+                    gpu_image.update_content(self.queue, &image, image_version, image_identity);
+                    gpu_image.texture_version = texture_version;
+                    gpu_image.texture_identity = texture_identity;
                     gpu_image.last_used_frame = self.frame_index;
                 }
 
@@ -184,23 +273,26 @@ impl<'a> BufferUploadContext<'a> {
                 // versions after `GpuImage::new/update` has consumed the bytes,
                 // so an in-place edit cannot be published under the older
                 // Composer snapshot key.
-                let texture_unchanged =
-                    assets
-                        .textures
-                        .get_entry(handle)
-                        .is_some_and(|(current, current_version)| {
-                            current_version == texture_version && current.image == image_handle
-                        });
+                let texture_unchanged = assets
+                    .textures
+                    .get_entry_with_identity(handle)
+                    .is_some_and(|(current, current_version, current_identity)| {
+                        current_version == texture_version
+                            && current_identity == texture_identity
+                            && current.image == image_handle
+                    });
                 let image_unchanged = assets
                     .images
-                    .get_entry(image_handle)
-                    .is_some_and(|(_, current_version)| current_version == image_version);
+                    .get_entry_with_identity(image_handle)
+                    .is_some_and(|(_, current_version, current_identity)| {
+                        current_version == image_version && current_identity == image_identity
+                    });
                 if !texture_unchanged || !image_unchanged {
                     return None;
                 }
 
                 self.resources
-                    .image(image_handle)
+                    .texture_image(handle)
                     .map(|gpu_image| PreparedTextureSource {
                         view: gpu_image.default_view.clone(),
                         view_id: gpu_image.id,
@@ -479,11 +571,5 @@ impl ResourceManager {
     #[inline]
     pub fn get_gpu_buffer_by_cpu_id(&self, cpu_id: u64) -> Option<&GpuBuffer> {
         self.resources.buffer_by_cpu_id(cpu_id)
-    }
-
-    /// Look up a [`GpuBuffer`] by its GPU arena handle.
-    #[inline]
-    pub(crate) fn get_gpu_buffer(&self, handle: GpuBufferHandle) -> Option<&GpuBuffer> {
-        self.resources.buffer(handle)
     }
 }

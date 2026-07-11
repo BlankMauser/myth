@@ -4,6 +4,7 @@ use smallvec::SmallVec;
 
 use crate::core::gpu::Tracked;
 
+use super::asset_texture::AssetTextureImportId;
 use super::persistent::PersistentTextureId;
 
 pub trait GraphResourceType: 'static + Send + Sync + Copy + Clone {}
@@ -273,6 +274,12 @@ pub enum TextureBacking {
     Transient,
     External(*const Tracked<wgpu::TextureView>),
     Persistent(PersistentTextureId),
+    /// Frame-scoped logical import of one exact asset-texture snapshot.
+    ///
+    /// The physical view is filled into GraphStorage by a live upload node's
+    /// prepare step. Unlike an ordinary external output, writing this backing
+    /// does not seed DPE liveness.
+    Asset(AssetTextureImportId),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -315,6 +322,15 @@ impl ResourceKind {
         Self::Texture {
             desc,
             backing: TextureBacking::Persistent(id),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn asset_texture(desc: TextureDesc, id: AssetTextureImportId) -> Self {
+        Self::Texture {
+            desc,
+            backing: TextureBacking::Asset(id),
         }
     }
 
@@ -401,6 +417,18 @@ impl ResourceKind {
 
     #[inline]
     #[must_use]
+    pub const fn asset_texture_import_id(&self) -> Option<AssetTextureImportId> {
+        match self {
+            Self::Texture {
+                backing: TextureBacking::Asset(id),
+                ..
+            } => Some(*id),
+            Self::Texture { .. } | Self::Buffer { .. } => None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn external_buffer_ptr(&self) -> Option<*const Tracked<wgpu::Buffer>> {
         match self {
             Self::Texture { .. } => None,
@@ -477,6 +505,12 @@ impl ResourceRecord {
     #[must_use]
     pub const fn persistent_texture_id(&self) -> Option<PersistentTextureId> {
         self.kind.persistent_texture_id()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn asset_texture_import_id(&self) -> Option<AssetTextureImportId> {
+        self.kind.asset_texture_import_id()
     }
 
     #[inline]
