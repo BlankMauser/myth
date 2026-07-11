@@ -514,7 +514,6 @@ impl Renderer {
                 camera.aa_mode.is_taa() || ssgi_enabled || ssr_enabled || dbg_needs_velocity;
 
             // let needs_normal = ssao_enabled || needs_feature_id;
-            let needs_skybox = scene.background.needs_skybox_pass();
             let environment_cache_frame = state.resource_manager.frame_index();
             let retired_environment_scenes = state
                 .environment_cache
@@ -524,7 +523,9 @@ impl Renderer {
                     .resource_manager
                     .remove_scene_global_states(retired_scene_id);
             }
-            state.atmosphere_pass.maintain(environment_cache_frame);
+            state
+                .atmosphere_pass
+                .maintain(&mut state.history_registry, environment_cache_frame);
 
             let mut extract_ctx = ExtractContext {
                 device: &state.wgpu_ctx.device,
@@ -544,21 +545,10 @@ impl Renderer {
             // now happens inside Composer after render-target acquisition.
             state.shadow_pass.extract_and_prepare(&mut extract_ctx);
 
-            // Procedural atmosphere (LUT + cubemap + PMREM compute)
-            let procedural_skybox_resources =
-                if let BackgroundMode::Procedural(params) = &scene.background.mode {
-                    state
-                        .atmosphere_pass
-                        .extract_and_prepare(&mut extract_ctx, scene.id(), params);
-                    state
-                        .atmosphere_pass
-                        .procedural_skybox_resources(scene.id())
-                } else {
-                    None
-                };
-
-            // Skybox (both pipelines)
-            if needs_skybox {
+            // Texture backgrounds still use the compatibility preparation path
+            // for same-frame asset mip generation. Gradient and Procedural
+            // Skybox preparation are deferred to their live RDG consumer.
+            if matches!(&scene.background.mode, BackgroundMode::Texture { .. }) {
                 let color_format = if is_hf {
                     HDR_TEXTURE_FORMAT
                 } else {
@@ -570,7 +560,6 @@ impl Renderer {
                     &scene.background.uniforms,
                     global_state_key,
                     color_format,
-                    procedural_skybox_resources,
                 );
             } else {
                 state.skybox_pass.deactivate();
@@ -1538,7 +1527,9 @@ mod tests {
         let retired = state
             .environment_cache
             .maintain(&mut state.history_registry, u64::MAX);
-        state.atmosphere_pass.maintain(u64::MAX);
+        state
+            .atmosphere_pass
+            .maintain(&mut state.history_registry, u64::MAX);
         assert!(retired.contains(&source_scene_id));
         assert!(retired.contains(&procedural_scene_id));
         assert!(!state.environment_cache.has_scene_state(source_scene_id));
@@ -1656,11 +1647,15 @@ mod tests {
         let retired = state
             .environment_cache
             .maintain(&mut state.history_registry, current_frame);
+        state
+            .atmosphere_pass
+            .maintain(&mut state.history_registry, current_frame);
         assert_eq!(vec![scene_id], retired);
         state.resource_manager.remove_scene_global_states(scene_id);
         state.resource_manager.prune(1);
         assert!(state.resource_manager.gpu_environment(scene_id).is_none());
         assert!(!state.environment_cache.has_scene_state(scene_id));
+        assert!(!state.atmosphere_pass.has_scene_state(scene_id));
         assert!(published_pmrem_view_id(state, scene_id).is_none());
         assert_ne!(0, active_source_version);
     }
@@ -2129,5 +2124,51 @@ mod tests {
         );
         assert!(graph_contains_pass(state, "Atmosphere_SkyToCube"));
         assert!(graph_contains_pass(state, "IBL_Compute"));
+    }
+
+    #[test]
+    fn pending_procedural_optional_source_keeps_published_environment() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        scene.background.set_mode(BackgroundMode::procedural());
+        let camera = make_camera();
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+
+        let scene_id = scene.id();
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
+            .expect("initial persistent PMREM must be published");
+
+        if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
+            params.set_starbox_texture(Some(TextureSource::Attachment(
+                u64::MAX,
+                wgpu::TextureViewDimension::D2,
+            )));
+        }
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let pending_env = state
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("procedural environment metadata missing");
+
+        assert!(!pending_env.source_ready);
+        assert_eq!(
+            Some(initial_pmrem_id),
+            published_pmrem_view_id(state, scene_id),
+            "a pending optional source must not overwrite the last published PMREM"
+        );
+        assert!(
+            graph_contains_pass(state, "Atmosphere_SkyView"),
+            "the visual atmosphere path must remain available while an optional source is pending"
+        );
+        assert!(!graph_contains_pass(state, "Atmosphere_SkyToCube"));
+        assert!(!graph_contains_pass(state, "IBL_Compute"));
     }
 }

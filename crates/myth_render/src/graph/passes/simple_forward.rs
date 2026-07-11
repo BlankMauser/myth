@@ -27,8 +27,8 @@ use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
     TextureDesc, TextureNodeId, build_screen_bind_group,
 };
-use crate::graph::frame::PreparedSkyboxDraw;
 use crate::graph::passes::draw::submit_draw_commands;
+use crate::graph::passes::skybox::{SkyboxDrawRequest, SkyboxDrawState};
 
 // ─── Feature ───────────────────────────────────────────────────────────
 
@@ -46,12 +46,13 @@ impl SimpleForwardFeature {
         Self
     }
 
-    pub fn add_to_graph<'a>(
+    #[allow(clippy::unused_self)] // Keep the uniform Feature::add_to_graph API.
+    pub(crate) fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
         // surface_out: TextureNodeId,
         clear_color: wgpu::Color,
-        prepared_skybox: Option<PreparedSkyboxDraw<'a>>,
+        skybox: Option<SkyboxDrawRequest<'a>>,
         shadow_tex: Option<TextureNodeId>,
         shadow_cube_tex: Option<TextureNodeId>,
         // env_map_tex: Option<TextureNodeId>,
@@ -109,11 +110,7 @@ impl SimpleForwardFeature {
             if let Some(bake_params) = scene_lighting.atmosphere_bake_params {
                 builder.read_buffer(bake_params);
             }
-            if let Some(skybox) = prepared_skybox {
-                for dependency in skybox.sampled_textures.into_iter().flatten() {
-                    builder.read_texture(dependency);
-                }
-            }
+            let skybox = skybox.map(|request| request.build(builder));
 
             let msaa_view = if fc.msaa_samples > 1 {
                 let desc = TextureDesc::new(
@@ -136,7 +133,7 @@ impl SimpleForwardFeature {
                 scene_depth,
                 msaa_view,
                 clear_color,
-                prepared_skybox,
+                skybox,
                 shadow_input: shadow_tex,
                 shadow_cube_input: shadow_cube_tex,
                 scene_lighting,
@@ -161,7 +158,7 @@ pub struct SimpleForwardPassNode<'a> {
     pub scene_depth: TextureNodeId,
     pub msaa_view: Option<TextureNodeId>,
     pub clear_color: wgpu::Color,
-    pub prepared_skybox: Option<PreparedSkyboxDraw<'a>>,
+    skybox: Option<SkyboxDrawState<'a>>,
     pub shadow_input: Option<TextureNodeId>,
     pub shadow_cube_input: Option<TextureNodeId>,
     pub scene_lighting: ClusteredScreenBindings,
@@ -179,6 +176,9 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
             self.scene_lighting,
         );
         self.screen_bind_group = Some(bg);
+        if let Some(skybox) = &mut self.skybox {
+            skybox.prepare(ctx);
+        }
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
@@ -218,7 +218,7 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
         submit_draw_commands(&mut pass, &ctx.baked_lists.opaque);
 
         // 2. Skybox (between opaque and transparent)
-        if let Some(skybox) = &self.prepared_skybox {
+        if let Some(skybox) = &self.skybox {
             skybox.draw(&mut pass, gpu_global_bind_group, ctx.pipeline_cache);
 
             pass.set_bind_group(0, gpu_global_bind_group, &[]);

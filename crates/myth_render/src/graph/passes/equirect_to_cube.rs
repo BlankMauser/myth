@@ -4,7 +4,9 @@
 //! texture upload/resolution, custom-view creation, sampler creation, and bind
 //! group assembly are deferred until the node survives DPE.
 
-use crate::core::gpu::{CommonSampler, CubeSourceType, GpuEnvironment, Tracked, binding_layout};
+use crate::core::gpu::{
+    CommonSampler, CubeSourceType, GpuEnvironment, PreparedTextureSource, Tracked, binding_layout,
+};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{ExecuteContext, PassNode, PrepareContext, TextureNodeId};
 use crate::pipeline::{
@@ -17,6 +19,7 @@ use myth_resources::texture::TextureSource;
 pub struct EquirectToCubeSnapshot {
     pub(crate) source: TextureSource,
     pub(crate) source_type: CubeSourceType,
+    pub(crate) source_version: u64,
     /// L1 identity used by the logical base-cache key for this conversion.
     pub(crate) producer_shader_identity: u64,
 }
@@ -67,6 +70,7 @@ impl EquirectToCubeFeature {
         Some(EquirectToCubeSnapshot {
             source: gpu_env.source_key?,
             source_type: gpu_env.source_type,
+            source_version: gpu_env.source_version,
             producer_shader_identity,
         })
     }
@@ -322,10 +326,32 @@ impl<'a> PassNode<'a> for EquirectToCubePassNode<'a> {
         ctx.mipmap_generator
             .ensure_pipeline(ctx.device, wgpu::TextureFormat::Rgba16Float);
 
-        let (source_view, source_view_id) = ctx
+        let PreparedTextureSource {
+            view: source_view,
+            view_id: source_view_id,
+            view_dimension: source_view_dimension,
+            logical_version: source_version,
+        } = ctx
             .uploads
-            .resolve_texture_source(ctx.assets, self.snapshot.source)
-            .expect("environment source was ready during extraction");
+            .resolve_texture_source(
+                ctx.assets,
+                self.snapshot.source,
+                self.snapshot.source_version,
+            )
+            .expect("environment source must keep its snapshot version through prepare");
+        let expected_view_dimension = match self.snapshot.source_type {
+            CubeSourceType::Equirectangular => wgpu::TextureViewDimension::D2,
+            CubeSourceType::Cubemap => wgpu::TextureViewDimension::Cube,
+            CubeSourceType::Procedural => unreachable!(),
+        };
+        assert_eq!(
+            source_view_dimension, expected_view_dimension,
+            "prepared environment source dimension diverged from its CPU snapshot"
+        );
+        assert_eq!(
+            source_version, self.snapshot.source_version,
+            "prepared environment source version diverged from its CPU snapshot"
+        );
         let base_cube_uid = ctx.views.get_physical_texture_uid(self.base_cube);
         let storage_view =
             ctx.views

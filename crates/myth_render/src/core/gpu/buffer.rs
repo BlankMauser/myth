@@ -23,6 +23,7 @@ use myth_assets::AssetServer;
 use myth_resources::buffer::BufferRef;
 use myth_resources::texture::TextureSource;
 
+use super::environment::{snapshot_attachment_texture_source, snapshot_ready_asset_texture_source};
 use super::{
     EnsureResult, GpuImage, InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
 };
@@ -40,6 +41,18 @@ pub struct BufferUploadContext<'a> {
     frame_index: u64,
     resources: &'a mut super::GpuResourceStore,
     internal_textures: &'a InternalTextureRegistry,
+}
+
+/// Physical texture binding resolved during live pass preparation.
+///
+/// `view_id` fingerprints the concrete WGPU view for bind-group caching, while
+/// `view_dimension` lets callers validate the pipeline/layout variant selected
+/// from their earlier CPU-only source snapshot.
+pub(crate) struct PreparedTextureSource {
+    pub(crate) view: wgpu::TextureView,
+    pub(crate) view_id: u64,
+    pub(crate) view_dimension: wgpu::TextureViewDimension,
+    pub(crate) logical_version: u64,
 }
 
 impl<'a> BufferUploadContext<'a> {
@@ -103,21 +116,33 @@ impl<'a> BufferUploadContext<'a> {
 
     /// Materialize and resolve one texture source during live-node prepare.
     ///
-    /// Asset decoding readiness is decided during the CPU-only snapshot stage;
-    /// this method performs the deferred GPU upload only after DPE has kept the
-    /// source-conversion node alive. The returned view is cloned deliberately
-    /// so callers can release the mutable upload borrow before assembling a
-    /// bind group from the other `PrepareContext` partitions.
+    /// Asset decoding readiness is decided during the CPU-only snapshot stage.
+    /// This method verifies that exact logical version before performing the
+    /// deferred GPU upload, after DPE has kept the source-conversion node alive.
+    /// The returned view is cloned deliberately so callers can release the
+    /// mutable upload borrow before assembling a bind group from the other
+    /// `PrepareContext` partitions.
     pub(crate) fn resolve_texture_source(
         &mut self,
         assets: &AssetServer,
         source: TextureSource,
-    ) -> Option<(wgpu::TextureView, u64)> {
+        expected_logical_version: u64,
+    ) -> Option<PreparedTextureSource> {
         match source {
             TextureSource::Asset(handle) => {
-                let texture_asset = assets.textures.get(handle)?;
+                let (texture_asset, texture_version) = assets.textures.get_entry(handle)?;
                 let image_handle = texture_asset.image;
                 let (image, image_version) = assets.images.get_entry(image_handle)?;
+                let logical = snapshot_ready_asset_texture_source(
+                    source,
+                    &texture_asset,
+                    texture_version,
+                    &image,
+                    image_version,
+                );
+                if !logical.ready || logical.version != expected_logical_version {
+                    return None;
+                }
                 let resolved_format = texture_asset.resolve_wgpu_format(image.format);
                 let required_usage =
                     wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
@@ -155,14 +180,48 @@ impl<'a> BufferUploadContext<'a> {
                     gpu_image.last_used_frame = self.frame_index;
                 }
 
+                // `Image` data is mutable behind its Arc. Re-read both storage
+                // versions after `GpuImage::new/update` has consumed the bytes,
+                // so an in-place edit cannot be published under the older
+                // Composer snapshot key.
+                let texture_unchanged =
+                    assets
+                        .textures
+                        .get_entry(handle)
+                        .is_some_and(|(current, current_version)| {
+                            current_version == texture_version && current.image == image_handle
+                        });
+                let image_unchanged = assets
+                    .images
+                    .get_entry(image_handle)
+                    .is_some_and(|(_, current_version)| current_version == image_version);
+                if !texture_unchanged || !image_unchanged {
+                    return None;
+                }
+
                 self.resources
                     .image(image_handle)
-                    .map(|gpu_image| (gpu_image.default_view.clone(), gpu_image.id))
+                    .map(|gpu_image| PreparedTextureSource {
+                        view: gpu_image.default_view.clone(),
+                        view_id: gpu_image.id,
+                        view_dimension: gpu_image.default_view_dimension,
+                        logical_version: logical.version,
+                    })
             }
-            TextureSource::Attachment(id, _) => {
+            TextureSource::Attachment(id, view_dimension) => {
+                let logical =
+                    snapshot_attachment_texture_source(source, self.internal_textures.revision(id));
+                if !logical.ready || logical.version != expected_logical_version {
+                    return None;
+                }
                 let view = self.internal_textures.get(id)?.clone();
                 let view_id = self.internal_textures.view_id(id)?;
-                Some((view, view_id))
+                Some(PreparedTextureSource {
+                    view,
+                    view_id,
+                    view_dimension,
+                    logical_version: logical.version,
+                })
             }
         }
     }

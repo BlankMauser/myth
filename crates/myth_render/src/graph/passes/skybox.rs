@@ -22,23 +22,26 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::core::gpu::{CommonSampler, ResourceState, Tracked};
+use crate::core::gpu::{
+    CommonSampler, GlobalStateKey, ProceduralEnvironmentSnapshot, ResourceState, Tracked,
+};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    ExecuteContext, ExtractContext, PassNode, RawBufferBinding, RawSamplerBinding, RenderTargetOps,
-    TextureNodeId,
+    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassBuilder, PassNode,
+    PrepareContext, RawBufferBinding, RenderTargetOps, TextureNodeId,
 };
-use crate::graph::passes::atmosphere::ProceduralSkyboxResources;
 use crate::pipeline::{
-    ColorTargetKey, DepthStencilKey, FullscreenPipelineKey, MultisampleKey, RenderPipelineId,
-    ShaderCompilationOptions, ShaderSource,
+    ColorTargetKey, DepthStencilKey, FullscreenPipelineKey, MultisampleKey, PipelineCache,
+    RenderPipelineId, ShaderCompilationOptions, ShaderManager, ShaderSource,
 };
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::shader_defines::ShaderDefines;
 use myth_resources::texture::TextureSampler;
 use myth_resources::texture::TextureSource;
 use myth_resources::uniforms::WgslStruct;
-use myth_scene::background::{BackgroundMapping, BackgroundMode, SkyboxParamsUniforms};
+use myth_scene::background::{
+    BackgroundMapping, BackgroundMode, ProceduralSkyParams, SkyboxParamsUniforms,
+};
 
 /// Sampler key for the skybox environment map: trilinear filtering with
 /// horizontal repeat (seamless panorama wrap) and vertical/depth clamp.
@@ -63,6 +66,17 @@ struct SkyboxPipelineKey {
     variant: SkyboxVariant,
     procedural_starbox: ProceduralStarboxKind,
     procedural_moon_texture: bool,
+    color_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    global_layout_id: u64,
+    shader_source_identity: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedTextureTargetKey {
+    variant: SkyboxVariant,
+    global_state_key: (u32, u32),
     color_format: wgpu::TextureFormat,
     depth_format: wgpu::TextureFormat,
     msaa_samples: u32,
@@ -158,18 +172,95 @@ struct ResolvedTextureView<'a> {
     resource_key: u64,
 }
 
-#[derive(Clone, Copy)]
-struct ProceduralStarboxView<'a> {
-    view: &'a wgpu::TextureView,
-    kind: ProceduralStarboxKind,
-    resource_key: u64,
+/// Logical atmosphere outputs sampled by a procedural skybox draw.
+///
+/// These IDs are the actual bind-group inputs, not artificial ordering edges.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProceduralSkyboxInputs {
+    pub sky_view: TextureNodeId,
+    pub transmittance: TextureNodeId,
+    pub bake_params: BufferNodeId,
 }
 
-#[derive(Clone, Copy)]
-struct ProceduralMoonView<'a> {
-    view: &'a wgpu::TextureView,
-    resource_key: u64,
-    enabled: bool,
+#[derive(Debug, Clone, Copy)]
+struct ProceduralStarboxSnapshot {
+    source: TextureSource,
+    kind: ProceduralStarboxKind,
+    logical_version: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProceduralTextureSnapshot {
+    source: TextureSource,
+    logical_version: u64,
+}
+
+/// Lightweight CPU-only state captured by Composer for a procedural skybox.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProceduralSkyboxSnapshot {
+    global_state_key: GlobalStateKey,
+    color_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    starbox: Option<ProceduralStarboxSnapshot>,
+    moon_texture: Option<ProceduralTextureSnapshot>,
+}
+
+/// Lightweight scene data for the texture-free gradient variant.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GradientSkyboxSnapshot {
+    params: SkyboxParamsUniforms,
+    global_state_key: GlobalStateKey,
+    color_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+}
+
+/// Build-time request shared by the standalone and inline skybox paths.
+pub(crate) enum SkyboxDrawRequest<'a> {
+    /// Compatibility path for Texture backgrounds. Their asset mipmap
+    /// upload still occurs before graph build until RDG asset imports can carry
+    /// deferred mip generation.
+    Prepared {
+        pipeline_id: RenderPipelineId,
+        bind_group: &'a wgpu::BindGroup,
+    },
+    Gradient {
+        feature: &'a mut SkyboxFeature,
+        snapshot: GradientSkyboxSnapshot,
+    },
+    /// Fully deferred procedural path. Physical resources are resolved only if
+    /// the containing render node survives DPE.
+    Procedural {
+        feature: &'a mut SkyboxFeature,
+        snapshot: ProceduralSkyboxSnapshot,
+        inputs: ProceduralSkyboxInputs,
+    },
+}
+
+pub(crate) enum SkyboxDrawState<'a> {
+    Prepared {
+        pipeline_id: RenderPipelineId,
+        bind_group: &'a wgpu::BindGroup,
+    },
+    Gradient(GradientSkyboxDrawState<'a>),
+    Procedural(ProceduralSkyboxDrawState<'a>),
+}
+
+pub(crate) struct GradientSkyboxDrawState<'a> {
+    feature: &'a mut SkyboxFeature,
+    snapshot: GradientSkyboxSnapshot,
+    params_buffer: BufferNodeId,
+    pipeline_id: Option<RenderPipelineId>,
+    bind_group: Option<&'a wgpu::BindGroup>,
+}
+
+pub(crate) struct ProceduralSkyboxDrawState<'a> {
+    feature: &'a mut SkyboxFeature,
+    snapshot: ProceduralSkyboxSnapshot,
+    inputs: ProceduralSkyboxInputs,
+    pipeline_id: Option<RenderPipelineId>,
+    bind_group: Option<&'a wgpu::BindGroup>,
 }
 
 // ─── Layout Helpers ───────────────────────────────────────────────────────────
@@ -406,6 +497,7 @@ pub struct SkyboxFeature {
     // ─── Runtime State ─────────────────────────────────────────────
     pub(crate) current_bind_group: Option<wgpu::BindGroup>,
     pub(crate) current_pipeline: Option<RenderPipelineId>,
+    current_texture_target: Option<PreparedTextureTargetKey>,
 }
 
 impl Default for SkyboxFeature {
@@ -430,36 +522,69 @@ impl SkyboxFeature {
             local_cache: FxHashMap::default(),
             current_bind_group: None,
             current_pipeline: None,
+            current_texture_target: None,
         }
     }
 
-    fn ensure_layouts(&mut self, device: &wgpu::Device) {
-        if self.layout_gradient.is_some() {
-            return;
+    fn ensure_layout_for_variant(
+        &mut self,
+        device: &wgpu::Device,
+        variant: SkyboxVariant,
+        procedural_starbox: ProceduralStarboxKind,
+    ) {
+        match variant {
+            SkyboxVariant::Gradient => {
+                if self.layout_gradient.is_none() {
+                    self.layout_gradient = Some(Tracked::new(create_uniform_layout(device)));
+                }
+            }
+            SkyboxVariant::Cube => {
+                if self.layout_cube.is_none() {
+                    self.layout_cube = Some(Tracked::new(create_texture_layout(
+                        device,
+                        wgpu::TextureViewDimension::Cube,
+                        "Skybox Layout (Cube)",
+                    )));
+                }
+            }
+            SkyboxVariant::Equirectangular | SkyboxVariant::Planar => {
+                if self.layout_2d.is_none() {
+                    self.layout_2d = Some(Tracked::new(create_texture_layout(
+                        device,
+                        wgpu::TextureViewDimension::D2,
+                        "Skybox Layout (2D)",
+                    )));
+                }
+            }
+            SkyboxVariant::Procedural => match procedural_starbox {
+                ProceduralStarboxKind::None => {
+                    if self.layout_procedural.is_none() {
+                        self.layout_procedural =
+                            Some(Tracked::new(create_procedural_layout(device)));
+                    }
+                }
+                ProceduralStarboxKind::Equirectangular => {
+                    if self.layout_procedural_eq.is_none() {
+                        self.layout_procedural_eq =
+                            Some(Tracked::new(create_procedural_texture_layout(
+                                device,
+                                wgpu::TextureViewDimension::D2,
+                                "Skybox Layout (Procedural Eq)",
+                            )));
+                    }
+                }
+                ProceduralStarboxKind::Cube => {
+                    if self.layout_procedural_cube.is_none() {
+                        self.layout_procedural_cube =
+                            Some(Tracked::new(create_procedural_texture_layout(
+                                device,
+                                wgpu::TextureViewDimension::Cube,
+                                "Skybox Layout (Procedural Cube)",
+                            )));
+                    }
+                }
+            },
         }
-
-        self.layout_gradient = Some(Tracked::new(create_uniform_layout(device)));
-        self.layout_cube = Some(Tracked::new(create_texture_layout(
-            device,
-            wgpu::TextureViewDimension::Cube,
-            "Skybox Layout (Cube)",
-        )));
-        self.layout_2d = Some(Tracked::new(create_texture_layout(
-            device,
-            wgpu::TextureViewDimension::D2,
-            "Skybox Layout (2D)",
-        )));
-        self.layout_procedural = Some(Tracked::new(create_procedural_layout(device)));
-        self.layout_procedural_eq = Some(Tracked::new(create_procedural_texture_layout(
-            device,
-            wgpu::TextureViewDimension::D2,
-            "Skybox Layout (Procedural Eq)",
-        )));
-        self.layout_procedural_cube = Some(Tracked::new(create_procedural_texture_layout(
-            device,
-            wgpu::TextureViewDimension::Cube,
-            "Skybox Layout (Procedural Cube)",
-        )));
     }
 
     fn layout_for_variant(
@@ -483,20 +608,36 @@ impl SkyboxFeature {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_or_create_pipeline(
         &mut self,
-        ctx: &mut ExtractContext,
-        key: SkyboxPipelineKey,
-        global_state_key: (u32, u32),
+        device: &wgpu::Device,
+        pipeline_cache: &mut PipelineCache,
+        shader_manager: &mut ShaderManager,
+        global_layout: &wgpu::BindGroupLayout,
+        global_layout_id: u64,
+        global_binding_wgsl: &str,
+        variant: SkyboxVariant,
+        procedural_starbox: ProceduralStarboxKind,
+        procedural_moon_texture: bool,
+        color_format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
+        msaa_samples: u32,
     ) -> RenderPipelineId {
+        let shader_source = ShaderSource::File("entry/utility/skybox");
+        let key = SkyboxPipelineKey {
+            variant,
+            procedural_starbox,
+            procedural_moon_texture,
+            color_format,
+            depth_format,
+            msaa_samples,
+            global_layout_id,
+            shader_source_identity: shader_manager.source_identity_hash(shader_source),
+        };
         if let Some(&pipeline_id) = self.local_cache.get(&key) {
             return pipeline_id;
         }
-
-        let gpu_world = ctx
-            .resource_manager
-            .get_global_state(global_state_key.0, global_state_key.1)
-            .expect("Global state must exist");
 
         let mut defines = ShaderDefines::new();
         key.variant.apply_shader_defines(
@@ -513,51 +654,46 @@ impl SkyboxFeature {
             "struct_definitions",
             SkyboxParamsUniforms::wgsl_struct_def("SkyboxParams").as_str(),
         );
-        options.inject_code("binding_code", &gpu_world.binding_wgsl);
+        options.inject_code("binding_code", global_binding_wgsl);
         options.inject_code(
             "scene_lighting_structs",
             myth_resources::uniforms::scene_lighting_structs_wgsl(),
         );
 
-        let (shader_module, shader_hash) = ctx.shader_manager.get_or_compile(
-            ctx.device,
-            ShaderSource::File("entry/utility/skybox"),
-            &options,
-        );
+        let (shader_module, shader_hash) =
+            shader_manager.get_or_compile(device, shader_source, &options);
 
         let layout = self.layout_for_variant(key.variant, key.procedural_starbox);
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Skybox Pipeline Layout"),
-                bind_group_layouts: &[Some(&gpu_world.layout), Some(layout)],
-                immediate_size: 0,
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Skybox Pipeline Layout"),
+            bind_group_layouts: &[Some(global_layout), Some(layout)],
+            immediate_size: 0,
+        });
 
         let fullscreen_key = FullscreenPipelineKey {
             shader_hash,
             compilation_hash: 0,
             color_targets: smallvec::smallvec![ColorTargetKey::from(wgpu::ColorTargetState {
-                format: key.color_format,
+                format: color_format,
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             depth_stencil: Some(DepthStencilKey::from(wgpu::DepthStencilState {
-                format: key.depth_format,
+                format: depth_format,
                 depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             })),
             multisample: MultisampleKey::from(wgpu::MultisampleState {
-                count: key.msaa_samples,
+                count: msaa_samples,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             }),
         };
 
-        let pipeline_id = ctx.pipeline_cache.get_or_create_fullscreen(
-            ctx.device,
+        let pipeline_id = pipeline_cache.get_or_create_fullscreen(
+            device,
             shader_module,
             &pipeline_layout,
             &fullscreen_key,
@@ -615,48 +751,12 @@ impl SkyboxFeature {
         }
     }
 
-    fn resolve_procedural_starbox_view<'a>(
-        resource_manager: &'a crate::core::ResourceManager,
-        source: &TextureSource,
-    ) -> Option<ProceduralStarboxView<'a>> {
-        let resolved = Self::resolve_texture_view_with_dimension(resource_manager, source)?;
-        let kind = ProceduralStarboxKind::from_view_dimension(resolved.view_dimension)?;
-        Some(ProceduralStarboxView {
-            view: resolved.view,
-            kind,
-            resource_key: resolved.resource_key,
-        })
-    }
-
-    fn resolve_procedural_moon_view(
-        resource_manager: &crate::core::ResourceManager,
-        source: Option<TextureSource>,
-    ) -> ProceduralMoonView<'_> {
-        source
-            .and_then(|source| {
-                let resolved =
-                    Self::resolve_texture_view_with_dimension(resource_manager, &source)?;
-                if resolved.view_dimension != wgpu::TextureViewDimension::D2 {
-                    return None;
-                }
-
-                Some(ProceduralMoonView {
-                    view: resolved.view,
-                    resource_key: resolved.resource_key,
-                    enabled: true,
-                })
-            })
-            .unwrap_or(ProceduralMoonView {
-                view: &resource_manager.system_textures().white_2d,
-                resource_key: resource_manager.system_textures().white_2d.id(),
-                enabled: false,
-            })
-    }
-
-    /// Extract scene data and prepare GPU resources for skybox rendering.
+    /// Compatibility preparation for Texture backgrounds.
     ///
-    /// Called **before** the render graph is built. Caches bind groups and
-    /// pipelines so the ephemeral [`SkyboxPassNode`] only carries lightweight IDs.
+    /// Texture backgrounds remain here temporarily because their asset path
+    /// owns mip-chain allocation and queues same-frame RDG mip generation. The
+    /// procedural path is deliberately rejected and is prepared only by a live
+    /// graph node.
     pub(crate) fn extract_and_prepare(
         &mut self,
         ctx: &mut ExtractContext,
@@ -664,14 +764,23 @@ impl SkyboxFeature {
         bg_uniforms: &CpuBuffer<SkyboxParamsUniforms>,
         global_state_key: (u32, u32),
         color_format: wgpu::TextureFormat,
-        procedural_resources: Option<ProceduralSkyboxResources<'_>>,
     ) {
-        self.ensure_layouts(ctx.device);
-
         let Some(variant) = SkyboxVariant::from_background(background_mode) else {
-            self.current_bind_group = None;
-            self.current_pipeline = None;
+            self.deactivate();
             return;
+        };
+        if !variant.needs_texture() || variant == SkyboxVariant::Procedural {
+            self.deactivate();
+            return;
+        }
+
+        self.ensure_layout_for_variant(ctx.device, variant, ProceduralStarboxKind::None);
+        let target_key = PreparedTextureTargetKey {
+            variant,
+            global_state_key,
+            color_format,
+            depth_format: ctx.wgpu_ctx.depth_format,
+            msaa_samples: ctx.wgpu_ctx.msaa_samples,
         };
 
         if let BackgroundMode::Texture {
@@ -681,47 +790,24 @@ impl SkyboxFeature {
         {
             let state = ctx.resource_manager.prepare_texture(ctx.assets, *handle);
             if matches!(state, ResourceState::Pending)
+                && self.current_texture_target == Some(target_key)
                 && self.current_bind_group.is_some()
                 && self.current_pipeline.is_some()
             {
-                // Texture is still loading, but we have a valid bind group and pipeline from the previous frame.
-                // Keep rendering the skybox with the old texture until the new one is ready, instead of stalling the GPU with an empty bind group.
+                // Preserve only the same scene's last prepared texture. The old
+                // feature-global fallback could leak a different scene's skybox.
+                return;
+            }
+            if matches!(state, ResourceState::Pending) {
+                self.deactivate();
                 return;
             }
         }
 
-        if let BackgroundMode::Procedural(params) = background_mode
-            && let Some(TextureSource::Asset(handle)) = params.starbox_texture
-        {
-            let state = ctx.resource_manager.prepare_texture(ctx.assets, handle);
-            if matches!(state, ResourceState::Pending)
-                && self.current_bind_group.is_some()
-                && self.current_pipeline.is_some()
-            {
-                return;
-            }
-        }
-
-        if let BackgroundMode::Procedural(params) = background_mode
-            && let Some(TextureSource::Asset(handle)) = params.moon_albedo_texture
-        {
-            let state = ctx.resource_manager.prepare_texture(ctx.assets, handle);
-            if matches!(state, ResourceState::Pending)
-                && self.current_bind_group.is_some()
-                && self.current_pipeline.is_some()
-            {
-                return;
-            }
-        }
-
-        // Ensure the custom sampler is created (first frame only; subsequent
-        // frames are a no-op HashMap lookup). The mutable borrow is released
-        // before we resolve the texture view below.
         let sampler_id = ctx
             .resource_manager
             .get_or_create_sampler(SKYBOX_SAMPLER_KEY);
 
-        // Resolve texture view
         let texture_view = match background_mode {
             BackgroundMode::Texture {
                 source, mapping, ..
@@ -729,190 +815,422 @@ impl SkyboxFeature {
                 .map(|resolved| (resolved.view.clone(), resolved.resource_key)),
             _ => None,
         };
-        let procedural_starbox = match background_mode {
-            BackgroundMode::Procedural(params) => params.starbox_texture.and_then(|source| {
-                Self::resolve_procedural_starbox_view(ctx.resource_manager, &source)
-                    .map(|starbox| (starbox.view.clone(), starbox.kind, starbox.resource_key))
-            }),
-            _ => None,
+        let layout = self.layout_for_variant(variant, ProceduralStarboxKind::None);
+        let bg_uniforms_resource_id = ctx.resource_manager.ensure_buffer_id(bg_uniforms);
+
+        let Some((tex_view, tex_view_resource_key)) = texture_view else {
+            self.deactivate();
+            return;
         };
-        let procedural_moon = match background_mode {
-            BackgroundMode::Procedural(params) => {
-                let moon = Self::resolve_procedural_moon_view(
-                    ctx.resource_manager,
-                    params.moon_albedo_texture,
-                );
-                Some((moon.view.clone(), moon.resource_key, moon.enabled))
-            }
-            _ => None,
+        let params_buffer = {
+            let params_gpu = bg_uniforms
+                .gpu_handle()
+                .and_then(|h| ctx.resource_manager.get_gpu_buffer(h))
+                .expect("Skybox params GPU buffer must exist");
+            params_gpu.buffer.clone()
         };
-        let procedural_starbox_kind = procedural_starbox
-            .as_ref()
-            .map_or(ProceduralStarboxKind::None, |(_, kind, _)| *kind);
-        let procedural_moon_enabled = procedural_moon
-            .as_ref()
-            .is_some_and(|(_, _, enabled)| *enabled);
-        let procedural_starbox_binding = procedural_starbox.clone();
-        let procedural_moon_binding = procedural_moon.clone();
-
-        // Build bind group (group 1)
-        let layout = self.layout_for_variant(variant, procedural_starbox_kind);
-
-        let bg_uniforms_resource_id = (variant != SkyboxVariant::Procedural)
-            .then(|| ctx.resource_manager.ensure_buffer_id(bg_uniforms));
-
-        let bind_group = if variant == SkyboxVariant::Procedural {
-            let Some(resources) = procedural_resources else {
-                self.current_bind_group = None;
-                self.current_pipeline = None;
-                return;
-            };
-            let (moon_view, moon_resource_key, _) =
-                procedural_moon_binding.expect("procedural moon view must exist");
-
-            let label = if procedural_starbox.is_some() {
-                Some("Skybox BG (Procedural+Starbox)")
-            } else {
-                Some("Skybox BG (Procedural)")
-            };
-
-            let builder = ctx
-                .build_bind_group(layout, label)
-                .bind_tracked_buffer(0, resources.bake_params_buffer)
-                .bind_tracked_texture_view(1, resources.sky_view_view)
-                .bind_common_sampler(2, CommonSampler::LinearClamp)
-                .bind_tracked_texture_view(3, resources.transmittance_view)
-                .bind_texture_view_with_id(4, &moon_view, moon_resource_key);
-
-            match procedural_starbox_binding {
-                Some((starbox_view, _, starbox_resource_key)) => builder
-                    .bind_texture_view_with_id(5, &starbox_view, starbox_resource_key)
-                    .build(),
-                None => builder.build(),
-            }
-        } else if variant.needs_texture() {
-            let Some((tex_view, tex_view_resource_key)) = texture_view else {
-                self.current_bind_group = None;
-                self.current_pipeline = None;
-                return;
-            };
-            let bg_uniforms_resource_id =
-                bg_uniforms_resource_id.expect("Skybox params resource id must exist");
-
-            let params_buffer = {
-                let params_gpu = bg_uniforms
-                    .gpu_handle()
-                    .and_then(|h| ctx.resource_manager.get_gpu_buffer(h))
-                    .expect("Skybox params GPU buffer must exist");
-                params_gpu.buffer.clone()
-            };
-
-            ctx.build_bind_group(layout, Some("Skybox BG (Texture)"))
-                .bind_raw_buffer(
-                    0,
-                    RawBufferBinding::new(&params_buffer, bg_uniforms_resource_id, None),
-                )
-                .bind_texture_view_with_id(1, &tex_view, tex_view_resource_key)
-                .bind_sampler_by_id(2, sampler_id)
-                .build()
-        } else {
-            let bg_uniforms_resource_id =
-                bg_uniforms_resource_id.expect("Skybox params resource id must exist");
-
-            let params_buffer = {
-                let params_gpu = bg_uniforms
-                    .gpu_handle()
-                    .and_then(|h| ctx.resource_manager.get_gpu_buffer(h))
-                    .expect("Skybox params GPU buffer must exist");
-                params_gpu.buffer.clone()
-            };
-
-            // Clone the system blue-noise view/sampler into owned locals so they
-            // can be bound without holding a borrow of `ctx` across the mutable
-            // `build_bind_group` call.
-            let blue_noise_view = ctx.resource_manager.system_textures().blue_noise.clone();
-            let blue_noise_view_id = blue_noise_view.id();
-            let blue_noise_sampler = ctx
-                .resource_manager
-                .system_textures()
-                .blue_noise_sampler
-                .clone();
-            let blue_noise_sampler_id = blue_noise_sampler.id();
-
-            ctx.build_bind_group(layout, Some("Skybox BG (Gradient)"))
-                .bind_raw_buffer(
-                    0,
-                    RawBufferBinding::new(&params_buffer, bg_uniforms_resource_id, None),
-                )
-                .bind_texture_view_with_id(1, &blue_noise_view, blue_noise_view_id)
-                .bind_raw_sampler(
-                    2,
-                    RawSamplerBinding::new(&blue_noise_sampler, blue_noise_sampler_id),
-                )
-                .build()
-        };
+        let bind_group = ctx
+            .build_bind_group(layout, Some("Skybox BG (Texture)"))
+            .bind_raw_buffer(
+                0,
+                RawBufferBinding::new(&params_buffer, bg_uniforms_resource_id, None),
+            )
+            .bind_texture_view_with_id(1, &tex_view, tex_view_resource_key)
+            .bind_sampler_by_id(2, sampler_id)
+            .build();
 
         self.current_bind_group = Some(bind_group.clone());
-
-        // Pipeline — uses pushed format fields instead of reading from the graph.
-        let pipeline_key = SkyboxPipelineKey {
+        let gpu_world = ctx
+            .resource_manager
+            .get_global_state(global_state_key.0, global_state_key.1)
+            .expect("Skybox global state must exist");
+        self.current_pipeline = Some(self.get_or_create_pipeline(
+            ctx.device,
+            ctx.pipeline_cache,
+            ctx.shader_manager,
+            &gpu_world.layout,
+            gpu_world.layout_id,
+            &gpu_world.binding_wgsl,
             variant,
-            procedural_starbox: if variant == SkyboxVariant::Procedural {
-                procedural_starbox_kind
-            } else {
-                ProceduralStarboxKind::None
-            },
-            procedural_moon_texture: if variant == SkyboxVariant::Procedural {
-                procedural_moon_enabled
-            } else {
-                false
-            },
+            ProceduralStarboxKind::None,
+            false,
             color_format,
-            depth_format: ctx.wgpu_ctx.depth_format,
-            msaa_samples: ctx.wgpu_ctx.msaa_samples,
-        };
-        self.current_pipeline =
-            Some(self.get_or_create_pipeline(ctx, pipeline_key, global_state_key));
+            ctx.wgpu_ctx.depth_format,
+            ctx.wgpu_ctx.msaa_samples,
+        ));
+        self.current_texture_target = Some(target_key);
     }
 
-    /// Release frame-selected state when the current background uses only a
-    /// hardware color clear. In particular, a procedural bind group retains
-    /// atmosphere LUT views and buffers and could otherwise outlive the
-    /// feature's scene-domain TTL.
+    /// Capture only POD state for a gradient draw.
+    #[must_use]
+    #[allow(clippy::unused_self)] // Keep the uniform Feature::extract API.
+    pub(crate) fn extract_gradient(
+        &self,
+        params: &CpuBuffer<SkyboxParamsUniforms>,
+        global_state_key: GlobalStateKey,
+        color_format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+    ) -> GradientSkyboxSnapshot {
+        GradientSkyboxSnapshot {
+            params: *params.read(),
+            global_state_key,
+            color_format,
+            depth_format,
+            msaa_samples,
+        }
+    }
+
+    /// Capture only logical/POD state for a procedural draw.
+    #[must_use]
+    #[allow(clippy::unused_self)] // Keep the uniform Feature::extract API.
+    pub(crate) fn extract_procedural(
+        &self,
+        params: &ProceduralSkyParams,
+        environment: ProceduralEnvironmentSnapshot,
+        global_state_key: GlobalStateKey,
+        color_format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+    ) -> ProceduralSkyboxSnapshot {
+        let starbox = params
+            .starbox_texture
+            .zip(environment.starbox_texture)
+            .and_then(|(source, logical)| {
+                if !logical.ready {
+                    return None;
+                }
+                Some(ProceduralStarboxSnapshot {
+                    source,
+                    kind: ProceduralStarboxKind::from_view_dimension(logical.view_dimension)?,
+                    logical_version: logical.version,
+                })
+            });
+        let moon_texture = params
+            .moon_albedo_texture
+            .zip(environment.moon_texture)
+            .and_then(|(source, logical)| {
+                (logical.ready && logical.view_dimension == wgpu::TextureViewDimension::D2)
+                    .then_some(ProceduralTextureSnapshot {
+                        source,
+                        logical_version: logical.version,
+                    })
+            });
+
+        ProceduralSkyboxSnapshot {
+            global_state_key,
+            color_format,
+            depth_format,
+            msaa_samples,
+            starbox,
+            moon_texture,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn prepared_draw_request(&self) -> Option<SkyboxDrawRequest<'_>> {
+        Some(SkyboxDrawRequest::Prepared {
+            pipeline_id: self.current_pipeline?,
+            bind_group: self.current_bind_group.as_ref()?,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn procedural_draw_request(
+        &mut self,
+        snapshot: ProceduralSkyboxSnapshot,
+        inputs: ProceduralSkyboxInputs,
+    ) -> SkyboxDrawRequest<'_> {
+        SkyboxDrawRequest::Procedural {
+            feature: self,
+            snapshot,
+            inputs,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn gradient_draw_request(
+        &mut self,
+        snapshot: GradientSkyboxSnapshot,
+    ) -> SkyboxDrawRequest<'_> {
+        SkyboxDrawRequest::Gradient {
+            feature: self,
+            snapshot,
+        }
+    }
+
+    fn prepare_gradient_draw<'frame>(
+        &mut self,
+        ctx: &mut PrepareContext<'frame>,
+        snapshot: GradientSkyboxSnapshot,
+        params_buffer: BufferNodeId,
+    ) -> (RenderPipelineId, &'frame wgpu::BindGroup) {
+        self.ensure_layout_for_variant(
+            ctx.device,
+            SkyboxVariant::Gradient,
+            ProceduralStarboxKind::None,
+        );
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(params_buffer),
+            0,
+            bytemuck::bytes_of(&snapshot.params),
+        );
+
+        let global_state = ctx
+            .global_states
+            .get(snapshot.global_state_key)
+            .expect("gradient Skybox global state must exist before RDG prepare");
+        let pipeline_id = self.get_or_create_pipeline(
+            ctx.device,
+            ctx.pipeline_cache,
+            ctx.shader_manager,
+            &global_state.layout,
+            global_state.layout_id,
+            &global_state.binding_wgsl,
+            SkyboxVariant::Gradient,
+            ProceduralStarboxKind::None,
+            false,
+            snapshot.color_format,
+            snapshot.depth_format,
+            snapshot.msaa_samples,
+        );
+
+        let blue_noise = ctx.system_textures.blue_noise.clone();
+        let blue_noise_sampler = ctx.system_textures.blue_noise_sampler.clone();
+        let layout = self.layout_for_variant(SkyboxVariant::Gradient, ProceduralStarboxKind::None);
+        let bind_group = ctx
+            .build_bind_group(layout, Some("Skybox BG (Gradient)"))
+            .bind_buffer(0, params_buffer)
+            .bind_tracked_texture_view(1, &blue_noise)
+            .bind_tracked_sampler(2, &blue_noise_sampler)
+            .build();
+
+        (pipeline_id, bind_group)
+    }
+
+    fn prepare_procedural_draw<'frame>(
+        &mut self,
+        ctx: &mut PrepareContext<'frame>,
+        snapshot: ProceduralSkyboxSnapshot,
+        inputs: ProceduralSkyboxInputs,
+    ) -> (RenderPipelineId, &'frame wgpu::BindGroup) {
+        let starbox_kind = snapshot
+            .starbox
+            .map_or(ProceduralStarboxKind::None, |starbox| starbox.kind);
+        self.ensure_layout_for_variant(ctx.device, SkyboxVariant::Procedural, starbox_kind);
+
+        let starbox = snapshot.starbox.map(|starbox| {
+            let prepared = ctx
+                .uploads
+                .resolve_texture_source(ctx.assets, starbox.source, starbox.logical_version)
+                .expect("procedural starbox must keep its snapshot version through prepare");
+            assert_eq!(
+                ProceduralStarboxKind::from_view_dimension(prepared.view_dimension),
+                Some(starbox.kind),
+                "procedural starbox view dimension changed after extraction",
+            );
+            assert_eq!(
+                prepared.logical_version, starbox.logical_version,
+                "procedural starbox version changed after extraction",
+            );
+            prepared
+        });
+        let moon_texture = snapshot.moon_texture.map(|source| {
+            let prepared = ctx
+                .uploads
+                .resolve_texture_source(ctx.assets, source.source, source.logical_version)
+                .expect("procedural moon texture must keep its snapshot version through prepare");
+            assert_eq!(
+                prepared.view_dimension,
+                wgpu::TextureViewDimension::D2,
+                "procedural moon texture view dimension changed after extraction",
+            );
+            assert_eq!(
+                prepared.logical_version, source.logical_version,
+                "procedural moon texture version changed after extraction",
+            );
+            prepared
+        });
+
+        let global_state = ctx
+            .global_states
+            .get(snapshot.global_state_key)
+            .expect("procedural Skybox global state must exist before RDG prepare");
+        let pipeline_id = self.get_or_create_pipeline(
+            ctx.device,
+            ctx.pipeline_cache,
+            ctx.shader_manager,
+            &global_state.layout,
+            global_state.layout_id,
+            &global_state.binding_wgsl,
+            SkyboxVariant::Procedural,
+            starbox_kind,
+            moon_texture.is_some(),
+            snapshot.color_format,
+            snapshot.depth_format,
+            snapshot.msaa_samples,
+        );
+
+        let white_moon = ctx.system_textures.white_2d.clone();
+        let layout = self.layout_for_variant(SkyboxVariant::Procedural, starbox_kind);
+        let label = if starbox.is_some() {
+            Some("Skybox BG (Procedural+Starbox)")
+        } else {
+            Some("Skybox BG (Procedural)")
+        };
+        let builder = ctx
+            .build_bind_group(layout, label)
+            .bind_buffer(0, inputs.bake_params)
+            .bind_texture(1, inputs.sky_view)
+            .bind_common_sampler(2, CommonSampler::LinearClamp)
+            .bind_texture(3, inputs.transmittance);
+        let builder = if let Some(moon) = moon_texture.as_ref() {
+            builder.bind_texture_view_with_id(4, &moon.view, moon.view_id)
+        } else {
+            builder.bind_tracked_texture_view(4, &white_moon)
+        };
+        let bind_group = if let Some(starbox) = starbox.as_ref() {
+            builder
+                .bind_texture_view_with_id(5, &starbox.view, starbox.view_id)
+                .build()
+        } else {
+            builder.build()
+        };
+
+        (pipeline_id, bind_group)
+    }
+
+    /// Release the compatibility path's frame-selected physical draw state.
     pub(crate) fn deactivate(&mut self) {
         self.current_bind_group = None;
         self.current_pipeline = None;
+        self.current_texture_target = None;
+    }
+}
+
+impl<'a> SkyboxDrawRequest<'a> {
+    /// Declare the real resources sampled by this draw and turn the build-time
+    /// request into node-local prepare state.
+    pub(crate) fn build(self, builder: &mut PassBuilder<'_, 'a>) -> SkyboxDrawState<'a> {
+        match self {
+            Self::Prepared {
+                pipeline_id,
+                bind_group,
+            } => SkyboxDrawState::Prepared {
+                pipeline_id,
+                bind_group,
+            },
+            Self::Gradient { feature, snapshot } => {
+                let params_buffer = builder.create_buffer(
+                    "Skybox_Params",
+                    BufferDesc::new(
+                        std::mem::size_of::<SkyboxParamsUniforms>() as u64,
+                        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    ),
+                );
+                SkyboxDrawState::Gradient(GradientSkyboxDrawState {
+                    feature,
+                    snapshot,
+                    params_buffer,
+                    pipeline_id: None,
+                    bind_group: None,
+                })
+            }
+            Self::Procedural {
+                feature,
+                snapshot,
+                inputs,
+            } => {
+                builder.read_texture(inputs.sky_view);
+                builder.read_texture(inputs.transmittance);
+                builder.read_buffer(inputs.bake_params);
+                SkyboxDrawState::Procedural(ProceduralSkyboxDrawState {
+                    feature,
+                    snapshot,
+                    inputs,
+                    pipeline_id: None,
+                    bind_group: None,
+                })
+            }
+        }
     }
 
-    /// Create an ephemeral [`SkyboxPassNode`] and add it to the render graph.
-    /// Build the ephemeral pass node and insert it into the graph.
-    ///
-    /// Creates an SSA alias of `scene_color` so that the dependency
-    /// Opaque → Skybox is locked by graph edges, not by registration
-    /// order.  Returns the new colour version for downstream threading.
-    pub fn add_to_graph<'a>(
-        &'a self,
+    /// Add the standalone HighFidelity skybox pass.
+    pub(crate) fn add_to_graph(
+        self,
         ctx: &mut GraphBuilderContext<'a, '_>,
         scene_color: TextureNodeId,
         scene_depth: TextureNodeId,
-        dependency_textures: [Option<TextureNodeId>; 2],
     ) -> TextureNodeId {
-        let pipeline_id = self.current_pipeline;
-        let bind_group = self.current_bind_group.as_ref();
         ctx.graph.add_pass("Skybox_Pass", |builder| {
             let out_color = builder.mutate_texture(scene_color, "Scene_Color_Skybox");
             builder.read_texture(scene_depth);
-            for dependency in dependency_textures.into_iter().flatten() {
-                builder.read_texture(dependency);
-            }
+            let draw = self.build(builder);
             let node = SkyboxPassNode {
                 out_color,
                 scene_depth,
-                pipeline_id,
-                bind_group,
+                draw,
             };
             (node, out_color)
         })
+    }
+}
+
+impl<'a> SkyboxDrawState<'a> {
+    pub(crate) fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        match self {
+            Self::Prepared { .. } => {}
+            Self::Gradient(state) => {
+                let (pipeline_id, bind_group) =
+                    state
+                        .feature
+                        .prepare_gradient_draw(ctx, state.snapshot, state.params_buffer);
+                state.pipeline_id = Some(pipeline_id);
+                state.bind_group = Some(bind_group);
+            }
+            Self::Procedural(state) => {
+                let (pipeline_id, bind_group) =
+                    state
+                        .feature
+                        .prepare_procedural_draw(ctx, state.snapshot, state.inputs);
+                state.pipeline_id = Some(pipeline_id);
+                state.bind_group = Some(bind_group);
+            }
+        }
+    }
+
+    pub(crate) fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'a>,
+        global_bind_group: &'a wgpu::BindGroup,
+        pipeline_cache: &'a PipelineCache,
+    ) {
+        let (pipeline_id, bind_group) = match self {
+            Self::Prepared {
+                pipeline_id,
+                bind_group,
+            } => (*pipeline_id, *bind_group),
+            Self::Gradient(state) => (
+                state
+                    .pipeline_id
+                    .expect("gradient Skybox pipeline must exist after prepare"),
+                state
+                    .bind_group
+                    .expect("gradient Skybox bind group must exist after prepare"),
+            ),
+            Self::Procedural(state) => (
+                state
+                    .pipeline_id
+                    .expect("procedural Skybox pipeline must exist after prepare"),
+                state
+                    .bind_group
+                    .expect("procedural Skybox bind group must exist after prepare"),
+            ),
+        };
+        pass.set_pipeline(pipeline_cache.get_render_pipeline(pipeline_id));
+        pass.set_bind_group(0, global_bind_group, &[]);
+        pass.set_bind_group(1, bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -922,17 +1240,15 @@ impl SkyboxFeature {
 pub struct SkyboxPassNode<'a> {
     out_color: TextureNodeId,
     scene_depth: TextureNodeId,
-    pipeline_id: Option<RenderPipelineId>,
-    bind_group: Option<&'a wgpu::BindGroup>,
+    draw: SkyboxDrawState<'a>,
 }
 
 impl<'a> PassNode<'a> for SkyboxPassNode<'a> {
-    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let (Some(pipeline_id), Some(bind_group)) = (self.pipeline_id, self.bind_group) else {
-            return;
-        };
-        let pipeline = ctx.pipeline_cache.get_render_pipeline(pipeline_id);
+    fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
+        self.draw.prepare(ctx);
+    }
 
+    fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let gpu_global_bind_group = ctx.baked_lists.global_bind_group;
 
         let color_att = ctx.get_color_attachment(self.out_color, RenderTargetOps::Load, None);
@@ -948,10 +1264,241 @@ impl<'a> PassNode<'a> for SkyboxPassNode<'a> {
         };
 
         let mut pass = encoder.begin_render_pass(&pass_desc);
+        self.draw
+            .draw(&mut pass, gpu_global_bind_group, ctx.pipeline_cache);
+    }
+}
 
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, gpu_global_bind_group, &[]);
-        pass.set_bind_group(1, bind_group, &[]);
-        pass.draw(0..3, 0..1);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::core::graph::FrameConfig;
+    use crate::graph::core::{
+        BufferDesc, ClusteredScreenBindings, FrameArena, GraphStorage, RenderGraph, TextureDesc,
+    };
+    use crate::graph::passes::SimpleForwardFeature;
+
+    struct TestNode;
+
+    impl PassNode<'_> for TestNode {
+        fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    fn frame_config() -> FrameConfig {
+        FrameConfig {
+            width: 320,
+            height: 180,
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            msaa_samples: 1,
+            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            hdr_format: crate::HDR_TEXTURE_FORMAT,
+        }
+    }
+
+    fn texture_desc(format: wgpu::TextureFormat) -> TextureDesc {
+        TextureDesc::new_2d(
+            16,
+            16,
+            format,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        )
+    }
+
+    fn procedural_graph_live_passes(root_skybox: bool) -> Vec<&'static str> {
+        let mut feature = SkyboxFeature::new();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let scene_color = graph.add_pass("Scene_Color_Producer", |builder| {
+            let output =
+                builder.create_texture("Scene_Color", texture_desc(crate::HDR_TEXTURE_FORMAT));
+            (TestNode, output)
+        });
+        let scene_depth = graph.add_pass("Scene_Depth_Producer", |builder| {
+            let output = builder.create_texture(
+                "Scene_Depth",
+                texture_desc(wgpu::TextureFormat::Depth32Float),
+            );
+            (TestNode, output)
+        });
+        let sky_view = graph.add_pass("SkyView_Producer", |builder| {
+            let output =
+                builder.create_texture("Sky_View", texture_desc(wgpu::TextureFormat::Rgba16Float));
+            (TestNode, output)
+        });
+        let transmittance = graph.add_pass("Transmittance_Producer", |builder| {
+            let output = builder.create_texture(
+                "Transmittance",
+                texture_desc(wgpu::TextureFormat::Rgba16Float),
+            );
+            (TestNode, output)
+        });
+        let bake_params = graph.add_pass("Bake_Params_Producer", |builder| {
+            let output = builder.create_buffer(
+                "Bake_Params",
+                BufferDesc::new(
+                    64,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                ),
+            );
+            (TestNode, output)
+        });
+        let config = frame_config();
+        let output = {
+            let mut ctx = GraphBuilderContext::new(&mut graph, &config, 0);
+            feature
+                .procedural_draw_request(
+                    ProceduralSkyboxSnapshot {
+                        global_state_key: GlobalStateKey::new(1, 7),
+                        color_format: crate::HDR_TEXTURE_FORMAT,
+                        depth_format: wgpu::TextureFormat::Depth32Float,
+                        msaa_samples: 1,
+                        starbox: None,
+                        moon_texture: None,
+                    },
+                    ProceduralSkyboxInputs {
+                        sky_view,
+                        transmittance,
+                        bake_params,
+                    },
+                )
+                .add_to_graph(&mut ctx, scene_color, scene_depth)
+        };
+        if root_skybox {
+            graph.add_pass("Skybox_Test_Root", |builder| {
+                builder.read_texture(output);
+                builder.mark_side_effect();
+                (TestNode, ())
+            });
+        }
+
+        graph.compile_topology();
+        graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect()
+    }
+
+    #[test]
+    fn procedural_skybox_declares_all_physical_inputs() {
+        let live = procedural_graph_live_passes(true);
+        assert!(live.contains(&"SkyView_Producer"));
+        assert!(live.contains(&"Transmittance_Producer"));
+        assert!(live.contains(&"Bake_Params_Producer"));
+        assert!(live.contains(&"Skybox_Pass"));
+    }
+
+    #[test]
+    fn basic_forward_inline_skybox_keeps_all_inputs_live() {
+        let mut skybox_feature = SkyboxFeature::new();
+        let simple_forward = SimpleForwardFeature::new();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let sky_view = graph.add_pass("Inline_SkyView_Producer", |builder| {
+            let output = builder.create_texture(
+                "Inline_Sky_View",
+                texture_desc(wgpu::TextureFormat::Rgba16Float),
+            );
+            (TestNode, output)
+        });
+        let transmittance = graph.add_pass("Inline_Transmittance_Producer", |builder| {
+            let output = builder.create_texture(
+                "Inline_Transmittance",
+                texture_desc(wgpu::TextureFormat::Rgba16Float),
+            );
+            (TestNode, output)
+        });
+        let bake_params = graph.add_pass("Inline_Bake_Params_Producer", |builder| {
+            let output = builder.create_buffer(
+                "Inline_Bake_Params",
+                BufferDesc::new(
+                    64,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                ),
+            );
+            (TestNode, output)
+        });
+        let config = frame_config();
+        let output = {
+            let mut ctx = GraphBuilderContext::new(&mut graph, &config, 0);
+            let skybox = skybox_feature.procedural_draw_request(
+                ProceduralSkyboxSnapshot {
+                    global_state_key: GlobalStateKey::new(2, 9),
+                    color_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                    depth_format: wgpu::TextureFormat::Depth32Float,
+                    msaa_samples: 1,
+                    starbox: None,
+                    moon_texture: None,
+                },
+                ProceduralSkyboxInputs {
+                    sky_view,
+                    transmittance,
+                    bake_params,
+                },
+            );
+            simple_forward.add_to_graph(
+                &mut ctx,
+                wgpu::Color::BLACK,
+                Some(skybox),
+                None,
+                None,
+                None,
+                ClusteredScreenBindings::default(),
+            )
+        };
+        graph.add_pass("Inline_Skybox_Test_Root", |builder| {
+            builder.read_texture(output);
+            builder.mark_side_effect();
+            (TestNode, ())
+        });
+
+        graph.compile_topology();
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert!(live.contains(&"Inline_SkyView_Producer"));
+        assert!(live.contains(&"Inline_Transmittance_Producer"));
+        assert!(live.contains(&"Inline_Bake_Params_Producer"));
+        assert!(live.contains(&"SimpleForward_Pass"));
+        assert!(!live.contains(&"Skybox_Pass"));
+    }
+
+    #[test]
+    fn dead_procedural_skybox_culls_its_entire_input_chain() {
+        assert!(procedural_graph_live_passes(false).is_empty());
+    }
+
+    #[test]
+    fn procedural_pipeline_key_tracks_global_and_shader_identity() {
+        let base = SkyboxPipelineKey {
+            variant: SkyboxVariant::Procedural,
+            procedural_starbox: ProceduralStarboxKind::None,
+            procedural_moon_texture: false,
+            color_format: crate::HDR_TEXTURE_FORMAT,
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            msaa_samples: 1,
+            global_layout_id: 11,
+            shader_source_identity: 17,
+        };
+        assert_ne!(
+            base,
+            SkyboxPipelineKey {
+                global_layout_id: 12,
+                ..base
+            }
+        );
+        assert_ne!(
+            base,
+            SkyboxPipelineKey {
+                shader_source_identity: 18,
+                ..base
+            }
+        );
     }
 }

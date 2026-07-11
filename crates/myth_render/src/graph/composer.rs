@@ -60,10 +60,11 @@ use crate::graph::core::{
     HookStage, PrepareContext, RenderGraph, TextureDesc, TransientPool, ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
-use crate::graph::frame::{PreparedSkyboxDraw, RenderLists};
+use crate::graph::frame::RenderLists;
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
 use crate::graph::passes::ibl_compute::EnvironmentCacheSnapshot;
+use crate::graph::passes::skybox::ProceduralSkyboxInputs;
 use crate::graph::passes::utils::add_msaa_resolve_pass;
 use crate::graph::passes::{
     AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, ClusteredLightingInputs,
@@ -589,6 +590,79 @@ impl<'a> FrameComposer<'a> {
 
         // let needs_normal = ssao_enabled || needs_feature_id;
         let needs_skybox = self.ctx.scene.background.needs_skybox_pass();
+        let skybox_global_state_key =
+            GlobalStateKey::new(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id);
+        let skybox_color_format = if is_high_fidelity {
+            crate::HDR_TEXTURE_FORMAT
+        } else {
+            self.frame_config.surface_format
+        };
+        let gradient_skybox_snapshot = matches!(
+            &self.ctx.scene.background.mode,
+            myth_scene::background::BackgroundMode::Gradient { .. }
+        )
+        .then(|| {
+            self.ctx.skybox_pass.extract_gradient(
+                &self.ctx.scene.background.uniforms,
+                skybox_global_state_key,
+                skybox_color_format,
+                self.frame_config.depth_format,
+                self.frame_config.msaa_samples,
+            )
+        });
+        let procedural_environment_snapshot =
+            if let myth_scene::background::BackgroundMode::Procedural(params) =
+                &self.ctx.scene.background.mode
+            {
+                Some(
+                    self.ctx
+                        .resource_manager
+                        .snapshot_procedural_environment(self.ctx.assets, params),
+                )
+            } else {
+                None
+            };
+        let procedural_skybox_snapshot = if let (
+            myth_scene::background::BackgroundMode::Procedural(params),
+            Some(environment),
+        ) = (
+            &self.ctx.scene.background.mode,
+            procedural_environment_snapshot,
+        ) {
+            Some(self.ctx.skybox_pass.extract_procedural(
+                params,
+                environment,
+                skybox_global_state_key,
+                skybox_color_format,
+                self.frame_config.depth_format,
+                self.frame_config.msaa_samples,
+            ))
+        } else {
+            None
+        };
+        let atmosphere_snapshot = if let (
+            myth_scene::background::BackgroundMode::Procedural(params),
+            Some(environment),
+        ) = (
+            &self.ctx.scene.background.mode,
+            procedural_environment_snapshot,
+        ) {
+            Some(self.ctx.atmosphere_pass.extract(
+                self.ctx.shader_manager,
+                self.ctx.scene.id(),
+                params,
+                environment,
+            ))
+        } else {
+            None
+        };
+        let atmosphere_cache_snapshot = atmosphere_snapshot.map(|snapshot| {
+            self.ctx.atmosphere_pass.plan_luts(
+                self.ctx.history_registry,
+                &snapshot,
+                self.ctx.resource_manager.frame_index(),
+            )
+        });
         let ssss_enabled = self.ctx.scene.ssss.enabled;
         let has_transmission = self.ctx.render_lists.use_transmission;
         let bloom_enabled = self.ctx.scene.bloom.enabled && is_high_fidelity;
@@ -603,14 +677,46 @@ impl<'a> FrameComposer<'a> {
             let scene_id = self.ctx.scene.id();
             let scene_gpu_environment = has_active_environment
                 .then(|| self.ctx.resource_manager.gpu_environment(scene_id).copied())
-                .flatten();
+                .flatten()
+                .map(|mut environment| {
+                    let source_matches = match environment.source_type {
+                        CubeSourceType::Procedural => procedural_environment_snapshot
+                            .is_some_and(|snapshot| snapshot.matches_gpu_environment(&environment)),
+                        CubeSourceType::Equirectangular | CubeSourceType::Cubemap => {
+                            environment.source_key.is_some_and(|source| {
+                                let logical = self
+                                    .ctx
+                                    .resource_manager
+                                    .snapshot_texture_source(self.ctx.assets, source);
+                                let dimension_matches = match environment.source_type {
+                                    CubeSourceType::Equirectangular => {
+                                        logical.view_dimension == wgpu::TextureViewDimension::D2
+                                    }
+                                    CubeSourceType::Cubemap => {
+                                        logical.view_dimension == wgpu::TextureViewDimension::Cube
+                                    }
+                                    CubeSourceType::Procedural => unreachable!(),
+                                };
+                                logical.ready == environment.source_ready
+                                    && logical.version == environment.source_version
+                                    && dimension_matches
+                            })
+                        }
+                    };
+                    if !source_matches {
+                        // Asset readiness/version changed after begin-frame.
+                        // Treat this attempt as pending so the cache coordinator
+                        // preserves the last submitted Base/PMREM publication.
+                        environment.source_ready = false;
+                    }
+                    environment
+                });
             let environment_shader_identities = scene_gpu_environment.map(|environment| {
                 let shader_options = ShaderCompilationOptions::default();
                 let base_shader_identity = match environment.source_type {
-                    CubeSourceType::Procedural => self
-                        .ctx
-                        .atmosphere_pass
-                        .procedural_base_shader_identity(scene_id),
+                    CubeSourceType::Procedural => atmosphere_snapshot
+                        .expect("procedural environment requires an atmosphere snapshot")
+                        .procedural_base_shader_identity(),
                     CubeSourceType::Equirectangular => {
                         self.ctx.shader_manager.pipeline_shader_hash(
                             ShaderSource::File("entry/utility/equirect_to_cube"),
@@ -689,7 +795,7 @@ impl<'a> FrameComposer<'a> {
             let environment_pmrem_max_mip_level = environment_cache_snapshot
                 .filter(|snapshot| snapshot.pmrem_plan.is_some())
                 .map(|snapshot| snapshot.pmrem_mip_level_count.saturating_sub(1) as f32);
-            let mut procedural_skybox_dependencies = [None, None];
+            let mut procedural_skybox_inputs = None;
             let mut atmosphere_transmittance = None;
             let mut atmosphere_bake_params = None;
 
@@ -699,6 +805,35 @@ impl<'a> FrameComposer<'a> {
             graph_ctx.with_group("Compute", |c| {
                 MipmapFeature::add_requests_to_graph(c, mipmap_requests);
 
+                // Visual atmosphere generation is independent from Environment
+                // cache readiness. Pending optional star/moon assets therefore
+                // suppress only Base/PMREM publication, not the live sky.
+                if let (Some(snapshot), Some(cache)) =
+                    (atmosphere_snapshot, atmosphere_cache_snapshot)
+                {
+                    let base_writer = environment_cache_snapshot
+                        .filter(|environment| environment.source_type == CubeSourceType::Procedural)
+                        .and_then(|environment| environment.base_plan)
+                        .and_then(|plan| plan.commit.map(|token| (token, environment_base)))
+                        .and_then(|(token, base)| base.map(|base| (token, base)));
+                    let atmosphere_output = self.ctx.atmosphere_pass.add_to_graph(
+                        c,
+                        &snapshot,
+                        &cache,
+                        base_writer.map(|(_, base)| base),
+                    );
+                    procedural_skybox_inputs = Some(ProceduralSkyboxInputs {
+                        sky_view: atmosphere_output.sky_view,
+                        transmittance: atmosphere_output.transmittance,
+                        bake_params: atmosphere_output.bake_params,
+                    });
+                    atmosphere_transmittance = Some(atmosphere_output.transmittance);
+                    atmosphere_bake_params = Some(atmosphere_output.bake_params);
+                    if let Some((token, base)) = base_writer {
+                        c.graph.register_cache_commit(token, &[base]);
+                    }
+                }
+
                 if let (Some(snapshot), Some(base_cube)) =
                     (environment_cache_snapshot, environment_base)
                 {
@@ -706,26 +841,7 @@ impl<'a> FrameComposer<'a> {
                         .base_plan
                         .expect("ready environment cache snapshot must plan a base cube");
                     match snapshot.source_type {
-                        CubeSourceType::Procedural => {
-                            if let myth_scene::background::BackgroundMode::Procedural(params) =
-                                &self.ctx.scene.background.mode
-                            {
-                                let atmosphere_output = self.ctx.atmosphere_pass.add_to_graph(
-                                    c,
-                                    scene_id,
-                                    params,
-                                    base_cube,
-                                    base_plan.commit.is_some(),
-                                );
-                                procedural_skybox_dependencies =
-                                    atmosphere_output.skybox_dependencies();
-                                atmosphere_transmittance = Some(atmosphere_output.transmittance);
-                                atmosphere_bake_params = Some(atmosphere_output.bake_params);
-                                if let Some(token) = base_plan.commit {
-                                    c.graph.register_cache_commit(token, &[base_cube]);
-                                }
-                            }
-                        }
+                        CubeSourceType::Procedural => {}
                         CubeSourceType::Equirectangular | CubeSourceType::Cubemap => {
                             if let Some(token) = base_plan.commit {
                                 self.ctx.equirect_to_cube_pass.add_to_graph(
@@ -970,12 +1086,21 @@ impl<'a> FrameComposer<'a> {
 
                         // 5. Skybox
                         if needs_skybox {
-                            active_color = self.ctx.skybox_pass.add_to_graph(
-                                c,
-                                active_color,
-                                opaque_out.active_depth,
-                                procedural_skybox_dependencies,
-                            );
+                            let draw = if let Some(snapshot) = procedural_skybox_snapshot {
+                                procedural_skybox_inputs.map(|inputs| {
+                                    self.ctx
+                                        .skybox_pass
+                                        .procedural_draw_request(snapshot, inputs)
+                                })
+                            } else if let Some(snapshot) = gradient_skybox_snapshot {
+                                Some(self.ctx.skybox_pass.gradient_draw_request(snapshot))
+                            } else {
+                                self.ctx.skybox_pass.prepared_draw_request()
+                            };
+                            if let Some(draw) = draw {
+                                active_color =
+                                    draw.add_to_graph(c, active_color, opaque_out.active_depth);
+                            }
                         }
 
                         if ssgi_enabled {
@@ -1252,23 +1377,6 @@ impl<'a> FrameComposer<'a> {
             } else {
                 // BasicForward pipeline: single-pass LDR rendering.
 
-                let prepared_skybox = if needs_skybox {
-                    let skybox_pipeline = self.ctx.skybox_pass.current_pipeline;
-                    let skybox_bind_group = &self.ctx.skybox_pass.current_bind_group;
-
-                    if let (Some(pipeline_id), Some(bg)) = (skybox_pipeline, skybox_bind_group) {
-                        Some(PreparedSkyboxDraw {
-                            pipeline_id,
-                            bind_group: bg,
-                            sampled_textures: procedural_skybox_dependencies,
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
                 let scene_color = graph_ctx.with_group("BasicForward", |c| {
                     let scene_lights = c.with_group("Scene_Lighting", |c| {
                         import_scene_lighting(c, self.ctx.render_lists)
@@ -1306,10 +1414,25 @@ impl<'a> FrameComposer<'a> {
                         atmosphere_transmittance,
                         atmosphere_bake_params,
                     };
+                    let skybox = if needs_skybox {
+                        if let Some(snapshot) = procedural_skybox_snapshot {
+                            procedural_skybox_inputs.map(|inputs| {
+                                self.ctx
+                                    .skybox_pass
+                                    .procedural_draw_request(snapshot, inputs)
+                            })
+                        } else if let Some(snapshot) = gradient_skybox_snapshot {
+                            Some(self.ctx.skybox_pass.gradient_draw_request(snapshot))
+                        } else {
+                            self.ctx.skybox_pass.prepared_draw_request()
+                        }
+                    } else {
+                        None
+                    };
                     self.ctx.simple_forward_pass.add_to_graph(
                         c,
                         self.ctx.extracted_scene.background.clear_color(),
-                        prepared_skybox,
+                        skybox,
                         shadow_output.shadow_2d,
                         shadow_output.shadow_cube,
                         env_dependency_pmrem,

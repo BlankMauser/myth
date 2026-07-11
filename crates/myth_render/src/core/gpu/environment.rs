@@ -4,7 +4,8 @@ use glam::Vec3;
 use wgpu::TextureViewDimension;
 
 use myth_assets::AssetServer;
-use myth_resources::texture::TextureSource;
+use myth_resources::image::Image;
+use myth_resources::texture::{Texture, TextureSource};
 use myth_scene::background::{BackgroundMode, ProceduralSkyParams};
 use myth_scene::environment::Environment;
 
@@ -51,11 +52,46 @@ impl GpuEnvironment {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ResolvedTextureSource {
-    version: u64,
-    ready: bool,
-    view_dimension: TextureViewDimension,
+/// CPU-only identity and readiness snapshot for one texture source.
+///
+/// This type deliberately contains no physical WGPU resource. Live pass
+/// preparation can use the source after DPE while graph construction relies on
+/// the logical version and view dimension for cache and pipeline decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogicalTextureSourceSnapshot {
+    pub(crate) version: u64,
+    pub(crate) ready: bool,
+    pub(crate) view_dimension: TextureViewDimension,
+}
+
+/// One coherent CPU-only snapshot of every source that contributes to a
+/// procedural environment bake.
+///
+/// Composer shares this value between Atmosphere and Skybox. Comparing its
+/// identity against the earlier frame metadata also closes the async-asset
+/// window before a persistent cache attempt is planned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProceduralEnvironmentSnapshot {
+    pub(crate) source_ready: bool,
+    pub(crate) source_version: u64,
+    pub(crate) physics_hash: u64,
+    pub(crate) static_bake_hash: u64,
+    pub(crate) moon_texture: Option<LogicalTextureSourceSnapshot>,
+    pub(crate) starbox_texture: Option<LogicalTextureSourceSnapshot>,
+}
+
+impl ProceduralEnvironmentSnapshot {
+    /// Whether begin-frame metadata and the Composer-time source snapshot still
+    /// describe the exact same procedural bake input.
+    #[inline]
+    #[must_use]
+    pub(crate) fn matches_gpu_environment(self, environment: &GpuEnvironment) -> bool {
+        environment.source_type == CubeSourceType::Procedural
+            && environment.source_ready == self.source_ready
+            && environment.source_version == self.source_version
+            && environment.procedural_physics_hash == self.physics_hash
+            && environment.procedural_static_bake_hash == self.static_bake_hash
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,23 +112,78 @@ fn hash_vec3<H: Hasher>(hasher: &mut H, value: Vec3) {
     hash_f32(hasher, value.z);
 }
 
+pub(super) fn snapshot_ready_asset_texture_source(
+    source: TextureSource,
+    texture: &Texture,
+    texture_version: u32,
+    image: &Image,
+    image_version: u32,
+) -> LogicalTextureSourceSnapshot {
+    let mut hasher = rustc_hash::FxHasher::default();
+    source.hash(&mut hasher);
+    1u8.hash(&mut hasher);
+    texture.uuid.hash(&mut hasher);
+    texture_version.hash(&mut hasher);
+    texture.image.hash(&mut hasher);
+    texture.view_dimension.hash(&mut hasher);
+    texture.color_space.hash(&mut hasher);
+    1u8.hash(&mut hasher);
+    image.uuid.hash(&mut hasher);
+    image_version.hash(&mut hasher);
+    image.width.hash(&mut hasher);
+    image.height.hash(&mut hasher);
+    image.depth.hash(&mut hasher);
+    image.mip_level_count.hash(&mut hasher);
+    image.dimension.hash(&mut hasher);
+    image.format.hash(&mut hasher);
+
+    let ready = match texture.view_dimension {
+        TextureViewDimension::D2 => {
+            image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 1
+        }
+        TextureViewDimension::Cube => {
+            image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 6
+        }
+        _ => false,
+    };
+
+    LogicalTextureSourceSnapshot {
+        version: hasher.finish(),
+        ready,
+        view_dimension: texture.view_dimension,
+    }
+}
+
+pub(super) fn snapshot_attachment_texture_source(
+    source: TextureSource,
+    revision: Option<u64>,
+) -> LogicalTextureSourceSnapshot {
+    let TextureSource::Attachment(_, view_dimension) = source else {
+        unreachable!("attachment snapshot requires an attachment source")
+    };
+    let mut hasher = rustc_hash::FxHasher::default();
+    source.hash(&mut hasher);
+    revision.hash(&mut hasher);
+    LogicalTextureSourceSnapshot {
+        version: hasher.finish(),
+        ready: revision.is_some(),
+        view_dimension,
+    }
+}
+
 fn hash_optional_texture_source(
-    resource_manager: &ResourceManager,
-    assets: &AssetServer,
     source: Option<TextureSource>,
+    logical: Option<LogicalTextureSourceSnapshot>,
 ) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     source.hash(&mut hasher);
-    if let Some(source) = source {
-        resource_manager
-            .resolve_logical_texture_source(assets, source)
-            .version
-            .hash(&mut hasher);
+    if let Some(logical) = logical {
+        logical.version.hash(&mut hasher);
     }
     hasher.finish()
 }
 
-fn procedural_physics_hash(params: &ProceduralSkyParams) -> u64 {
+pub(crate) fn procedural_physics_hash(params: &ProceduralSkyParams) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     hash_vec3(&mut hasher, params.rayleigh_scattering);
     hash_f32(&mut hasher, params.rayleigh_scale_height);
@@ -144,11 +235,11 @@ fn procedural_source_version(
 impl ResourceManager {
     /// Resolves the logical identity and readiness of a texture without
     /// uploading it or otherwise interacting with the GPU.
-    fn resolve_logical_texture_source(
+    pub(crate) fn snapshot_texture_source(
         &self,
         assets: &AssetServer,
         source: TextureSource,
-    ) -> ResolvedTextureSource {
+    ) -> LogicalTextureSourceSnapshot {
         let mut hasher = rustc_hash::FxHasher::default();
         source.hash(&mut hasher);
 
@@ -156,67 +247,87 @@ impl ResourceManager {
             TextureSource::Asset(handle) => {
                 let Some((texture, texture_version)) = assets.textures.get_entry(handle) else {
                     0u8.hash(&mut hasher);
-                    return ResolvedTextureSource {
+                    return LogicalTextureSourceSnapshot {
                         version: hasher.finish(),
                         ready: false,
                         view_dimension: TextureViewDimension::D2,
                     };
                 };
 
-                1u8.hash(&mut hasher);
-                texture.uuid.hash(&mut hasher);
-                texture_version.hash(&mut hasher);
-                texture.image.hash(&mut hasher);
-                texture.view_dimension.hash(&mut hasher);
-                texture.color_space.hash(&mut hasher);
-
                 let Some((image, image_version)) = assets.images.get_entry(texture.image) else {
+                    1u8.hash(&mut hasher);
+                    texture.uuid.hash(&mut hasher);
+                    texture_version.hash(&mut hasher);
+                    texture.image.hash(&mut hasher);
+                    texture.view_dimension.hash(&mut hasher);
+                    texture.color_space.hash(&mut hasher);
                     0u8.hash(&mut hasher);
-                    return ResolvedTextureSource {
+                    return LogicalTextureSourceSnapshot {
                         version: hasher.finish(),
                         ready: false,
                         view_dimension: texture.view_dimension,
                     };
                 };
 
-                1u8.hash(&mut hasher);
-                image.uuid.hash(&mut hasher);
-                image_version.hash(&mut hasher);
-                image.width.hash(&mut hasher);
-                image.height.hash(&mut hasher);
-                image.depth.hash(&mut hasher);
-                image.mip_level_count.hash(&mut hasher);
-                image.dimension.hash(&mut hasher);
-                image.format.hash(&mut hasher);
-
-                let view_is_compatible = match texture.view_dimension {
-                    TextureViewDimension::D2 => {
-                        image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 1
-                    }
-                    TextureViewDimension::Cube => {
-                        image.dimension.to_wgpu() == wgpu::TextureDimension::D2 && image.depth == 6
-                    }
-                    _ => false,
-                };
-
-                ResolvedTextureSource {
-                    version: hasher.finish(),
-                    ready: view_is_compatible,
-                    view_dimension: texture.view_dimension,
-                }
+                snapshot_ready_asset_texture_source(
+                    source,
+                    &texture,
+                    texture_version,
+                    &image,
+                    image_version,
+                )
             }
-            TextureSource::Attachment(id, view_dimension) => {
+            TextureSource::Attachment(id, _) => {
                 // The revision changes when a stable attachment ID is rebound
                 // to new content, so cached environment data cannot silently
                 // survive an in-place producer update.
                 let revision = self.get_internal_texture_revision(id);
-                revision.hash(&mut hasher);
-                ResolvedTextureSource {
-                    version: hasher.finish(),
-                    ready: revision.is_some(),
-                    view_dimension,
-                }
+                snapshot_attachment_texture_source(source, revision)
             }
+        }
+    }
+
+    /// Capture procedural physics and optional texture identities once for all
+    /// graph consumers, without touching WGPU.
+    pub(crate) fn snapshot_procedural_environment(
+        &self,
+        assets: &AssetServer,
+        params: &ProceduralSkyParams,
+    ) -> ProceduralEnvironmentSnapshot {
+        let moon_texture = params
+            .moon_albedo_texture
+            .map(|source| self.snapshot_texture_source(assets, source));
+        let starbox_texture = params
+            .starbox_texture
+            .map(|source| self.snapshot_texture_source(assets, source));
+        let source_ready = moon_texture
+            .is_none_or(|source| source.ready && source.view_dimension == TextureViewDimension::D2)
+            && starbox_texture.is_none_or(|source| {
+                source.ready
+                    && matches!(
+                        source.view_dimension,
+                        TextureViewDimension::D2 | TextureViewDimension::Cube
+                    )
+            });
+        let physics_hash = procedural_physics_hash(params);
+        let moon_texture_hash =
+            hash_optional_texture_source(params.moon_albedo_texture, moon_texture);
+        let starbox_hash = hash_optional_texture_source(params.starbox_texture, starbox_texture);
+        let static_bake_hash = procedural_static_bake_hash(params, moon_texture_hash, starbox_hash);
+        let source_version = procedural_source_version(
+            physics_hash,
+            static_bake_hash,
+            params.sun_direction,
+            params.moon_direction,
+        );
+
+        ProceduralEnvironmentSnapshot {
+            source_ready,
+            source_version,
+            physics_hash,
+            static_bake_hash,
+            moon_texture,
+            starbox_texture,
         }
     }
 
@@ -246,31 +357,20 @@ impl ResourceManager {
 
         let (source_type, source_key, source_ready, source_version, physics_hash, static_bake_hash) =
             if let BackgroundMode::Procedural(params) = background {
-                let physics_hash = procedural_physics_hash(params);
-                let moon_texture_hash =
-                    hash_optional_texture_source(self, assets, params.moon_albedo_texture);
-                let starbox_hash =
-                    hash_optional_texture_source(self, assets, params.starbox_texture);
-                let static_bake_hash =
-                    procedural_static_bake_hash(params, moon_texture_hash, starbox_hash);
+                let snapshot = self.snapshot_procedural_environment(assets, params);
                 (
                     CubeSourceType::Procedural,
                     None,
-                    true,
-                    procedural_source_version(
-                        physics_hash,
-                        static_bake_hash,
-                        params.sun_direction,
-                        params.moon_direction,
-                    ),
-                    physics_hash,
-                    static_bake_hash,
+                    snapshot.source_ready,
+                    snapshot.source_version,
+                    snapshot.physics_hash,
+                    snapshot.static_bake_hash,
                 )
             } else {
                 let source = *environment
                     .source_env_map()
                     .expect("active non-procedural environment must have a source map");
-                let logical_source = self.resolve_logical_texture_source(assets, source);
+                let logical_source = self.snapshot_texture_source(assets, source);
                 let (source_type, supported_dimension) = match logical_source.view_dimension {
                     TextureViewDimension::D2 => (CubeSourceType::Equirectangular, true),
                     TextureViewDimension::Cube => (CubeSourceType::Cubemap, true),
@@ -426,5 +526,38 @@ mod tests {
 
         assert_ne!(initial, moved_sun);
         assert_ne!(initial, moved_moon);
+    }
+
+    #[test]
+    fn composer_snapshot_rejects_stale_begin_frame_metadata() {
+        let snapshot = ProceduralEnvironmentSnapshot {
+            source_ready: true,
+            source_version: 17,
+            physics_hash: 23,
+            static_bake_hash: 29,
+            moon_texture: None,
+            starbox_texture: None,
+        };
+        let environment = GpuEnvironment {
+            base_cube_size: 64,
+            pmrem_size: 32,
+            source_version: snapshot.source_version,
+            source_type: CubeSourceType::Procedural,
+            source_key: None,
+            source_ready: snapshot.source_ready,
+            procedural_physics_hash: snapshot.physics_hash,
+            procedural_static_bake_hash: snapshot.static_bake_hash,
+            last_used_frame: 1,
+        };
+
+        assert!(snapshot.matches_gpu_environment(&environment));
+
+        let mut stale_version = environment;
+        stale_version.source_version += 1;
+        assert!(!snapshot.matches_gpu_environment(&stale_version));
+
+        let mut stale_readiness = environment;
+        stale_readiness.source_ready = false;
+        assert!(!snapshot.matches_gpu_environment(&stale_readiness));
     }
 }

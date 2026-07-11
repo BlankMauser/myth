@@ -1,28 +1,28 @@
 //! Procedural sky atmosphere bake passes.
 //!
-//! The atmosphere pipeline is decomposed into four atomic RenderGraph nodes:
+//! The system is decomposed into four demand-driven RDG nodes:
 //!
-//! - Transmittance LUT
-//! - Multi-scatter LUT
-//! - Sky-view LUT
+//! - Transmittance LUT (independent persistent cache)
+//! - Multi-scatter LUT (independent persistent cache)
+//! - Sky-view LUT (transient, varies with the current sun)
 //! - Sky-view -> persistent scene base cubemap bake
 //!
-//! The LUTs are transient RDG resources while all persistent buffers,
-//! layouts, pipelines, and samplers live on the long-lived feature.
+//! Graph construction carries only POD snapshots and logical resource IDs.
+//! Static layouts/pipelines, source texture upload, bind groups, and uniform
+//! writes happen only in live-node `prepare` after DPE.
 
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 
-use crate::core::gpu::{CommonSampler, ResourceState, Tracked};
+use crate::core::gpu::{CommonSampler, ProceduralEnvironmentSnapshot, Tracked, binding_layout};
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, ExtractContext, PassNode, PrepareContext,
-    TextureDesc, TextureNodeId,
+    BufferDesc, BufferNodeId, CacheId, CacheKey, CachePlan, ExecuteContext, HistoryRegistry,
+    PassNode, PersistentTextureSpec, PrepareContext, TextureDesc, TextureNodeId,
 };
 use crate::pipeline::{
-    ComputePipelineId, ComputePipelineKey, ShaderCompilationOptions, ShaderSource,
+    ComputePipelineId, ComputePipelineKey, ShaderCompilationOptions, ShaderManager, ShaderSource,
 };
 use myth_resources::shader_defines::ShaderDefines;
 use myth_resources::texture::TextureSource;
@@ -34,6 +34,8 @@ const MULTI_SCATTER_SIZE: u32 = 32;
 const SKY_VIEW_WIDTH: u32 = 192;
 const SKY_VIEW_HEIGHT: u32 = 108;
 const SCENE_CACHE_TTL: u64 = 120;
+const TRANSMITTANCE_CACHE_SCHEMA: u64 = 1;
+const MULTI_SCATTER_CACHE_SCHEMA: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AtmosphereStarboxKind {
@@ -54,12 +56,8 @@ impl AtmosphereStarboxKind {
     fn apply_shader_defines(self, defines: &mut ShaderDefines) {
         match self {
             Self::None => {}
-            Self::Equirectangular => {
-                defines.set("CELESTIAL_STARBOX_EQUIRECT", "1");
-            }
-            Self::Cube => {
-                defines.set("CELESTIAL_STARBOX_CUBE", "1");
-            }
+            Self::Equirectangular => defines.set("CELESTIAL_STARBOX_EQUIRECT", "1"),
+            Self::Cube => defines.set("CELESTIAL_STARBOX_CUBE", "1"),
         }
     }
 }
@@ -68,12 +66,6 @@ impl AtmosphereStarboxKind {
 struct AtmosphereSkyToCubePipelineKey {
     starbox_kind: AtmosphereStarboxKind,
     moon_texture: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AtmosphereComputePipelineState {
-    id: ComputePipelineId,
-    shader_identity: u64,
 }
 
 impl AtmosphereSkyToCubePipelineKey {
@@ -85,31 +77,27 @@ impl AtmosphereSkyToCubePipelineKey {
     }
 }
 
-struct ResolvedAtmosphereStarbox {
-    view: wgpu::TextureView,
-    resource_id: u64,
+#[derive(Debug, Clone, Copy)]
+struct AtmosphereComputePipelineState {
+    id: ComputePipelineId,
+    shader_identity: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AtmosphereStarboxSnapshot {
+    source: TextureSource,
     kind: AtmosphereStarboxKind,
+    logical_version: u64,
 }
 
-struct ResolvedAtmosphereMoonTexture {
-    view: wgpu::TextureView,
-    resource_id: u64,
-    enabled: bool,
-}
-
-impl ResolvedAtmosphereMoonTexture {
-    fn fallback(ctx: &ExtractContext) -> Self {
-        let system_textures = ctx.resource_manager.system_textures();
-        Self {
-            view: (*system_textures.white_2d).clone(),
-            resource_id: system_textures.white_2d.id(),
-            enabled: false,
-        }
-    }
+#[derive(Debug, Clone, Copy)]
+struct AtmosphereTextureSnapshot {
+    source: TextureSource,
+    logical_version: u64,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuAtmosphereParams {
     rayleigh_scattering: [f32; 3],
     rayleigh_scale_height: f32,
@@ -149,7 +137,7 @@ impl GpuAtmosphereParams {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuBakeParams {
     sun_direction: [f32; 3],
     sun_intensity: f32,
@@ -184,114 +172,280 @@ impl GpuBakeParams {
     }
 }
 
-fn atmosphere_upload_hash(
-    atmosphere_params: &GpuAtmosphereParams,
-    bake_params: &GpuBakeParams,
-) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
-    hasher.write(bytemuck::bytes_of(atmosphere_params));
-    hasher.write(bytemuck::bytes_of(bake_params));
-    hasher.finish()
-}
-
-struct AtmosphereSceneState {
-    atmosphere_params_buffer: Tracked<wgpu::Buffer>,
-    bake_params_buffer: Tracked<wgpu::Buffer>,
-    _transmittance_texture: wgpu::Texture,
-    transmittance_view: Tracked<wgpu::TextureView>,
-    _multi_scatter_texture: wgpu::Texture,
-    multi_scatter_view: Tracked<wgpu::TextureView>,
-    _sky_view_texture: wgpu::Texture,
-    sky_view_view: Tracked<wgpu::TextureView>,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtmosphereSnapshot {
+    scene_id: u32,
+    gpu_params: GpuAtmosphereParams,
+    bake_params: GpuBakeParams,
     physics_hash: u64,
-    physics_dirty: AtomicBool,
-    uploaded_params_hash: AtomicU64,
-    last_used_frame: u64,
-    starbox: Option<ResolvedAtmosphereStarbox>,
-    moon_texture: ResolvedAtmosphereMoonTexture,
+    transmittance_shader_identity: u64,
+    multi_scatter_shader_identity: u64,
+    sky_view_shader_identity: u64,
+    sky_to_cube_shader_identity: u64,
+    sky_to_cube_pipeline_key: AtmosphereSkyToCubePipelineKey,
+    starbox: Option<AtmosphereStarboxSnapshot>,
+    moon_texture: Option<AtmosphereTextureSnapshot>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ProceduralSkyboxResources<'a> {
-    pub sky_view_view: &'a Tracked<wgpu::TextureView>,
-    pub transmittance_view: &'a Tracked<wgpu::TextureView>,
-    pub bake_params_buffer: &'a Tracked<wgpu::Buffer>,
+impl AtmosphereSnapshot {
+    #[must_use]
+    pub(crate) fn procedural_base_shader_identity(self) -> u64 {
+        let mut hasher = FxHasher::default();
+        self.transmittance_shader_identity.hash(&mut hasher);
+        self.multi_scatter_shader_identity.hash(&mut hasher);
+        self.sky_view_shader_identity.hash(&mut hasher);
+        self.sky_to_cube_pipeline_key.hash(&mut hasher);
+        self.sky_to_cube_shader_identity.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtmosphereCacheSnapshot {
+    transmittance_plan: CachePlan<1>,
+    multi_scatter_plan: CachePlan<1>,
+}
+
+struct AtmosphereCacheDomain {
+    transmittance_cache: CacheId,
+    multi_scatter_cache: CacheId,
+    last_used_frame: u64,
 }
 
 pub(crate) struct AtmosphereGraphOutput {
     pub sky_view: TextureNodeId,
     pub transmittance: TextureNodeId,
     pub bake_params: BufferNodeId,
-    // pub baked_base_cube: Option<TextureNodeId>,
 }
 
-impl AtmosphereGraphOutput {
-    #[must_use]
-    pub fn skybox_dependencies(&self) -> [Option<TextureNodeId>; 2] {
-        [Some(self.sky_view), Some(self.transmittance)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtmosphereComputeKind {
+    Transmittance,
+    MultiScatter,
+    SkyView,
+}
+
+impl AtmosphereComputeKind {
+    fn shader_source(self) -> ShaderSource<'static> {
+        match self {
+            Self::Transmittance => ShaderSource::File("entry/utility/atmosphere/transmittance_lut"),
+            Self::MultiScatter => ShaderSource::File("entry/utility/atmosphere/multi_scatter_lut"),
+            Self::SkyView => ShaderSource::File("entry/utility/atmosphere/sky_view_lut"),
+        }
+    }
+
+    fn pipeline_layout_label(self) -> &'static str {
+        match self {
+            Self::Transmittance => "Atmo Transmittance PL",
+            Self::MultiScatter => "Atmo Multi-Scatter PL",
+            Self::SkyView => "Atmo Sky-View PL",
+        }
+    }
+
+    fn pipeline_label(self) -> &'static str {
+        match self {
+            Self::Transmittance => "Atmo Transmittance Pipeline",
+            Self::MultiScatter => "Atmo Multi-Scatter Pipeline",
+            Self::SkyView => "Atmo Sky-View Pipeline",
+        }
     }
 }
 
-fn hash_f32<H: Hasher>(hasher: &mut H, value: f32) {
-    value.to_bits().hash(hasher);
+struct AtmosphereComputeFeature {
+    kind: AtmosphereComputeKind,
+    pipeline: Option<AtmosphereComputePipelineState>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
 }
 
-fn hash_vec3<H: Hasher>(hasher: &mut H, value: glam::Vec3) {
-    hash_f32(hasher, value.x);
-    hash_f32(hasher, value.y);
-    hash_f32(hasher, value.z);
-}
+impl AtmosphereComputeFeature {
+    const fn new(kind: AtmosphereComputeKind) -> Self {
+        Self {
+            kind,
+            pipeline: None,
+            layout: None,
+        }
+    }
 
-fn physics_hash(params: &ProceduralSkyParams) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
-    hash_vec3(&mut hasher, params.rayleigh_scattering);
-    hash_f32(&mut hasher, params.rayleigh_scale_height);
-    hash_f32(&mut hasher, params.mie_scattering);
-    hash_f32(&mut hasher, params.mie_absorption);
-    hash_f32(&mut hasher, params.mie_scale_height);
-    hash_f32(&mut hasher, params.mie_anisotropy);
-    hash_vec3(&mut hasher, params.ozone_absorption);
-    hash_f32(&mut hasher, params.planet_radius);
-    hash_f32(&mut hasher, params.atmosphere_radius);
-    hasher.finish()
-}
-
-impl AtmosphereSceneState {
-    fn update_if_needed(
-        &self,
-        queue: &wgpu::Queue,
-        params_hash: u64,
-        atmosphere_params: &GpuAtmosphereParams,
-        bake_params: &GpuBakeParams,
-    ) {
-        if self.uploaded_params_hash.load(Ordering::Relaxed) == params_hash {
+    fn ensure_resources(&mut self, ctx: &mut PrepareContext<'_>, expected_shader_identity: u64) {
+        if self.layout.is_none() {
+            self.layout = Some(create_compute_layout(ctx.device, self.kind));
+        }
+        if self
+            .pipeline
+            .is_some_and(|state| state.shader_identity == expected_shader_identity)
+        {
             return;
         }
 
-        queue.write_buffer(
-            &self.atmosphere_params_buffer,
-            0,
-            bytemuck::bytes_of(atmosphere_params),
+        let source = self.kind.shader_source();
+        let options = ShaderCompilationOptions::default();
+        assert_eq!(
+            ctx.shader_manager.pipeline_shader_hash(source, &options),
+            expected_shader_identity,
+            "atmosphere cache key and live compute shader identity diverged",
         );
-        queue.write_buffer(&self.bake_params_buffer, 0, bytemuck::bytes_of(bake_params));
-        self.uploaded_params_hash
-            .store(params_hash, Ordering::Relaxed);
+        let (module, shader_hash) = ctx
+            .shader_manager
+            .get_or_compile(ctx.device, source, &options);
+        let layout = self.layout.as_deref().expect("atmosphere layout missing");
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(self.kind.pipeline_layout_label()),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+        let compilation_options = wgpu::PipelineCompilationOptions::default();
+        let id = ctx.pipeline_cache.get_or_create_compute(
+            ctx.device,
+            module,
+            &pipeline_layout,
+            &ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options),
+            &compilation_options,
+            self.kind.pipeline_label(),
+        );
+        self.pipeline = Some(AtmosphereComputePipelineState {
+            id,
+            shader_identity: expected_shader_identity,
+        });
+    }
+
+    fn pipeline_id(&self) -> ComputePipelineId {
+        self.pipeline
+            .expect("atmosphere pipeline must exist after prepare")
+            .id
+    }
+
+    fn layout(&self) -> &Tracked<wgpu::BindGroupLayout> {
+        self.layout
+            .as_ref()
+            .expect("atmosphere layout must exist after prepare")
+    }
+}
+
+struct AtmosphereSkyToCubeFeature {
+    pipelines: FxHashMap<AtmosphereSkyToCubePipelineKey, AtmosphereComputePipelineState>,
+    layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    equirect_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+    cube_layout: Option<Tracked<wgpu::BindGroupLayout>>,
+}
+
+impl AtmosphereSkyToCubeFeature {
+    fn new() -> Self {
+        Self {
+            pipelines: FxHashMap::default(),
+            layout: None,
+            equirect_layout: None,
+            cube_layout: None,
+        }
+    }
+
+    fn ensure_layout(&mut self, device: &wgpu::Device, kind: AtmosphereStarboxKind) {
+        match kind {
+            AtmosphereStarboxKind::None => {
+                if self.layout.is_none() {
+                    self.layout = Some(Tracked::new(create_sky_to_cube_layout(
+                        device,
+                        None,
+                        "Atmo Sky-to-Cube BGL",
+                    )));
+                }
+            }
+            AtmosphereStarboxKind::Equirectangular => {
+                if self.equirect_layout.is_none() {
+                    self.equirect_layout = Some(Tracked::new(create_sky_to_cube_layout(
+                        device,
+                        Some(wgpu::TextureViewDimension::D2),
+                        "Atmo Sky-to-Cube Eq BGL",
+                    )));
+                }
+            }
+            AtmosphereStarboxKind::Cube => {
+                if self.cube_layout.is_none() {
+                    self.cube_layout = Some(Tracked::new(create_sky_to_cube_layout(
+                        device,
+                        Some(wgpu::TextureViewDimension::Cube),
+                        "Atmo Sky-to-Cube Cube BGL",
+                    )));
+                }
+            }
+        }
+    }
+
+    fn layout(&self, kind: AtmosphereStarboxKind) -> &Tracked<wgpu::BindGroupLayout> {
+        match kind {
+            AtmosphereStarboxKind::None => self.layout.as_ref(),
+            AtmosphereStarboxKind::Equirectangular => self.equirect_layout.as_ref(),
+            AtmosphereStarboxKind::Cube => self.cube_layout.as_ref(),
+        }
+        .expect("selected sky-to-cube layout must exist after prepare")
+    }
+
+    fn ensure_resources(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        key: AtmosphereSkyToCubePipelineKey,
+        expected_shader_identity: u64,
+    ) {
+        self.ensure_layout(ctx.device, key.starbox_kind);
+        if self
+            .pipelines
+            .get(&key)
+            .is_some_and(|state| state.shader_identity == expected_shader_identity)
+        {
+            return;
+        }
+
+        let source = ShaderSource::File("entry/utility/atmosphere/sky_to_cube");
+        let mut options = ShaderCompilationOptions::default();
+        key.apply_shader_defines(&mut options.defines);
+        assert_eq!(
+            ctx.shader_manager.pipeline_shader_hash(source, &options),
+            expected_shader_identity,
+            "procedural base key and live sky-to-cube shader identity diverged",
+        );
+        let (module, shader_hash) = ctx
+            .shader_manager
+            .get_or_compile(ctx.device, source, &options);
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Atmo Sky-to-Cube PL"),
+                bind_group_layouts: &[Some(self.layout(key.starbox_kind))],
+                immediate_size: 0,
+            });
+        let compilation_options = wgpu::PipelineCompilationOptions::default();
+        let id = ctx.pipeline_cache.get_or_create_compute(
+            ctx.device,
+            module,
+            &pipeline_layout,
+            &ComputePipelineKey::new(shader_hash).with_compilation_options(&compilation_options),
+            &compilation_options,
+            "Atmo Sky-to-Cube Pipeline",
+        );
+        self.pipelines.insert(
+            key,
+            AtmosphereComputePipelineState {
+                id,
+                shader_identity: expected_shader_identity,
+            },
+        );
+    }
+
+    fn pipeline_id(&self, key: AtmosphereSkyToCubePipelineKey) -> ComputePipelineId {
+        self.pipelines
+            .get(&key)
+            .expect("sky-to-cube pipeline must exist after prepare")
+            .id
     }
 }
 
 pub struct AtmosphereFeature {
-    transmittance_pipeline: Option<AtmosphereComputePipelineState>,
-    multi_scatter_pipeline: Option<AtmosphereComputePipelineState>,
-    sky_view_pipeline: Option<AtmosphereComputePipelineState>,
-    sky_to_cube_pipelines:
-        FxHashMap<AtmosphereSkyToCubePipelineKey, AtmosphereComputePipelineState>,
-    transmittance_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    multi_scatter_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    sky_view_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    sky_to_cube_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    sky_to_cube_eq_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    sky_to_cube_cube_layout: Option<Tracked<wgpu::BindGroupLayout>>,
-    scene_states: FxHashMap<u32, AtmosphereSceneState>,
+    domains: FxHashMap<u32, AtmosphereCacheDomain>,
+    transmittance: AtmosphereComputeFeature,
+    multi_scatter: AtmosphereComputeFeature,
+    sky_view: AtmosphereComputeFeature,
+    sky_to_cube: AtmosphereSkyToCubeFeature,
 }
 
 impl Default for AtmosphereFeature {
@@ -304,856 +458,405 @@ impl AtmosphereFeature {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            transmittance_pipeline: None,
-            multi_scatter_pipeline: None,
-            sky_view_pipeline: None,
-            sky_to_cube_pipelines: FxHashMap::default(),
-            transmittance_layout: None,
-            multi_scatter_layout: None,
-            sky_view_layout: None,
-            sky_to_cube_layout: None,
-            sky_to_cube_eq_layout: None,
-            sky_to_cube_cube_layout: None,
-            scene_states: FxHashMap::default(),
+            domains: FxHashMap::default(),
+            transmittance: AtmosphereComputeFeature::new(AtmosphereComputeKind::Transmittance),
+            multi_scatter: AtmosphereComputeFeature::new(AtmosphereComputeKind::MultiScatter),
+            sky_view: AtmosphereComputeFeature::new(AtmosphereComputeKind::SkyView),
+            sky_to_cube: AtmosphereSkyToCubeFeature::new(),
         }
     }
 
-    pub fn extract_and_prepare(
-        &mut self,
-        ctx: &mut ExtractContext,
+    /// Capture the current atmosphere without touching WGPU state.
+    #[must_use]
+    pub(crate) fn extract(
+        &self,
+        shader_manager: &ShaderManager,
         scene_id: u32,
         params: &ProceduralSkyParams,
-    ) {
-        self.ensure_layouts(ctx.device);
-        self.ensure_pipelines(ctx);
-        self.ensure_scene_state(ctx, scene_id, params);
-        self.update_starbox_state(ctx, scene_id, params);
-        self.update_moon_texture_state(ctx, scene_id, params);
+        environment: ProceduralEnvironmentSnapshot,
+    ) -> AtmosphereSnapshot {
+        let starbox = params
+            .starbox_texture
+            .zip(environment.starbox_texture)
+            .and_then(|(source, logical)| {
+                if !logical.ready {
+                    return None;
+                }
+                Some(AtmosphereStarboxSnapshot {
+                    source,
+                    kind: AtmosphereStarboxKind::from_view_dimension(logical.view_dimension)?,
+                    logical_version: logical.version,
+                })
+            });
+        let moon_texture = params
+            .moon_albedo_texture
+            .zip(environment.moon_texture)
+            .and_then(|(source, logical)| {
+                (logical.ready && logical.view_dimension == wgpu::TextureViewDimension::D2)
+                    .then_some(AtmosphereTextureSnapshot {
+                        source,
+                        logical_version: logical.version,
+                    })
+            });
+
+        let options = ShaderCompilationOptions::default();
+        let transmittance_shader_identity =
+            shader_manager.pipeline_shader_hash(self.transmittance.kind.shader_source(), &options);
+        let multi_scatter_shader_identity =
+            shader_manager.pipeline_shader_hash(self.multi_scatter.kind.shader_source(), &options);
+        let sky_view_shader_identity =
+            shader_manager.pipeline_shader_hash(self.sky_view.kind.shader_source(), &options);
+        let sky_to_cube_pipeline_key = AtmosphereSkyToCubePipelineKey {
+            starbox_kind: starbox.map_or(AtmosphereStarboxKind::None, |source| source.kind),
+            moon_texture: moon_texture.is_some(),
+        };
+        let mut sky_to_cube_options = ShaderCompilationOptions::default();
+        sky_to_cube_pipeline_key.apply_shader_defines(&mut sky_to_cube_options.defines);
+        let sky_to_cube_shader_identity = shader_manager.pipeline_shader_hash(
+            ShaderSource::File("entry/utility/atmosphere/sky_to_cube"),
+            &sky_to_cube_options,
+        );
+
+        AtmosphereSnapshot {
+            scene_id,
+            gpu_params: GpuAtmosphereParams::from_scene(params),
+            bake_params: GpuBakeParams::from_scene(params),
+            physics_hash: environment.physics_hash,
+            transmittance_shader_identity,
+            multi_scatter_shader_identity,
+            sky_view_shader_identity,
+            sky_to_cube_shader_identity,
+            sky_to_cube_pipeline_key,
+            starbox,
+            moon_texture,
+        }
     }
 
-    /// Prune abandoned scene domains even while the current scene does not
-    /// use a procedural atmosphere.
-    pub(crate) fn maintain(&mut self, current_frame: u64) {
-        self.prune_scene_states(current_frame);
+    pub(crate) fn plan_luts(
+        &mut self,
+        registry: &mut HistoryRegistry,
+        snapshot: &AtmosphereSnapshot,
+        attempt_serial: u64,
+    ) -> AtmosphereCacheSnapshot {
+        let domain =
+            self.domains
+                .entry(snapshot.scene_id)
+                .or_insert_with(|| AtmosphereCacheDomain {
+                    transmittance_cache: registry.create_cache(),
+                    multi_scatter_cache: registry.create_cache(),
+                    last_used_frame: attempt_serial,
+                });
+        domain.last_used_frame = attempt_serial;
+
+        let transmittance_key = transmittance_cache_key(
+            snapshot.physics_hash,
+            snapshot.transmittance_shader_identity,
+        );
+        let transmittance_plan = registry.plan_cache(
+            domain.transmittance_cache,
+            transmittance_key,
+            [transmittance_spec()],
+            attempt_serial,
+        );
+        let multi_scatter_key = multi_scatter_cache_key(
+            transmittance_key,
+            transmittance_plan.epoch,
+            snapshot.multi_scatter_shader_identity,
+        );
+        let multi_scatter_plan = registry.plan_cache(
+            domain.multi_scatter_cache,
+            multi_scatter_key,
+            [multi_scatter_spec()],
+            attempt_serial,
+        );
+
+        AtmosphereCacheSnapshot {
+            transmittance_plan,
+            multi_scatter_plan,
+        }
+    }
+
+    /// Retire both independent LUT cache identities for inactive scenes.
+    pub(crate) fn maintain(&mut self, registry: &mut HistoryRegistry, current_frame: u64) {
+        let retired: Vec<u32> = self
+            .domains
+            .iter()
+            .filter_map(|(&scene_id, domain)| {
+                (current_frame.saturating_sub(domain.last_used_frame) > SCENE_CACHE_TTL)
+                    .then_some(scene_id)
+            })
+            .collect();
+        for scene_id in retired {
+            let domain = self
+                .domains
+                .remove(&scene_id)
+                .expect("retired atmosphere cache domain disappeared");
+            let removed_transmittance = registry.remove_cache(domain.transmittance_cache);
+            let removed_multi_scatter = registry.remove_cache(domain.multi_scatter_cache);
+            debug_assert!(removed_transmittance);
+            debug_assert!(removed_multi_scatter);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn has_scene_state(&self, scene_id: u32) -> bool {
-        self.scene_states.contains_key(&scene_id)
+        self.domains.contains_key(&scene_id)
     }
 
-    pub(crate) fn procedural_skybox_resources(
-        &self,
-        scene_id: u32,
-    ) -> Option<ProceduralSkyboxResources<'_>> {
-        self.scene_states
-            .get(&scene_id)
-            .map(|state| ProceduralSkyboxResources {
-                sky_view_view: &state.sky_view_view,
-                transmittance_view: &state.transmittance_view,
-                bake_params_buffer: &state.bake_params_buffer,
-            })
-    }
-
-    /// Identity of the complete shader chain that produces a procedural base
-    /// cube for this scene. The logical cache key must describe the pipelines
-    /// that will actually execute, including the selected starbox/moon variant.
-    #[must_use]
-    pub(crate) fn procedural_base_shader_identity(&self, scene_id: u32) -> u64 {
-        let pipeline_key = self.sky_to_cube_pipeline_key(scene_id);
-        let mut hasher = rustc_hash::FxHasher::default();
-        self.transmittance_pipeline
-            .expect("atmosphere transmittance pipeline must be prepared")
-            .shader_identity
-            .hash(&mut hasher);
-        self.multi_scatter_pipeline
-            .expect("atmosphere multi-scatter pipeline must be prepared")
-            .shader_identity
-            .hash(&mut hasher);
-        self.sky_view_pipeline
-            .expect("atmosphere sky-view pipeline must be prepared")
-            .shader_identity
-            .hash(&mut hasher);
-        pipeline_key.hash(&mut hasher);
-        self.sky_to_cube_pipelines
-            .get(&pipeline_key)
-            .expect("selected atmosphere sky-to-cube pipeline must be prepared")
-            .shader_identity
-            .hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn sky_to_cube_pipeline_key(&self, scene_id: u32) -> AtmosphereSkyToCubePipelineKey {
-        let state = self
-            .scene_states
-            .get(&scene_id)
-            .expect("scene atmosphere state must be prepared");
-        AtmosphereSkyToCubePipelineKey {
-            starbox_kind: state
-                .starbox
-                .as_ref()
-                .map_or(AtmosphereStarboxKind::None, |starbox| starbox.kind),
-            moon_texture: state.moon_texture.enabled,
-        }
-    }
-
+    /// Add logical LUT writers and the transient SkyView producer.
+    ///
+    /// `environment_base` is present only when EnvironmentCache requests a new
+    /// procedural base publication. Visual SkyView remains independent, so a
+    /// pending optional star/moon texture cannot suppress the sky itself.
     pub(crate) fn add_to_graph<'a>(
         &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
-        scene_id: u32,
-        params: &ProceduralSkyParams,
-        base_cube: TextureNodeId,
-        bake_environment: bool,
+        snapshot: &AtmosphereSnapshot,
+        cache: &AtmosphereCacheSnapshot,
+        environment_base: Option<TextureNodeId>,
     ) -> AtmosphereGraphOutput {
-        let state = self
-            .scene_states
-            .get(&scene_id)
-            .expect("scene atmosphere state must be prepared before graph build");
-
-        let rebuild_physics = state.physics_dirty.load(Ordering::Relaxed);
-
-        let state = self
-            .scene_states
-            .get(&scene_id)
-            .expect("scene atmosphere state must be prepared before graph build");
-
-        let transmittance_pipeline_id = self
-            .transmittance_pipeline
-            .expect("atmosphere transmittance pipeline must exist")
-            .id;
-        let multi_scatter_pipeline_id = self
-            .multi_scatter_pipeline
-            .expect("atmosphere multi scatter pipeline must exist")
-            .id;
-        let sky_view_pipeline_id = self
-            .sky_view_pipeline
-            .expect("atmosphere sky view pipeline must exist")
-            .id;
-        let sky_to_cube_pipeline_key = self.sky_to_cube_pipeline_key(scene_id);
-        let sky_to_cube_kind = sky_to_cube_pipeline_key.starbox_kind;
-        let sky_to_cube_pipeline_id = self
-            .sky_to_cube_pipelines
-            .get(&sky_to_cube_pipeline_key)
-            .expect("atmosphere sky-to-cube pipeline must exist")
-            .id;
-
-        let gpu_params = GpuAtmosphereParams::from_scene(params);
-        let bake_params = GpuBakeParams::from_scene(params);
-        let params_hash = atmosphere_upload_hash(&gpu_params, &bake_params);
-        let transmittance_layout = self
-            .transmittance_layout
-            .as_ref()
-            .expect("atmosphere transmittance layout must exist");
-        let multi_scatter_layout = self
-            .multi_scatter_layout
-            .as_ref()
-            .expect("atmosphere multi-scatter layout must exist");
-        let sky_view_layout = self
-            .sky_view_layout
-            .as_ref()
-            .expect("atmosphere sky-view layout must exist");
-        let sky_to_cube_layout = self.sky_to_cube_layout_for_kind(sky_to_cube_kind);
-        let atmosphere_params_desc = BufferDesc::new(
-            std::mem::size_of::<GpuAtmosphereParams>() as u64,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-        let bake_params_desc = BufferDesc::new(
-            std::mem::size_of::<GpuBakeParams>() as u64,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-
-        let transmittance_desc = TextureDesc::new_2d(
-            TRANSMITTANCE_WIDTH,
-            TRANSMITTANCE_HEIGHT,
-            wgpu::TextureFormat::Rgba16Float,
-            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let multi_scatter_desc = TextureDesc::new_2d(
-            MULTI_SCATTER_SIZE,
-            MULTI_SCATTER_SIZE,
-            wgpu::TextureFormat::Rgba16Float,
-            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let sky_view_desc = TextureDesc::new_2d(
-            SKY_VIEW_WIDTH,
-            SKY_VIEW_HEIGHT,
-            wgpu::TextureFormat::Rgba16Float,
-            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let atmosphere_params_buf = ctx.graph.import_external_buffer(
-            "Atmosphere_Params",
-            atmosphere_params_desc,
-            &state.atmosphere_params_buffer,
-        );
-        let bake_params_buf = ctx.graph.import_external_buffer(
-            "Atmosphere_Bake_Params",
-            bake_params_desc,
-            &state.bake_params_buffer,
-        );
-
-        ctx.with_group("Atmosphere_System", |ctx| {
-            let transmittance = if rebuild_physics {
-                ctx.graph.add_pass("Atmosphere_Transmittance", |builder| {
-                    builder.read_buffer(atmosphere_params_buf);
-                    let output = builder.write_external_texture(
-                        "Atmosphere_Transmittance",
-                        transmittance_desc,
-                        &state.transmittance_view,
-                    );
-                    let node = AtmosphereTransmittanceNode {
-                        output_tex: output,
-                        atmosphere_params_buf,
-                        params_hash,
-                        gpu_params,
-                        bake_params,
-                        state,
-                        pipeline_id: transmittance_pipeline_id,
-                        layout: transmittance_layout,
-                        bind_group: None,
-                    };
-                    (node, output)
-                })
-            } else {
-                ctx.graph.import_external_resource(
-                    "Atmosphere_Transmittance",
-                    transmittance_desc,
-                    &state.transmittance_view,
+        let snapshot = *snapshot;
+        let atmosphere_params = ctx.graph.add_pass("Atmosphere_Params_Upload", |builder| {
+            let output = builder.create_buffer("Atmosphere_Params", atmosphere_params_desc());
+            (
+                AtmosphereParamsUploadNode {
+                    output,
+                    params: snapshot.gpu_params,
+                },
+                output,
+            )
+        });
+        let bake_params = ctx
+            .graph
+            .add_pass("Atmosphere_Bake_Params_Upload", |builder| {
+                let output = builder.create_buffer("Atmosphere_Bake_Params", bake_params_desc());
+                (
+                    AtmosphereBakeParamsUploadNode {
+                        output,
+                        params: snapshot.bake_params,
+                    },
+                    output,
                 )
-            };
+            });
 
-            let multi_scatter = if rebuild_physics {
-                ctx.graph.add_pass("Atmosphere_MultiScatter", |builder| {
-                    builder.read_texture(transmittance);
-                    builder.read_buffer(atmosphere_params_buf);
-                    let output = builder.write_external_texture(
-                        "Atmosphere_MultiScatter",
-                        multi_scatter_desc,
-                        &state.multi_scatter_view,
-                    );
-                    let node = AtmosphereMultiScatterNode {
-                        transmittance_tex: transmittance,
-                        output_tex: output,
-                        atmosphere_params_buf,
-                        params_hash,
-                        gpu_params,
-                        bake_params,
-                        state,
-                        pipeline_id: multi_scatter_pipeline_id,
-                        layout: multi_scatter_layout,
+        let transmittance = ctx.graph.import_persistent_texture(
+            "Atmosphere_Transmittance",
+            cache.transmittance_plan.textures[0],
+        );
+        if let Some(token) = cache.transmittance_plan.commit {
+            let feature = &mut self.transmittance;
+            ctx.graph.add_pass("Atmosphere_Transmittance", |builder| {
+                builder.read_buffer(atmosphere_params);
+                builder.write_texture(transmittance);
+                (
+                    AtmosphereTransmittanceNode {
+                        feature,
+                        expected_shader_identity: snapshot.transmittance_shader_identity,
+                        output_tex: transmittance,
+                        atmosphere_params,
                         bind_group: None,
-                    };
-                    (node, output)
-                })
-            } else {
-                ctx.graph.import_external_resource(
-                    "Atmosphere_MultiScatter",
-                    multi_scatter_desc,
-                    &state.multi_scatter_view,
+                    },
+                    (),
                 )
-            };
+            });
+            ctx.graph.register_cache_commit(token, &[transmittance]);
+        }
 
-            let sky_view = ctx.graph.add_pass("Atmosphere_SkyView", |builder| {
+        let multi_scatter = ctx.graph.import_persistent_texture(
+            "Atmosphere_MultiScatter",
+            cache.multi_scatter_plan.textures[0],
+        );
+        if let Some(token) = cache.multi_scatter_plan.commit {
+            let feature = &mut self.multi_scatter;
+            ctx.graph.add_pass("Atmosphere_MultiScatter", |builder| {
+                builder.read_buffer(atmosphere_params);
                 builder.read_texture(transmittance);
-                builder.read_texture(multi_scatter);
-                builder.read_buffer(atmosphere_params_buf);
-                let output = builder.write_external_texture(
-                    "Atmosphere_SkyView",
-                    sky_view_desc,
-                    &state.sky_view_view,
-                );
-                let node = AtmosphereSkyViewNode {
-                    transmittance_tex: transmittance,
-                    multi_scatter_tex: multi_scatter,
-                    output_tex: output,
-                    atmosphere_params_buf,
-                    params_hash,
-                    gpu_params,
-                    bake_params,
-                    state,
-                    pipeline_id: sky_view_pipeline_id,
-                    layout: sky_view_layout,
-                    bind_group: None,
-                };
-                (node, output)
-            });
-
-            if bake_environment {
-                ctx.graph.add_pass("Atmosphere_SkyToCube", |builder| {
-                    builder.read_texture(transmittance);
-                    builder.read_texture(sky_view);
-                    let environment_bake_params_buf = builder
-                        .create_buffer("Atmosphere_Environment_Bake_Params", bake_params_desc);
-                    builder.write_texture(base_cube);
-                    let node = AtmosphereSkyToCubeNode {
-                        base_cube,
-                        transmittance_tex: transmittance,
-                        sky_view_tex: sky_view,
-                        bake_params_buf: environment_bake_params_buf,
-                        params_hash,
-                        gpu_params,
-                        bake_params,
-                        environment_bake_params: GpuBakeParams {
-                            // Environment lighting is baked in a canonical
-                            // star-field orientation. Visual sky rotation is
-                            // applied independently by the skybox path and
-                            // must not invalidate PMREM every frame.
-                            star_rotation: 0.0,
-                            ..bake_params
-                        },
-                        state,
-                        pipeline_id: sky_to_cube_pipeline_id,
-                        layout: sky_to_cube_layout,
-                        starbox: state.starbox.as_ref(),
-                        moon_texture: &state.moon_texture,
+                builder.write_texture(multi_scatter);
+                (
+                    AtmosphereMultiScatterNode {
+                        feature,
+                        expected_shader_identity: snapshot.multi_scatter_shader_identity,
+                        transmittance,
+                        output_tex: multi_scatter,
+                        atmosphere_params,
                         bind_group: None,
-                    };
-                    (node, ())
-                });
-            }
-
-            AtmosphereGraphOutput {
-                sky_view,
-                transmittance,
-                bake_params: bake_params_buf,
-                // baked_base_cube: bake_environment.then_some(base_cube),
-            }
-        })
-    }
-
-    fn ensure_scene_state(
-        &mut self,
-        ctx: &mut ExtractContext,
-        scene_id: u32,
-        params: &ProceduralSkyParams,
-    ) {
-        let frame_index = ctx.resource_manager.frame_index();
-        let state = self.scene_states.entry(scene_id).or_insert_with(|| {
-            let atmosphere_params_buffer =
-                Tracked::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Atmosphere Params"),
-                    size: std::mem::size_of::<GpuAtmosphereParams>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            let bake_params_buffer =
-                Tracked::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Atmosphere Bake Params"),
-                    size: std::mem::size_of::<GpuBakeParams>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-
-            let transmittance_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Atmosphere Transmittance LUT"),
-                size: wgpu::Extent3d {
-                    width: TRANSMITTANCE_WIDTH,
-                    height: TRANSMITTANCE_HEIGHT,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
+                    },
+                    (),
+                )
             });
-            let transmittance_view = Tracked::new(
-                transmittance_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            );
+            ctx.graph.register_cache_commit(token, &[multi_scatter]);
+        }
 
-            let multi_scatter_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Atmosphere Multi-Scatter LUT"),
-                size: wgpu::Extent3d {
-                    width: MULTI_SCATTER_SIZE,
-                    height: MULTI_SCATTER_SIZE,
-                    depth_or_array_layers: 1,
+        let sky_view_feature = &mut self.sky_view;
+        let sky_view = ctx.graph.add_pass("Atmosphere_SkyView", |builder| {
+            builder.read_buffer(atmosphere_params);
+            builder.read_texture(transmittance);
+            builder.read_texture(multi_scatter);
+            let output = builder.create_texture("Atmosphere_SkyView", sky_view_desc());
+            (
+                AtmosphereSkyViewNode {
+                    feature: sky_view_feature,
+                    expected_shader_identity: snapshot.sky_view_shader_identity,
+                    transmittance,
+                    multi_scatter,
+                    output_tex: output,
+                    atmosphere_params,
+                    bind_group: None,
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let multi_scatter_view = Tracked::new(
-                multi_scatter_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            );
-
-            let sky_view_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Atmosphere Sky-View LUT"),
-                size: wgpu::Extent3d {
-                    width: SKY_VIEW_WIDTH,
-                    height: SKY_VIEW_HEIGHT,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let sky_view_view =
-                Tracked::new(sky_view_texture.create_view(&wgpu::TextureViewDescriptor::default()));
-
-            AtmosphereSceneState {
-                atmosphere_params_buffer,
-                bake_params_buffer,
-                _transmittance_texture: transmittance_texture,
-                transmittance_view,
-                _multi_scatter_texture: multi_scatter_texture,
-                multi_scatter_view,
-                _sky_view_texture: sky_view_texture,
-                sky_view_view,
-                physics_hash: u64::MAX,
-                physics_dirty: AtomicBool::new(true),
-                uploaded_params_hash: AtomicU64::new(u64::MAX),
-                last_used_frame: frame_index,
-                starbox: None,
-                moon_texture: ResolvedAtmosphereMoonTexture::fallback(ctx),
-            }
+                output,
+            )
         });
 
-        state.last_used_frame = frame_index;
-
-        let next_physics_hash = physics_hash(params);
-        if state.physics_hash != next_physics_hash {
-            state.physics_hash = next_physics_hash;
-            state.physics_dirty.store(true, Ordering::Relaxed);
-        }
-    }
-
-    fn prune_scene_states(&mut self, current_frame: u64) {
-        self.scene_states.retain(|_, state| {
-            current_frame.saturating_sub(state.last_used_frame) <= SCENE_CACHE_TTL
-        });
-    }
-
-    fn update_starbox_state(
-        &mut self,
-        ctx: &mut ExtractContext,
-        scene_id: u32,
-        params: &ProceduralSkyParams,
-    ) {
-        let starbox = params
-            .starbox_texture
-            .and_then(|source| Self::resolve_starbox(ctx, &source));
-
-        if let Some(state) = self.scene_states.get_mut(&scene_id) {
-            state.starbox = starbox;
-        }
-    }
-
-    fn update_moon_texture_state(
-        &mut self,
-        ctx: &mut ExtractContext,
-        scene_id: u32,
-        params: &ProceduralSkyParams,
-    ) {
-        let moon_texture = params
-            .moon_albedo_texture
-            .and_then(|source| Self::resolve_moon_texture(ctx, &source))
-            .unwrap_or_else(|| ResolvedAtmosphereMoonTexture::fallback(ctx));
-
-        if let Some(state) = self.scene_states.get_mut(&scene_id) {
-            state.moon_texture = moon_texture;
-        }
-    }
-
-    fn resolve_starbox(
-        ctx: &mut ExtractContext,
-        source: &TextureSource,
-    ) -> Option<ResolvedAtmosphereStarbox> {
-        match source {
-            TextureSource::Asset(handle) => {
-                let state = ctx.resource_manager.prepare_texture(ctx.assets, *handle);
-                if !matches!(state, ResourceState::Ready) {
-                    return None;
-                }
-
-                let binding = ctx.resource_manager.get_texture_binding(*handle)?;
-                let image = ctx.resource_manager.get_image(binding.image_handle)?;
-                let kind =
-                    AtmosphereStarboxKind::from_view_dimension(image.default_view_dimension)?;
-                Some(ResolvedAtmosphereStarbox {
-                    view: image.default_view.clone(),
-                    resource_id: binding.view_id,
-                    kind,
-                })
-            }
-            TextureSource::Attachment(id, dimension) => {
-                let kind = AtmosphereStarboxKind::from_view_dimension(*dimension)?;
-                let view = ctx.resource_manager.get_internal_texture(*id)?.clone();
-                let view_id = ctx.resource_manager.get_internal_texture_view_id(*id)?;
-                Some(ResolvedAtmosphereStarbox {
-                    view,
-                    resource_id: view_id,
-                    kind,
-                })
-            }
-        }
-    }
-
-    fn resolve_moon_texture(
-        ctx: &mut ExtractContext,
-        source: &TextureSource,
-    ) -> Option<ResolvedAtmosphereMoonTexture> {
-        match source {
-            TextureSource::Asset(handle) => {
-                let state = ctx.resource_manager.prepare_texture(ctx.assets, *handle);
-                if !matches!(state, ResourceState::Ready) {
-                    return None;
-                }
-
-                let binding = ctx.resource_manager.get_texture_binding(*handle)?;
-                let image = ctx.resource_manager.get_image(binding.image_handle)?;
-                if image.default_view_dimension != wgpu::TextureViewDimension::D2 {
-                    return None;
-                }
-
-                Some(ResolvedAtmosphereMoonTexture {
-                    view: image.default_view.clone(),
-                    resource_id: binding.view_id,
-                    enabled: true,
-                })
-            }
-            TextureSource::Attachment(id, dimension) => {
-                if *dimension != wgpu::TextureViewDimension::D2 {
-                    return None;
-                }
-
-                let view = ctx.resource_manager.get_internal_texture(*id)?.clone();
-                let view_id = ctx.resource_manager.get_internal_texture_view_id(*id)?;
-                Some(ResolvedAtmosphereMoonTexture {
-                    view,
-                    resource_id: view_id,
-                    enabled: true,
-                })
-            }
-        }
-    }
-
-    fn ensure_layouts(&mut self, device: &wgpu::Device) {
-        if self.transmittance_layout.is_some() {
-            return;
-        }
-
-        self.transmittance_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Atmo Transmittance BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        if let Some(base_cube) = environment_base {
+            let feature = &mut self.sky_to_cube;
+            ctx.graph.add_pass("Atmosphere_SkyToCube", |builder| {
+                builder.read_texture(transmittance);
+                builder.read_texture(sky_view);
+                builder.write_texture(base_cube);
+                let canonical_bake_params =
+                    builder.create_buffer("Atmosphere_Environment_Bake_Params", bake_params_desc());
+                (
+                    AtmosphereSkyToCubeNode {
+                        feature,
+                        snapshot,
+                        base_cube,
+                        transmittance,
+                        sky_view,
+                        canonical_bake_params,
+                        bind_group: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            },
-        )));
-
-        self.multi_scatter_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Atmo Multi-Scatter BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            },
-        )));
-
-        self.sky_view_layout = Some(Tracked::new(device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("Atmo Sky-View BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            },
-        )));
-
-        self.sky_to_cube_layout = Some(Tracked::new(create_sky_to_cube_layout(
-            device,
-            None,
-            "Atmo Sky-to-Cube BGL",
-        )));
-        self.sky_to_cube_eq_layout = Some(Tracked::new(create_sky_to_cube_layout(
-            device,
-            Some(wgpu::TextureViewDimension::D2),
-            "Atmo Sky-to-Cube Eq BGL",
-        )));
-        self.sky_to_cube_cube_layout = Some(Tracked::new(create_sky_to_cube_layout(
-            device,
-            Some(wgpu::TextureViewDimension::Cube),
-            "Atmo Sky-to-Cube Cube BGL",
-        )));
-    }
-
-    fn sky_to_cube_layout_for_kind(
-        &self,
-        kind: AtmosphereStarboxKind,
-    ) -> &Tracked<wgpu::BindGroupLayout> {
-        match kind {
-            AtmosphereStarboxKind::None => self.sky_to_cube_layout.as_ref().unwrap(),
-            AtmosphereStarboxKind::Equirectangular => self.sky_to_cube_eq_layout.as_ref().unwrap(),
-            AtmosphereStarboxKind::Cube => self.sky_to_cube_cube_layout.as_ref().unwrap(),
-        }
-    }
-
-    fn ensure_pipelines(&mut self, ctx: &mut ExtractContext) {
-        let opts = ShaderCompilationOptions::default();
-        let compilation_options = wgpu::PipelineCompilationOptions::default();
-        let mut physics_pipeline_changed = false;
-
-        let trans_source = ShaderSource::File("entry/utility/atmosphere/transmittance_lut");
-        let trans_identity = ctx.shader_manager.pipeline_shader_hash(trans_source, &opts);
-        if self
-            .transmittance_pipeline
-            .is_none_or(|state| state.shader_identity != trans_identity)
-        {
-            physics_pipeline_changed |= self.transmittance_pipeline.is_some();
-            let (trans_module, trans_hash) =
-                ctx.shader_manager
-                    .get_or_compile(ctx.device, trans_source, &opts);
-            let trans_layout = ctx
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Atmo Transmittance PL"),
-                    bind_group_layouts: &[Some(self.transmittance_layout.as_deref().unwrap())],
-                    immediate_size: 0,
-                });
-            let id = ctx.pipeline_cache.get_or_create_compute(
-                ctx.device,
-                trans_module,
-                &trans_layout,
-                &ComputePipelineKey::new(trans_hash).with_compilation_options(&compilation_options),
-                &compilation_options,
-                "Atmo Transmittance Pipeline",
-            );
-            self.transmittance_pipeline = Some(AtmosphereComputePipelineState {
-                id,
-                shader_identity: trans_identity,
+                    (),
+                )
             });
         }
 
-        let multi_source = ShaderSource::File("entry/utility/atmosphere/multi_scatter_lut");
-        let multi_identity = ctx.shader_manager.pipeline_shader_hash(multi_source, &opts);
-        if self
-            .multi_scatter_pipeline
-            .is_none_or(|state| state.shader_identity != multi_identity)
-        {
-            physics_pipeline_changed |= self.multi_scatter_pipeline.is_some();
-            let (multi_module, multi_hash) =
-                ctx.shader_manager
-                    .get_or_compile(ctx.device, multi_source, &opts);
-            let multi_layout = ctx
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Atmo Multi-Scatter PL"),
-                    bind_group_layouts: &[Some(self.multi_scatter_layout.as_deref().unwrap())],
-                    immediate_size: 0,
-                });
-            let id = ctx.pipeline_cache.get_or_create_compute(
-                ctx.device,
-                multi_module,
-                &multi_layout,
-                &ComputePipelineKey::new(multi_hash).with_compilation_options(&compilation_options),
-                &compilation_options,
-                "Atmo Multi-Scatter Pipeline",
-            );
-            self.multi_scatter_pipeline = Some(AtmosphereComputePipelineState {
-                id,
-                shader_identity: multi_identity,
-            });
-        }
-
-        let sky_view_source = ShaderSource::File("entry/utility/atmosphere/sky_view_lut");
-        let sky_view_identity = ctx
-            .shader_manager
-            .pipeline_shader_hash(sky_view_source, &opts);
-        if self
-            .sky_view_pipeline
-            .is_none_or(|state| state.shader_identity != sky_view_identity)
-        {
-            let (sky_view_module, sky_view_hash) =
-                ctx.shader_manager
-                    .get_or_compile(ctx.device, sky_view_source, &opts);
-            let sky_view_layout =
-                ctx.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("Atmo Sky-View PL"),
-                        bind_group_layouts: &[Some(self.sky_view_layout.as_deref().unwrap())],
-                        immediate_size: 0,
-                    });
-            let id = ctx.pipeline_cache.get_or_create_compute(
-                ctx.device,
-                sky_view_module,
-                &sky_view_layout,
-                &ComputePipelineKey::new(sky_view_hash)
-                    .with_compilation_options(&compilation_options),
-                &compilation_options,
-                "Atmo Sky-View Pipeline",
-            );
-            self.sky_view_pipeline = Some(AtmosphereComputePipelineState {
-                id,
-                shader_identity: sky_view_identity,
-            });
-        }
-
-        for starbox_kind in [
-            AtmosphereStarboxKind::None,
-            AtmosphereStarboxKind::Equirectangular,
-            AtmosphereStarboxKind::Cube,
-        ] {
-            for moon_texture in [false, true] {
-                let pipeline_key = AtmosphereSkyToCubePipelineKey {
-                    starbox_kind,
-                    moon_texture,
-                };
-                let mut sky_to_cube_opts = ShaderCompilationOptions::default();
-                pipeline_key.apply_shader_defines(&mut sky_to_cube_opts.defines);
-                let sky_to_cube_source = ShaderSource::File("entry/utility/atmosphere/sky_to_cube");
-                let shader_identity = ctx
-                    .shader_manager
-                    .pipeline_shader_hash(sky_to_cube_source, &sky_to_cube_opts);
-                if self
-                    .sky_to_cube_pipelines
-                    .get(&pipeline_key)
-                    .is_some_and(|state| state.shader_identity == shader_identity)
-                {
-                    continue;
-                }
-                let (sky_to_cube_module, sky_to_cube_hash) = ctx.shader_manager.get_or_compile(
-                    ctx.device,
-                    sky_to_cube_source,
-                    &sky_to_cube_opts,
-                );
-                let sky_to_cube_bind_group_layout: &wgpu::BindGroupLayout =
-                    self.sky_to_cube_layout_for_kind(starbox_kind);
-                let sky_to_cube_layout =
-                    ctx.device
-                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                            label: Some("Atmo Sky-to-Cube PL"),
-                            bind_group_layouts: &[Some(sky_to_cube_bind_group_layout)],
-                            immediate_size: 0,
-                        });
-                let pipeline = ctx.pipeline_cache.get_or_create_compute(
-                    ctx.device,
-                    sky_to_cube_module,
-                    &sky_to_cube_layout,
-                    &ComputePipelineKey::new(sky_to_cube_hash)
-                        .with_compilation_options(&compilation_options),
-                    &compilation_options,
-                    "Atmo Sky-to-Cube Pipeline",
-                );
-                self.sky_to_cube_pipelines.insert(
-                    pipeline_key,
-                    AtmosphereComputePipelineState {
-                        id: pipeline,
-                        shader_identity,
-                    },
-                );
-            }
-        }
-
-        if physics_pipeline_changed {
-            for state in self.scene_states.values() {
-                state.physics_dirty.store(true, Ordering::Relaxed);
-            }
+        AtmosphereGraphOutput {
+            sky_view,
+            transmittance,
+            bake_params,
         }
     }
+}
+
+fn transmittance_cache_key(physics_hash: u64, shader_identity: u64) -> CacheKey {
+    let mut low = FxHasher::default();
+    TRANSMITTANCE_CACHE_SCHEMA.hash(&mut low);
+    physics_hash.hash(&mut low);
+    shader_identity.hash(&mut low);
+    CacheKey::new((u128::from(physics_hash) << 64) | u128::from(low.finish()))
+}
+
+fn multi_scatter_cache_key(
+    transmittance_key: CacheKey,
+    transmittance_epoch: u64,
+    shader_identity: u64,
+) -> CacheKey {
+    let mut high = FxHasher::default();
+    MULTI_SCATTER_CACHE_SCHEMA.hash(&mut high);
+    transmittance_key.get().hash(&mut high);
+    transmittance_epoch.hash(&mut high);
+    let mut low = FxHasher::default();
+    transmittance_key.get().hash(&mut low);
+    transmittance_epoch.hash(&mut low);
+    shader_identity.hash(&mut low);
+    CacheKey::new((u128::from(high.finish()) << 64) | u128::from(low.finish()))
+}
+
+fn atmosphere_params_desc() -> BufferDesc {
+    BufferDesc::new(
+        std::mem::size_of::<GpuAtmosphereParams>() as u64,
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    )
+}
+
+fn bake_params_desc() -> BufferDesc {
+    BufferDesc::new(
+        std::mem::size_of::<GpuBakeParams>() as u64,
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    )
+}
+
+fn transmittance_desc() -> TextureDesc {
+    TextureDesc::new_2d(
+        TRANSMITTANCE_WIDTH,
+        TRANSMITTANCE_HEIGHT,
+        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+    )
+}
+
+fn multi_scatter_desc() -> TextureDesc {
+    TextureDesc::new_2d(
+        MULTI_SCATTER_SIZE,
+        MULTI_SCATTER_SIZE,
+        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+    )
+}
+
+fn sky_view_desc() -> TextureDesc {
+    TextureDesc::new_2d(
+        SKY_VIEW_WIDTH,
+        SKY_VIEW_HEIGHT,
+        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+    )
+}
+
+fn transmittance_spec() -> PersistentTextureSpec {
+    PersistentTextureSpec::new(transmittance_desc(), Some(wgpu::TextureViewDimension::D2))
+}
+
+fn multi_scatter_spec() -> PersistentTextureSpec {
+    PersistentTextureSpec::new(multi_scatter_desc(), Some(wgpu::TextureViewDimension::D2))
+}
+
+fn create_compute_layout(
+    device: &wgpu::Device,
+    kind: AtmosphereComputeKind,
+) -> Tracked<wgpu::BindGroupLayout> {
+    let visibility = wgpu::ShaderStages::COMPUTE;
+    let sampled = wgpu::TextureSampleType::Float { filterable: true };
+    let storage = |binding| {
+        binding_layout::storage_texture(
+            binding,
+            visibility,
+            wgpu::StorageTextureAccess::WriteOnly,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureViewDimension::D2,
+        )
+    };
+    let (label, entries): (&str, Vec<wgpu::BindGroupLayoutEntry>) = match kind {
+        AtmosphereComputeKind::Transmittance => (
+            "Atmo Transmittance BGL",
+            vec![binding_layout::uniform_buffer(0, visibility), storage(1)],
+        ),
+        AtmosphereComputeKind::MultiScatter => (
+            "Atmo Multi-Scatter BGL",
+            vec![
+                binding_layout::uniform_buffer(0, visibility),
+                binding_layout::texture_2d(1, visibility, sampled),
+                binding_layout::sampler(2, visibility, wgpu::SamplerBindingType::Filtering),
+                storage(3),
+            ],
+        ),
+        AtmosphereComputeKind::SkyView => (
+            "Atmo Sky-View BGL",
+            vec![
+                binding_layout::uniform_buffer(0, visibility),
+                binding_layout::texture_2d(1, visibility, sampled),
+                binding_layout::texture_2d(2, visibility, sampled),
+                binding_layout::sampler(3, visibility, wgpu::SamplerBindingType::Filtering),
+                storage(4),
+            ],
+        ),
+    };
+    Tracked::new(
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &entries,
+        }),
+    )
 }
 
 fn create_sky_to_cube_layout(
@@ -1161,135 +864,106 @@ fn create_sky_to_cube_layout(
     starbox_view_dimension: Option<wgpu::TextureViewDimension>,
     label: &str,
 ) -> wgpu::BindGroupLayout {
+    let visibility = wgpu::ShaderStages::COMPUTE;
+    let sampled = wgpu::TextureSampleType::Float { filterable: true };
     let mut entries = vec![
-        wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 2,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 3,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::StorageTexture {
-                access: wgpu::StorageTextureAccess::WriteOnly,
-                format: wgpu::TextureFormat::Rgba16Float,
-                view_dimension: wgpu::TextureViewDimension::D2Array,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 4,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 5,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        },
+        binding_layout::texture_2d(0, visibility, sampled),
+        binding_layout::sampler(1, visibility, wgpu::SamplerBindingType::Filtering),
+        binding_layout::uniform_buffer(2, visibility),
+        binding_layout::storage_texture(
+            3,
+            visibility,
+            wgpu::StorageTextureAccess::WriteOnly,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureViewDimension::D2Array,
+        ),
+        binding_layout::texture_2d(4, visibility, sampled),
+        binding_layout::texture_2d(5, visibility, sampled),
     ];
-
     if let Some(view_dimension) = starbox_view_dimension {
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 6,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension,
-                multisampled: false,
-            },
-            count: None,
-        });
+        entries.push(binding_layout::texture(
+            6,
+            visibility,
+            sampled,
+            view_dimension,
+            false,
+        ));
     }
-
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &entries,
     })
 }
 
-trait AtmosphereNodeState {
-    fn update_params(&self, ctx: &PrepareContext<'_>);
+struct AtmosphereParamsUploadNode {
+    output: BufferNodeId,
+    params: GpuAtmosphereParams,
+}
+
+impl PassNode<'_> for AtmosphereParamsUploadNode {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.output),
+            0,
+            bytemuck::bytes_of(&self.params),
+        );
+    }
+
+    fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+}
+
+struct AtmosphereBakeParamsUploadNode {
+    output: BufferNodeId,
+    params: GpuBakeParams,
+}
+
+impl PassNode<'_> for AtmosphereBakeParamsUploadNode {
+    fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
+        ctx.queue.write_buffer(
+            ctx.views.get_buffer(self.output),
+            0,
+            bytemuck::bytes_of(&self.params),
+        );
+    }
+
+    fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
 }
 
 struct AtmosphereTransmittanceNode<'a> {
+    feature: &'a mut AtmosphereComputeFeature,
+    expected_shader_identity: u64,
     output_tex: TextureNodeId,
-    atmosphere_params_buf: BufferNodeId,
-    params_hash: u64,
-    gpu_params: GpuAtmosphereParams,
-    bake_params: GpuBakeParams,
-    state: &'a AtmosphereSceneState,
-    pipeline_id: ComputePipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
+    atmosphere_params: BufferNodeId,
     bind_group: Option<&'a wgpu::BindGroup>,
-}
-
-impl AtmosphereNodeState for AtmosphereTransmittanceNode<'_> {
-    fn update_params(&self, ctx: &PrepareContext<'_>) {
-        self.state.update_if_needed(
-            ctx.queue,
-            self.params_hash,
-            &self.gpu_params,
-            &self.bake_params,
-        );
-    }
 }
 
 impl<'a> PassNode<'a> for AtmosphereTransmittanceNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.update_params(ctx);
-
+        self.feature
+            .ensure_resources(ctx, self.expected_shader_identity);
         self.bind_group = Some(
-            ctx.build_bind_group(self.layout, Some("Atmo Transmittance BG"))
-                .bind_buffer(0, self.atmosphere_params_buf)
+            ctx.build_bind_group(self.feature.layout(), Some("Atmo Transmittance BG"))
+                .bind_buffer(0, self.atmosphere_params)
                 .bind_texture(1, self.output_tex)
                 .build(),
         );
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Atmosphere Transmittance LUT"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
-        cpass.set_bind_group(
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.feature.pipeline_id()),
+        );
+        pass.set_bind_group(
             0,
             self.bind_group.expect("atmo transmittance bg missing"),
             &[],
         );
-        cpass.dispatch_workgroups(
+        pass.dispatch_workgroups(
             TRANSMITTANCE_WIDTH.div_ceil(8),
             TRANSMITTANCE_HEIGHT.div_ceil(8),
             1,
@@ -1298,37 +972,22 @@ impl<'a> PassNode<'a> for AtmosphereTransmittanceNode<'a> {
 }
 
 struct AtmosphereMultiScatterNode<'a> {
-    transmittance_tex: TextureNodeId,
+    feature: &'a mut AtmosphereComputeFeature,
+    expected_shader_identity: u64,
+    transmittance: TextureNodeId,
     output_tex: TextureNodeId,
-    atmosphere_params_buf: BufferNodeId,
-    params_hash: u64,
-    gpu_params: GpuAtmosphereParams,
-    bake_params: GpuBakeParams,
-    state: &'a AtmosphereSceneState,
-    pipeline_id: ComputePipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
+    atmosphere_params: BufferNodeId,
     bind_group: Option<&'a wgpu::BindGroup>,
-}
-
-impl AtmosphereNodeState for AtmosphereMultiScatterNode<'_> {
-    fn update_params(&self, ctx: &PrepareContext<'_>) {
-        self.state.update_if_needed(
-            ctx.queue,
-            self.params_hash,
-            &self.gpu_params,
-            &self.bake_params,
-        );
-    }
 }
 
 impl<'a> PassNode<'a> for AtmosphereMultiScatterNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.update_params(ctx);
-
+        self.feature
+            .ensure_resources(ctx, self.expected_shader_identity);
         self.bind_group = Some(
-            ctx.build_bind_group(self.layout, Some("Atmo Multi-Scatter BG"))
-                .bind_buffer(0, self.atmosphere_params_buf)
-                .bind_texture(1, self.transmittance_tex)
+            ctx.build_bind_group(self.feature.layout(), Some("Atmo Multi-Scatter BG"))
+                .bind_buffer(0, self.atmosphere_params)
+                .bind_texture(1, self.transmittance)
                 .bind_common_sampler(2, CommonSampler::LinearClamp)
                 .bind_texture(3, self.output_tex)
                 .build(),
@@ -1336,60 +995,46 @@ impl<'a> PassNode<'a> for AtmosphereMultiScatterNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Atmosphere Multi-Scatter LUT"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
-        cpass.set_bind_group(
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.feature.pipeline_id()),
+        );
+        pass.set_bind_group(
             0,
             self.bind_group.expect("atmo multi-scatter bg missing"),
             &[],
         );
-        cpass.dispatch_workgroups(
+        pass.dispatch_workgroups(
             MULTI_SCATTER_SIZE.div_ceil(8),
             MULTI_SCATTER_SIZE.div_ceil(8),
             1,
         );
-
-        self.state.physics_dirty.store(false, Ordering::Relaxed);
     }
 }
 
 struct AtmosphereSkyViewNode<'a> {
-    transmittance_tex: TextureNodeId,
-    multi_scatter_tex: TextureNodeId,
+    feature: &'a mut AtmosphereComputeFeature,
+    expected_shader_identity: u64,
+    transmittance: TextureNodeId,
+    multi_scatter: TextureNodeId,
     output_tex: TextureNodeId,
-    atmosphere_params_buf: BufferNodeId,
-    params_hash: u64,
-    gpu_params: GpuAtmosphereParams,
-    bake_params: GpuBakeParams,
-    state: &'a AtmosphereSceneState,
-    pipeline_id: ComputePipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
+    atmosphere_params: BufferNodeId,
     bind_group: Option<&'a wgpu::BindGroup>,
-}
-
-impl AtmosphereNodeState for AtmosphereSkyViewNode<'_> {
-    fn update_params(&self, ctx: &PrepareContext<'_>) {
-        self.state.update_if_needed(
-            ctx.queue,
-            self.params_hash,
-            &self.gpu_params,
-            &self.bake_params,
-        );
-    }
 }
 
 impl<'a> PassNode<'a> for AtmosphereSkyViewNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.update_params(ctx);
-
+        self.feature
+            .ensure_resources(ctx, self.expected_shader_identity);
         self.bind_group = Some(
-            ctx.build_bind_group(self.layout, Some("Atmo Sky-View BG"))
-                .bind_buffer(0, self.atmosphere_params_buf)
-                .bind_texture(1, self.transmittance_tex)
-                .bind_texture(2, self.multi_scatter_tex)
+            ctx.build_bind_group(self.feature.layout(), Some("Atmo Sky-View BG"))
+                .bind_buffer(0, self.atmosphere_params)
+                .bind_texture(1, self.transmittance)
+                .bind_texture(2, self.multi_scatter)
                 .bind_common_sampler(3, CommonSampler::LinearClamp)
                 .bind_texture(4, self.output_tex)
                 .build(),
@@ -1397,55 +1042,83 @@ impl<'a> PassNode<'a> for AtmosphereSkyViewNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Atmosphere Sky-View LUT"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
-        cpass.set_bind_group(0, self.bind_group.expect("atmo sky-view bg missing"), &[]);
-        cpass.dispatch_workgroups(SKY_VIEW_WIDTH.div_ceil(8), SKY_VIEW_HEIGHT.div_ceil(8), 1);
+        pass.set_pipeline(
+            ctx.pipeline_cache
+                .get_compute_pipeline(self.feature.pipeline_id()),
+        );
+        pass.set_bind_group(0, self.bind_group.expect("atmo sky-view bg missing"), &[]);
+        pass.dispatch_workgroups(SKY_VIEW_WIDTH.div_ceil(8), SKY_VIEW_HEIGHT.div_ceil(8), 1);
     }
 }
 
 struct AtmosphereSkyToCubeNode<'a> {
+    feature: &'a mut AtmosphereSkyToCubeFeature,
+    snapshot: AtmosphereSnapshot,
     base_cube: TextureNodeId,
-    transmittance_tex: TextureNodeId,
-    sky_view_tex: TextureNodeId,
-    bake_params_buf: BufferNodeId,
-    params_hash: u64,
-    gpu_params: GpuAtmosphereParams,
-    bake_params: GpuBakeParams,
-    environment_bake_params: GpuBakeParams,
-    state: &'a AtmosphereSceneState,
-    pipeline_id: ComputePipelineId,
-    layout: &'a Tracked<wgpu::BindGroupLayout>,
-    starbox: Option<&'a ResolvedAtmosphereStarbox>,
-    moon_texture: &'a ResolvedAtmosphereMoonTexture,
+    transmittance: TextureNodeId,
+    sky_view: TextureNodeId,
+    canonical_bake_params: BufferNodeId,
     bind_group: Option<&'a wgpu::BindGroup>,
-}
-
-impl AtmosphereNodeState for AtmosphereSkyToCubeNode<'_> {
-    fn update_params(&self, ctx: &PrepareContext<'_>) {
-        self.state.update_if_needed(
-            ctx.queue,
-            self.params_hash,
-            &self.gpu_params,
-            &self.bake_params,
-        );
-    }
 }
 
 impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.update_params(ctx);
+        self.feature.ensure_resources(
+            ctx,
+            self.snapshot.sky_to_cube_pipeline_key,
+            self.snapshot.sky_to_cube_shader_identity,
+        );
         ctx.mipmap_generator
             .ensure_pipeline(ctx.device, wgpu::TextureFormat::Rgba16Float);
+        let canonical = GpuBakeParams {
+            star_rotation: 0.0,
+            ..self.snapshot.bake_params
+        };
         ctx.queue.write_buffer(
-            ctx.views.get_buffer(self.bake_params_buf),
+            ctx.views.get_buffer(self.canonical_bake_params),
             0,
-            bytemuck::bytes_of(&self.environment_bake_params),
+            bytemuck::bytes_of(&canonical),
         );
 
+        let starbox = self.snapshot.starbox.map(|source| {
+            let prepared = ctx
+                .uploads
+                .resolve_texture_source(ctx.assets, source.source, source.logical_version)
+                .expect("ready atmosphere starbox must keep its snapshot version through prepare");
+            assert_eq!(
+                AtmosphereStarboxKind::from_view_dimension(prepared.view_dimension),
+                Some(source.kind),
+                "atmosphere starbox dimension changed after snapshot extraction"
+            );
+            assert_eq!(
+                prepared.logical_version, source.logical_version,
+                "atmosphere starbox version changed after snapshot extraction"
+            );
+            prepared
+        });
+        let moon = self.snapshot.moon_texture.map(|source| {
+            let prepared = ctx
+                .uploads
+                .resolve_texture_source(ctx.assets, source.source, source.logical_version)
+                .expect(
+                    "ready atmosphere moon texture must keep its snapshot version through prepare",
+                );
+            assert_eq!(
+                prepared.view_dimension,
+                wgpu::TextureViewDimension::D2,
+                "atmosphere moon texture dimension changed after snapshot extraction"
+            );
+            assert_eq!(
+                prepared.logical_version, source.logical_version,
+                "atmosphere moon texture version changed after snapshot extraction"
+            );
+            prepared
+        });
+        let white_moon = ctx.system_textures.white_2d.clone();
         let base_cube_storage_view =
             Tracked::new(ctx.views.get_texture(self.base_cube).create_view(
                 &wgpu::TextureViewDescriptor {
@@ -1461,24 +1134,23 @@ impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
                 },
             ));
 
-        let label = if self.starbox.is_some() {
-            Some("Atmo Sky-to-Cube BG + Moon + Starbox")
-        } else {
-            Some("Atmo Sky-to-Cube BG + Moon")
-        };
-
+        let key = self.snapshot.sky_to_cube_pipeline_key;
+        let layout = self.feature.layout(key.starbox_kind);
         let builder = ctx
-            .build_bind_group(self.layout, label)
-            .bind_texture(0, self.sky_view_tex)
+            .build_bind_group(layout, Some("Atmo Sky-to-Cube BG"))
+            .bind_texture(0, self.sky_view)
             .bind_common_sampler(1, CommonSampler::LinearClamp)
-            .bind_buffer(2, self.bake_params_buf)
+            .bind_buffer(2, self.canonical_bake_params)
             .bind_tracked_texture_view(3, &base_cube_storage_view)
-            .bind_texture(4, self.transmittance_tex)
-            .bind_texture_view_with_id(5, &self.moon_texture.view, self.moon_texture.resource_id);
-
-        self.bind_group = Some(if let Some(starbox) = self.starbox {
+            .bind_texture(4, self.transmittance);
+        let builder = if let Some(moon) = moon.as_ref() {
+            builder.bind_texture_view_with_id(5, &moon.view, moon.view_id)
+        } else {
+            builder.bind_tracked_texture_view(5, &white_moon)
+        };
+        self.bind_group = Some(if let Some(starbox) = starbox.as_ref() {
             builder
-                .bind_texture_view_with_id(6, &starbox.view, starbox.resource_id)
+                .bind_texture_view_with_id(6, &starbox.view, starbox.view_id)
                 .build()
         } else {
             builder.build()
@@ -1487,21 +1159,24 @@ impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
         let dispatch = ctx.get_texture(self.base_cube).width().div_ceil(8);
-
         {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Atmosphere Sky-to-Cube Bake"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(ctx.pipeline_cache.get_compute_pipeline(self.pipeline_id));
-            cpass.set_bind_group(
+            pass.set_pipeline(
+                ctx.pipeline_cache.get_compute_pipeline(
+                    self.feature
+                        .pipeline_id(self.snapshot.sky_to_cube_pipeline_key),
+                ),
+            );
+            pass.set_bind_group(
                 0,
                 self.bind_group.expect("atmo sky-to-cube bg missing"),
                 &[],
             );
-            cpass.dispatch_workgroups(dispatch, dispatch, 6);
+            pass.dispatch_workgroups(dispatch, dispatch, 6);
         }
-
         ctx.mipmap_generator
             .generate(ctx.device, encoder, ctx.get_texture(self.base_cube));
     }
@@ -1510,29 +1185,198 @@ impl<'a> PassNode<'a> for AtmosphereSkyToCubeNode<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::gpu::procedural_physics_hash;
+    use crate::graph::core::graph::FrameConfig;
+    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph};
+
+    struct TestNode;
+
+    impl PassNode<'_> for TestNode {
+        fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestRoot {
+        None,
+        Transmittance,
+        SkyView,
+    }
+
+    fn snapshot(scene_id: u32, physics_hash: u64) -> AtmosphereSnapshot {
+        AtmosphereSnapshot {
+            scene_id,
+            gpu_params: bytemuck::Zeroable::zeroed(),
+            bake_params: bytemuck::Zeroable::zeroed(),
+            physics_hash,
+            transmittance_shader_identity: 101,
+            multi_scatter_shader_identity: 202,
+            sky_view_shader_identity: 303,
+            sky_to_cube_shader_identity: 404,
+            sky_to_cube_pipeline_key: AtmosphereSkyToCubePipelineKey {
+                starbox_kind: AtmosphereStarboxKind::None,
+                moon_texture: false,
+            },
+            starbox: None,
+            moon_texture: None,
+        }
+    }
+
+    fn live_passes(root: TestRoot) -> Vec<&'static str> {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = AtmosphereFeature::new();
+        let snapshot = snapshot(5, 17);
+        let cache = feature.plan_luts(&mut registry, &snapshot, 1);
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let config = FrameConfig {
+            width: 320,
+            height: 180,
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            msaa_samples: 1,
+            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            hdr_format: crate::HDR_TEXTURE_FORMAT,
+        };
+        let output = {
+            let mut ctx = GraphBuilderContext::new(&mut graph, &config, 0);
+            feature.add_to_graph(&mut ctx, &snapshot, &cache, None)
+        };
+        match root {
+            TestRoot::None => {}
+            TestRoot::Transmittance => {
+                graph.add_pass("Atmosphere_Test_Root", |builder| {
+                    builder.read_texture(output.transmittance);
+                    builder.mark_side_effect();
+                    (TestNode, ())
+                });
+            }
+            TestRoot::SkyView => {
+                graph.add_pass("Atmosphere_Test_Root", |builder| {
+                    builder.read_texture(output.sky_view);
+                    builder.mark_side_effect();
+                    (TestNode, ())
+                });
+            }
+        }
+        graph.compile_topology();
+        graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect()
+    }
 
     #[test]
-    fn upload_hash_tracks_direct_public_parameter_mutation() {
-        let params = ProceduralSkyParams::golden_hour();
-        let initial_version = params.version();
-        let initial_hash = atmosphere_upload_hash(
-            &GpuAtmosphereParams::from_scene(&params),
-            &GpuBakeParams::from_scene(&params),
-        );
+    fn physics_mutation_rekeys_both_lut_plans() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = AtmosphereFeature::new();
+        let first = feature.plan_luts(&mut registry, &snapshot(1, 11), 1);
+        registry
+            .commit_cache(
+                first
+                    .transmittance_plan
+                    .commit
+                    .expect("cold transmittance plan must publish"),
+                &[first.transmittance_plan.textures[0].id],
+            )
+            .expect("transmittance publication must succeed");
+        registry
+            .commit_cache(
+                first
+                    .multi_scatter_plan
+                    .commit
+                    .expect("cold multi-scatter plan must publish"),
+                &[first.multi_scatter_plan.textures[0].id],
+            )
+            .expect("multi-scatter publication must succeed");
 
-        let mut modified = params;
-        modified.rayleigh_scale_height += 1.0;
-        assert_eq!(
-            initial_version,
-            modified.version(),
-            "this regression specifically covers public fields that bypass setters"
-        );
-        assert_ne!(
-            initial_hash,
-            atmosphere_upload_hash(
-                &GpuAtmosphereParams::from_scene(&modified),
-                &GpuBakeParams::from_scene(&modified),
-            ),
-        );
+        let steady = feature.plan_luts(&mut registry, &snapshot(1, 11), 2);
+        assert!(steady.transmittance_plan.valid);
+        assert!(steady.multi_scatter_plan.valid);
+        let changed = feature.plan_luts(&mut registry, &snapshot(1, 12), 3);
+        assert!(!changed.transmittance_plan.valid);
+        assert!(!changed.multi_scatter_plan.valid);
+    }
+
+    #[test]
+    fn only_multi_shader_change_keeps_transmittance_valid() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = AtmosphereFeature::new();
+        let initial = feature.plan_luts(&mut registry, &snapshot(2, 7), 1);
+        registry
+            .commit_cache(
+                initial.transmittance_plan.commit.unwrap(),
+                &[initial.transmittance_plan.textures[0].id],
+            )
+            .unwrap();
+        registry
+            .commit_cache(
+                initial.multi_scatter_plan.commit.unwrap(),
+                &[initial.multi_scatter_plan.textures[0].id],
+            )
+            .unwrap();
+
+        let mut changed = snapshot(2, 7);
+        changed.multi_scatter_shader_identity += 1;
+        let next = feature.plan_luts(&mut registry, &changed, 2);
+        assert!(next.transmittance_plan.valid);
+        assert!(!next.multi_scatter_plan.valid);
+    }
+
+    #[test]
+    fn dynamic_sun_does_not_change_static_physics_hash() {
+        let mut params = ProceduralSkyParams::golden_hour();
+        let initial = procedural_physics_hash(&params);
+        params.sun_direction = glam::Vec3::X;
+        params.sun_intensity *= 2.0;
+        assert_eq!(initial, procedural_physics_hash(&params));
+        params.rayleigh_scale_height *= 1.1;
+        assert_ne!(initial, procedural_physics_hash(&params));
+    }
+
+    #[test]
+    fn cache_commit_registration_does_not_keep_dead_luts_alive() {
+        assert!(live_passes(TestRoot::None).is_empty());
+    }
+
+    #[test]
+    fn transmittance_only_demand_does_not_publish_multi_scatter() {
+        let live = live_passes(TestRoot::Transmittance);
+        assert!(live.contains(&"Atmosphere_Params_Upload"));
+        assert!(live.contains(&"Atmosphere_Transmittance"));
+        assert!(!live.contains(&"Atmosphere_MultiScatter"));
+        assert!(!live.contains(&"Atmosphere_SkyView"));
+        assert!(!live.contains(&"Atmosphere_Bake_Params_Upload"));
+    }
+
+    #[test]
+    fn sky_view_demand_keeps_both_lut_writers_live() {
+        let live = live_passes(TestRoot::SkyView);
+        assert!(live.contains(&"Atmosphere_Params_Upload"));
+        assert!(live.contains(&"Atmosphere_Transmittance"));
+        assert!(live.contains(&"Atmosphere_MultiScatter"));
+        assert!(live.contains(&"Atmosphere_SkyView"));
+        assert!(!live.contains(&"Atmosphere_Bake_Params_Upload"));
+    }
+
+    #[test]
+    fn ttl_retires_both_scene_cache_identities() {
+        let mut registry = HistoryRegistry::new();
+        let mut feature = AtmosphereFeature::new();
+        let _ = feature.plan_luts(&mut registry, &snapshot(9, 1), 10);
+        let (transmittance_cache, multi_scatter_cache) = {
+            let domain = feature
+                .domains
+                .get(&9)
+                .expect("atmosphere cache domain missing");
+            (domain.transmittance_cache, domain.multi_scatter_cache)
+        };
+        feature.maintain(&mut registry, 10 + SCENE_CACHE_TTL);
+        assert!(feature.has_scene_state(9));
+        feature.maintain(&mut registry, 11 + SCENE_CACHE_TTL);
+        assert!(!feature.has_scene_state(9));
+        assert!(!registry.remove_cache(transmittance_cache));
+        assert!(!registry.remove_cache(multi_scatter_cache));
     }
 }

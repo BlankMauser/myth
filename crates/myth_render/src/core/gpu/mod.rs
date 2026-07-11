@@ -43,10 +43,13 @@ mod tracked;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) use crate::core::gpu::buffer::GpuBuffer;
 pub use crate::core::gpu::buffer::{BufferUploadContext, GpuBufferHandle};
-pub(crate) use crate::core::gpu::environment::CubeSourceType;
-pub(crate) use crate::core::gpu::environment::GpuEnvironment;
+pub(crate) use crate::core::gpu::buffer::{GpuBuffer, PreparedTextureSource};
+#[cfg(test)]
+pub(crate) use crate::core::gpu::environment::procedural_physics_hash;
+pub(crate) use crate::core::gpu::environment::{
+    CubeSourceType, GpuEnvironment, ProceduralEnvironmentSnapshot,
+};
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
 pub(crate) use crate::core::gpu::material::GpuMaterial;
 pub(crate) use crate::core::gpu::texture::{GpuImage, ResourceState, TextureBinding};
