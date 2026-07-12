@@ -44,7 +44,6 @@ zstd = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "time", "macros"] }
-parking_lot = { workspace = true, features = ["deadlock_detection"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { workspace = true }
@@ -54,6 +53,11 @@ js-sys = { workspace = true }
 
 [features]
 default = []
+deadlock_detection = [
+    "parking_lot/deadlock_detection",
+    "myth_resources/deadlock_detection",
+    "myth_scene/deadlock_detection",
+]
 3dgs = ["myth_resources/3dgs"]
 gltf = ["dep:gltf"]
 gltf-meshopt = ["gltf", "dep:meshopt"]

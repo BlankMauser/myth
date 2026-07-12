@@ -41,9 +41,6 @@ image = { workspace = true }
 minijinja = { workspace = true }
 rust-embed = { workspace = true }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-parking_lot = { workspace = true, features = ["deadlock_detection"] }
-
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { workspace = true, features = ["webgpu", "fragile-send-sync-non-atomic-wasm"] }
 
@@ -52,6 +49,12 @@ pollster = { workspace = true }
 
 [features]
 default = ["advanced_noise"]
+deadlock_detection = [
+    "parking_lot/deadlock_detection",
+    "myth_resources/deadlock_detection",
+    "myth_scene/deadlock_detection",
+    "myth_assets/deadlock_detection",
+]
 advanced_noise = []
 rdg_inspector = []
 debug_view = ["myth_scene/debug_view"]

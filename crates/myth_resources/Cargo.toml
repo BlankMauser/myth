@@ -30,11 +30,9 @@ paste = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-parking_lot = { workspace = true, features = ["deadlock_detection"] }
-
 [features]
 default = []
+deadlock_detection = ["parking_lot/deadlock_detection"]
 3dgs = []
 
 [lints]
