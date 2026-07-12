@@ -78,10 +78,7 @@ impl PassBuilder<'_, '_> {
 
     pub fn read<T: GraphResourceType>(&mut self, id: ResourceNodeId<T>) -> ResourceNodeId<T> {
         let raw = id.erase();
-        self.graph.storage.passes[self.pass_index].reads.push(raw);
-        self.graph.storage.resources[raw.index() as usize]
-            .consumers
-            .push(self.pass_index);
+        self.graph.storage.append_pass_read(self.pass_index, raw);
         id
     }
 

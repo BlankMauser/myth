@@ -10,7 +10,9 @@ use std::hint::black_box;
 
 use myth_render::graph::bench_support::{
     DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern, DrawDemandRoot,
-    RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness, RdgRecorderLifecycleToken,
+    DrawDemandTextureTopology, HighFanOutBenchHarness, HighFanOutBenchSpec, HighFanOutRoot,
+    HighFanOutRunToken, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
+    RdgRecorderLifecycleToken,
 };
 
 #[global_allocator]
@@ -192,6 +194,31 @@ fn main() {
         );
     }
 
+    println!("producer_fan_in");
+    println!(
+        "pattern root plans alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+    );
+    for root in [DrawDemandRoot::Both, DrawDemandRoot::None] {
+        for pattern in [
+            DrawDemandDependencyPattern::Shared,
+            DrawDemandDependencyPattern::Disjoint,
+        ] {
+            for plan_count in [32, 64, 128] {
+                run_producer_fan_in_scenario(pattern, root, plan_count);
+            }
+        }
+    }
+
+    println!("high_fan_out");
+    println!(
+        "root consumers alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+    );
+    for root in [HighFanOutRoot::AllConsumers, HighFanOutRoot::None] {
+        for consumer_count in [4, 8, 16, 64, 128] {
+            run_high_fan_out_scenario(root, consumer_count);
+        }
+    }
+
     println!(
         "recorder_lifecycle live alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
     );
@@ -227,6 +254,7 @@ fn run_scenario(
         plan_count,
         textures_per_plan: 8,
         dependency_pattern: pattern,
+        texture_topology: DrawDemandTextureTopology::ResidentInputs,
         demand_repetitions,
         compile_topology: true,
         root,
@@ -245,6 +273,11 @@ fn run_scenario(
     assert_eq!(
         enabled_stats, disabled_stats,
         "diagnostics bookkeeping changed steady-state allocator traffic"
+    );
+    assert_eq!(
+        enabled_stats,
+        AllocationStats::default(),
+        "resident DrawPlan workload regressed from its zero-allocation plateau"
     );
     let expected_passes = if root == DrawDemandRoot::None { 3 } else { 4 };
     let expected_live = match root {
@@ -276,6 +309,118 @@ fn run_scenario(
     );
 }
 
+fn run_producer_fan_in_scenario(
+    pattern: DrawDemandDependencyPattern,
+    root: DrawDemandRoot,
+    plan_count: usize,
+) {
+    let resident_spec = DrawDemandBenchSpec {
+        plan_count,
+        textures_per_plan: 8,
+        dependency_pattern: pattern,
+        texture_topology: DrawDemandTextureTopology::ResidentInputs,
+        demand_repetitions: 1,
+        compile_topology: true,
+        root,
+    };
+    let produced_spec = DrawDemandBenchSpec {
+        texture_topology: DrawDemandTextureTopology::PerTextureProducer,
+        ..resident_spec
+    };
+
+    // Each topology owns and warms an independent high-water-mark store. The
+    // measured equality therefore checks steady churn, not retained capacity.
+    let mut resident = DrawDemandBenchHarness::new();
+    let mut produced = DrawDemandBenchHarness::new();
+    let (resident_token, resident_stats) = measure_plateau(&mut resident, resident_spec);
+    let (produced_token, produced_stats) = measure_plateau(&mut produced, produced_spec);
+
+    assert_eq!(
+        produced_stats, resident_stats,
+        "real texture producers added steady-state allocation churn"
+    );
+    assert_eq!(
+        produced_stats,
+        AllocationStats::default(),
+        "producer-heavy DrawPlan workload regressed from its zero-allocation plateau"
+    );
+    assert_eq!(
+        produced_token.registered_resource_count, resident_token.registered_resource_count,
+        "producer topology changed the logical resource count"
+    );
+    assert_eq!(produced_token.d2_read_count, resident_token.d2_read_count);
+    assert_eq!(
+        produced_token.cube_read_count,
+        resident_token.cube_read_count
+    );
+    assert_eq!(
+        produced_token.d2_demand_count,
+        resident_token.d2_demand_count
+    );
+    assert_eq!(
+        produced_token.cube_demand_count,
+        resident_token.cube_demand_count
+    );
+
+    let d2_plan_count = plan_count / 4;
+    let cube_plan_count = plan_count - d2_plan_count;
+    let producer_count = match pattern {
+        DrawDemandDependencyPattern::Shared => 8,
+        DrawDemandDependencyPattern::Disjoint => plan_count * 8,
+    };
+    let d2_texture_count = match pattern {
+        DrawDemandDependencyPattern::Shared => 8,
+        DrawDemandDependencyPattern::Disjoint => d2_plan_count * 8,
+    };
+    let cube_texture_count = match pattern {
+        DrawDemandDependencyPattern::Shared => 8,
+        DrawDemandDependencyPattern::Disjoint => cube_plan_count * 8,
+    };
+    let root_pass_count = usize::from(root != DrawDemandRoot::None);
+    assert_eq!(
+        produced_token.registered_pass_count,
+        producer_count + 3 + root_pass_count
+    );
+    assert_eq!(
+        produced_token.d2_physical_dependency_count,
+        d2_texture_count + 1
+    );
+    assert_eq!(
+        produced_token.cube_physical_dependency_count,
+        cube_texture_count + 1
+    );
+    assert_eq!(
+        produced_token.root_physical_dependency_count,
+        match root {
+            DrawDemandRoot::None => 0,
+            DrawDemandRoot::D2 | DrawDemandRoot::Cube => 1,
+            DrawDemandRoot::Both => 2,
+        }
+    );
+    let expected_live = match root {
+        DrawDemandRoot::None => 0,
+        DrawDemandRoot::D2 => 3 + d2_texture_count,
+        DrawDemandRoot::Cube => 3 + cube_texture_count,
+        DrawDemandRoot::Both => 4 + producer_count,
+    };
+    assert_eq!(produced_token.compiled_pass_count, expected_live);
+
+    println!(
+        "{} {} {} {} {} {} {} {} {} {} {}",
+        pattern.label(),
+        root_label(root),
+        plan_count,
+        produced_stats.alloc_calls,
+        produced_stats.alloc_zeroed_calls,
+        produced_stats.realloc_calls,
+        produced_stats.dealloc_calls,
+        produced_stats.allocated_bytes,
+        produced_stats.reallocated_old_bytes,
+        produced_stats.reallocated_new_bytes,
+        produced_stats.deallocated_bytes,
+    );
+}
+
 fn measure_plateau(
     harness: &mut DrawDemandBenchHarness,
     spec: DrawDemandBenchSpec,
@@ -302,6 +447,78 @@ fn measure_plateau(
     (
         token.expect("DrawPlan workload was not sampled"),
         baseline.expect("allocation baseline was not sampled"),
+    )
+}
+
+fn run_high_fan_out_scenario(root: HighFanOutRoot, consumer_count: usize) {
+    let spec = HighFanOutBenchSpec {
+        consumer_count,
+        root,
+    };
+    let mut harness = HighFanOutBenchHarness::new();
+    let (token, stats) = measure_high_fan_out_plateau(&mut harness, spec);
+    let rooted = usize::from(root == HighFanOutRoot::AllConsumers);
+
+    assert_eq!(
+        stats,
+        AllocationStats::default(),
+        "high-fan-out workload regressed from its zero-allocation plateau"
+    );
+
+    assert_eq!(token.registered_pass_count, consumer_count + 1 + rooted);
+    assert_eq!(token.registered_resource_count, consumer_count + 1 + rooted);
+    assert_eq!(token.logical_consumer_count, consumer_count);
+    assert_eq!(
+        token.producer_reverse_consumer_count,
+        consumer_count * rooted
+    );
+    assert_eq!(
+        token.root_physical_dependency_count,
+        consumer_count * rooted
+    );
+    assert_eq!(token.compiled_pass_count, (consumer_count + 2) * rooted);
+
+    println!(
+        "{} {} {} {} {} {} {} {} {} {}",
+        root.label(),
+        consumer_count,
+        stats.alloc_calls,
+        stats.alloc_zeroed_calls,
+        stats.realloc_calls,
+        stats.dealloc_calls,
+        stats.allocated_bytes,
+        stats.reallocated_old_bytes,
+        stats.reallocated_new_bytes,
+        stats.deallocated_bytes,
+    );
+}
+
+fn measure_high_fan_out_plateau(
+    harness: &mut HighFanOutBenchHarness,
+    spec: HighFanOutBenchSpec,
+) -> (HighFanOutRunToken, AllocationStats) {
+    for _ in 0..3 {
+        black_box(harness.run_iteration(spec));
+    }
+
+    let mut baseline = None;
+    let mut token = None;
+    for _ in 0..3 {
+        let (current_token, stats) = measure(|| black_box(harness.run_iteration(spec)));
+        if let Some(expected) = baseline {
+            assert_eq!(
+                stats, expected,
+                "high-fan-out steady allocation counts did not plateau"
+            );
+        } else {
+            baseline = Some(stats);
+        }
+        token = Some(current_token);
+    }
+
+    (
+        token.expect("high-fan-out workload was not sampled"),
+        baseline.expect("high-fan-out allocation baseline was not sampled"),
     )
 }
 

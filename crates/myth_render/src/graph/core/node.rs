@@ -124,7 +124,10 @@ pub struct PassRecord {
     /// Type-erased handle to the arena-allocated pass node.
     pub(crate) node: Option<NodeSlot>,
 
-    pub reads: SmallVec<[ErasedResourceNodeId; 8]>,
+    /// Range into GraphStorage's capacity-retaining flat logical-read table.
+    /// Direct setup reads and deferred DrawPlan texture dependencies remain
+    /// contiguous because pass setup is deliberately non-reentrant.
+    pub(crate) logical_read_range: Range<usize>,
     pub writes: SmallVec<[ErasedResourceNodeId; 4]>,
     pub creates: SmallVec<[ErasedResourceNodeId; 4]>,
     /// Frame-local draw plans consumed by this pass.
@@ -137,7 +140,9 @@ pub struct PassRecord {
     pub(crate) draw_plan_demand_range: Range<usize>,
 
     // Compile-time state
-    pub physical_dependencies: SmallVec<[usize; 8]>,
+    /// Range into GraphStorage's capacity-retaining flat producer table.
+    /// Entries preserve first-read producer order and are unique per pass.
+    pub(crate) physical_dependency_range: Range<usize>,
     pub has_side_effect: bool,
     pub reference_count: u32,
 
@@ -160,17 +165,17 @@ impl PassRecord {
     /// insertion: the record is pushed first so the [`PassBuilder`] can
     /// reference it, then the node is stored after the closure returns.
     #[must_use]
-    pub fn new_empty(name: &'static str) -> Self {
+    pub(crate) fn new_empty(name: &'static str, logical_read_start: usize) -> Self {
         Self {
             name,
             #[cfg(feature = "rdg_inspector")]
             groups: SmallVec::new(),
             node: None,
-            reads: SmallVec::new(),
+            logical_read_range: logical_read_start..logical_read_start,
             writes: SmallVec::new(),
             creates: SmallVec::new(),
             draw_plan_demand_range: 0..0,
-            physical_dependencies: SmallVec::new(),
+            physical_dependency_range: 0..0,
             has_side_effect: false,
             reference_count: 0,
             is_pure_forwarding: false,

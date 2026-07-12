@@ -683,15 +683,16 @@ mod tests {
                 .storage
                 .resources
                 .iter()
-                .map(|resource| ResourceFact {
+                .enumerate()
+                .map(|(resource_index, resource)| ResourceFact {
                     name: resource.name,
                     producer: resource
                         .producer
                         .map(|index| graph.storage.passes[index].name),
-                    consumers: resource
-                        .consumers
-                        .iter()
-                        .map(|&index| graph.storage.passes[index].name)
+                    consumers: graph
+                        .storage
+                        .resource_consumers(resource_index)
+                        .map(|index| graph.storage.passes[index].name)
                         .collect(),
                     texture_desc: resource.kind.texture_desc(),
                     buffer_desc: resource.kind.buffer_desc(),

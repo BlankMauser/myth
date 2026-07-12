@@ -17,7 +17,7 @@ use std::{hint::black_box, time::Duration};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use myth_render::graph::bench_support::{
     DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern, DrawDemandRoot,
-    RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
+    DrawDemandTextureTopology, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
 };
 
 const PLAN_COUNTS: &[usize] = &[32, 64, 128];
@@ -49,6 +49,7 @@ fn bench_rdg_diagnostics_ab(c: &mut Criterion) {
                     plan_count,
                     textures_per_plan: TEXTURES_PER_PLAN,
                     dependency_pattern: pattern,
+                    texture_topology: DrawDemandTextureTopology::ResidentInputs,
                     demand_repetitions: 1,
                     compile_topology: true,
                     root,

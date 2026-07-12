@@ -172,9 +172,9 @@ impl MipmapEncodeCoordinator {
 /// Reusable dense set for attempt-local IDs.
 ///
 /// Starting a new operation advances one generation instead of clearing every
-/// slot. The backing vector remains at its high-water mark across frames. A
-/// full clear occurs only on the practically unreachable generation wrap,
-/// before generation one is reused.
+/// slot. The backing vector remains at its high-water mark across frames. On
+/// generation wrap, one O(high-water) fill clears stale stamps before
+/// generation one is safely reused; long-running editor sessions may reach it.
 #[derive(Default)]
 struct DenseGenerationScratch {
     stamps: Vec<u32>,
@@ -207,6 +207,29 @@ impl DenseGenerationScratch {
     }
 }
 
+fn append_logical_read(
+    logical_reads: &mut Vec<ErasedResourceNodeId>,
+    pass: &mut PassRecord,
+    resources: &mut [ResourceRecord],
+    read: ErasedResourceNodeId,
+) {
+    let resource_index = read.index() as usize;
+    assert!(
+        resource_index < resources.len(),
+        "pass '{}' read a resource from another graph",
+        pass.name
+    );
+    debug_assert_eq!(
+        pass.logical_read_range.end,
+        logical_reads.len(),
+        "pass '{}' logical reads are no longer the open flat-table tail",
+        pass.name
+    );
+    logical_reads.push(read);
+    pass.logical_read_range.end += 1;
+    resources[resource_index].add_consumer_edge();
+}
+
 /// Declarative Render Graph — persistent capacity storage.
 ///
 /// Holds the backing `Vec`s whose heap capacity is reused across frames.
@@ -230,6 +253,12 @@ pub struct GraphStorage {
     pub resources: Vec<ResourceRecord>,
     /// Compiled execution queue (topologically sorted pass indices).
     pub execution_queue: Vec<usize>,
+    /// Capacity-retaining flat logical-read table. Pass records address this
+    /// table by range.
+    logical_reads: Vec<ErasedResourceNodeId>,
+    /// Capacity-retaining flat physical producer table. Pass records address
+    /// this table by range after topology compilation.
+    physical_dependencies: Vec<usize>,
     /// Whether topology compilation has started for the current graph attempt.
     ///
     /// Compilation derives mutable state in-place (reference counts, physical
@@ -289,7 +318,10 @@ pub struct GraphStorage {
     compile_stack: Vec<usize>,
     compile_in_degrees: Vec<usize>,
     compile_ready_heap: BinaryHeap<ReadyNode>,
-    compile_dependency_graph: Vec<SmallVec<[usize; 8]>>,
+    /// CSR reverse adjacency from producer pass to DPE-live consumers.
+    compile_reverse_offsets: Vec<usize>,
+    compile_reverse_edges: Vec<usize>,
+    compile_reverse_cursors: Vec<usize>,
 
     compile_max_ext_indices: Vec<usize>,
 
@@ -297,6 +329,7 @@ pub struct GraphStorage {
     /// high-water marks and generation-cleared between operations.
     draw_plan_demand_scratch: DenseGenerationScratch,
     draw_plan_resource_scratch: DenseGenerationScratch,
+    physical_dependency_scratch: DenseGenerationScratch,
     /// Raw demand IDs for the pass whose setup closure is currently running.
     /// Cleared without releasing capacity before each `add_pass` call.
     pub(crate) draw_plan_raw_demands: Vec<DrawPlanId>,
@@ -327,6 +360,8 @@ impl GraphStorage {
             passes: Vec::new(),
             resources: Vec::new(),
             execution_queue: Vec::new(),
+            logical_reads: Vec::with_capacity(256),
+            physical_dependencies: Vec::with_capacity(256),
             topology_compiled: false,
             persistent_texture_lookup: FxHashMap::default(),
             asset_texture_imports: AssetTextureImportStore::new(),
@@ -347,10 +382,13 @@ impl GraphStorage {
             compile_stack: Vec::new(),
             compile_in_degrees: Vec::new(),
             compile_ready_heap: BinaryHeap::new(),
-            compile_dependency_graph: Vec::new(),
+            compile_reverse_offsets: Vec::new(),
+            compile_reverse_edges: Vec::new(),
+            compile_reverse_cursors: Vec::new(),
             compile_max_ext_indices: Vec::new(),
             draw_plan_demand_scratch: DenseGenerationScratch::default(),
             draw_plan_resource_scratch: DenseGenerationScratch::default(),
+            physical_dependency_scratch: DenseGenerationScratch::default(),
             draw_plan_raw_demands: Vec::with_capacity(64),
             pass_setup_active: false,
             #[cfg(feature = "rdg_inspector")]
@@ -365,6 +403,11 @@ impl GraphStorage {
         self.passes.clear();
         self.resources.clear();
         self.execution_queue.clear();
+        self.logical_reads.clear();
+        self.physical_dependencies.clear();
+        self.compile_reverse_offsets.clear();
+        self.compile_reverse_edges.clear();
+        self.compile_reverse_cursors.clear();
         self.draw_plan_demands.clear();
         self.draw_plan_raw_demands.clear();
         self.pass_setup_active = false;
@@ -385,6 +428,114 @@ impl GraphStorage {
     #[must_use]
     pub fn latest_diagnostics(&self) -> Option<RdgFrameDiagnostics> {
         self.diagnostics.latest()
+    }
+
+    /// Logical resources read by one pass, in declaration order.
+    #[must_use]
+    pub fn pass_reads(&self, pass_index: usize) -> &[ErasedResourceNodeId] {
+        &self.logical_reads[self.passes[pass_index].logical_read_range.clone()]
+    }
+
+    /// Enumerates consumer pass indices for one resource in pass/read
+    /// declaration order.
+    ///
+    /// This is a linear topology-inspection view derived from the canonical
+    /// flat pass-read table. Runtime compilation should use pass-local reads or
+    /// compiled physical adjacency instead of repeatedly scanning this view.
+    pub fn resource_consumers(&self, resource_index: usize) -> impl Iterator<Item = usize> + '_ {
+        assert!(
+            resource_index < self.resources.len(),
+            "resource consumer query is outside this graph"
+        );
+        self.passes
+            .iter()
+            .enumerate()
+            .flat_map(move |(pass_index, _)| {
+                let edge_count = self
+                    .pass_reads(pass_index)
+                    .iter()
+                    .filter(|read| read.index() as usize == resource_index)
+                    .count();
+                std::iter::repeat_n(pass_index, edge_count)
+            })
+    }
+
+    /// Unique physical producer passes required by one pass, in the order
+    /// their first logical read declared them.
+    ///
+    /// The slice is empty before topology compilation. If compilation aborts,
+    /// already-derived passes retain a valid prefix for post-mortem inspection;
+    /// the next graph attempt clears every range and reuses the flat capacity.
+    #[must_use]
+    pub fn pass_physical_dependencies(&self, pass_index: usize) -> &[usize] {
+        &self.physical_dependencies[self.passes[pass_index].physical_dependency_range.clone()]
+    }
+
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    pub(crate) fn compiled_reverse_consumers(&self, producer_index: usize) -> &[usize] {
+        let start = self.compile_reverse_offsets[producer_index];
+        let end = self.compile_reverse_offsets[producer_index + 1];
+        &self.compile_reverse_edges[start..end]
+    }
+
+    /// Append one logical read to the currently open pass range.
+    pub(crate) fn append_pass_read(&mut self, pass_index: usize, read: ErasedResourceNodeId) {
+        assert!(
+            self.pass_setup_active,
+            "logical reads may only be appended during pass setup"
+        );
+        assert_eq!(
+            pass_index + 1,
+            self.passes.len(),
+            "logical reads must target the currently open final pass"
+        );
+        append_logical_read(
+            &mut self.logical_reads,
+            &mut self.passes[pass_index],
+            &mut self.resources,
+            read,
+        );
+    }
+
+    /// Make one pass's logical-read view empty and remove its resource-side
+    /// consumer edges without shifting later pass ranges. The retained flat
+    /// bytes are discarded on the next clear.
+    fn clear_pass_reads(&mut self, pass_index: usize) {
+        let range = self.passes[pass_index].logical_read_range.clone();
+        for read_index in range.clone() {
+            let resource_index = self.logical_reads[read_index].index() as usize;
+            if let Some(resource) = self.resources.get_mut(resource_index) {
+                resource.remove_consumer_edge();
+            }
+        }
+        let start = range.start;
+        self.passes[pass_index].logical_read_range = start..start;
+    }
+
+    /// Roll back only logical-read staging when a setup closure unwinds.
+    /// Other attempt topology remains forensic-only until the next clear, but
+    /// no trailing reads or consumer edges may leak into that next attempt.
+    fn rollback_active_pass_reads(&mut self) {
+        if !self.pass_setup_active {
+            return;
+        }
+        let Some(pass_index) = self.passes.len().checked_sub(1) else {
+            return;
+        };
+        let range = self.passes[pass_index].logical_read_range.clone();
+        let logical_read_count = self.logical_reads.len();
+        if range.start <= logical_read_count {
+            let valid_end = range.end.min(logical_read_count);
+            for read_index in range.start..valid_end {
+                let resource_index = self.logical_reads[read_index].index() as usize;
+                if let Some(resource) = self.resources.get_mut(resource_index) {
+                    resource.remove_consumer_edge();
+                }
+            }
+            self.logical_reads.truncate(range.start);
+        }
+        let cleared_start = range.start.min(self.logical_reads.len());
+        self.passes[pass_index].logical_read_range = cleared_start..cleared_start;
     }
 
     /// Canonicalize raw draw-plan demands and attach their logical texture
@@ -422,7 +573,9 @@ impl GraphStorage {
         self.passes[pass_index].draw_plan_demand_range = canonical_start..canonical_end;
 
         self.draw_plan_resource_scratch.begin(self.resources.len());
-        for read in self.passes[pass_index].reads.iter().copied() {
+        let existing_read_count = self.pass_reads(pass_index).len();
+        for read_index in 0..existing_read_count {
+            let read = self.pass_reads(pass_index)[read_index];
             self.draw_plan_resource_scratch
                 .insert(read.index() as usize);
         }
@@ -430,19 +583,23 @@ impl GraphStorage {
         for demand_index in canonical_start..canonical_end {
             let id = self.draw_plan_demands[demand_index];
             let dependency_key = self.draw_plans.mark_topology_demanded(id);
-            for &dependency in self.draw_plans.texture_dependencies(dependency_key) {
+            let dependencies = self.draw_plans.texture_dependencies(dependency_key);
+            let logical_reads = &mut self.logical_reads;
+            let pass = &mut self.passes[pass_index];
+            let resources = &mut self.resources;
+            let resource_scratch = &mut self.draw_plan_resource_scratch;
+            for &dependency in dependencies {
                 let resource_index = dependency.index() as usize;
                 assert!(
-                    resource_index < self.resources.len(),
+                    resource_index < resources.len(),
                     "pass '{}' demanded a draw-plan texture from another graph",
-                    self.passes[pass_index].name
+                    pass.name
                 );
-                if !self.draw_plan_resource_scratch.insert(resource_index) {
+                if !resource_scratch.insert(resource_index) {
                     continue;
                 }
 
-                self.passes[pass_index].reads.push(dependency.erase());
-                self.resources[resource_index].consumers.push(pass_index);
+                append_logical_read(logical_reads, pass, resources, dependency.erase());
             }
         }
     }
@@ -558,33 +715,77 @@ impl GraphStorage {
             compact_asset_inputs.then(|| vec![0usize; self.passes.len()]);
         let mut asset_input_edges = FxHashSet::default();
         let mut declared_asset_inputs = 0usize;
-        let mut live_asset_inputs = 0usize;
+        let mut live_asset_resources =
+            compact_asset_inputs.then(|| vec![false; self.resources.len()]);
+        let mut read_edges = String::new();
 
         if compact_asset_inputs {
             for res in &self.resources {
-                let Some(import) = res.asset_texture_import_id() else {
+                if res.asset_texture_import_id().is_none() {
                     continue;
-                };
+                }
                 if !res.is_external || res.producer.is_some() || res.alias_of.is_some() {
                     continue;
                 }
                 declared_asset_inputs += 1;
-                if res
-                    .consumers
-                    .iter()
-                    .any(|&pass| self.passes[pass].reference_count > 0)
-                {
-                    live_asset_inputs += 1;
-                }
-                for &consumer in &res.consumers {
-                    if asset_input_edges.insert((import, consumer)) {
+            }
+        }
+
+        // Logical reads are the canonical consumer topology. Scan them exactly
+        // once to derive both human-facing edges and compact Asset Texture
+        // aggregation; ResourceRecord intentionally stores only an edge count.
+        for consumer_index in 0..self.passes.len() {
+            for &read_id in self.pass_reads(consumer_index) {
+                let resource_index = read_id.index() as usize;
+                let res = &self.resources[resource_index];
+                let asset_import = res.asset_texture_import_id();
+                let compact_asset_root = compact_asset_inputs
+                    && asset_import.is_some()
+                    && res.is_external
+                    && res.producer.is_none()
+                    && res.alias_of.is_none();
+
+                if compact_asset_root {
+                    if self.passes[consumer_index].reference_count > 0 {
+                        live_asset_resources
+                            .as_mut()
+                            .expect("compact Asset Texture live set missing")[resource_index] =
+                            true;
+                    }
+                    let import = asset_import.expect("compact Asset Texture import missing");
+                    if asset_input_edges.insert((import, consumer_index)) {
                         asset_input_edge_counts
                             .as_mut()
-                            .expect("compact Asset Texture counts missing")[consumer] += 1;
+                            .expect("compact Asset Texture counts missing")[consumer_index] += 1;
                     }
+                    continue;
+                }
+
+                if res.is_external
+                    && res.producer.is_none()
+                    && !(compact_asset_inputs && asset_import.is_some())
+                {
+                    writeln!(
+                        &mut read_edges,
+                        "    IN_{resource_index} -.-> P{consumer_index};",
+                    )
+                    .unwrap();
+                }
+
+                if let Some(producer_index) = res.producer {
+                    let edge_style = if res.alias_of.is_some() { "==>" } else { "-->" };
+                    let name = Self::escape_mermaid_label(res.name);
+                    writeln!(
+                        &mut read_edges,
+                        "    P{producer_index} {edge_style}|\"{name}\"| P{consumer_index};"
+                    )
+                    .unwrap();
                 }
             }
         }
+        let live_asset_inputs = live_asset_resources
+            .as_deref()
+            .map_or(0, |live| live.iter().filter(|&&is_live| is_live).count());
         writeln!(
             &mut out,
             "    classDef dead fill:#222,stroke:#555,stroke-width:2px,stroke-dasharray: 5 5,color:#777,rx:5,ry:5;"
@@ -753,45 +954,28 @@ impl GraphStorage {
                     let name = Self::escape_mermaid_label(res.name);
                     writeln!(&mut out, "    IN_{i}[\"{name}\"]:::external_in").unwrap();
                 }
-                if Self::is_terminal_external_output(res) {
+                if self.is_declared_terminal_output(i) {
                     let name = Self::escape_mermaid_label(res.name);
                     writeln!(&mut out, "    OUT_{i}[/\"{name}\"/]:::external_out").unwrap();
                 }
             }
         }
 
-        for (pass_idx, pass) in self.passes.iter().enumerate() {
-            // External resources (read)
-            for &read_id in &pass.reads {
-                let res = &self.resources[read_id.index() as usize];
-                if compact_asset_inputs && res.asset_texture_import_id().is_some() {
-                    continue;
-                }
-                if res.is_external && res.producer.is_none() {
-                    writeln!(
-                        &mut out,
-                        "    IN_{id} -.-> P{pass_idx};",
-                        id = read_id.index(),
-                    )
-                    .unwrap();
-                }
-            }
+        out.push_str(&read_edges);
 
+        // Preserve the declared-output contract after edge contraction: an
+        // aliased source ResourceRecord can inherit output-root metadata, but
+        // only IDs still present in a pass's writes are graph outputs.
+        for (producer_index, pass) in self.passes.iter().enumerate() {
             for &write_id in &pass.writes {
                 let res = &self.resources[write_id.index() as usize];
-
-                for &consumer_idx in &res.consumers {
-                    let edge_style = if res.alias_of.is_some() { "==>" } else { "-->" };
-                    let name = Self::escape_mermaid_label(res.name);
+                if Self::is_terminal_external_output(res) {
                     writeln!(
                         &mut out,
-                        "    P{pass_idx} {edge_style}|\"{name}\"| P{consumer_idx};"
+                        "    P{producer_index} --> OUT_{};",
+                        write_id.index()
                     )
                     .unwrap();
-                }
-
-                if Self::is_terminal_external_output(res) {
-                    writeln!(&mut out, "    P{pass_idx} --> OUT_{};", write_id.index()).unwrap();
                 }
             }
         }
@@ -842,7 +1026,22 @@ impl GraphStorage {
 
     #[inline]
     fn is_terminal_external_output(res: &ResourceRecord) -> bool {
-        res.is_external && res.is_output_root && res.producer.is_some() && res.consumers.is_empty()
+        res.is_external
+            && res.is_output_root
+            && res.producer.is_some()
+            && res.consumer_edge_count() == 0
+    }
+
+    #[inline]
+    fn is_declared_terminal_output(&self, resource_index: usize) -> bool {
+        let res = &self.resources[resource_index];
+        Self::is_terminal_external_output(res)
+            && res.producer.is_some_and(|producer_index| {
+                self.passes[producer_index]
+                    .writes
+                    .iter()
+                    .any(|write| write.index() as usize == resource_index)
+            })
     }
 }
 
@@ -882,6 +1081,7 @@ impl Drop for RenderGraph<'_> {
         // Raw demand staging is meaningful only while one setup closure is
         // running. In particular, do not let a setup panic leave stale IDs for
         // retained-topology inspection or a later attempt.
+        self.storage.rollback_active_pass_reads();
         self.storage.draw_plan_raw_demands.clear();
         self.storage.pass_setup_active = false;
         // NodeSlot erases the arena lifetime behind a raw trait-object pointer.
@@ -1215,7 +1415,7 @@ impl<'a> RenderGraph<'a> {
             is_external,
             is_output_root,
             producer: None,
-            consumers: smallvec::SmallVec::new(),
+            consumer_edge_count: 0,
             first_use: usize::MAX,
             last_use: 0,
             physical_index: None,
@@ -1686,11 +1886,14 @@ impl<'a> RenderGraph<'a> {
         );
         self.storage.pass_setup_active = true;
         let pass_index = self.storage.passes.len();
+        let logical_read_start = self.storage.logical_reads.len();
         self.storage.draw_plan_raw_demands.clear();
 
         // Phase 1: placeholder record (node = None) so the PassBuilder can
         // reference the correct index.
-        self.storage.passes.push(PassRecord::new_empty(name));
+        self.storage
+            .passes
+            .push(PassRecord::new_empty(name, logical_read_start));
 
         #[cfg(feature = "rdg_inspector")]
         {
@@ -1706,6 +1909,10 @@ impl<'a> RenderGraph<'a> {
             };
             setup_fn(&mut builder)
         };
+        debug_assert_eq!(
+            self.storage.passes[pass_index].logical_read_range.end,
+            self.storage.logical_reads.len()
+        );
         self.storage.pass_setup_active = false;
 
         // Phase 3: one-shot plan-demand canonicalization. The setup hot path
@@ -1882,11 +2089,14 @@ impl<'a> RenderGraph<'a> {
         for i in 0..self.storage.passes.len() {
             // ── Gate: only fold flagged single-in / single-out passes ──
             let pass = &self.storage.passes[i];
-            if !pass.is_pure_forwarding || pass.reads.is_empty() || pass.writes.is_empty() {
+            if !pass.is_pure_forwarding
+                || self.storage.pass_reads(i).is_empty()
+                || pass.writes.is_empty()
+            {
                 continue;
             }
 
-            let src_idx = pass.reads[0].index() as usize;
+            let src_idx = self.storage.pass_reads(i)[0].index() as usize;
             let dst_id = pass.writes[0];
             let dst_idx = dst_id.index() as usize;
             let src_root_idx = self.resolve_alias_root(src_idx);
@@ -1933,7 +2143,7 @@ impl<'a> RenderGraph<'a> {
             }
 
             // ── Condition 2: the source feeds only this forwarding pass ──
-            if src_res.consumers.len() > 1 {
+            if src_res.consumer_edge_count() != 1 {
                 continue;
             }
 
@@ -1977,8 +2187,8 @@ impl<'a> RenderGraph<'a> {
 
             // (4) Strip the forwarding pass into an island for the dead-pass
             //     cull to remove.
+            self.storage.clear_pass_reads(i);
             let folded = &mut self.storage.passes[i];
-            folded.reads.clear();
             folded.writes.clear();
             folded.creates.clear();
             folded.has_side_effect = false;
@@ -1987,29 +2197,32 @@ impl<'a> RenderGraph<'a> {
     }
 
     fn build_physical_dependencies(&mut self) {
-        const LINEAR_DEDUP_LIMIT: usize = 16;
-        for pass_idx in 0..self.storage.passes.len() {
-            let num_reads = self.storage.passes[pass_idx].reads.len();
-            let mut seen = (num_reads > LINEAR_DEDUP_LIMIT)
-                .then(|| FxHashSet::with_capacity_and_hasher(num_reads, rustc_hash::FxBuildHasher));
-            for read_i in 0..num_reads {
-                let res_id = self.storage.passes[pass_idx].reads[read_i];
+        self.storage.physical_dependencies.clear();
+        let pass_count = self.storage.passes.len();
+        for pass_idx in 0..pass_count {
+            let dependency_start = self.storage.physical_dependencies.len();
+            self.storage.passes[pass_idx].physical_dependency_range =
+                dependency_start..dependency_start;
+            self.storage.physical_dependency_scratch.begin(pass_count);
 
-                if let Some(producer_idx) = self.storage.resources[res_id.index() as usize].producer
-                    && producer_idx < pass_idx
-                    && seen.as_mut().map_or_else(
-                        || {
-                            !self.storage.passes[pass_idx]
-                                .physical_dependencies
-                                .contains(&producer_idx)
-                        },
-                        |seen| seen.insert(producer_idx),
-                    )
+            let read_count = self.storage.pass_reads(pass_idx).len();
+            for read_index in 0..read_count {
+                let read = self.storage.pass_reads(pass_idx)[read_index];
+                let Some(producer_index) = self.storage.resources[read.index() as usize].producer
+                else {
+                    continue;
+                };
+                if producer_index >= pass_idx
+                    || !self
+                        .storage
+                        .physical_dependency_scratch
+                        .insert(producer_index)
                 {
-                    self.storage.passes[pass_idx]
-                        .physical_dependencies
-                        .push(producer_idx);
+                    continue;
                 }
+                self.storage.physical_dependencies.push(producer_index);
+                self.storage.passes[pass_idx].physical_dependency_range.end =
+                    self.storage.physical_dependencies.len();
             }
         }
     }
@@ -2019,7 +2232,8 @@ impl<'a> RenderGraph<'a> {
     /// missing or late derived producer during topology compilation instead of
     /// allowing a resolver panic deep in prepare/execute.
     fn validate_live_asset_texture_dependencies(&self) {
-        for (pass_idx, pass) in self.storage.passes.iter().enumerate() {
+        for pass_idx in 0..self.storage.passes.len() {
+            let pass = &self.storage.passes[pass_idx];
             if pass.reference_count == 0 {
                 continue;
             }
@@ -2038,14 +2252,15 @@ impl<'a> RenderGraph<'a> {
                     pass.name
                 );
                 assert!(
-                    pass.reads
+                    self.storage
+                        .pass_reads(pass_idx)
                         .iter()
                         .any(|read| { self.resolve_alias_root(read.index() as usize) == root_idx }),
                     "derived asset texture producer '{}' must read the lazy import chain it mutates",
                     pass.name
                 );
             }
-            for read in &pass.reads {
+            for read in self.storage.pass_reads(pass_idx) {
                 let read_idx = read.index() as usize;
                 let root_idx = self.resolve_alias_root(read_idx);
                 if self.storage.resources[root_idx]
@@ -2072,8 +2287,8 @@ impl<'a> RenderGraph<'a> {
                     pass.name
                 );
                 assert!(
-                    self.storage.passes[producer]
-                        .reads
+                    self.storage
+                        .pass_reads(producer)
                         .iter()
                         .any(|read| { self.resolve_alias_root(read.index() as usize) == root_idx }),
                     "derived asset texture producer '{}' must read the lazy import chain it mutates",
@@ -2122,9 +2337,9 @@ impl<'a> RenderGraph<'a> {
         }
 
         while let Some(pass_idx) = self.storage.compile_stack.pop() {
-            let num_deps = self.storage.passes[pass_idx].physical_dependencies.len();
+            let num_deps = self.storage.pass_physical_dependencies(pass_idx).len();
             for dep_i in 0..num_deps {
-                let dep_idx = self.storage.passes[pass_idx].physical_dependencies[dep_i];
+                let dep_idx = self.storage.pass_physical_dependencies(pass_idx)[dep_i];
                 if self.storage.passes[dep_idx].reference_count == 0 {
                     self.storage.compile_stack.push(dep_idx);
                 }
@@ -2162,32 +2377,76 @@ impl<'a> RenderGraph<'a> {
     fn topological_sort(&mut self) {
         let pass_count = self.storage.passes.len();
 
+        self.storage.execution_queue.clear();
         self.storage.compile_in_degrees.clear();
         self.storage.compile_in_degrees.resize(pass_count, 0);
-
-        self.storage.compile_dependency_graph.clear();
-        self.storage
-            .compile_dependency_graph
-            .resize(pass_count, SmallVec::new());
-
         self.storage.compile_ready_heap.clear();
+        self.storage.compile_reverse_offsets.clear();
+        self.storage
+            .compile_reverse_offsets
+            .resize(pass_count + 1, 0);
+        self.storage.compile_reverse_edges.clear();
+        self.storage.compile_reverse_cursors.clear();
+        self.storage.compile_reverse_cursors.resize(pass_count, 0);
 
-        for (i, pass) in self.storage.passes.iter().enumerate() {
-            if pass.reference_count > 0 {
-                self.storage.compile_in_degrees[i] = pass.physical_dependencies.len();
-
-                if self.storage.compile_in_degrees[i] == 0 {
-                    self.storage.compile_ready_heap.push(ReadyNode {
-                        priority: 0,
-                        pass_idx: i,
-                    });
-                }
-
-                for &dep in &pass.physical_dependencies {
-                    self.storage.compile_dependency_graph[dep].push(i);
-                }
+        // First CSR pass: count only edges whose consumer survived DPE.
+        for consumer_index in 0..pass_count {
+            if self.storage.passes[consumer_index].reference_count == 0 {
+                continue;
+            }
+            let dependency_count = self
+                .storage
+                .pass_physical_dependencies(consumer_index)
+                .len();
+            self.storage.compile_in_degrees[consumer_index] = dependency_count;
+            if dependency_count == 0 {
+                self.storage.compile_ready_heap.push(ReadyNode {
+                    priority: 0,
+                    pass_idx: consumer_index,
+                });
+            }
+            for dependency_index in 0..dependency_count {
+                let producer_index =
+                    self.storage.pass_physical_dependencies(consumer_index)[dependency_index];
+                debug_assert!(self.storage.passes[producer_index].reference_count > 0);
+                self.storage.compile_reverse_offsets[producer_index + 1] += 1;
             }
         }
+
+        for producer_index in 0..pass_count {
+            self.storage.compile_reverse_offsets[producer_index + 1] +=
+                self.storage.compile_reverse_offsets[producer_index];
+        }
+        let reverse_edge_count = self.storage.compile_reverse_offsets[pass_count];
+        self.storage
+            .compile_reverse_edges
+            .resize(reverse_edge_count, usize::MAX);
+        self.storage
+            .compile_reverse_cursors
+            .copy_from_slice(&self.storage.compile_reverse_offsets[..pass_count]);
+
+        // Second CSR pass: consumers are visited in registration order, so
+        // every producer's adjacency slice preserves that deterministic order.
+        for consumer_index in 0..pass_count {
+            if self.storage.passes[consumer_index].reference_count == 0 {
+                continue;
+            }
+            let dependency_count = self
+                .storage
+                .pass_physical_dependencies(consumer_index)
+                .len();
+            for dependency_index in 0..dependency_count {
+                let producer_index =
+                    self.storage.pass_physical_dependencies(consumer_index)[dependency_index];
+                let cursor = self.storage.compile_reverse_cursors[producer_index];
+                self.storage.compile_reverse_edges[cursor] = consumer_index;
+                self.storage.compile_reverse_cursors[producer_index] += 1;
+            }
+        }
+        debug_assert!((0..pass_count).all(|producer_index| {
+            self.storage.compile_reverse_cursors[producer_index]
+                == self.storage.compile_reverse_offsets[producer_index + 1]
+        }));
 
         let mut sequence_counter = 0;
 
@@ -2195,7 +2454,10 @@ impl<'a> RenderGraph<'a> {
             self.storage.execution_queue.push(node);
             sequence_counter += 1;
 
-            for &downstream in &self.storage.compile_dependency_graph[node] {
+            let edge_start = self.storage.compile_reverse_offsets[node];
+            let edge_end = self.storage.compile_reverse_offsets[node + 1];
+            for edge_index in edge_start..edge_end {
+                let downstream = self.storage.compile_reverse_edges[edge_index];
                 self.storage.compile_in_degrees[downstream] -= 1;
                 if self.storage.compile_in_degrees[downstream] == 0 {
                     let heuristic_score = sequence_counter;
@@ -2231,22 +2493,24 @@ impl<'a> RenderGraph<'a> {
         }
 
         for (timeline_index, &pass_idx) in self.storage.execution_queue.iter().enumerate() {
-            let pass = &self.storage.passes[pass_idx];
-
-            let mut touch_resource = |id: ErasedResourceNodeId| {
+            let read_count = self.storage.pass_reads(pass_idx).len();
+            for read_index in 0..read_count {
+                let id = self.storage.pass_reads(pass_idx)[read_index];
                 let res = &mut self.storage.resources[id.index() as usize];
                 res.first_use = res.first_use.min(timeline_index);
                 res.last_use = res.last_use.max(timeline_index);
-            };
-
-            for &id in &pass.reads {
-                touch_resource(id);
             }
+
+            let pass = &self.storage.passes[pass_idx];
             for &id in &pass.writes {
-                touch_resource(id);
+                let res = &mut self.storage.resources[id.index() as usize];
+                res.first_use = res.first_use.min(timeline_index);
+                res.last_use = res.last_use.max(timeline_index);
             }
             for &id in &pass.creates {
-                touch_resource(id);
+                let res = &mut self.storage.resources[id.index() as usize];
+                res.first_use = res.first_use.min(timeline_index);
+                res.last_use = res.last_use.max(timeline_index);
             }
         }
     }
@@ -2614,15 +2878,25 @@ mod tests {
             graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
             let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
             graph.add_pass("Panicking_Draw_Setup", |builder| -> (MockExec, ()) {
+                builder.read_texture(texture);
+                builder.read_texture(texture);
                 builder.demand_draw_plan(plan);
                 panic!("intentional draw setup failure")
             });
         }));
         assert!(result.is_err());
         assert!(storage.draw_plan_raw_demands.is_empty());
+        assert!(storage.logical_reads.is_empty());
+        assert!(storage.pass_reads(0).is_empty());
+        assert_eq!(
+            storage.resources[0].consumer_edge_count(),
+            0,
+            "setup unwind must remove its logical-read consumer edge"
+        );
 
         let mut graph = begin_test_frame(&mut storage, &arena);
         assert!(graph.storage.passes.is_empty());
+        assert!(graph.storage.logical_reads.is_empty());
         assert!(graph.storage.draw_plan_raw_demands.is_empty());
         assert!(graph.storage.draw_plan_demands.is_empty());
 
@@ -2635,9 +2909,71 @@ mod tests {
             (MockExec, ())
         });
         assert_eq!(graph.storage.pass_draw_plan_demands(pass_index), &[plan]);
+        assert_eq!(graph.storage.pass_reads(pass_index), &[texture.erase()]);
+    }
+
+    #[test]
+    fn second_setup_panic_rolls_back_only_its_read_tail() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let first_input = graph.register_texture("First_Input", dummy_desc(), false);
+            let second_input = graph.register_texture("Second_Input", dummy_desc(), false);
+            graph.add_pass("Completed_First", |builder| {
+                builder.read_texture(first_input);
+                builder.mark_side_effect();
+                (MockExec, ())
+            });
+            graph.add_pass("Panicking_Second", |builder| -> (MockExec, ()) {
+                builder.read_texture(second_input);
+                panic!("intentional second setup failure")
+            });
+        }));
+        assert!(result.is_err());
+
         assert_eq!(
-            graph.storage.passes[pass_index].reads.as_slice(),
-            &[texture.erase()]
+            storage.pass_reads(0),
+            &[ErasedResourceNodeId::new(0, 0)],
+            "completed pass prefix must survive later setup unwind"
+        );
+        assert!(storage.pass_reads(1).is_empty());
+        assert_eq!(storage.logical_reads.len(), 1);
+        assert_eq!(storage.resource_consumers(0).collect::<Vec<_>>(), [0]);
+        assert_eq!(storage.resources[0].consumer_edge_count(), 1);
+        assert_eq!(storage.resources[1].consumer_edge_count(), 0);
+    }
+
+    #[test]
+    fn repeated_reads_are_distinct_consumer_edges_derived_from_pass_reads() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let input = graph.register_texture("Repeated_Input", dummy_desc(), false);
+        let pass_index = graph.storage.passes.len();
+
+        graph.add_pass("Repeated_Reader", |builder| {
+            builder.read_texture(input);
+            builder.read_texture(input);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        assert_eq!(
+            graph.storage.pass_reads(pass_index),
+            &[input.erase(), input.erase()]
+        );
+        assert_eq!(
+            graph.storage.resources[input.index() as usize].consumer_edge_count(),
+            2
+        );
+        assert_eq!(
+            graph
+                .storage
+                .resource_consumers(input.index() as usize)
+                .collect::<Vec<_>>(),
+            [pass_index, pass_index]
         );
     }
 
@@ -2773,7 +3109,7 @@ mod tests {
 
         assert_eq!(graph.storage.pass_draw_plan_demands(4).len(), 2);
         assert_eq!(
-            graph.storage.passes[4].reads.as_slice(),
+            graph.storage.pass_reads(4),
             &[shared_texture.erase()],
             "repeated demands and Prepass/Opaque sharing must add one physical read"
         );
@@ -2821,8 +3157,10 @@ mod tests {
                 "setup must append raw IDs without accumulated-demand scans"
             );
             assert!(
-                builder.graph.storage.passes[builder.pass_index]
-                    .reads
+                builder
+                    .graph
+                    .storage
+                    .pass_reads(builder.pass_index)
                     .is_empty(),
                 "draw-plan dependency union must wait until setup returns"
             );
@@ -2830,14 +3168,12 @@ mod tests {
         });
 
         assert_eq!(graph.storage.pass_draw_plan_demands(pass_index), &[plan]);
+        assert_eq!(graph.storage.pass_reads(pass_index), &[texture.erase()]);
         assert_eq!(
-            graph.storage.passes[pass_index].reads.as_slice(),
-            &[texture.erase()]
-        );
-        assert_eq!(
-            graph.storage.resources[texture.index() as usize]
-                .consumers
-                .as_slice(),
+            graph
+                .storage
+                .resource_consumers(texture.index() as usize)
+                .collect::<Vec<_>>(),
             &[pass_index]
         );
     }
@@ -2876,14 +3212,12 @@ mod tests {
 
         assert_eq!(graph.storage.passes.len(), 1);
         assert_eq!(graph.storage.pass_draw_plan_demands(outer_index), &[plan]);
+        assert_eq!(graph.storage.pass_reads(outer_index), &[texture.erase()]);
         assert_eq!(
-            graph.storage.passes[outer_index].reads.as_slice(),
-            &[texture.erase()]
-        );
-        assert_eq!(
-            graph.storage.resources[texture.index() as usize]
-                .consumers
-                .as_slice(),
+            graph
+                .storage
+                .resource_consumers(texture.index() as usize)
+                .collect::<Vec<_>>(),
             &[outer_index]
         );
     }
@@ -2923,7 +3257,7 @@ mod tests {
             &[transparent, opaque]
         );
         assert_eq!(
-            graph.storage.passes[pass_index].reads.as_slice(),
+            graph.storage.pass_reads(pass_index),
             &[
                 direct.erase(),
                 shared.erase(),
@@ -2933,9 +3267,10 @@ mod tests {
         );
         for texture in [direct, shared, opaque_only, transparent_only] {
             assert_eq!(
-                graph.storage.resources[texture.index() as usize]
-                    .consumers
-                    .as_slice(),
+                graph
+                    .storage
+                    .resource_consumers(texture.index() as usize)
+                    .collect::<Vec<_>>(),
                 &[pass_index],
                 "the union must install exactly one consumer edge per resource"
             );
@@ -2971,14 +3306,10 @@ mod tests {
             (MockExec, ())
         });
 
+        assert_eq!(graph.storage.pass_reads(pass_index), &[retained.erase()]);
         assert_eq!(
-            graph.storage.passes[pass_index].reads.as_slice(),
-            &[retained.erase()]
-        );
-        assert!(
-            graph.storage.resources[abandoned.index() as usize]
-                .consumers
-                .is_empty()
+            graph.storage.resources[abandoned.index() as usize].consumer_edge_count(),
+            0
         );
     }
 
@@ -3046,13 +3377,16 @@ mod tests {
     }
 
     #[test]
-    fn retained_demand_ranges_restart_at_zero_after_attempt_clear() {
+    fn retained_demand_and_read_ranges_restart_at_zero_after_attempt_clear() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
 
         let first_plan;
+        let first_texture;
         {
             let mut graph = begin_test_frame(&mut storage, &arena);
+            first_texture = graph.register_texture("First_Texture", dummy_desc(), false);
+            graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [first_texture]);
             first_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
             graph.add_pass("First_Consumer", |builder| {
                 builder.demand_draw_plan(first_plan);
@@ -3061,8 +3395,17 @@ mod tests {
         }
         assert_eq!(storage.pass_draw_plan_demands(0), &[first_plan]);
         assert_eq!(storage.passes[0].draw_plan_demand_range, 0..1);
+        assert_eq!(storage.pass_reads(0), &[first_texture.erase()]);
+        assert_eq!(storage.passes[0].logical_read_range, 0..1);
+        let retained_read_capacity = storage.logical_reads.capacity();
 
         let mut graph = begin_test_frame(&mut storage, &arena);
+        assert_eq!(
+            graph.storage.logical_reads.capacity(),
+            retained_read_capacity
+        );
+        let second_texture = graph.register_texture("Second_Texture", dummy_desc(), false);
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [second_texture]);
         let second_plan = graph.reserve_draw_plan(DrawPlanKey::Transparent);
         graph.add_pass("Second_Consumer", |builder| {
             builder.demand_draw_plan(second_plan);
@@ -3070,6 +3413,135 @@ mod tests {
         });
         assert_eq!(graph.storage.pass_draw_plan_demands(0), &[second_plan]);
         assert_eq!(graph.storage.passes[0].draw_plan_demand_range, 0..1);
+        assert_eq!(graph.storage.pass_reads(0), &[second_texture.erase()]);
+        assert_eq!(graph.storage.passes[0].logical_read_range, 0..1);
+    }
+
+    #[test]
+    fn physical_dependency_ranges_survive_drop_and_restart_after_clear() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let output = graph.add_pass("First_Producer", |builder| {
+                let output = builder.create_texture("First_Output", dummy_desc());
+                (MockExec, output)
+            });
+            graph.add_pass("First_Consumer", |builder| {
+                builder.read_texture(output);
+                builder.mark_side_effect();
+                (MockExec, ())
+            });
+            graph.compile_topology();
+            assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
+            assert_eq!(graph.storage.passes[1].physical_dependency_range, 0..1);
+        }
+
+        assert_eq!(storage.pass_physical_dependencies(1), &[0]);
+        let retained_capacity = storage.physical_dependencies.capacity();
+
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        assert!(graph.storage.physical_dependencies.is_empty());
+        assert!(graph.storage.compile_reverse_offsets.is_empty());
+        assert_eq!(
+            graph.storage.physical_dependencies.capacity(),
+            retained_capacity
+        );
+        let output = graph.add_pass("Second_Producer", |builder| {
+            let output = builder.create_texture("Second_Output", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Second_Consumer", |builder| {
+            builder.read_texture(output);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+        assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
+        assert_eq!(graph.storage.passes[1].physical_dependency_range, 0..1);
+    }
+
+    #[test]
+    fn physical_dependency_scratch_wrap_clears_stale_producer_marks() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let output = graph.add_pass("Wrap_Producer", |builder| {
+            let output = builder.create_texture("Wrap_Output", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Wrap_Consumer", |builder| {
+            builder.read_texture(output);
+            builder.read_texture(output);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph
+            .storage
+            .physical_dependency_scratch
+            .stamps
+            .resize(2, 1);
+        graph.storage.physical_dependency_scratch.generation = u32::MAX - 1;
+
+        graph.compile_topology();
+
+        assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
+        assert_eq!(
+            graph.storage.physical_dependency_scratch.generation, 1,
+            "the consumer pass must trigger the wrap clear"
+        );
+    }
+
+    #[test]
+    fn compile_panic_partial_physical_tail_is_cleared_by_next_attempt() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let first = graph.add_pass("Panic_Producer_A", |builder| {
+            let output = builder.create_texture("Panic_A", dummy_desc());
+            (MockExec, output)
+        });
+        let second = graph.add_pass("Panic_Producer_B", |builder| {
+            let output = builder.create_texture("Panic_B", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Panic_Consumer", |builder| {
+            builder.read_texture(first);
+            builder.read_texture(second);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        let second_read = graph.storage.passes[2].logical_read_range.start + 1;
+        graph.storage.logical_reads[second_read] = ErasedResourceNodeId::new(u32::MAX, 0);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            graph.compile_topology();
+        }));
+        assert!(result.is_err());
+        drop(graph);
+
+        assert_eq!(storage.pass_physical_dependencies(2), &[0]);
+        let retained_capacity = storage.physical_dependencies.capacity();
+
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        assert!(graph.storage.physical_dependencies.is_empty());
+        assert_eq!(
+            graph.storage.physical_dependencies.capacity(),
+            retained_capacity
+        );
+        let output = graph.add_pass("Recovered_Producer", |builder| {
+            let output = builder.create_texture("Recovered_Output", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Recovered_Consumer", |builder| {
+            builder.read_texture(output);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+        assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
+        assert_eq!(graph.storage.passes[1].physical_dependency_range, 0..1);
     }
 
     #[test]
@@ -3099,13 +3571,174 @@ mod tests {
             (MockExec, ())
         });
 
-        assert_eq!(graph.storage.passes[consumer].reads.len(), textures.len());
+        assert_eq!(graph.storage.pass_reads(consumer).len(), textures.len());
         graph.compile_topology();
+        let expected_producers: Vec<_> = (0..textures.len()).collect();
         assert_eq!(
-            graph.storage.passes[consumer].physical_dependencies.len(),
-            textures.len()
+            graph.storage.pass_physical_dependencies(consumer),
+            expected_producers,
+            ">16 fan-in must remain linear and preserve first producer order"
         );
         assert_eq!(graph.storage.execution_queue.len(), textures.len() + 1);
+    }
+
+    #[test]
+    fn physical_dependencies_deduplicate_in_first_read_producer_order() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+
+        let a = graph.add_pass("Producer_A", |builder| {
+            let output = builder.create_texture("A", dummy_desc());
+            (MockExec, output)
+        });
+        let b = graph.add_pass("Producer_B", |builder| {
+            let output = builder.create_texture("B", dummy_desc());
+            (MockExec, output)
+        });
+        let c = graph.add_pass("Producer_C", |builder| {
+            let output = builder.create_texture("C", dummy_desc());
+            (MockExec, output)
+        });
+        let consumer = graph.storage.passes.len();
+        graph.add_pass("Ordered_Consumer", |builder| {
+            builder.read_texture(b);
+            builder.read_texture(a);
+            builder.read_texture(b);
+            builder.read_texture(c);
+            builder.read_texture(a);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        assert_eq!(
+            graph.storage.pass_physical_dependencies(consumer),
+            &[1, 0, 2]
+        );
+        for producer in 0..3 {
+            assert_eq!(
+                graph.storage.compiled_reverse_consumers(producer),
+                &[consumer]
+            );
+        }
+    }
+
+    #[test]
+    fn csr_topology_preserves_diamond_and_independent_ready_order() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+
+        let a = graph.add_pass("Diamond_A", |builder| {
+            let output = builder.create_texture("Diamond_A_Output", dummy_desc());
+            (MockExec, output)
+        });
+        let b = graph.add_pass("Diamond_B", |builder| {
+            builder.read_texture(a);
+            let output = builder.create_texture("Diamond_B_Output", dummy_desc());
+            (MockExec, output)
+        });
+        let c = graph.add_pass("Diamond_C", |builder| {
+            builder.read_texture(a);
+            let output = builder.create_texture("Diamond_C_Output", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Diamond_D", |builder| {
+            builder.read_texture(b);
+            builder.read_texture(c);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.add_pass("Independent", |builder| {
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        assert_eq!(graph.storage.compiled_reverse_consumers(0), &[1, 2]);
+        assert_eq!(graph.storage.compiled_reverse_consumers(1), &[3]);
+        assert_eq!(graph.storage.compiled_reverse_consumers(2), &[3]);
+        assert_eq!(graph.storage.pass_physical_dependencies(3), &[1, 2]);
+        let order: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "Diamond_A",
+                "Diamond_B",
+                "Diamond_C",
+                "Diamond_D",
+                "Independent"
+            ]
+        );
+    }
+
+    #[test]
+    fn csr_reverse_adjacency_handles_more_than_eight_consumers_without_reordering() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+
+        let output = graph.add_pass("Fanout_Producer", |builder| {
+            let output = builder.create_texture("Fanout_Output", dummy_desc());
+            (MockExec, output)
+        });
+        for _ in 0..12 {
+            graph.add_pass("Fanout_Consumer", |builder| {
+                builder.read_texture(output);
+                builder.mark_side_effect();
+                (MockExec, ())
+            });
+        }
+
+        graph.compile_topology();
+
+        let expected_consumers: Vec<_> = (1..=12).collect();
+        assert_eq!(
+            graph.storage.compiled_reverse_consumers(0),
+            expected_consumers
+        );
+        assert_eq!(graph.storage.execution_queue, (0..=12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn csr_contains_only_live_consumer_edges() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+
+        let dead_output = graph.add_pass("Dead_Producer", |builder| {
+            let output = builder.create_texture("Dead_Output", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Dead_Consumer", |builder| {
+            builder.read_texture(dead_output);
+            (MockExec, ())
+        });
+        let live_output = graph.add_pass("Live_Producer", |builder| {
+            let output = builder.create_texture("Live_Output", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Live_Consumer", |builder| {
+            builder.read_texture(live_output);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
+        assert_eq!(graph.storage.pass_physical_dependencies(3), &[2]);
+        assert!(graph.storage.compiled_reverse_consumers(0).is_empty());
+        assert_eq!(graph.storage.compiled_reverse_consumers(2), &[3]);
+        assert_eq!(graph.storage.execution_queue, [2, 3]);
     }
 
     #[test]
@@ -3285,7 +3918,7 @@ mod tests {
         graph.compile_topology();
 
         assert_eq!(graph.storage.passes.len(), 1);
-        assert!(graph.storage.passes[0].physical_dependencies.is_empty());
+        assert!(graph.storage.pass_physical_dependencies(0).is_empty());
         assert_eq!(graph.storage.execution_queue, [0]);
         let compact = graph.dump_mermaid();
         assert!(compact.contains("declared 1024 · live 1024"));
@@ -3614,15 +4247,13 @@ mod tests {
         graph.compile_topology();
 
         assert_eq!(graph.storage.execution_queue.len(), 2);
-        assert!(
-            !graph.storage.resources[color.index() as usize]
-                .consumers
-                .is_empty()
+        assert_ne!(
+            graph.storage.resources[color.index() as usize].consumer_edge_count(),
+            0
         );
-        assert!(
-            graph.storage.resources[motion.index() as usize]
-                .consumers
-                .is_empty()
+        assert_eq!(
+            graph.storage.resources[motion.index() as usize].consumer_edge_count(),
+            0
         );
         assert_ne!(
             graph.storage.resources[motion.index() as usize].first_use,
@@ -3653,7 +4284,27 @@ mod tests {
             (MockExec, out)
         });
 
+        assert_eq!(
+            graph.storage.resources[intermediate.index() as usize].consumer_edge_count(),
+            1,
+            "the fold gate must observe the canonical logical-read edge"
+        );
+
         graph.compile_topology();
+
+        assert!(graph.storage.pass_reads(1).is_empty());
+        assert_eq!(
+            graph.storage.passes[1].logical_read_range.start,
+            graph.storage.passes[1].logical_read_range.end,
+            "folding must clear the pass view without shifting flat storage"
+        );
+        assert_eq!(
+            graph.storage.resources[intermediate.index() as usize].consumer_edge_count(),
+            0,
+            "folding must remove the eliminated pass's consumer edge"
+        );
+        assert!(graph.storage.pass_physical_dependencies(1).is_empty());
+        assert!(graph.storage.compiled_reverse_consumers(0).is_empty());
 
         let queue_names: Vec<&str> = graph
             .storage
@@ -3685,6 +4336,17 @@ mod tests {
             "intermediate must inherit the surface's external status"
         );
 
+        let dump = graph.dump_mermaid_full();
+        assert!(dump.contains(&format!("P0 --> OUT_{};", present_out.index())));
+        assert!(
+            !dump.contains(&format!("P0 --> OUT_{};", intermediate.index())),
+            "folded source aliases must not invent an additional terminal edge"
+        );
+        assert!(
+            !dump.contains(&format!("OUT_{}[", intermediate.index())),
+            "folded source aliases must not invent an orphan terminal node"
+        );
+
         // The present output (a surface alias) is now owned by the producer, so
         // any downstream reader depends on the producer rather than the
         // eliminated present pass.
@@ -3705,6 +4367,51 @@ mod tests {
         assert_eq!(diagnostics.declared_passes(), 2);
         assert_eq!(diagnostics.folded_passes(), 1);
         assert_eq!(diagnostics.live_passes(), Some(1));
+    }
+
+    #[test]
+    fn folding_middle_pass_does_not_shift_later_flat_ranges() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let surface = graph.register_texture("Surface", dummy_desc(), true);
+        let later_input = graph.register_texture("Later_Input", dummy_desc(), false);
+        let intermediate = graph.add_pass("Producer", |builder| {
+            let output = builder.create_texture("Intermediate", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Present", |builder| {
+            builder.read_texture(intermediate);
+            let output = builder.replace_texture(surface, "Surface_Present");
+            builder.mark_pure_forwarding();
+            (MockExec, output)
+        });
+        let later_index = graph.storage.passes.len();
+        graph.add_pass("Later", |builder| {
+            builder.read_texture(later_input);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        let later_range = graph.storage.passes[later_index].logical_read_range.clone();
+        let later_reads = graph.storage.pass_reads(later_index).to_vec();
+
+        graph.compile_topology();
+
+        assert!(graph.storage.pass_reads(1).is_empty());
+        assert_eq!(
+            graph.storage.passes[later_index].logical_read_range,
+            later_range
+        );
+        assert_eq!(graph.storage.pass_reads(later_index), later_reads);
+        assert!(graph.storage.pass_physical_dependencies(1).is_empty());
+        assert!(graph.storage.compiled_reverse_consumers(0).is_empty());
+        assert_eq!(
+            graph
+                .storage
+                .resource_consumers(later_input.index() as usize)
+                .collect::<Vec<_>>(),
+            &[later_index]
+        );
     }
 
     #[test]
@@ -3815,10 +4522,9 @@ mod tests {
         });
 
         graph.compile_topology();
-        assert!(
-            !graph.storage.resources[internal.index() as usize]
-                .consumers
-                .is_empty()
+        assert_ne!(
+            graph.storage.resources[internal.index() as usize].consumer_edge_count(),
+            0
         );
     }
 
@@ -4952,6 +5658,7 @@ mod tests {
         });
         let precompile = graph.dump_mermaid();
         assert!(precompile.contains("declared 2 · live pending"));
+        assert!(precompile.contains("ASSET_TEXTURES_IN -.->|\"2 textures\"| P0;"));
         graph.compile_topology();
 
         let compact = graph.dump_mermaid();
@@ -4964,6 +5671,43 @@ mod tests {
         assert!(!full.contains("ASSET_TEXTURES_IN"));
         assert!(full.contains(&format!("IN_{}[\"Arbitrary_First\"]", first.index())));
         assert!(full.contains(&format!("IN_{}[\"Arbitrary_Second\"]", second.index())));
+    }
+
+    #[test]
+    fn mermaid_derives_deterministic_consumer_edges_before_and_after_compile() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let output = graph.add_pass("Shared_Producer", |builder| {
+            let output = builder.create_texture("Shared_Output", dummy_desc());
+            (MockExec, output)
+        });
+        for name in ["First_Consumer", "Second_Consumer"] {
+            graph.add_pass(name, |builder| {
+                builder.read_texture(output);
+                builder.mark_side_effect();
+                (MockExec, ())
+            });
+        }
+
+        let consumer_edges = |dump: &str| {
+            dump.lines()
+                .filter(|line| line.contains("-->|\"Shared_Output\"|"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let expected = [
+            "    P0 -->|\"Shared_Output\"| P1;".to_owned(),
+            "    P0 -->|\"Shared_Output\"| P2;".to_owned(),
+        ];
+        let precompile = consumer_edges(&graph.dump_mermaid_full());
+        assert_eq!(precompile, expected);
+
+        graph.compile_topology();
+
+        let compiled = consumer_edges(&graph.dump_mermaid_full());
+        assert_eq!(compiled, expected);
+        assert_eq!(compiled, precompile);
     }
 
     #[test]

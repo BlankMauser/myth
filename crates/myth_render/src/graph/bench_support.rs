@@ -4,7 +4,7 @@
 //! builds, but absent from default shipping builds. Its narrow semantic API
 //! avoids exposing DrawPlan internals or timing an approximate public topology.
 
-use crate::graph::core::node::PassRecord;
+use crate::graph::core::types::ErasedResourceNodeId;
 use crate::graph::core::{
     BufferDesc, ExecuteContext, FrameArena, GraphStorage, PassBuilder, PassNode,
     RdgDiagnosticsRecorder, RdgFramePhase, RenderGraph, TextureDesc, TextureNodeId,
@@ -152,6 +152,26 @@ impl DrawDemandDependencyPattern {
     }
 }
 
+/// Whether benchmark texture inputs are already resident or have real RDG producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawDemandTextureTopology {
+    /// Producer-less, non-root inputs matching steady resident lazy imports.
+    ResidentInputs,
+    /// One real RDG producer pass for every unique logical texture input.
+    PerTextureProducer,
+}
+
+impl DrawDemandTextureTopology {
+    /// Stable label used by Criterion and the allocation probe.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ResidentInputs => "resident",
+            Self::PerTextureProducer => "produced",
+        }
+    }
+}
+
 /// Which Shadow branch is retained by the benchmark's external output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawDemandRoot {
@@ -174,6 +194,8 @@ pub struct DrawDemandBenchSpec {
     pub textures_per_plan: usize,
     /// Whether plans share or own disjoint dependency sets.
     pub dependency_pattern: DrawDemandDependencyPattern,
+    /// Whether logical texture inputs are resident or produced by real passes.
+    pub texture_topology: DrawDemandTextureTopology,
     /// Number of times each plan is demanded by its Shadow pass.
     pub demand_repetitions: usize,
     /// Whether the graph is compiled after construction.
@@ -209,6 +231,12 @@ pub struct DrawDemandRunToken {
     pub d2_demand_count: usize,
     /// Unique demands on the Cube consumer.
     pub cube_demand_count: usize,
+    /// Direct producer-pass dependencies on the D2 consumer.
+    pub d2_physical_dependency_count: usize,
+    /// Direct producer-pass dependencies on the Cube consumer.
+    pub cube_physical_dependency_count: usize,
+    /// Direct producer-pass dependencies on the optional output root.
+    pub root_physical_dependency_count: usize,
     /// Passes retained by compilation, or zero for build-only runs.
     pub compiled_pass_count: usize,
 }
@@ -243,13 +271,19 @@ pub struct DrawDemandBenchObservation {
     pub compiled_pass_count: usize,
     /// Exact producer dependencies of the optional output-root pass.
     pub root_physical_dependencies: Vec<usize>,
+    /// Texture producer passes registered by this workload.
+    pub texture_producer_pass_count: usize,
+    /// Physical dependency edges retained by texture producer passes.
+    ///
+    /// Per-texture producers are intentionally flat leaves, so this must be zero.
+    pub texture_producer_dependency_edge_count: usize,
 }
 
 /// Reusable owner for exact DrawPlan demand benchmark iterations.
 ///
-/// GraphStorage's top-level collections, FrameArena, and harness scratch retain
-/// their high-water-mark capacity. Per-record SmallVec spills are deliberately
-/// destroyed by GraphStorage::clear and remain visible to allocation probes.
+/// GraphStorage's flat topology collections, FrameArena, and harness scratch
+/// retain their high-water-mark capacity. The allocation probe verifies that
+/// adding real producer fan-in does not reintroduce per-record heap churn.
 pub struct DrawDemandBenchHarness {
     storage: GraphStorage,
     arena: FrameArena,
@@ -280,22 +314,29 @@ impl DrawDemandBenchHarness {
     /// Run one production-path iteration with only an O(1) timed result.
     #[must_use]
     pub fn run_iteration(&mut self, spec: DrawDemandBenchSpec) -> DrawDemandRunToken {
-        self.run_iteration_with(spec, |graph, indices| {
-            let d2 = &graph.storage.passes[indices.d2];
-            let cube = &graph.storage.passes[indices.cube];
-            DrawDemandRunToken {
-                registered_pass_count: graph.storage.passes.len(),
-                registered_resource_count: graph.storage.resources.len(),
-                d2_read_count: d2.reads.len(),
-                cube_read_count: cube.reads.len(),
-                d2_demand_count: graph.storage.pass_draw_plan_demands(indices.d2).len(),
-                cube_demand_count: graph.storage.pass_draw_plan_demands(indices.cube).len(),
-                compiled_pass_count: if spec.compile_topology {
-                    graph.storage.execution_queue.len()
-                } else {
-                    0
-                },
-            }
+        self.run_iteration_with(spec, |graph, indices| DrawDemandRunToken {
+            registered_pass_count: graph.storage.passes.len(),
+            registered_resource_count: graph.storage.resources.len(),
+            d2_read_count: graph.storage.pass_reads(indices.d2).len(),
+            cube_read_count: graph.storage.pass_reads(indices.cube).len(),
+            d2_demand_count: graph.storage.pass_draw_plan_demands(indices.d2).len(),
+            cube_demand_count: graph.storage.pass_draw_plan_demands(indices.cube).len(),
+            d2_physical_dependency_count: graph
+                .storage
+                .pass_physical_dependencies(indices.d2)
+                .len(),
+            cube_physical_dependency_count: graph
+                .storage
+                .pass_physical_dependencies(indices.cube)
+                .len(),
+            root_physical_dependency_count: indices.root.map_or(0, |index| {
+                graph.storage.pass_physical_dependencies(index).len()
+            }),
+            compiled_pass_count: if spec.compile_topology {
+                graph.storage.execution_queue.len()
+            } else {
+                0
+            },
         })
     }
 
@@ -312,12 +353,14 @@ impl DrawDemandBenchHarness {
             let draw_plans = &graph.storage.draw_plans;
             DrawDemandBenchObservation {
                 d2: observe_pass(
-                    &graph.storage.passes[indices.d2],
+                    graph.storage.pass_reads(indices.d2),
+                    graph.storage.pass_physical_dependencies(indices.d2),
                     graph.storage.pass_draw_plan_demands(indices.d2),
                     draw_plans,
                 ),
                 cube: observe_pass(
-                    &graph.storage.passes[indices.cube],
+                    graph.storage.pass_reads(indices.cube),
+                    graph.storage.pass_physical_dependencies(indices.cube),
                     graph.storage.pass_draw_plan_demands(indices.cube),
                     draw_plans,
                 ),
@@ -327,7 +370,7 @@ impl DrawDemandBenchHarness {
                     .storage
                     .resources
                     .iter()
-                    .map(|resource| resource.consumers.len())
+                    .map(crate::graph::core::ResourceRecord::consumer_edge_count)
                     .sum(),
                 live_plans: if spec.compile_topology {
                     draw_plans.live_keys().map(project_plan_key).collect()
@@ -340,8 +383,12 @@ impl DrawDemandBenchHarness {
                     0
                 },
                 root_physical_dependencies: indices.root.map_or_else(Vec::new, |index| {
-                    graph.storage.passes[index].physical_dependencies.to_vec()
+                    graph.storage.pass_physical_dependencies(index).to_vec()
                 }),
+                texture_producer_pass_count: indices.texture_producer_end,
+                texture_producer_dependency_edge_count: (0..indices.texture_producer_end)
+                    .map(|index| graph.storage.pass_physical_dependencies(index).len())
+                    .sum(),
             }
         })
     }
@@ -371,7 +418,11 @@ impl DrawDemandBenchHarness {
         if spec.dependency_pattern == DrawDemandDependencyPattern::Shared {
             dependency_scratch.reserve(spec.textures_per_plan);
             for _ in 0..spec.textures_per_plan {
-                dependency_scratch.push(register_texture_input(&mut graph, texture_desc));
+                dependency_scratch.push(register_texture_input(
+                    &mut graph,
+                    texture_desc,
+                    spec.texture_topology,
+                ));
             }
         }
 
@@ -392,7 +443,11 @@ impl DrawDemandBenchHarness {
                     dependency_scratch.clear();
                     dependency_scratch.reserve(spec.textures_per_plan);
                     for _ in 0..spec.textures_per_plan {
-                        dependency_scratch.push(register_texture_input(&mut graph, texture_desc));
+                        dependency_scratch.push(register_texture_input(
+                            &mut graph,
+                            texture_desc,
+                            spec.texture_topology,
+                        ));
                     }
                     graph.set_draw_plan_texture_dependencies(
                         key,
@@ -402,6 +457,8 @@ impl DrawDemandBenchHarness {
             }
             plan_ids.push(plan);
         }
+
+        let texture_producer_end = graph.storage.passes.len();
 
         let vp_buffer = graph.add_pass("Shadow_VP_Upload", |builder: &mut PassBuilder<'_, '_>| {
             let buffer = builder.create_buffer(
@@ -442,6 +499,7 @@ impl DrawDemandBenchHarness {
                 d2: d2_pass,
                 cube: cube_pass,
                 root: root_pass,
+                texture_producer_end,
             },
         )
     }
@@ -458,6 +516,7 @@ struct DrawDemandRunIndices {
     d2: usize,
     cube: usize,
     root: Option<usize>,
+    texture_producer_end: usize,
 }
 
 fn validate_spec(spec: DrawDemandBenchSpec) {
@@ -475,10 +534,25 @@ fn validate_spec(spec: DrawDemandBenchSpec) {
     );
 }
 
-fn register_texture_input(graph: &mut RenderGraph<'_>, desc: TextureDesc) -> TextureNodeId {
-    // Producer-less/non-root matches the steady resident lazy-import topology
-    // without invoking Asset-specific lookup and validation.
-    graph.register_texture("Shadow_Material_Texture", desc, false)
+fn register_texture_input(
+    graph: &mut RenderGraph<'_>,
+    desc: TextureDesc,
+    topology: DrawDemandTextureTopology,
+) -> TextureNodeId {
+    match topology {
+        DrawDemandTextureTopology::ResidentInputs => {
+            // Producer-less/non-root matches the steady resident lazy-import topology
+            // without invoking Asset-specific lookup and validation.
+            graph.register_texture("Shadow_Material_Texture", desc, false)
+        }
+        DrawDemandTextureTopology::PerTextureProducer => graph.add_pass(
+            "Shadow_Material_Texture_Producer",
+            |builder: &mut PassBuilder<'_, '_>| {
+                let texture = builder.create_texture("Shadow_Material_Texture", desc);
+                (DrawDemandBenchNode, texture)
+            },
+        ),
+    }
 }
 
 fn shadow_plan_key(plan_index: usize, d2_plan_count: usize) -> DrawPlanKey {
@@ -530,21 +604,18 @@ fn add_output_root(
 }
 
 fn observe_pass(
-    pass: &PassRecord,
+    reads: &[ErasedResourceNodeId],
+    physical_dependencies: &[usize],
     demands: &[DrawPlanId],
     draw_plans: &DrawPlanStore,
 ) -> DrawDemandPassObservation {
     DrawDemandPassObservation {
-        logical_reads: pass
-            .reads
-            .iter()
-            .map(|id| (id.index(), id.version()))
-            .collect(),
+        logical_reads: reads.iter().map(|id| (id.index(), id.version())).collect(),
         demanded_plans: demands
             .iter()
             .map(|&id| resolve_plan_key(draw_plans, id))
             .collect(),
-        physical_dependencies: pass.physical_dependencies.to_vec(),
+        physical_dependencies: physical_dependencies.to_vec(),
     }
 }
 
@@ -588,11 +659,220 @@ fn dependency_desc() -> TextureDesc {
     )
 }
 
+/// Whether the high-fan-out workload is rooted or entirely removed by DPE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighFanOutRoot {
+    /// No output root; the producer and every consumer are dead.
+    None,
+    /// One output root reads every consumer output.
+    AllConsumers,
+}
+
+impl HighFanOutRoot {
+    /// Stable label used by the allocation probe.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "all_dead",
+            Self::AllConsumers => "live",
+        }
+    }
+}
+
+/// Exact workload for one producer resource with many consumer passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighFanOutBenchSpec {
+    /// Number of passes that directly read the producer texture.
+    pub consumer_count: usize,
+    /// DPE root mode.
+    pub root: HighFanOutRoot,
+}
+
+/// O(1) result suitable for allocation-counting scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighFanOutRunToken {
+    pub registered_pass_count: usize,
+    pub registered_resource_count: usize,
+    pub logical_consumer_count: usize,
+    pub producer_reverse_consumer_count: usize,
+    pub root_physical_dependency_count: usize,
+    pub compiled_pass_count: usize,
+}
+
+/// Untimed exact topology facts for the high-fan-out golden tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighFanOutBenchObservation {
+    pub registered_pass_count: usize,
+    pub registered_resource_count: usize,
+    pub logical_consumer_order: Vec<usize>,
+    pub producer_physical_dependencies: Vec<usize>,
+    pub consumer_physical_dependencies: Vec<Vec<usize>>,
+    pub producer_reverse_consumers: Vec<usize>,
+    pub consumer_reverse_consumers: Vec<Vec<usize>>,
+    pub root_physical_dependencies: Vec<usize>,
+    pub execution_queue: Vec<usize>,
+}
+
+/// Capacity-reusing owner for the real high-fan-out topology.
+pub struct HighFanOutBenchHarness {
+    storage: GraphStorage,
+    arena: FrameArena,
+    consumer_outputs: Vec<TextureNodeId>,
+}
+
+impl HighFanOutBenchHarness {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            storage: GraphStorage::new(),
+            arena: FrameArena::new(),
+            consumer_outputs: Vec::new(),
+        }
+    }
+
+    /// Run one compiled topology iteration with an O(1) result.
+    #[must_use]
+    pub fn run_iteration(&mut self, spec: HighFanOutBenchSpec) -> HighFanOutRunToken {
+        self.run_iteration_with(spec, |graph, indices| HighFanOutRunToken {
+            registered_pass_count: graph.storage.passes.len(),
+            registered_resource_count: graph.storage.resources.len(),
+            logical_consumer_count: graph.storage.resources
+                [indices.producer_texture.index() as usize]
+                .consumer_edge_count(),
+            producer_reverse_consumer_count: graph
+                .storage
+                .compiled_reverse_consumers(indices.producer_pass)
+                .len(),
+            root_physical_dependency_count: indices.root.map_or(0, |root| {
+                graph.storage.pass_physical_dependencies(root).len()
+            }),
+            compiled_pass_count: graph.storage.execution_queue.len(),
+        })
+    }
+
+    /// Run one iteration and copy exact identities outside timed scopes.
+    #[must_use]
+    pub fn run_observed_iteration(
+        &mut self,
+        spec: HighFanOutBenchSpec,
+    ) -> HighFanOutBenchObservation {
+        self.run_iteration_with(spec, |graph, indices| HighFanOutBenchObservation {
+            registered_pass_count: graph.storage.passes.len(),
+            registered_resource_count: graph.storage.resources.len(),
+            logical_consumer_order: graph
+                .storage
+                .resource_consumers(indices.producer_texture.index() as usize)
+                .collect(),
+            producer_physical_dependencies: graph
+                .storage
+                .pass_physical_dependencies(indices.producer_pass)
+                .to_vec(),
+            consumer_physical_dependencies: (indices.consumer_start..indices.consumer_end)
+                .map(|consumer| graph.storage.pass_physical_dependencies(consumer).to_vec())
+                .collect(),
+            producer_reverse_consumers: graph
+                .storage
+                .compiled_reverse_consumers(indices.producer_pass)
+                .to_vec(),
+            consumer_reverse_consumers: (indices.consumer_start..indices.consumer_end)
+                .map(|consumer| graph.storage.compiled_reverse_consumers(consumer).to_vec())
+                .collect(),
+            root_physical_dependencies: indices.root.map_or_else(Vec::new, |root| {
+                graph.storage.pass_physical_dependencies(root).to_vec()
+            }),
+            execution_queue: graph.storage.execution_queue.clone(),
+        })
+    }
+
+    fn run_iteration_with<R>(
+        &mut self,
+        spec: HighFanOutBenchSpec,
+        observe: impl FnOnce(&RenderGraph<'_>, HighFanOutRunIndices) -> R,
+    ) -> R {
+        assert!(
+            spec.consumer_count > 0,
+            "high-fan-out benchmark requires at least one consumer"
+        );
+
+        self.arena.reset();
+        self.consumer_outputs.clear();
+        self.consumer_outputs.reserve(spec.consumer_count);
+
+        let mut graph = RenderGraph::new_for_benchmark(&mut self.storage, &self.arena, true);
+        let desc = dependency_desc();
+        let producer_pass = graph.storage.passes.len();
+        let producer_texture = graph.add_pass(
+            "HighFanOut_Producer",
+            |builder: &mut PassBuilder<'_, '_>| {
+                let texture = builder.create_texture("HighFanOut_Source", desc);
+                (DrawDemandBenchNode, texture)
+            },
+        );
+
+        let consumer_start = graph.storage.passes.len();
+        for _ in 0..spec.consumer_count {
+            let output = graph.add_pass(
+                "HighFanOut_Consumer",
+                |builder: &mut PassBuilder<'_, '_>| {
+                    builder.read_texture(producer_texture);
+                    let output = builder.create_texture("HighFanOut_Consumer_Output", desc);
+                    (DrawDemandBenchNode, output)
+                },
+            );
+            self.consumer_outputs.push(output);
+        }
+        let consumer_end = graph.storage.passes.len();
+
+        let root = if spec.root == HighFanOutRoot::AllConsumers {
+            let backbuffer = graph.register_texture("HighFanOut_Backbuffer", desc, true);
+            let root = graph.storage.passes.len();
+            graph.add_pass("HighFanOut_Root", |builder: &mut PassBuilder<'_, '_>| {
+                for &output in &self.consumer_outputs {
+                    builder.read_texture(output);
+                }
+                builder.write_texture(backbuffer);
+                (DrawDemandBenchNode, ())
+            });
+            Some(root)
+        } else {
+            None
+        };
+
+        graph.compile_topology();
+        observe(
+            &graph,
+            HighFanOutRunIndices {
+                producer_pass,
+                producer_texture,
+                consumer_start,
+                consumer_end,
+                root,
+            },
+        )
+    }
+}
+
+impl Default for HighFanOutBenchHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HighFanOutRunIndices {
+    producer_pass: usize,
+    producer_texture: TextureNodeId,
+    consumer_start: usize,
+    consumer_end: usize,
+    root: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern,
-        DrawDemandPlanKey, DrawDemandRoot, RdgBenchDiagnosticsMode,
+        DrawDemandPlanKey, DrawDemandRoot, DrawDemandTextureTopology, HighFanOutBenchHarness,
+        HighFanOutBenchSpec, HighFanOutRoot, RdgBenchDiagnosticsMode,
         RdgRecorderLifecycleBenchHarness, project_plan_key, shadow_plan_key,
     };
 
@@ -602,14 +882,64 @@ mod tests {
         compile_topology: bool,
         root: DrawDemandRoot,
     ) -> DrawDemandBenchSpec {
+        spec_with_topology(
+            pattern,
+            DrawDemandTextureTopology::ResidentInputs,
+            repetitions,
+            compile_topology,
+            root,
+        )
+    }
+
+    fn spec_with_topology(
+        pattern: DrawDemandDependencyPattern,
+        texture_topology: DrawDemandTextureTopology,
+        repetitions: usize,
+        compile_topology: bool,
+        root: DrawDemandRoot,
+    ) -> DrawDemandBenchSpec {
         DrawDemandBenchSpec {
             plan_count: 32,
             textures_per_plan: 8,
             dependency_pattern: pattern,
+            texture_topology,
             demand_repetitions: repetitions,
             compile_topology,
             root,
         }
+    }
+
+    fn unique_texture_count(pattern: DrawDemandDependencyPattern) -> usize {
+        match pattern {
+            DrawDemandDependencyPattern::Shared => 8,
+            DrawDemandDependencyPattern::Disjoint => 32 * 8,
+        }
+    }
+
+    fn branch_texture_count(pattern: DrawDemandDependencyPattern, plan_count: usize) -> usize {
+        match pattern {
+            DrawDemandDependencyPattern::Shared => 8,
+            DrawDemandDependencyPattern::Disjoint => plan_count * 8,
+        }
+    }
+
+    fn expected_producer_dependencies(
+        pattern: DrawDemandDependencyPattern,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let producer_count = unique_texture_count(pattern);
+        let mut d2 = vec![producer_count];
+        let mut cube = vec![producer_count];
+        match pattern {
+            DrawDemandDependencyPattern::Shared => {
+                d2.extend(0..8);
+                cube.extend(0..8);
+            }
+            DrawDemandDependencyPattern::Disjoint => {
+                d2.extend(0..8 * 8);
+                cube.extend(8 * 8..producer_count);
+            }
+        }
+        (d2, cube)
     }
 
     fn expected_plan_keys(plan_count: usize) -> Vec<DrawDemandPlanKey> {
@@ -666,12 +996,173 @@ mod tests {
             DrawDemandDependencyPattern::Shared,
             DrawDemandDependencyPattern::Disjoint,
         ] {
+            for texture_topology in [
+                DrawDemandTextureTopology::ResidentInputs,
+                DrawDemandTextureTopology::PerTextureProducer,
+            ] {
+                let mut harness = DrawDemandBenchHarness::new();
+                let single = harness.run_observed_iteration(spec_with_topology(
+                    pattern,
+                    texture_topology,
+                    1,
+                    true,
+                    DrawDemandRoot::Both,
+                ));
+                let duplicate = harness.run_observed_iteration(spec_with_topology(
+                    pattern,
+                    texture_topology,
+                    2,
+                    true,
+                    DrawDemandRoot::Both,
+                ));
+                assert_eq!(single, duplicate);
+            }
+        }
+    }
+
+    #[test]
+    fn producer_heavy_build_facts_match_exact_formulas() {
+        let expected_plans = expected_plan_keys(32);
+        for pattern in [
+            DrawDemandDependencyPattern::Shared,
+            DrawDemandDependencyPattern::Disjoint,
+        ] {
             let mut harness = DrawDemandBenchHarness::new();
-            let single =
-                harness.run_observed_iteration(spec(pattern, 1, true, DrawDemandRoot::Both));
-            let duplicate =
-                harness.run_observed_iteration(spec(pattern, 2, true, DrawDemandRoot::Both));
-            assert_eq!(single, duplicate);
+            let facts = harness.run_observed_iteration(spec_with_topology(
+                pattern,
+                DrawDemandTextureTopology::PerTextureProducer,
+                1,
+                false,
+                DrawDemandRoot::Both,
+            ));
+            let producer_count = unique_texture_count(pattern);
+            let d2_texture_reads = branch_texture_count(pattern, 8);
+            let cube_texture_reads = branch_texture_count(pattern, 24);
+            let texture_consumer_edges = match pattern {
+                DrawDemandDependencyPattern::Shared => 2 * 8,
+                DrawDemandDependencyPattern::Disjoint => 32 * 8,
+            };
+
+            assert_eq!(facts.d2.logical_reads.len(), d2_texture_reads + 1);
+            assert_eq!(facts.cube.logical_reads.len(), cube_texture_reads + 1);
+            assert_eq!(facts.d2.demanded_plans, expected_plans[..8]);
+            assert_eq!(facts.cube.demanded_plans, expected_plans[8..]);
+            assert_eq!(facts.registered_pass_count, producer_count + 4);
+            assert_eq!(facts.registered_resource_count, producer_count + 4);
+            assert_eq!(
+                facts.resource_consumer_edge_count,
+                texture_consumer_edges + 4
+            );
+            assert_eq!(facts.texture_producer_pass_count, producer_count);
+            assert_eq!(facts.texture_producer_dependency_edge_count, 0);
+            assert!(facts.live_plans.is_empty());
+            assert_eq!(facts.compiled_pass_count, 0);
+            assert!(facts.d2.physical_dependencies.is_empty());
+            assert!(facts.cube.physical_dependencies.is_empty());
+            assert!(facts.root_physical_dependencies.is_empty());
+        }
+    }
+
+    #[test]
+    fn producer_heavy_compile_keeps_ordered_flat_dependencies_for_every_root() {
+        let expected_plans = expected_plan_keys(32);
+        for pattern in [
+            DrawDemandDependencyPattern::Shared,
+            DrawDemandDependencyPattern::Disjoint,
+        ] {
+            let producer_count = unique_texture_count(pattern);
+            let (expected_d2_dependencies, expected_cube_dependencies) =
+                expected_producer_dependencies(pattern);
+
+            for root in [
+                DrawDemandRoot::None,
+                DrawDemandRoot::D2,
+                DrawDemandRoot::Cube,
+                DrawDemandRoot::Both,
+            ] {
+                let mut harness = DrawDemandBenchHarness::new();
+                let facts = harness.run_observed_iteration(spec_with_topology(
+                    pattern,
+                    DrawDemandTextureTopology::PerTextureProducer,
+                    1,
+                    true,
+                    root,
+                ));
+
+                assert_eq!(facts.d2.physical_dependencies, expected_d2_dependencies);
+                assert_eq!(facts.cube.physical_dependencies, expected_cube_dependencies);
+                assert_eq!(facts.texture_producer_pass_count, producer_count);
+                assert_eq!(facts.texture_producer_dependency_edge_count, 0);
+
+                let (expected_live_plans, expected_live_passes, expected_root_dependencies) =
+                    match root {
+                        DrawDemandRoot::None => (&expected_plans[0..0], 0, vec![]),
+                        DrawDemandRoot::D2 => (
+                            &expected_plans[..8],
+                            3 + branch_texture_count(pattern, 8),
+                            vec![producer_count + 1],
+                        ),
+                        DrawDemandRoot::Cube => (
+                            &expected_plans[8..],
+                            3 + branch_texture_count(pattern, 24),
+                            vec![producer_count + 2],
+                        ),
+                        DrawDemandRoot::Both => (
+                            expected_plans.as_slice(),
+                            4 + producer_count,
+                            vec![producer_count + 1, producer_count + 2],
+                        ),
+                    };
+                assert_eq!(facts.live_plans, expected_live_plans);
+                assert_eq!(facts.compiled_pass_count, expected_live_passes);
+                assert_eq!(facts.root_physical_dependencies, expected_root_dependencies);
+            }
+        }
+    }
+
+    #[test]
+    fn resident_and_produced_inputs_preserve_logical_draw_demand_facts() {
+        for pattern in [
+            DrawDemandDependencyPattern::Shared,
+            DrawDemandDependencyPattern::Disjoint,
+        ] {
+            for root in [
+                DrawDemandRoot::None,
+                DrawDemandRoot::D2,
+                DrawDemandRoot::Cube,
+                DrawDemandRoot::Both,
+            ] {
+                let mut resident_harness = DrawDemandBenchHarness::new();
+                let resident = resident_harness.run_observed_iteration(spec_with_topology(
+                    pattern,
+                    DrawDemandTextureTopology::ResidentInputs,
+                    1,
+                    true,
+                    root,
+                ));
+                let mut produced_harness = DrawDemandBenchHarness::new();
+                let produced = produced_harness.run_observed_iteration(spec_with_topology(
+                    pattern,
+                    DrawDemandTextureTopology::PerTextureProducer,
+                    1,
+                    true,
+                    root,
+                ));
+
+                assert_eq!(resident.d2.logical_reads, produced.d2.logical_reads);
+                assert_eq!(resident.cube.logical_reads, produced.cube.logical_reads);
+                assert_eq!(resident.d2.demanded_plans, produced.d2.demanded_plans);
+                assert_eq!(resident.cube.demanded_plans, produced.cube.demanded_plans);
+                assert_eq!(
+                    resident.registered_resource_count,
+                    produced.registered_resource_count
+                );
+                assert_eq!(
+                    resident.resource_consumer_edge_count,
+                    produced.resource_consumer_edge_count
+                );
+                assert_eq!(resident.live_plans, produced.live_plans);
+            }
         }
     }
 
@@ -717,17 +1208,24 @@ mod tests {
             DrawDemandDependencyPattern::Disjoint,
         ] {
             for root in [DrawDemandRoot::Both, DrawDemandRoot::None] {
-                let workload = spec(pattern, 1, true, root);
-                let mut enabled =
-                    DrawDemandBenchHarness::new_with_diagnostics(RdgBenchDiagnosticsMode::Enabled);
-                let mut disabled =
-                    DrawDemandBenchHarness::new_with_diagnostics(RdgBenchDiagnosticsMode::Disabled);
+                for texture_topology in [
+                    DrawDemandTextureTopology::ResidentInputs,
+                    DrawDemandTextureTopology::PerTextureProducer,
+                ] {
+                    let workload = spec_with_topology(pattern, texture_topology, 1, true, root);
+                    let mut enabled = DrawDemandBenchHarness::new_with_diagnostics(
+                        RdgBenchDiagnosticsMode::Enabled,
+                    );
+                    let mut disabled = DrawDemandBenchHarness::new_with_diagnostics(
+                        RdgBenchDiagnosticsMode::Disabled,
+                    );
 
-                assert_eq!(
-                    enabled.run_observed_iteration(workload),
-                    disabled.run_observed_iteration(workload),
-                    "diagnostics routing changed the benchmark topology"
-                );
+                    assert_eq!(
+                        enabled.run_observed_iteration(workload),
+                        disabled.run_observed_iteration(workload),
+                        "diagnostics routing changed the benchmark topology"
+                    );
+                }
             }
         }
     }
@@ -753,6 +1251,92 @@ mod tests {
             assert_eq!(snapshot.prepared_passes(), live_passes);
             assert_eq!(snapshot.executed_passes(), live_passes);
             assert!(snapshot.queue_submitted());
+        }
+    }
+
+    #[test]
+    fn high_fan_out_preserves_consumer_order_dpe_and_live_csr() {
+        for consumer_count in [4, 8, 16, 64, 128] {
+            let mut harness = HighFanOutBenchHarness::new();
+            let facts = harness.run_observed_iteration(HighFanOutBenchSpec {
+                consumer_count,
+                root: HighFanOutRoot::AllConsumers,
+            });
+            let consumers: Vec<_> = (1..=consumer_count).collect();
+            let root = consumer_count + 1;
+            let mut expected_execution = vec![0];
+            expected_execution.extend(consumers.iter().copied());
+            expected_execution.push(root);
+
+            assert_eq!(facts.registered_pass_count, consumer_count + 2);
+            assert_eq!(facts.registered_resource_count, consumer_count + 2);
+            assert_eq!(facts.logical_consumer_order, consumers);
+            assert!(facts.producer_physical_dependencies.is_empty());
+            assert_eq!(
+                facts.consumer_physical_dependencies,
+                vec![vec![0]; consumer_count]
+            );
+            assert_eq!(facts.producer_reverse_consumers, consumers);
+            assert_eq!(
+                facts.consumer_reverse_consumers,
+                vec![vec![root]; consumer_count]
+            );
+            assert_eq!(facts.root_physical_dependencies, consumers);
+            assert_eq!(facts.execution_queue, expected_execution);
+        }
+    }
+
+    #[test]
+    fn high_fan_out_all_dead_keeps_physical_facts_but_builds_empty_csr() {
+        for consumer_count in [4, 8, 16, 64, 128] {
+            let mut harness = HighFanOutBenchHarness::new();
+            let facts = harness.run_observed_iteration(HighFanOutBenchSpec {
+                consumer_count,
+                root: HighFanOutRoot::None,
+            });
+            let consumers: Vec<_> = (1..=consumer_count).collect();
+
+            assert_eq!(facts.registered_pass_count, consumer_count + 1);
+            assert_eq!(facts.registered_resource_count, consumer_count + 1);
+            assert_eq!(facts.logical_consumer_order, consumers);
+            assert!(facts.producer_physical_dependencies.is_empty());
+            assert_eq!(
+                facts.consumer_physical_dependencies,
+                vec![vec![0]; consumer_count]
+            );
+            assert!(facts.producer_reverse_consumers.is_empty());
+            assert_eq!(
+                facts.consumer_reverse_consumers,
+                vec![Vec::<usize>::new(); consumer_count]
+            );
+            assert!(facts.root_physical_dependencies.is_empty());
+            assert!(facts.execution_queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn high_fan_out_timed_token_matches_exact_live_and_dead_formulas() {
+        for consumer_count in [4, 8, 16, 64, 128] {
+            for root in [HighFanOutRoot::None, HighFanOutRoot::AllConsumers] {
+                let mut harness = HighFanOutBenchHarness::new();
+                let token = harness.run_iteration(HighFanOutBenchSpec {
+                    consumer_count,
+                    root,
+                });
+                let rooted = usize::from(root == HighFanOutRoot::AllConsumers);
+                assert_eq!(token.registered_pass_count, consumer_count + 1 + rooted);
+                assert_eq!(token.registered_resource_count, consumer_count + 1 + rooted);
+                assert_eq!(token.logical_consumer_count, consumer_count);
+                assert_eq!(
+                    token.producer_reverse_consumer_count,
+                    consumer_count * rooted
+                );
+                assert_eq!(
+                    token.root_physical_dependency_count,
+                    consumer_count * rooted
+                );
+                assert_eq!(token.compiled_pass_count, (consumer_count + 2) * rooted);
+            }
         }
     }
 }

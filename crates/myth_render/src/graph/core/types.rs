@@ -1,7 +1,5 @@
 use std::marker::PhantomData;
 
-use smallvec::SmallVec;
-
 use crate::core::gpu::Tracked;
 
 use super::asset_texture::AssetTextureImportId;
@@ -450,7 +448,13 @@ pub struct ResourceRecord {
 
     // 在严格 SSA 下，一个资源最多只能有一个生产者
     pub producer: Option<usize>,
-    pub consumers: SmallVec<[usize; 8]>,
+    /// Number of logical read edges that currently target this resource.
+    ///
+    /// Consumer identities are derived from GraphStorage's canonical flat
+    /// pass-read table. Keeping only the count avoids a per-resource heap spill
+    /// when one resource fans out to many passes. Repeated reads by the same
+    /// pass intentionally count as distinct edges.
+    pub(crate) consumer_edge_count: usize,
 
     pub first_use: usize,
     pub last_use: usize,
@@ -467,6 +471,32 @@ pub struct ResourceRecord {
 }
 
 impl ResourceRecord {
+    /// Number of logical read edges that currently target this resource.
+    ///
+    /// This is an edge count, not a unique-pass count: repeated reads declared
+    /// by one pass are represented independently in the canonical topology.
+    #[inline]
+    #[must_use]
+    pub const fn consumer_edge_count(&self) -> usize {
+        self.consumer_edge_count
+    }
+
+    #[inline]
+    pub(crate) fn add_consumer_edge(&mut self) {
+        self.consumer_edge_count = self
+            .consumer_edge_count
+            .checked_add(1)
+            .expect("RDG resource consumer-edge count overflowed");
+    }
+
+    #[inline]
+    pub(crate) fn remove_consumer_edge(&mut self) {
+        self.consumer_edge_count = self
+            .consumer_edge_count
+            .checked_sub(1)
+            .expect("RDG resource consumer-edge count underflowed");
+    }
+
     #[inline]
     #[must_use]
     pub const fn class(&self) -> ResourceClass {

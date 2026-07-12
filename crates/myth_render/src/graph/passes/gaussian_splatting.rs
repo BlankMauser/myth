@@ -2373,15 +2373,17 @@ mod tests {
                     .storage
                     .resources
                     .iter()
-                    .find(|resource| resource.name == resource_name)
+                    .enumerate()
+                    .find(|(_, resource)| resource.name == resource_name)
                     .unwrap_or_else(|| panic!("Gaussian resource '{resource_name}' missing"));
                 let producer = resource
+                    .1
                     .producer
                     .map(|index| graph.storage.passes[index].name);
-                let consumers = resource
-                    .consumers
-                    .iter()
-                    .map(|&index| graph.storage.passes[index].name)
+                let consumers = graph
+                    .storage
+                    .resource_consumers(resource.0)
+                    .map(|index| graph.storage.passes[index].name)
                     .collect::<Vec<_>>();
                 (producer, consumers)
             };
