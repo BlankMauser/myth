@@ -4,6 +4,7 @@ mod asset_texture;
 pub mod blackboard;
 pub mod builder;
 pub mod context;
+mod diagnostics;
 #[cfg(feature = "3dgs")]
 pub(crate) mod gaussian;
 pub mod graph;
@@ -23,6 +24,13 @@ pub use context::{
     BindGroupBuilder, BindableResource, ClusteredScreenBindings, ExecuteContext, ExtractContext,
     GraphBinding, PrepareContext, RawBufferBinding, RawSamplerBinding, RawTextureViewBinding,
     ViewResolver, build_screen_bind_group,
+};
+pub use diagnostics::{
+    RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
+    RdgSurfaceAcquireFailure,
+};
+pub(crate) use diagnostics::{
+    RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgRendererAttemptGuard,
 };
 pub use graph::{GraphStorage, MermaidDumpMode, RenderGraph};
 pub use node::PassNode;

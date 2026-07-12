@@ -22,6 +22,10 @@ use crate::graph::material_plan::MaterialPlanStore;
 
 use super::asset_texture::{AssetTextureImportId, AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
+use super::diagnostics::{
+    RdgAttemptOwner, RdgDiagnosticsRecorder, RdgFrameDiagnostics, RdgFramePhase,
+    RdgStandaloneAttempt, RdgStandaloneDiagnosticsStore,
+};
 use super::node::{NodeSlot, PassNode, PassRecord};
 use super::persistent::{
     CacheCommitToken, CachePublicationReceipt, HistoryCommitToken, HistoryRegistry,
@@ -179,6 +183,9 @@ impl MipmapEncodeCoordinator {
 /// require reconstructing them every frame, wasting the capacity
 /// that `Vec::clear()` preserves for free.
 pub struct GraphStorage {
+    /// Attempt lifecycle and zero-allocation health counters. This is not
+    /// cleared with topology or frame-owned physical resources.
+    pub(crate) diagnostics: RdgStandaloneDiagnosticsStore,
     /// All pass records for the current frame.
     pub passes: Vec<PassRecord>,
     /// All resource records for the current frame.
@@ -263,6 +270,7 @@ impl GraphStorage {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            diagnostics: RdgStandaloneDiagnosticsStore::default(),
             passes: Vec::new(),
             resources: Vec::new(),
             execution_queue: Vec::new(),
@@ -308,6 +316,14 @@ impl GraphStorage {
         // self.resource_registry.clear();
         #[cfg(feature = "rdg_inspector")]
         self.current_group_stack.clear();
+    }
+
+    /// Latest terminal standalone attempt, retained independently from graph
+    /// topology. Renderer-owned attempts are exposed by
+    /// `Renderer::latest_rdg_diagnostics`.
+    #[must_use]
+    pub fn latest_diagnostics(&self) -> Option<RdgFrameDiagnostics> {
+        self.diagnostics.latest()
     }
 
     /// Immediately releases Drop-bearing owners captured by one graph attempt.
@@ -730,6 +746,8 @@ impl<T> AssertNoDrop for T {
 pub struct RenderGraph<'a> {
     pub(crate) storage: &'a mut GraphStorage,
     arena: &'a FrameArena,
+    renderer_diagnostics: Option<&'a RdgDiagnosticsRecorder>,
+    standalone_diagnostics: Option<RdgStandaloneAttempt>,
 }
 
 impl Drop for RenderGraph<'_> {
@@ -745,6 +763,14 @@ impl Drop for RenderGraph<'_> {
         // GraphStorage from pinning physical textures, mip requests, Gaussian
         // asset Arcs, or WGPU bind groups until a later graph is constructed.
         self.storage.release_frame_owners();
+        // Renderer attempts remain owned by FrameComposer so target/present
+        // paths can publish one terminal snapshot after graph owners drop.
+        // A standalone graph owns its plain active snapshot directly and
+        // publishes it here without adding interior mutability to public
+        // GraphStorage.
+        if let Some(attempt) = self.standalone_diagnostics.take() {
+            self.storage.diagnostics.publish(attempt);
+        }
     }
 }
 
@@ -755,16 +781,115 @@ impl<'a> RenderGraph<'a> {
     /// for pass-level access via [`PassBuilder::frame_config`].
     pub fn new(storage: &'a mut GraphStorage, arena: &'a FrameArena) -> Self {
         storage.clear();
-        Self { storage, arena }
+        let standalone_diagnostics = storage.diagnostics.begin_attempt();
+        Self {
+            storage,
+            arena,
+            renderer_diagnostics: None,
+            standalone_diagnostics: Some(standalone_diagnostics),
+        }
+    }
+
+    /// Creates the graph view for an attempt already started by `Renderer`.
+    pub(crate) fn from_started_renderer_attempt(
+        storage: &'a mut GraphStorage,
+        arena: &'a FrameArena,
+        diagnostics: &'a RdgDiagnosticsRecorder,
+    ) -> Self {
+        assert_eq!(
+            diagnostics.active_owner(),
+            Some(RdgAttemptOwner::Renderer),
+            "FrameComposer constructed a RenderGraph without a Renderer attempt"
+        );
+        debug_assert!(storage.passes.is_empty());
+        debug_assert!(storage.resources.is_empty());
+        debug_assert!(storage.execution_queue.is_empty());
+        debug_assert!(!storage.topology_compiled);
+        diagnostics.enter_phase(RdgFramePhase::BuildGraph);
+        Self {
+            storage,
+            arena,
+            renderer_diagnostics: Some(diagnostics),
+            standalone_diagnostics: None,
+        }
+    }
+
+    /// Current in-progress diagnostics for this graph attempt.
+    #[must_use]
+    pub fn diagnostics(&self) -> RdgFrameDiagnostics {
+        if let Some(diagnostics) = self.renderer_diagnostics {
+            diagnostics
+                .current()
+                .expect("live RenderGraph lost its Renderer diagnostics attempt")
+        } else {
+            self.standalone_diagnostics
+                .as_ref()
+                .expect("live standalone RenderGraph lost its diagnostics attempt")
+                .current()
+        }
+    }
+
+    #[inline]
+    fn enter_diagnostics_phase(&mut self, phase: RdgFramePhase) {
+        if let Some(diagnostics) = self.renderer_diagnostics {
+            diagnostics.enter_phase(phase);
+        } else {
+            self.standalone_diagnostics
+                .as_mut()
+                .expect("standalone diagnostics attempt missing")
+                .enter_phase(phase);
+        }
+    }
+
+    #[inline]
+    fn record_declared_pass(&mut self) {
+        if let Some(diagnostics) = self.renderer_diagnostics {
+            diagnostics.record_declared_pass();
+        } else {
+            self.standalone_diagnostics
+                .as_mut()
+                .expect("standalone diagnostics attempt missing")
+                .record_declared_pass();
+        }
+    }
+
+    #[inline]
+    fn record_folded_pass(&mut self) {
+        if let Some(diagnostics) = self.renderer_diagnostics {
+            diagnostics.record_folded_pass();
+        } else {
+            self.standalone_diagnostics
+                .as_mut()
+                .expect("standalone diagnostics attempt missing")
+                .record_folded_pass();
+        }
+    }
+
+    #[inline]
+    fn record_compiled_live_passes(&mut self, live_passes: usize) {
+        if let Some(diagnostics) = self.renderer_diagnostics {
+            diagnostics.record_compiled_live_passes(live_passes);
+        } else {
+            self.standalone_diagnostics
+                .as_mut()
+                .expect("standalone diagnostics attempt missing")
+                .record_compiled_live_passes(live_passes);
+        }
     }
 
     /// Explicitly ends this graph attempt and releases its arena-backed nodes
     /// and Drop-bearing frame owners.
     ///
-    /// Calling `finish` is equivalent to `drop(graph)`, but makes the lifetime
-    /// boundary clear when code needs to borrow a Feature again after building
-    /// or executing the graph.
-    pub fn finish(self) {}
+    /// A standalone graph is reported as
+    /// [`RdgAttemptOutcome::CompletedWithoutSubmission`](crate::graph::RdgAttemptOutcome::CompletedWithoutSubmission).
+    /// Calling `finish` also makes the lifetime boundary clear when code needs
+    /// to borrow a Feature again after building the graph. This method does not
+    /// submit GPU commands.
+    pub fn finish(mut self) {
+        if let Some(diagnostics) = self.standalone_diagnostics.as_mut() {
+            diagnostics.mark_completed_without_submission();
+        }
+    }
 
     #[inline]
     pub(crate) fn assert_topology_mutable(&self) {
@@ -1385,11 +1510,13 @@ impl<'a> RenderGraph<'a> {
         let node_ref: &'a mut N = self.arena.alloc(node);
         let ptr = node_ref as *mut N;
         self.storage.passes[pass_index].node = Some(NodeSlot::new(ptr));
+        self.record_declared_pass();
         output
     }
 
     pub fn compile_topology(&mut self) {
         self.assert_topology_mutable();
+        self.enter_diagnostics_phase(RdgFramePhase::CompileGraph);
         self.storage.topology_compiled = true;
         self.fold_simple_passes();
         self.build_physical_dependencies();
@@ -1399,11 +1526,14 @@ impl<'a> RenderGraph<'a> {
         self.collect_live_draw_plan_demands();
 
         self.compute_resource_lifetimes();
+        let live_passes = self.storage.execution_queue.len();
+        self.record_compiled_live_passes(live_passes);
     }
 
     pub fn compile(&mut self, pool: &mut TransientPool, device: &Device) {
         self.compile_topology();
 
+        self.enter_diagnostics_phase(RdgFramePhase::MaterializeResources);
         self.allocate_physical_resources(pool, device);
     }
 
@@ -1643,6 +1773,7 @@ impl<'a> RenderGraph<'a> {
             folded.writes.clear();
             folded.creates.clear();
             folded.has_side_effect = false;
+            self.record_folded_pass();
         }
     }
 
@@ -2037,6 +2168,7 @@ mod tests {
     use super::*;
     use crate::core::gpu::snapshot_asset_texture;
     use crate::core::{ResourceManager, WgpuContext};
+    use crate::graph::RdgAttemptOutcome;
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
     use crate::graph::{composer::GraphBuilderContext, core::context::ExecuteContext};
@@ -2183,6 +2315,81 @@ mod tests {
         assert!(storage.draw_plans.is_empty());
         assert!(storage.prepared_global_bind_group.is_empty());
         assert!(storage.draw_plans.resolve_plan(plan).is_none());
+    }
+
+    #[test]
+    fn standalone_graph_drop_publishes_exact_abandoned_attempt() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            graph.add_pass("Declared_Only", |_builder| (MockExec, ()));
+
+            let current = graph.diagnostics();
+            assert_eq!(current.outcome(), RdgAttemptOutcome::InProgress);
+            assert_eq!(current.declared_passes(), 1);
+            assert_eq!(current.live_passes(), None);
+        }
+
+        let abandoned = storage.latest_diagnostics().unwrap();
+        assert_eq!(abandoned.outcome(), RdgAttemptOutcome::Abandoned);
+        assert_eq!(abandoned.declared_passes(), 1);
+        assert_eq!(abandoned.live_passes(), None);
+        assert_eq!(abandoned.prepared_passes(), 0);
+        assert_eq!(abandoned.executed_passes(), 0);
+        assert!(!abandoned.queue_submitted());
+    }
+
+    #[test]
+    fn all_dead_graph_records_compiled_zero_and_survives_topology_clear() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            graph.add_pass("Dead", |_builder| (MockExec, ()));
+            graph.compile_topology();
+
+            let current = graph.diagnostics();
+            assert_eq!(current.declared_passes(), 1);
+            assert_eq!(current.live_passes(), Some(0));
+            graph.finish();
+        }
+
+        let submitted = storage.latest_diagnostics().unwrap();
+        assert_eq!(
+            submitted.outcome(),
+            RdgAttemptOutcome::CompletedWithoutSubmission
+        );
+        assert!(!submitted.queue_submitted());
+        assert_eq!(submitted.live_passes(), Some(0));
+        assert_eq!(submitted.prepared_passes(), 0);
+        assert_eq!(submitted.executed_passes(), 0);
+
+        storage.clear();
+        storage.clear();
+        assert_eq!(storage.latest_diagnostics(), Some(submitted));
+    }
+
+    #[test]
+    fn pass_setup_panic_does_not_count_a_placeholder_as_declared() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            graph.add_pass("Panicking_Setup", |_builder| -> (MockExec, ()) {
+                panic!("intentional setup failure")
+            });
+        }));
+        assert!(result.is_err());
+
+        let abandoned = storage.latest_diagnostics().unwrap();
+        assert_eq!(abandoned.outcome(), RdgAttemptOutcome::Abandoned);
+        assert_eq!(abandoned.declared_passes(), 0);
+        assert_eq!(abandoned.live_passes(), None);
+        assert!(abandoned.panicked());
     }
 
     #[test]
@@ -2764,7 +2971,6 @@ mod tests {
         storage: &'a mut GraphStorage,
         arena: &'a FrameArena,
     ) -> RenderGraph<'a> {
-        storage.clear();
         RenderGraph::new(storage, arena)
     }
 
@@ -2991,6 +3197,54 @@ mod tests {
             Some(producer_idx),
             "the surface alias must be owned by the producer after rerouting"
         );
+
+        let diagnostics = graph.diagnostics();
+        assert_eq!(diagnostics.declared_passes(), 2);
+        assert_eq!(diagnostics.folded_passes(), 1);
+        assert_eq!(diagnostics.live_passes(), Some(1));
+    }
+
+    #[test]
+    fn folded_count_survives_a_later_compile_failure_without_inventing_live_count() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let surface = graph.register_texture("Surface", dummy_desc(), true);
+            let intermediate = graph.add_pass("Producer", |builder| {
+                let output = builder.create_texture("Intermediate", dummy_desc());
+                (MockExec, output)
+            });
+            graph.add_pass("Present", |builder| {
+                builder.read_texture(intermediate);
+                let output = builder.replace_texture(surface, "Surface_Present");
+                builder.mark_pure_forwarding();
+                (MockExec, output)
+            });
+
+            let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+            let mip_ready = graph.add_pass("Broken_Mipmap", |builder| {
+                let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
+                (MockExec, output)
+            });
+            graph.storage.resources[mip_ready.index() as usize].producer = None;
+            graph.add_pass("Asset_Consumer", |builder| {
+                builder.read_texture(mip_ready);
+                builder.mark_side_effect();
+                (MockExec, ())
+            });
+
+            graph.compile_topology();
+        }));
+        assert!(result.is_err());
+
+        let diagnostics = storage.latest_diagnostics().unwrap();
+        assert_eq!(diagnostics.declared_passes(), 4);
+        assert_eq!(diagnostics.folded_passes(), 1);
+        assert_eq!(diagnostics.live_passes(), None);
+        assert_eq!(diagnostics.phase(), RdgFramePhase::CompileGraph);
+        assert!(diagnostics.panicked());
     }
 
     #[test]

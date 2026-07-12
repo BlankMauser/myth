@@ -57,6 +57,7 @@ deadlock_detection = [
 ]
 advanced_noise = []
 rdg_inspector = []
+rdg_bench_support = []
 debug_view = ["myth_scene/debug_view"]
 3dgs = ["myth_resources/3dgs", "myth_scene/3dgs", "myth_assets/3dgs"]
 

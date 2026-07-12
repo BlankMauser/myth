@@ -9,6 +9,9 @@
 //! - [`RenderLists`]: CPU-only main/shadow draw-intent lists
 
 pub mod bake;
+#[cfg(any(test, feature = "rdg_bench_support"))]
+#[doc(hidden)]
+pub mod bench_support;
 pub mod composer;
 pub mod core;
 pub mod culling;
@@ -20,7 +23,10 @@ pub mod render_state;
 pub mod shadow_utils;
 
 pub use composer::FrameComposer;
-pub use core::MermaidDumpMode;
+pub use core::{
+    MermaidDumpMode, RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
+    RdgSurfaceAcquireFailure,
+};
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton};
 pub use frame::{
     DrawCommand, DrawPlanId, RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,

@@ -234,6 +234,16 @@ web-sys = { workspace = true, features = ["Window", "Document", "Element", "DomT
 name = "render_graph_bench"
 harness = false
 
+[[bench]]
+name = "rdg_draw_demand_bench"
+harness = false
+required-features = ["rdg_bench_support"]
+
+[[bench]]
+name = "rdg_allocation_probe"
+harness = false
+required-features = ["rdg_bench_support"]
+
 [[example]]
 name = "gaussian_splatting"
 required-features = ["3dgs", "gaussian-npz"]
@@ -260,6 +270,7 @@ gltf = ["myth_assets/gltf"]
 gaussian-npz = ["3dgs", "myth_assets/gaussian-npz"]
 gaussian-spz = ["3dgs", "myth_assets/gaussian-spz"]
 rdg_inspector = ["myth_render/rdg_inspector"]
+rdg_bench_support = ["myth_render/rdg_bench_support"]
 egui = ["dep:myth_egui"]
 debug_view = ["myth_render/debug_view", "myth_scene/debug_view"]
 gltf-meshopt = ["gltf", "myth_assets/gltf-meshopt"]

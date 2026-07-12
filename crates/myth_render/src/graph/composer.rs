@@ -54,6 +54,7 @@ use crate::core::gpu::{
 };
 use crate::core::{ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
+use crate::graph::RdgSurfaceAcquireFailure;
 use crate::graph::RenderState;
 use crate::graph::core::ClusteredScreenBindings;
 use crate::graph::core::GraphStorage;
@@ -62,7 +63,8 @@ use crate::graph::core::gaussian::GaussianFrameResolver;
 use crate::graph::core::graph::FrameConfig;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GraphBlackboard, HistoryRegistry,
-    HookStage, PrepareContext, RenderGraph, SceneDrawPrepareContext, TextureDesc, TransientPool,
+    HookStage, PrepareContext, RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgFramePhase,
+    RdgRenderTargetKind, RenderGraph, SceneDrawPrepareContext, TextureDesc, TransientPool,
     ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
@@ -125,6 +127,7 @@ pub struct ComposerContext<'a> {
     pub frame_time: FrameTime,
 
     pub graph_storage: &'a mut GraphStorage,
+    pub(crate) rdg_diagnostics: &'a RdgDiagnosticsRecorder,
     pub transient_pool: &'a mut TransientPool,
     pub history_registry: &'a mut HistoryRegistry,
     // pub sampler_registry: &'a mut SamplerRegistry,
@@ -354,6 +357,24 @@ pub struct FrameComposer<'a> {
             Option<Box<dyn FnOnce(&mut RenderGraph<'a>, GraphBlackboard) -> GraphBlackboard + 'a>>,
         ); 4],
     >,
+    // Declared last so hook captures and every other Composer field are
+    // released before the terminal attempt snapshot is published.
+    _attempt_guard: RdgComposerAttemptGuard<'a>,
+}
+
+fn classify_surface_acquisition_failure(
+    result: &wgpu::CurrentSurfaceTexture,
+) -> Option<RdgSurfaceAcquireFailure> {
+    match result {
+        wgpu::CurrentSurfaceTexture::Timeout => Some(RdgSurfaceAcquireFailure::Timeout),
+        wgpu::CurrentSurfaceTexture::Occluded => Some(RdgSurfaceAcquireFailure::Occluded),
+        wgpu::CurrentSurfaceTexture::Outdated => Some(RdgSurfaceAcquireFailure::Outdated),
+        wgpu::CurrentSurfaceTexture::Lost => Some(RdgSurfaceAcquireFailure::Lost),
+        wgpu::CurrentSurfaceTexture::Validation => Some(RdgSurfaceAcquireFailure::Validation),
+        wgpu::CurrentSurfaceTexture::Success(_) | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+            None
+        }
+    }
 }
 
 impl<'a> FrameComposer<'a> {
@@ -369,6 +390,7 @@ impl<'a> FrameComposer<'a> {
         };
 
         Self {
+            _attempt_guard: RdgComposerAttemptGuard::new(ctx.rdg_diagnostics),
             ctx,
             frame_config,
             gpu_local_light_hook: None,
@@ -458,6 +480,9 @@ impl<'a> FrameComposer<'a> {
     pub fn render(mut self) {
         // ━━━ 1. Acquire Render Target ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+        let rdg_diagnostics = self.ctx.rdg_diagnostics;
+        rdg_diagnostics.enter_phase(RdgFramePhase::AcquireTarget);
+
         let view_format = self.ctx.wgpu_ctx.surface_view_format;
 
         // Acquire either the swap-chain back buffer or the headless texture view.
@@ -468,37 +493,51 @@ impl<'a> FrameComposer<'a> {
 
         if let Some(surface) = &self.ctx.wgpu_ctx.surface {
             let output = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+                wgpu::CurrentSurfaceTexture::Success(frame) => {
+                    rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Surface, false);
+                    frame
+                }
                 wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Surface, true);
                     reconfigure_after_present = true;
                     log::debug!(
                         "Acquired suboptimal swap-chain surface; reconfiguring after present"
                     );
                     frame
                 }
-                wgpu::CurrentSurfaceTexture::Timeout => {
-                    log::trace!("Skipped frame: timed out acquiring swap-chain surface");
-                    return;
-                }
-                wgpu::CurrentSurfaceTexture::Occluded => {
-                    log::debug!("Skipped frame: swap-chain surface is occluded");
-                    return;
-                }
-                wgpu::CurrentSurfaceTexture::Outdated => {
-                    if let Some(config) = &self.ctx.wgpu_ctx.config {
+                failure => {
+                    let reason = classify_surface_acquisition_failure(&failure)
+                        .expect("successful surface acquisition entered the failure branch");
+                    if matches!(reason, RdgSurfaceAcquireFailure::Outdated)
+                        && let Some(config) = &self.ctx.wgpu_ctx.config
+                    {
                         surface.configure(&self.ctx.wgpu_ctx.device, config);
                     }
-                    log::debug!("Skipped frame: reconfigured outdated swap-chain surface");
-                    return;
-                }
-                wgpu::CurrentSurfaceTexture::Lost => {
-                    log::warn!(
-                        "Skipped frame: lost swap-chain surface must be recreated by the application"
-                    );
-                    return;
-                }
-                wgpu::CurrentSurfaceTexture::Validation => {
-                    log::error!("Validation error while acquiring swap-chain surface");
+                    if rdg_diagnostics.mark_surface_acquisition_failed(reason) {
+                        match reason {
+                            RdgSurfaceAcquireFailure::Timeout => {
+                                log::trace!(
+                                    "Skipped frame: timed out acquiring swap-chain surface"
+                                );
+                            }
+                            RdgSurfaceAcquireFailure::Occluded => {
+                                log::debug!("Skipped frame: swap-chain surface is occluded");
+                            }
+                            RdgSurfaceAcquireFailure::Outdated => {
+                                log::debug!(
+                                    "Skipped frame: reconfigured outdated swap-chain surface"
+                                );
+                            }
+                            RdgSurfaceAcquireFailure::Lost => {
+                                log::warn!(
+                                    "Skipped frame: lost swap-chain surface must be recreated by the application"
+                                );
+                            }
+                            RdgSurfaceAcquireFailure::Validation => {
+                                log::error!("Validation error while acquiring swap-chain surface");
+                            }
+                        }
+                    }
                     return;
                 }
             };
@@ -511,6 +550,7 @@ impl<'a> FrameComposer<'a> {
             height = output.texture.height();
             surface_output = Some(output);
         } else if let Some(tex) = &self.ctx.wgpu_ctx.headless_texture {
+            rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Headless, false);
             surface_view = tex.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(view_format),
                 ..Default::default()
@@ -519,9 +559,13 @@ impl<'a> FrameComposer<'a> {
             height = tex.height();
             surface_output = None;
         } else {
-            log::error!("No render target available (neither surface nor headless texture)");
+            if rdg_diagnostics.mark_no_render_target() {
+                log::error!("No render target available (neither surface nor headless texture)");
+            }
             return;
         }
+
+        rdg_diagnostics.enter_phase(RdgFramePhase::Cull);
 
         // ━━━ 2a. Collect CPU-only central draw intents ━━━━━━━━━━━━━━━━━━
         //
@@ -533,6 +577,8 @@ impl<'a> FrameComposer<'a> {
             &self.ctx.camera,
             self.ctx.assets,
         );
+
+        rdg_diagnostics.enter_phase(RdgFramePhase::BuildGraph);
 
         // ━━━ 2b. Build Unified RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -547,7 +593,11 @@ impl<'a> FrameComposer<'a> {
 
         // Declared after the tracked external view so reverse drop order keeps
         // the raw external-view pointer valid for the graph's whole lifetime.
-        let mut graph = RenderGraph::new(self.ctx.graph_storage, self.ctx.frame_arena);
+        let mut graph = RenderGraph::from_started_renderer_attempt(
+            self.ctx.graph_storage,
+            self.ctx.frame_arena,
+            rdg_diagnostics,
+        );
         graph.storage.material_plans.capture(
             self.ctx.assets,
             self.ctx.extracted_scene,
@@ -1830,6 +1880,8 @@ impl<'a> FrameComposer<'a> {
                 &mut graph.storage.draw_plans,
             );
 
+            rdg_diagnostics.enter_phase(RdgFramePhase::PreparePasses);
+
             // ─── 3b. RDG Prepare: live-pass deferred preparation ───────────
             //
             // Only the swapchain surface is truly external — all other textures
@@ -1882,8 +1934,11 @@ impl<'a> FrameComposer<'a> {
                     // pass has no competing mutable reference.
                     let pass = unsafe { graph.storage.passes[pass_idx].get_pass_mut() };
                     pass.prepare(&mut prepare_ctx);
+                    rdg_diagnostics.record_prepared_pass();
                 }
             }
+
+            rdg_diagnostics.enter_phase(RdgFramePhase::FinalizeDrawPlans);
 
             #[cfg(feature = "3dgs")]
             if let Some(snapshot) = gaussian_snapshot {
@@ -1911,6 +1966,8 @@ impl<'a> FrameComposer<'a> {
             // asset/interface owners as soon as every live plan is baked;
             // DrawPlanStore continues to own the physical WGPU handles.
             graph.storage.prepared_draws.clear();
+
+            rdg_diagnostics.enter_phase(RdgFramePhase::RecordCommands);
 
             // ─── 3d. Execute ───────────────────────────────────────────────
 
@@ -1950,6 +2007,7 @@ impl<'a> FrameComposer<'a> {
                     // execute phase and each queue entry is visited serially.
                     unsafe { graph.storage.passes[pass_idx].get_pass_mut() }
                         .execute(&execute_ctx, &mut encoder);
+                    rdg_diagnostics.record_executed_pass();
                     #[cfg(debug_assertions)]
                     encoder.pop_debug_group();
                 }
@@ -1957,7 +2015,10 @@ impl<'a> FrameComposer<'a> {
 
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+            rdg_diagnostics.enter_phase(RdgFramePhase::Submit);
             self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
+            rdg_diagnostics.mark_queue_submitted();
+            rdg_diagnostics.enter_phase(RdgFramePhase::Publish);
             // Morph history is a submission result, not a begin-frame side
             // effect. Once the queue accepts these commands, advance the
             // previous-weight baseline even if later publication bookkeeping
@@ -1988,10 +2049,14 @@ impl<'a> FrameComposer<'a> {
         drop(surface_view_tracked);
 
         if let Some(output) = surface_output {
+            rdg_diagnostics.enter_phase(RdgFramePhase::Present);
             present_then_reconfigure_if_needed(
                 output,
                 reconfigure_after_present,
-                wgpu::SurfaceTexture::present,
+                |output| {
+                    output.present();
+                    rdg_diagnostics.mark_presented();
+                },
                 || {
                     if let (Some(surface), Some(config)) =
                         (&self.ctx.wgpu_ctx.surface, &self.ctx.wgpu_ctx.config)
@@ -1999,6 +2064,45 @@ impl<'a> FrameComposer<'a> {
                         surface.configure(&self.ctx.wgpu_ctx.device, config);
                     }
                 },
+            );
+        }
+        rdg_diagnostics.mark_completed();
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn surface_acquisition_failures_map_to_stable_diagnostic_reasons() {
+        let cases = [
+            (
+                wgpu::CurrentSurfaceTexture::Timeout,
+                RdgSurfaceAcquireFailure::Timeout,
+            ),
+            (
+                wgpu::CurrentSurfaceTexture::Occluded,
+                RdgSurfaceAcquireFailure::Occluded,
+            ),
+            (
+                wgpu::CurrentSurfaceTexture::Outdated,
+                RdgSurfaceAcquireFailure::Outdated,
+            ),
+            (
+                wgpu::CurrentSurfaceTexture::Lost,
+                RdgSurfaceAcquireFailure::Lost,
+            ),
+            (
+                wgpu::CurrentSurfaceTexture::Validation,
+                RdgSurfaceAcquireFailure::Validation,
+            ),
+        ];
+
+        for (failure, expected) in cases {
+            assert_eq!(
+                classify_surface_acquisition_failure(&failure),
+                Some(expected)
             );
         }
     }

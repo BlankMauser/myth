@@ -8,11 +8,14 @@ use smallvec::SmallVec;
 use crate::core::binding::GlobalBindGroupCache;
 use crate::core::gpu::Tracked;
 use crate::graph::composer::ComposerContext;
-use crate::graph::core::HistoryRegistry;
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 use crate::graph::core::graph::GraphStorage;
 use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
+use crate::graph::core::{
+    HistoryRegistry, RdgDiagnosticsRecorder, RdgFrameDiagnostics, RdgFramePhase,
+    RdgRendererAttemptGuard,
+};
 use crate::graph::frame::{RenderFrameFeatureConfig, RenderLists};
 #[cfg(feature = "debug_view")]
 use crate::graph::passes::DebugViewFeature;
@@ -106,6 +109,10 @@ struct RendererState {
     global_bind_group_cache: GlobalBindGroupCache,
 
     // ===== RDG (Declarative Render Graph) =====
+    /// Renderer-attempt lifecycle lives beside GraphStorage so Composer can
+    /// retain a shared, non-atomic guard while RenderGraph exclusively borrows
+    /// topology storage for the frame lifetime.
+    pub(crate) rdg_diagnostics: RdgDiagnosticsRecorder,
     pub(crate) graph_storage: GraphStorage,
     // pub(crate) sampler_registry: SamplerRegistry,
     pub(crate) transient_pool: TransientPool,
@@ -291,6 +298,7 @@ impl Renderer {
             render_lists: RenderLists::new(),
             global_bind_group_cache,
 
+            rdg_diagnostics: RdgDiagnosticsRecorder::default(),
             graph_storage: GraphStorage::new(),
             transient_pool: TransientPool::new(),
             history_registry: HistoryRegistry::new(),
@@ -388,6 +396,10 @@ impl Renderer {
         // Invalidate every raw NodeSlot before resetting the arena that owns
         // its pointee. This also makes an abandoned Composer or a later surface
         // acquisition failure leave an empty, safe graph inspection state.
+        state
+            .rdg_diagnostics
+            .start_renderer_attempt(frame_time.frame_count);
+        let frame_attempt = RdgRendererAttemptGuard::new(&state.rdg_diagnostics);
         state.graph_storage.clear();
         // Reset the arena in O(1) — all previous PassNodes are trivially
         // forgotten (no Drop needed).
@@ -397,6 +409,8 @@ impl Renderer {
         state.global_bind_group_cache.begin_frame();
 
         // ── Phase 1: Extract scene, build shadow views, prepare global ──
+
+        frame_attempt.enter_phase(RdgFramePhase::Extract);
 
         let surface_size = state.wgpu_ctx.size();
         let max_extracted_lights = max_extracted_light_count(&state.wgpu_ctx.device);
@@ -444,6 +458,8 @@ impl Renderer {
             published_pmrem_max_mip,
         );
 
+        frame_attempt.enter_phase(RdgFramePhase::Maintenance);
+
         let clustered_lighting_enabled = state
             .render_frame
             .extracted_scene
@@ -479,6 +495,7 @@ impl Renderer {
         }
 
         // ── Phase 3: Build ComposerContext ──────────────────────────────
+        frame_attempt.enter_phase(RdgFramePhase::AwaitingRender);
         let ctx = ComposerContext {
             wgpu_ctx: &mut state.wgpu_ctx,
             resource_manager: &mut state.resource_manager,
@@ -501,6 +518,7 @@ impl Renderer {
             frame_time,
 
             graph_storage: &mut state.graph_storage,
+            rdg_diagnostics: &state.rdg_diagnostics,
             transient_pool: &mut state.transient_pool,
             history_registry: &mut state.history_registry,
             // sampler_registry: &mut state.sampler_registry,
@@ -541,7 +559,9 @@ impl Renderer {
         };
 
         // Return FrameComposer, defer Surface acquisition to render() call
-        Some(FrameComposer::new(ctx, self.size))
+        let composer = FrameComposer::new(ctx, self.size);
+        frame_attempt.hand_off();
+        Some(composer)
     }
 
     /// Performs periodic resource cleanup.
@@ -761,6 +781,18 @@ impl Renderer {
                 .published_pmrem_mip_level_count(scene_id, &state.history_registry)
                 .map(|mip_count| mip_count.saturating_sub(1) as f32)
         })
+    }
+
+    /// Returns the latest terminal Render Graph attempt diagnostics.
+    ///
+    /// This includes submitted frames, target-acquisition failures, and
+    /// abandoned composers. Zero-sized or uninitialized Renderer calls do not
+    /// create an RDG attempt and therefore leave this snapshot unchanged.
+    #[must_use]
+    pub fn latest_rdg_diagnostics(&self) -> Option<RdgFrameDiagnostics> {
+        self.context
+            .as_ref()
+            .and_then(|state| state.rdg_diagnostics.latest())
     }
 
     /// Dumps a compact, human-oriented Mermaid view of the latest Render Graph.
@@ -1124,7 +1156,10 @@ impl Renderer {
 mod tests {
     use super::*;
 
-    use crate::graph::core::{ExecuteContext, GraphBlackboard, HookStage, PassNode, TextureDesc};
+    use crate::graph::core::{
+        ExecuteContext, GraphBlackboard, HookStage, PassNode, RdgAttemptOutcome, RdgFramePhase,
+        RdgRenderTargetKind, TextureDesc,
+    };
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::{AssetServer, SceneExt};
     use myth_core::SkeletonKey;
@@ -1225,6 +1260,103 @@ mod tests {
             )
             .expect("frame composer must exist")
             .render();
+    }
+
+    #[test]
+    fn headless_renderer_publishes_pass_conservation_diagnostics() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 17);
+
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("submitted frame diagnostics missing");
+        let live = diagnostics
+            .live_passes()
+            .expect("submitted graph must have compiled topology");
+        assert_eq!(diagnostics.renderer_frame(), Some(17));
+        assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::Submitted);
+        assert_eq!(diagnostics.phase(), RdgFramePhase::Complete);
+        assert_eq!(diagnostics.target(), Some(RdgRenderTargetKind::Headless));
+        assert!(diagnostics.declared_passes() >= live);
+        assert_eq!(diagnostics.prepared_passes(), live);
+        assert_eq!(diagnostics.executed_passes(), live);
+        assert!(diagnostics.queue_submitted());
+        assert!(!diagnostics.presented());
+        assert!(!diagnostics.panicked());
+    }
+
+    #[test]
+    fn dropped_composer_publishes_an_abandoned_pre_graph_attempt() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+
+        let composer = renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    frame_count: 23,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("frame composer missing");
+        drop(composer);
+
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("abandoned composer diagnostics missing");
+        assert_eq!(diagnostics.renderer_frame(), Some(23));
+        assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::Abandoned);
+        assert_eq!(diagnostics.phase(), RdgFramePhase::AwaitingRender);
+        assert_eq!(diagnostics.declared_passes(), 0);
+        assert_eq!(diagnostics.live_passes(), None);
+        assert_eq!(diagnostics.prepared_passes(), 0);
+        assert_eq!(diagnostics.executed_passes(), 0);
+        assert!(!diagnostics.queue_submitted());
+    }
+
+    #[test]
+    fn missing_headless_target_publishes_no_target_without_building_a_graph() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        renderer
+            .context
+            .as_mut()
+            .expect("renderer state missing")
+            .wgpu_ctx
+            .headless_texture = None;
+
+        renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    frame_count: 29,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("frame composer missing")
+            .render();
+
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("no-target diagnostics missing");
+        assert_eq!(diagnostics.renderer_frame(), Some(29));
+        assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::NoRenderTarget);
+        assert_eq!(diagnostics.phase(), RdgFramePhase::AcquireTarget);
+        assert_eq!(diagnostics.target(), None);
+        assert_eq!(diagnostics.declared_passes(), 0);
+        assert_eq!(diagnostics.live_passes(), None);
+        assert_eq!(diagnostics.prepared_passes(), 0);
+        assert_eq!(diagnostics.executed_passes(), 0);
+        assert!(!diagnostics.queue_submitted());
     }
 
     fn published_pmrem_view_id(state: &RendererState, scene_id: u32) -> Option<u64> {
