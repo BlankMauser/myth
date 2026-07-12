@@ -10,6 +10,7 @@ use std::hint::black_box;
 
 use myth_render::graph::bench_support::{
     DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern, DrawDemandRoot,
+    RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness, RdgRecorderLifecycleToken,
 };
 
 #[global_allocator]
@@ -169,19 +170,33 @@ fn main() {
         "dealloc columns include preceding same-shape topology retirement and current-frame temporaries; bytes are diagnostic, not a leak/net-balance metric"
     );
     println!(
-        "pattern plans repeats alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+        "pattern root plans repeats alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
     );
 
-    for pattern in [
-        DrawDemandDependencyPattern::Shared,
-        DrawDemandDependencyPattern::Disjoint,
-    ] {
-        for plan_count in [32, 64, 128] {
-            run_scenario(pattern, plan_count, 1);
+    for root in [DrawDemandRoot::Both, DrawDemandRoot::None] {
+        for pattern in [
+            DrawDemandDependencyPattern::Shared,
+            DrawDemandDependencyPattern::Disjoint,
+        ] {
+            for plan_count in [32, 64, 128] {
+                run_scenario(pattern, root, plan_count, 1);
+            }
         }
     }
     for repetitions in [2, 4] {
-        run_scenario(DrawDemandDependencyPattern::Shared, 64, repetitions);
+        run_scenario(
+            DrawDemandDependencyPattern::Shared,
+            DrawDemandRoot::Both,
+            64,
+            repetitions,
+        );
+    }
+
+    println!(
+        "recorder_lifecycle live alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+    );
+    for live_passes in [0, 32, 64, 128] {
+        run_recorder_scenario(live_passes);
     }
 }
 
@@ -204,6 +219,7 @@ fn verify_counter_is_live() {
 
 fn run_scenario(
     pattern: DrawDemandDependencyPattern,
+    root: DrawDemandRoot,
     plan_count: usize,
     demand_repetitions: usize,
 ) {
@@ -213,9 +229,60 @@ fn run_scenario(
         dependency_pattern: pattern,
         demand_repetitions,
         compile_topology: true,
-        root: DrawDemandRoot::Both,
+        root,
     };
-    let mut harness = DrawDemandBenchHarness::new();
+    let mut enabled =
+        DrawDemandBenchHarness::new_with_diagnostics(RdgBenchDiagnosticsMode::Enabled);
+    let mut disabled =
+        DrawDemandBenchHarness::new_with_diagnostics(RdgBenchDiagnosticsMode::Disabled);
+    let (enabled_token, enabled_stats) = measure_plateau(&mut enabled, spec);
+    let (disabled_token, disabled_stats) = measure_plateau(&mut disabled, spec);
+
+    assert_eq!(
+        enabled_token, disabled_token,
+        "diagnostics A/B routes produced different RDG topology"
+    );
+    assert_eq!(
+        enabled_stats, disabled_stats,
+        "diagnostics bookkeeping changed steady-state allocator traffic"
+    );
+    let expected_passes = if root == DrawDemandRoot::None { 3 } else { 4 };
+    let expected_live = match root {
+        DrawDemandRoot::None => 0,
+        DrawDemandRoot::D2 | DrawDemandRoot::Cube => 3,
+        DrawDemandRoot::Both => 4,
+    };
+    assert_eq!(enabled_token.registered_pass_count, expected_passes);
+    assert_eq!(enabled_token.compiled_pass_count, expected_live);
+    assert_eq!(
+        enabled_token.d2_demand_count + enabled_token.cube_demand_count,
+        plan_count
+    );
+
+    println!(
+        "{} {} {} {} {} {} {} {} {} {} {} {}",
+        pattern.label(),
+        root_label(root),
+        plan_count,
+        demand_repetitions,
+        enabled_stats.alloc_calls,
+        enabled_stats.alloc_zeroed_calls,
+        enabled_stats.realloc_calls,
+        enabled_stats.dealloc_calls,
+        enabled_stats.allocated_bytes,
+        enabled_stats.reallocated_old_bytes,
+        enabled_stats.reallocated_new_bytes,
+        enabled_stats.deallocated_bytes,
+    );
+}
+
+fn measure_plateau(
+    harness: &mut DrawDemandBenchHarness,
+    spec: DrawDemandBenchSpec,
+) -> (
+    myth_render::graph::bench_support::DrawDemandRunToken,
+    AllocationStats,
+) {
     for _ in 0..3 {
         black_box(harness.run_iteration(spec));
     }
@@ -231,24 +298,73 @@ fn run_scenario(
         }
         token = Some(current_token);
     }
-    let stats = baseline.expect("allocation baseline was not sampled");
-    let token = token.expect("DrawPlan workload was not sampled");
-    assert_eq!(token.registered_pass_count, 4);
-    assert_eq!(token.compiled_pass_count, 4);
-    assert_eq!(token.d2_demand_count + token.cube_demand_count, plan_count);
+
+    (
+        token.expect("DrawPlan workload was not sampled"),
+        baseline.expect("allocation baseline was not sampled"),
+    )
+}
+
+const fn root_label(root: DrawDemandRoot) -> &'static str {
+    match root {
+        DrawDemandRoot::None => "all_dead",
+        DrawDemandRoot::D2 => "d2",
+        DrawDemandRoot::Cube => "cube",
+        DrawDemandRoot::Both => "live",
+    }
+}
+
+fn run_recorder_scenario(live_passes: usize) {
+    let mut enabled = RdgRecorderLifecycleBenchHarness::new(RdgBenchDiagnosticsMode::Enabled);
+    let mut disabled = RdgRecorderLifecycleBenchHarness::new(RdgBenchDiagnosticsMode::Disabled);
+    let (enabled_token, enabled_stats) = measure_recorder_plateau(&mut enabled, live_passes);
+    let (disabled_token, disabled_stats) = measure_recorder_plateau(&mut disabled, live_passes);
+
+    assert_eq!(
+        enabled_token, disabled_token,
+        "diagnostics recorder A/B routes produced different work tokens"
+    );
+    assert_eq!(
+        enabled_stats, disabled_stats,
+        "diagnostics recorder changed steady-state allocator traffic"
+    );
 
     println!(
-        "{} {} {} {} {} {} {} {} {} {} {}",
-        pattern.label(),
-        plan_count,
-        demand_repetitions,
-        stats.alloc_calls,
-        stats.alloc_zeroed_calls,
-        stats.realloc_calls,
-        stats.dealloc_calls,
-        stats.allocated_bytes,
-        stats.reallocated_old_bytes,
-        stats.reallocated_new_bytes,
-        stats.deallocated_bytes,
+        "recorder_lifecycle {} {} {} {} {} {} {} {} {}",
+        live_passes,
+        enabled_stats.alloc_calls,
+        enabled_stats.alloc_zeroed_calls,
+        enabled_stats.realloc_calls,
+        enabled_stats.dealloc_calls,
+        enabled_stats.allocated_bytes,
+        enabled_stats.reallocated_old_bytes,
+        enabled_stats.reallocated_new_bytes,
+        enabled_stats.deallocated_bytes,
     );
+}
+
+fn measure_recorder_plateau(
+    harness: &mut RdgRecorderLifecycleBenchHarness,
+    live_passes: usize,
+) -> (RdgRecorderLifecycleToken, AllocationStats) {
+    for _ in 0..3 {
+        black_box(harness.run_iteration(live_passes));
+    }
+
+    let mut baseline = None;
+    let mut token = None;
+    for _ in 0..3 {
+        let (current_token, stats) = measure(|| black_box(harness.run_iteration(live_passes)));
+        if let Some(expected) = baseline {
+            assert_eq!(stats, expected, "steady allocation counts did not plateau");
+        } else {
+            baseline = Some(stats);
+        }
+        token = Some(current_token);
+    }
+
+    (
+        token.expect("recorder lifecycle workload was not sampled"),
+        baseline.expect("recorder lifecycle allocation baseline was not sampled"),
+    )
 }

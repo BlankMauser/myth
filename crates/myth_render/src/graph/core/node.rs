@@ -1,5 +1,5 @@
 use crate::graph::core::context::{ExecuteContext, PrepareContext};
-use crate::graph::frame::DrawPlanId;
+use std::ops::Range;
 
 use super::types::ErasedResourceNodeId;
 use smallvec::SmallVec;
@@ -129,12 +129,12 @@ pub struct PassRecord {
     pub creates: SmallVec<[ErasedResourceNodeId; 4]>,
     /// Frame-local draw plans consumed by this pass.
     ///
-    /// Demand metadata never makes a pass live. The builder may additionally
-    /// attach ordinary logical texture reads for resources sampled by the
-    /// plan; those edges retain producers only when this pass survives DPE.
-    /// After DPE, demands from the compiled execution queue select plans for
-    /// finalization.
-    pub(crate) draw_plan_demands: SmallVec<[DrawPlanId; 4]>,
+    /// The setup closure appends raw IDs to GraphStorage-owned staging.
+    /// `RenderGraph::add_pass` canonicalizes them once after setup into a
+    /// retained flat vector; this range addresses that first-demand-ordered
+    /// slice. Demand metadata never makes a pass live. After DPE, demands from
+    /// the compiled execution queue select plans for physical finalization.
+    pub(crate) draw_plan_demand_range: Range<usize>,
 
     // Compile-time state
     pub physical_dependencies: SmallVec<[usize; 8]>,
@@ -169,7 +169,7 @@ impl PassRecord {
             reads: SmallVec::new(),
             writes: SmallVec::new(),
             creates: SmallVec::new(),
-            draw_plan_demands: SmallVec::new(),
+            draw_plan_demand_range: 0..0,
             physical_dependencies: SmallVec::new(),
             has_side_effect: false,
             reference_count: 0,

@@ -1,14 +1,11 @@
 use crate::core::gpu::Tracked;
 use crate::graph::frame::DrawPlanId;
-use rustc_hash::FxHashSet;
 
 use super::graph::RenderGraph;
 use super::types::{
     BufferDesc, BufferNodeId, GraphResourceType, ResourceClass, ResourceNodeId, TextureDesc,
     TextureNodeId,
 };
-
-const DRAW_TEXTURE_LINEAR_DEDUP_LIMIT: usize = 16;
 
 /// Builder for declaring a pass's resource dependencies during eager graph
 /// construction.
@@ -201,52 +198,17 @@ impl PassBuilder<'_, '_> {
 
     /// Declare that this pass consumes a frame-local draw plan.
     ///
-    /// The demand metadata never roots an otherwise dead pass. Any logical
-    /// Asset Texture roots or aliases pre-registered for the plan are also
-    /// declared as ordinary reads. A surviving pass therefore demands exact
-    /// post-DPE root materialization and remains ordered after any optional
-    /// Mipmap producer it samples.
+    /// This hot-path call records only the raw POD ID. After the setup closure
+    /// returns, [`RenderGraph::add_pass`] deduplicates all plan IDs and unions
+    /// their logical texture dependencies in one linear finalization step.
+    /// Demand metadata never roots an otherwise dead pass.
     pub(crate) fn demand_draw_plan(&mut self, id: DrawPlanId) {
         assert!(
             self.graph.storage.draw_plans.validate_reserved(id),
             "pass '{}' demanded a draw plan from another graph attempt",
             self.graph.storage.passes[self.pass_index].name
         );
-
-        let texture_dependencies = self
-            .graph
-            .storage
-            .draw_plans
-            .texture_dependencies_for_demand(id);
-
-        let demands = &mut self.graph.storage.passes[self.pass_index].draw_plan_demands;
-        if !demands.contains(&id) {
-            demands.push(id);
-        }
-
-        let read_count = self.graph.storage.passes[self.pass_index].reads.len();
-        if read_count + texture_dependencies.len() <= DRAW_TEXTURE_LINEAR_DEDUP_LIMIT {
-            for dependency in texture_dependencies {
-                let raw = dependency.erase();
-                if !self.graph.storage.passes[self.pass_index]
-                    .reads
-                    .contains(&raw)
-                {
-                    self.read_texture(dependency);
-                }
-            }
-        } else {
-            let mut reads: FxHashSet<_> = self.graph.storage.passes[self.pass_index]
-                .reads
-                .iter()
-                .copied()
-                .collect();
-            for dependency in texture_dependencies {
-                if reads.insert(dependency.erase()) {
-                    self.read_texture(dependency);
-                }
-            }
-        }
+        self.graph.storage.draw_plan_raw_demands.push(id);
     }
 
     /// Flags this pass as a pure forwarding (blit/present) node.

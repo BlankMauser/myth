@@ -244,6 +244,11 @@ name = "rdg_allocation_probe"
 harness = false
 required-features = ["rdg_bench_support"]
 
+[[bench]]
+name = "rdg_diagnostics_ab"
+harness = false
+required-features = ["rdg_bench_support"]
+
 [[example]]
 name = "gaussian_splatting"
 required-features = ["3dgs", "gaussian-npz"]

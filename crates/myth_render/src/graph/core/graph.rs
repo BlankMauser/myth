@@ -169,6 +169,44 @@ impl MipmapEncodeCoordinator {
 
 }
 
+/// Reusable dense set for attempt-local IDs.
+///
+/// Starting a new operation advances one generation instead of clearing every
+/// slot. The backing vector remains at its high-water mark across frames. A
+/// full clear occurs only on the practically unreachable generation wrap,
+/// before generation one is reused.
+#[derive(Default)]
+struct DenseGenerationScratch {
+    stamps: Vec<u32>,
+    generation: u32,
+}
+
+impl DenseGenerationScratch {
+    fn begin(&mut self, domain_len: usize) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.stamps.fill(0);
+            self.generation = 1;
+        }
+        if self.stamps.len() < domain_len {
+            self.stamps.resize(domain_len, 0);
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, index: usize) -> bool {
+        let stamp = self
+            .stamps
+            .get_mut(index)
+            .expect("dense generation scratch index is outside its domain");
+        if *stamp == self.generation {
+            return false;
+        }
+        *stamp = self.generation;
+        true
+    }
+}
+
 /// Declarative Render Graph — persistent capacity storage.
 ///
 /// Holds the backing `Vec`s whose heap capacity is reused across frames.
@@ -226,6 +264,9 @@ pub struct GraphStorage {
     /// Destructor-aware physical resources and compact commands for scene
     /// draws selected during post-prepare baking.
     pub(crate) draw_plans: DrawPlanStore,
+    /// Canonical per-pass plan demands in one capacity-retaining flat table.
+    /// Pass records address this table by range.
+    pub(crate) draw_plan_demands: Vec<DrawPlanId>,
     /// Graph-attempt source records materialized only for the source-item
     /// union selected by DPE-live draw plans.
     pub(crate) prepared_draws: PreparedDrawStore,
@@ -251,6 +292,18 @@ pub struct GraphStorage {
     compile_dependency_graph: Vec<SmallVec<[usize; 8]>>,
 
     compile_max_ext_indices: Vec<usize>,
+
+    /// One-shot draw-demand union scratch, retained at the plan/resource
+    /// high-water marks and generation-cleared between operations.
+    draw_plan_demand_scratch: DenseGenerationScratch,
+    draw_plan_resource_scratch: DenseGenerationScratch,
+    /// Raw demand IDs for the pass whose setup closure is currently running.
+    /// Cleared without releasing capacity before each `add_pass` call.
+    pub(crate) draw_plan_raw_demands: Vec<DrawPlanId>,
+    /// Setup is deliberately non-reentrant. External callers cannot reach the
+    /// graph through PassBuilder, and internal nested construction would make
+    /// one-shot finalization and consumer-edge order ambiguous.
+    pass_setup_active: bool,
 
     /// Group-name stack for logical subgraph tagging.
     #[cfg(feature = "rdg_inspector")]
@@ -284,6 +337,7 @@ impl GraphStorage {
             mipmap_encode_coordinator: MipmapEncodeCoordinator::default(),
             prepared_bind_groups: PreparedBindGroupStore::new(),
             draw_plans: DrawPlanStore::new(),
+            draw_plan_demands: Vec::with_capacity(64),
             prepared_draws: PreparedDrawStore::new(),
             material_plans: MaterialPlanStore::new(),
             prepared_global_bind_group: PreparedGlobalBindGroup::default(),
@@ -295,6 +349,10 @@ impl GraphStorage {
             compile_ready_heap: BinaryHeap::new(),
             compile_dependency_graph: Vec::new(),
             compile_max_ext_indices: Vec::new(),
+            draw_plan_demand_scratch: DenseGenerationScratch::default(),
+            draw_plan_resource_scratch: DenseGenerationScratch::default(),
+            draw_plan_raw_demands: Vec::with_capacity(64),
+            pass_setup_active: false,
             #[cfg(feature = "rdg_inspector")]
             current_group_stack: Vec::new(),
             #[cfg(debug_assertions)]
@@ -307,6 +365,9 @@ impl GraphStorage {
         self.passes.clear();
         self.resources.clear();
         self.execution_queue.clear();
+        self.draw_plan_demands.clear();
+        self.draw_plan_raw_demands.clear();
+        self.pass_setup_active = false;
         self.topology_compiled = false;
         self.persistent_texture_lookup.clear();
         self.history_commit_requests.clear();
@@ -324,6 +385,72 @@ impl GraphStorage {
     #[must_use]
     pub fn latest_diagnostics(&self) -> Option<RdgFrameDiagnostics> {
         self.diagnostics.latest()
+    }
+
+    /// Canonicalize raw draw-plan demands and attach their logical texture
+    /// reads after one pass setup closure has completed.
+    ///
+    /// Both dense sets are generation-stamped and storage-owned, so this does
+    /// no temporary hashing or dependency cloning. First-demand and
+    /// first-resource order are preserved.
+    fn finalize_pass_draw_plan_demands(&mut self, pass_index: usize) {
+        let canonical_start = self.draw_plan_demands.len();
+        if self.draw_plan_raw_demands.is_empty() {
+            self.passes[pass_index].draw_plan_demand_range = canonical_start..canonical_start;
+            return;
+        }
+
+        self.draw_plan_demand_scratch
+            .begin(self.draw_plans.plan_count());
+        let raw_demand_count = self.draw_plan_raw_demands.len();
+        let mut unique_demand_count = 0;
+        for read_index in 0..raw_demand_count {
+            let id = self.draw_plan_raw_demands[read_index];
+            let dense_index = self
+                .draw_plans
+                .reserved_index(id)
+                .expect("draw plan demand does not belong to this graph attempt");
+            if self.draw_plan_demand_scratch.insert(dense_index) {
+                self.draw_plan_raw_demands[unique_demand_count] = id;
+                unique_demand_count += 1;
+            }
+        }
+        self.draw_plan_raw_demands.truncate(unique_demand_count);
+        self.draw_plan_demands
+            .extend_from_slice(&self.draw_plan_raw_demands);
+        let canonical_end = self.draw_plan_demands.len();
+        self.passes[pass_index].draw_plan_demand_range = canonical_start..canonical_end;
+
+        self.draw_plan_resource_scratch.begin(self.resources.len());
+        for read in self.passes[pass_index].reads.iter().copied() {
+            self.draw_plan_resource_scratch
+                .insert(read.index() as usize);
+        }
+
+        for demand_index in canonical_start..canonical_end {
+            let id = self.draw_plan_demands[demand_index];
+            let dependency_key = self.draw_plans.mark_topology_demanded(id);
+            for &dependency in self.draw_plans.texture_dependencies(dependency_key) {
+                let resource_index = dependency.index() as usize;
+                assert!(
+                    resource_index < self.resources.len(),
+                    "pass '{}' demanded a draw-plan texture from another graph",
+                    self.passes[pass_index].name
+                );
+                if !self.draw_plan_resource_scratch.insert(resource_index) {
+                    continue;
+                }
+
+                self.passes[pass_index].reads.push(dependency.erase());
+                self.resources[resource_index].consumers.push(pass_index);
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    pub(crate) fn pass_draw_plan_demands(&self, pass_index: usize) -> &[DrawPlanId] {
+        &self.draw_plan_demands[self.passes[pass_index].draw_plan_demand_range.clone()]
     }
 
     /// Immediately releases Drop-bearing owners captured by one graph attempt.
@@ -752,6 +879,11 @@ pub struct RenderGraph<'a> {
 
 impl Drop for RenderGraph<'_> {
     fn drop(&mut self) {
+        // Raw demand staging is meaningful only while one setup closure is
+        // running. In particular, do not let a setup panic leave stale IDs for
+        // retained-topology inspection or a later attempt.
+        self.storage.draw_plan_raw_demands.clear();
+        self.storage.pass_setup_active = false;
         // NodeSlot erases the arena lifetime behind a raw trait-object pointer.
         // Remove every slot at the graph boundary so resetting FrameArena can
         // never leave a callable dangling node in retained topology metadata.
@@ -787,6 +919,28 @@ impl<'a> RenderGraph<'a> {
             arena,
             renderer_diagnostics: None,
             standalone_diagnostics: Some(standalone_diagnostics),
+        }
+    }
+
+    /// Benchmark-only constructor for same-binary diagnostics A/B measurements.
+    ///
+    /// The disabled branch preserves the exact graph topology path while
+    /// omitting attempt creation, counter updates, and terminal publication.
+    /// This API is crate-private and absent from shipping builds.
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    pub(crate) fn new_for_benchmark(
+        storage: &'a mut GraphStorage,
+        arena: &'a FrameArena,
+        diagnostics_enabled: bool,
+    ) -> Self {
+        storage.clear();
+        let standalone_diagnostics =
+            diagnostics_enabled.then(|| storage.diagnostics.begin_attempt());
+        Self {
+            storage,
+            arena,
+            renderer_diagnostics: None,
+            standalone_diagnostics,
         }
     }
 
@@ -834,6 +988,10 @@ impl<'a> RenderGraph<'a> {
         if let Some(diagnostics) = self.renderer_diagnostics {
             diagnostics.enter_phase(phase);
         } else {
+            #[cfg(any(test, feature = "rdg_bench_support"))]
+            if self.standalone_diagnostics.is_none() {
+                return;
+            }
             self.standalone_diagnostics
                 .as_mut()
                 .expect("standalone diagnostics attempt missing")
@@ -846,6 +1004,10 @@ impl<'a> RenderGraph<'a> {
         if let Some(diagnostics) = self.renderer_diagnostics {
             diagnostics.record_declared_pass();
         } else {
+            #[cfg(any(test, feature = "rdg_bench_support"))]
+            if self.standalone_diagnostics.is_none() {
+                return;
+            }
             self.standalone_diagnostics
                 .as_mut()
                 .expect("standalone diagnostics attempt missing")
@@ -858,6 +1020,10 @@ impl<'a> RenderGraph<'a> {
         if let Some(diagnostics) = self.renderer_diagnostics {
             diagnostics.record_folded_pass();
         } else {
+            #[cfg(any(test, feature = "rdg_bench_support"))]
+            if self.standalone_diagnostics.is_none() {
+                return;
+            }
             self.standalone_diagnostics
                 .as_mut()
                 .expect("standalone diagnostics attempt missing")
@@ -870,6 +1036,10 @@ impl<'a> RenderGraph<'a> {
         if let Some(diagnostics) = self.renderer_diagnostics {
             diagnostics.record_compiled_live_passes(live_passes);
         } else {
+            #[cfg(any(test, feature = "rdg_bench_support"))]
+            if self.standalone_diagnostics.is_none() {
+                return;
+            }
             self.standalone_diagnostics
                 .as_mut()
                 .expect("standalone diagnostics attempt missing")
@@ -950,7 +1120,28 @@ impl<'a> RenderGraph<'a> {
         self.assert_topology_mutable();
         self.storage
             .draw_plans
-            .set_texture_dependencies(key, dependencies);
+            .assert_texture_dependencies_registerable(key);
+        self.storage
+            .draw_plan_resource_scratch
+            .begin(self.storage.resources.len());
+        let mut unique = SmallVec::<[TextureNodeId; 8]>::new();
+        for dependency in dependencies {
+            let resource_index = dependency.index() as usize;
+            assert!(
+                resource_index < self.storage.resources.len(),
+                "draw-plan texture dependency belongs to another graph"
+            );
+            if self
+                .storage
+                .draw_plan_resource_scratch
+                .insert(resource_index)
+            {
+                unique.push(dependency);
+            }
+        }
+        self.storage
+            .draw_plans
+            .set_texture_dependencies(key, unique);
     }
 
     /// Moves Drop-bearing WGPU request owners into persistent GraphStorage and
@@ -1461,6 +1652,11 @@ impl<'a> RenderGraph<'a> {
     /// a [`TextureNodeId`] or typed output struct) is forwarded to the
     /// caller for downstream wiring.
     ///
+    /// Setup closures are non-reentrant: they must not recursively call
+    /// `add_pass`. One-shot demand finalization runs after each closure, and a
+    /// nested setup would make both staging ownership and consumer-edge order
+    /// ambiguous. Such an internal call fails before mutating graph state.
+    ///
     /// # Arena Allocation
     ///
     /// The returned `PassNode` is allocated on the current frame's
@@ -1484,7 +1680,13 @@ impl<'a> RenderGraph<'a> {
         // This ensures that PassNodes are safe to allocate on the FrameArena without needing to run destructors.
         let () = <N as AssertNoDrop>::VALID;
 
+        assert!(
+            !self.storage.pass_setup_active,
+            "nested RenderGraph::add_pass is unsupported; pass setup must complete before another pass is added"
+        );
+        self.storage.pass_setup_active = true;
         let pass_index = self.storage.passes.len();
+        self.storage.draw_plan_raw_demands.clear();
 
         // Phase 1: placeholder record (node = None) so the PassBuilder can
         // reference the correct index.
@@ -1504,8 +1706,15 @@ impl<'a> RenderGraph<'a> {
             };
             setup_fn(&mut builder)
         };
+        self.storage.pass_setup_active = false;
 
-        // Phase 3: allocate the node on the frame arena (O(1) pointer bump).
+        // Phase 3: one-shot plan-demand canonicalization. The setup hot path
+        // records raw IDs only; texture reads and consumer edges are attached
+        // once, in deterministic first-occurrence order, after the closure no
+        // longer borrows the graph.
+        self.storage.finalize_pass_draw_plan_demands(pass_index);
+
+        // Phase 4: allocate the node on the frame arena (O(1) pointer bump).
         // let node_ref: &mut N = self.arena.alloc(node);
         let node_ref: &'a mut N = self.arena.alloc(node);
         let ptr = node_ref as *mut N;
@@ -1934,9 +2143,11 @@ impl<'a> RenderGraph<'a> {
 
         for queue_index in 0..self.storage.execution_queue.len() {
             let pass_index = self.storage.execution_queue[queue_index];
-            let demand_count = self.storage.passes[pass_index].draw_plan_demands.len();
-            for demand_index in 0..demand_count {
-                let id = self.storage.passes[pass_index].draw_plan_demands[demand_index];
+            let demand_range = self.storage.passes[pass_index]
+                .draw_plan_demand_range
+                .clone();
+            for demand_index in demand_range {
+                let id = self.storage.draw_plan_demands[demand_index];
                 assert!(
                     self.storage.draw_plans.validate_reserved(id),
                     "live pass '{}' retained a draw plan from another graph attempt",
@@ -2393,6 +2604,44 @@ mod tests {
     }
 
     #[test]
+    fn next_attempt_clears_raw_draw_staging_after_setup_panic() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let texture = graph.register_texture("Abandoned", dummy_desc(), false);
+            graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
+            let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+            graph.add_pass("Panicking_Draw_Setup", |builder| -> (MockExec, ()) {
+                builder.demand_draw_plan(plan);
+                panic!("intentional draw setup failure")
+            });
+        }));
+        assert!(result.is_err());
+        assert!(storage.draw_plan_raw_demands.is_empty());
+
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        assert!(graph.storage.passes.is_empty());
+        assert!(graph.storage.draw_plan_raw_demands.is_empty());
+        assert!(graph.storage.draw_plan_demands.is_empty());
+
+        let texture = graph.register_texture("Recovered", dummy_desc(), false);
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [texture]);
+        let plan = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let pass_index = graph.storage.passes.len();
+        graph.add_pass("Recovered_Draw_Setup", |builder| {
+            builder.demand_draw_plan(plan);
+            (MockExec, ())
+        });
+        assert_eq!(graph.storage.pass_draw_plan_demands(pass_index), &[plan]);
+        assert_eq!(
+            graph.storage.passes[pass_index].reads.as_slice(),
+            &[texture.erase()]
+        );
+    }
+
+    #[test]
     fn duplicate_request_owners_share_publication_and_retry_after_attempt_release() {
         let wgpu = pollster::block_on(WgpuContext::new_headless(
             &RendererInitConfig::default(),
@@ -2522,7 +2771,7 @@ mod tests {
             (MockExec, ())
         });
 
-        assert_eq!(graph.storage.passes[4].draw_plan_demands.len(), 2);
+        assert_eq!(graph.storage.pass_draw_plan_demands(4).len(), 2);
         assert_eq!(
             graph.storage.passes[4].reads.as_slice(),
             &[shared_texture.erase()],
@@ -2553,6 +2802,211 @@ mod tests {
     }
 
     #[test]
+    fn draw_plan_demands_are_raw_during_setup_and_canonical_afterward() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.register_texture("Draw_Texture", dummy_desc(), false);
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture, texture]);
+        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let pass_index = graph.storage.passes.len();
+
+        graph.add_pass("Repeated_Draw_Consumer", |builder| {
+            builder.demand_draw_plan(plan);
+            builder.demand_draw_plan(plan);
+            builder.demand_draw_plan(plan);
+            assert_eq!(
+                builder.graph.storage.draw_plan_raw_demands.len(),
+                3,
+                "setup must append raw IDs without accumulated-demand scans"
+            );
+            assert!(
+                builder.graph.storage.passes[builder.pass_index]
+                    .reads
+                    .is_empty(),
+                "draw-plan dependency union must wait until setup returns"
+            );
+            (MockExec, ())
+        });
+
+        assert_eq!(graph.storage.pass_draw_plan_demands(pass_index), &[plan]);
+        assert_eq!(
+            graph.storage.passes[pass_index].reads.as_slice(),
+            &[texture.erase()]
+        );
+        assert_eq!(
+            graph.storage.resources[texture.index() as usize]
+                .consumers
+                .as_slice(),
+            &[pass_index]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "nested RenderGraph::add_pass is unsupported")]
+    fn nested_add_pass_is_rejected_before_mutating_graph_state() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        graph.add_pass("Outer", |builder| {
+            builder.graph.add_pass("Nested", |_nested| (MockExec, ()));
+            (MockExec, ())
+        });
+    }
+
+    #[test]
+    fn caught_nested_add_pass_panic_preserves_outer_raw_demands() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.register_texture("Outer_Texture", dummy_desc(), false);
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
+        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let outer_index = graph.storage.passes.len();
+
+        graph.add_pass("Outer", |builder| {
+            builder.demand_draw_plan(plan);
+            let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                builder.graph.add_pass("Nested", |_nested| (MockExec, ()));
+            }));
+            assert!(nested.is_err());
+            builder.demand_draw_plan(plan);
+            (MockExec, ())
+        });
+
+        assert_eq!(graph.storage.passes.len(), 1);
+        assert_eq!(graph.storage.pass_draw_plan_demands(outer_index), &[plan]);
+        assert_eq!(
+            graph.storage.passes[outer_index].reads.as_slice(),
+            &[texture.erase()]
+        );
+        assert_eq!(
+            graph.storage.resources[texture.index() as usize]
+                .consumers
+                .as_slice(),
+            &[outer_index]
+        );
+    }
+
+    #[test]
+    fn disjoint_draw_plans_union_dependencies_in_first_occurrence_order() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let direct = graph.register_texture("Direct", dummy_desc(), false);
+        let shared = graph.register_texture("Shared", dummy_desc(), false);
+        let opaque_only = graph.register_texture("Opaque", dummy_desc(), false);
+        let transparent_only = graph.register_texture("Transparent", dummy_desc(), false);
+
+        graph
+            .set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [shared, opaque_only, shared]);
+        graph.set_draw_plan_texture_dependencies(
+            DrawPlanKey::Transparent,
+            [transparent_only, shared, transparent_only],
+        );
+        let opaque = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let transparent = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let pass_index = graph.storage.passes.len();
+
+        graph.add_pass("Disjoint_Draw_Consumer", |builder| {
+            builder.read_texture(direct);
+            builder.read_texture(shared);
+            builder.demand_draw_plan(transparent);
+            builder.demand_draw_plan(opaque);
+            builder.demand_draw_plan(transparent);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        assert_eq!(
+            graph.storage.pass_draw_plan_demands(pass_index),
+            &[transparent, opaque]
+        );
+        assert_eq!(
+            graph.storage.passes[pass_index].reads.as_slice(),
+            &[
+                direct.erase(),
+                shared.erase(),
+                transparent_only.erase(),
+                opaque_only.erase()
+            ]
+        );
+        for texture in [direct, shared, opaque_only, transparent_only] {
+            assert_eq!(
+                graph.storage.resources[texture.index() as usize]
+                    .consumers
+                    .as_slice(),
+                &[pass_index],
+                "the union must install exactly one consumer edge per resource"
+            );
+        }
+
+        graph.compile_topology();
+        assert!(graph.storage.draw_plans.is_live(opaque));
+        assert!(graph.storage.draw_plans.is_live(transparent));
+    }
+
+    #[test]
+    fn draw_plan_resource_scratch_recovers_after_iterator_panic() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let abandoned = graph.register_texture("Abandoned", dummy_desc(), false);
+        let retained = graph.register_texture("Retained", dummy_desc(), false);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            graph.set_draw_plan_texture_dependencies(
+                DrawPlanKey::Opaque,
+                std::iter::once(abandoned)
+                    .chain(std::iter::once_with(|| panic!("dependency iterator panic"))),
+            );
+        }));
+        assert!(result.is_err());
+
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [retained, retained]);
+        let plan = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let pass_index = graph.storage.passes.len();
+        graph.add_pass("Post_Panic_Consumer", |builder| {
+            builder.demand_draw_plan(plan);
+            (MockExec, ())
+        });
+
+        assert_eq!(
+            graph.storage.passes[pass_index].reads.as_slice(),
+            &[retained.erase()]
+        );
+        assert!(
+            graph.storage.resources[abandoned.index() as usize]
+                .consumers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dense_generation_scratch_retains_capacity_and_clears_on_wrap() {
+        let mut scratch = DenseGenerationScratch::default();
+        scratch.begin(64);
+        assert!(scratch.insert(7));
+        assert!(!scratch.insert(7));
+        let capacity = scratch.stamps.capacity();
+
+        scratch.begin(8);
+        assert_eq!(scratch.stamps.len(), 64, "the dense domain must not shrink");
+        assert_eq!(scratch.stamps.capacity(), capacity);
+        assert!(scratch.insert(7));
+
+        scratch.generation = u32::MAX;
+        scratch.stamps[7] = 1;
+        scratch.begin(8);
+        assert_eq!(scratch.generation, 1);
+        assert!(
+            scratch.insert(7),
+            "wrap must clear stale generation-one marks"
+        );
+        assert!(!scratch.insert(7));
+    }
+
+    #[test]
     #[should_panic(
         expected = "draw-plan texture dependencies must be registered before the first consumer"
     )]
@@ -2567,6 +3021,55 @@ mod tests {
         });
         let texture = graph.register_texture("Late_Texture", dummy_desc(), false);
         graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "draw-plan texture dependencies must be registered before the first consumer"
+    )]
+    fn prepass_demand_rejects_late_opaque_dependency_registration() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let prepass = graph.reserve_draw_plan(DrawPlanKey::Prepass {
+            needs_normal: true,
+            needs_feature_id: false,
+            needs_velocity: true,
+        });
+        graph.add_pass("Prepass_Consumer", |builder| {
+            builder.demand_draw_plan(prepass);
+            (MockExec, ())
+        });
+
+        let texture = graph.register_texture("Late_Opaque_Texture", dummy_desc(), false);
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
+    }
+
+    #[test]
+    fn retained_demand_ranges_restart_at_zero_after_attempt_clear() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let first_plan;
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            first_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+            graph.add_pass("First_Consumer", |builder| {
+                builder.demand_draw_plan(first_plan);
+                (MockExec, ())
+            });
+        }
+        assert_eq!(storage.pass_draw_plan_demands(0), &[first_plan]);
+        assert_eq!(storage.passes[0].draw_plan_demand_range, 0..1);
+
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let second_plan = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        graph.add_pass("Second_Consumer", |builder| {
+            builder.demand_draw_plan(second_plan);
+            (MockExec, ())
+        });
+        assert_eq!(graph.storage.pass_draw_plan_demands(0), &[second_plan]);
+        assert_eq!(graph.storage.passes[0].draw_plan_demand_range, 0..1);
     }
 
     #[test]

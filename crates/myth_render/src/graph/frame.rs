@@ -20,7 +20,7 @@
 //!
 
 use glam::Mat4;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
@@ -45,8 +45,6 @@ use super::core::TextureNodeId;
 use super::extracted::{ExtractedRenderItem, ExtractedScene, SceneFeatures};
 use super::render_state::RenderState;
 use super::shadow_utils;
-
-const DRAW_TEXTURE_LINEAR_DEDUP_LIMIT: usize = 16;
 
 // ============================================================================
 // Render intents, physical commands, and render lists
@@ -432,11 +430,7 @@ impl DrawPlanStore {
     /// key is normalized to [`DrawPlanKey::Opaque`]. Registration must happen
     /// before any pass demands that plan; otherwise its real RDG reads would
     /// be incomplete and producer ordering could not be recovered later.
-    pub(crate) fn set_texture_dependencies(
-        &mut self,
-        key: DrawPlanKey,
-        dependencies: impl IntoIterator<Item = TextureNodeId>,
-    ) {
+    pub(crate) fn assert_texture_dependencies_registerable(&self, key: DrawPlanKey) {
         let key = draw_texture_dependency_key(key);
         assert!(
             self.plans.iter().all(|plan| {
@@ -444,55 +438,53 @@ impl DrawPlanStore {
             }),
             "draw-plan texture dependencies must be registered before the first consumer"
         );
-
-        let mut unique = SmallVec::<[TextureNodeId; 8]>::new();
-        let mut seen: Option<FxHashSet<TextureNodeId>> = None;
-        for dependency in dependencies {
-            if let Some(seen) = &mut seen {
-                if seen.insert(dependency) {
-                    unique.push(dependency);
-                }
-                continue;
-            }
-            if unique.contains(&dependency) {
-                continue;
-            }
-            unique.push(dependency);
-            if unique.len() == DRAW_TEXTURE_LINEAR_DEDUP_LIMIT {
-                seen = Some(unique.iter().copied().collect::<FxHashSet<_>>());
-            }
-        }
-        assert!(
-            self.texture_dependencies.insert(key, unique).is_none(),
-            "draw-plan texture dependencies registered twice for {key:?}"
-        );
     }
 
-    /// Freeze and copy the logical texture reads for a pass demand.
-    ///
-    /// Returning owned POD IDs avoids borrowing the store while
-    /// [`PassBuilder`](super::core::PassBuilder) mutates graph records.
-    pub(crate) fn texture_dependencies_for_demand(
+    pub(crate) fn set_texture_dependencies(
         &mut self,
-        id: DrawPlanId,
-    ) -> SmallVec<[TextureNodeId; 8]> {
-        let key = {
-            let plan = self
-                .plan_mut(id)
-                .expect("draw plan demand does not belong to this graph attempt");
-            plan.topology_demanded = true;
-            draw_texture_dependency_key(plan.key)
-        };
+        key: DrawPlanKey,
+        dependencies: SmallVec<[TextureNodeId; 8]>,
+    ) {
+        let key = draw_texture_dependency_key(key);
+        match self.texture_dependencies.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(dependencies);
+            }
+            Entry::Occupied(_) => {
+                panic!("draw-plan texture dependencies registered twice for {key:?}");
+            }
+        }
+    }
+
+    /// Marks one canonical plan as topology-demanded and returns its normalized
+    /// texture-dependency key. The caller may then borrow the registered slice
+    /// without cloning it.
+    pub(crate) fn mark_topology_demanded(&mut self, id: DrawPlanId) -> DrawPlanKey {
+        let plan = self
+            .plan_mut(id)
+            .expect("draw plan demand does not belong to this graph attempt");
+        plan.topology_demanded = true;
+        draw_texture_dependency_key(plan.key)
+    }
+
+    /// Borrow the logical texture dependencies registered for a normalized
+    /// draw-plan key.
+    pub(crate) fn texture_dependencies(&self, normalized_key: DrawPlanKey) -> &[TextureNodeId] {
         self.texture_dependencies
-            .get(&key)
-            .cloned()
-            .unwrap_or_default()
+            .get(&normalized_key)
+            .map_or(&[], SmallVec::as_slice)
     }
 
     /// Return whether an ID addresses a reserved plan in this graph attempt.
     #[must_use]
     pub(crate) fn validate_reserved(&self, id: DrawPlanId) -> bool {
         id.attempt_token == self.attempt_token && (id.index as usize) < self.plans.len()
+    }
+
+    /// Return the dense attempt-local slot addressed by a valid plan ID.
+    #[must_use]
+    pub(crate) fn reserved_index(&self, id: DrawPlanId) -> Option<usize> {
+        self.validate_reserved(id).then_some(id.index as usize)
     }
 
     /// Reset compile-time demand marks before collecting the current DPE

@@ -6,12 +6,131 @@
 
 use crate::graph::core::node::PassRecord;
 use crate::graph::core::{
-    BufferDesc, ExecuteContext, FrameArena, GraphStorage, PassBuilder, PassNode, RenderGraph,
-    TextureDesc, TextureNodeId,
+    BufferDesc, ExecuteContext, FrameArena, GraphStorage, PassBuilder, PassNode,
+    RdgDiagnosticsRecorder, RdgFramePhase, RenderGraph, TextureDesc, TextureNodeId,
 };
 use crate::graph::frame::{DrawPlanId, DrawPlanKey, DrawPlanStore};
 
 const CUBE_LIGHT_ID_BASE: u64 = 1 << 32;
+
+/// Benchmark-only diagnostics route for same-binary A/B measurements.
+///
+/// Both modes execute identical RDG topology code. `Disabled` skips only the
+/// attempt lifecycle and counter updates that are absent from the control arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdgBenchDiagnosticsMode {
+    Enabled,
+    Disabled,
+}
+
+impl RdgBenchDiagnosticsMode {
+    /// Stable label used by Criterion and the allocation probe.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// O(1) correctness token for the synthetic Renderer-recorder lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdgRecorderLifecycleToken {
+    pub declared_passes: usize,
+    pub live_passes: usize,
+    pub prepared_passes: usize,
+    pub executed_passes: usize,
+    pub queue_submitted: bool,
+}
+
+/// Same-binary control harness for per-pass diagnostics recorder updates.
+///
+/// Both modes traverse the same `black_box`-guarded loop skeleton. `Enabled`
+/// additionally calls the real Renderer-owned Cell recorder, isolating its
+/// incremental cost without involving GPU work or graph topology setup.
+pub struct RdgRecorderLifecycleBenchHarness {
+    diagnostics_mode: RdgBenchDiagnosticsMode,
+    recorder: RdgDiagnosticsRecorder,
+    renderer_frame: u64,
+}
+
+impl RdgRecorderLifecycleBenchHarness {
+    #[must_use]
+    pub fn new(diagnostics_mode: RdgBenchDiagnosticsMode) -> Self {
+        Self {
+            diagnostics_mode,
+            recorder: RdgDiagnosticsRecorder::default(),
+            renderer_frame: 0,
+        }
+    }
+
+    /// Run a complete synthetic Renderer diagnostics lifecycle.
+    #[must_use]
+    pub fn run_iteration(&mut self, live_passes: usize) -> RdgRecorderLifecycleToken {
+        self.renderer_frame = self
+            .renderer_frame
+            .checked_add(1)
+            .expect("diagnostics lifecycle benchmark frame overflowed");
+        let enabled = std::hint::black_box(self.diagnostics_mode.is_enabled());
+
+        let attempt_id = if enabled {
+            self.recorder.start_renderer_attempt(self.renderer_frame);
+            self.recorder.enter_phase(RdgFramePhase::BuildGraph);
+            self.recorder
+                .current()
+                .expect("benchmark recorder attempt missing")
+                .attempt_id()
+        } else {
+            0
+        };
+
+        for pass_index in 0..live_passes {
+            std::hint::black_box(pass_index);
+            if enabled {
+                self.recorder.record_declared_pass();
+            }
+        }
+        if enabled {
+            self.recorder.enter_phase(RdgFramePhase::CompileGraph);
+            self.recorder.record_compiled_live_passes(live_passes);
+            self.recorder.enter_phase(RdgFramePhase::PreparePasses);
+        }
+        for pass_index in 0..live_passes {
+            std::hint::black_box(pass_index);
+            if enabled {
+                self.recorder.record_prepared_pass();
+            }
+        }
+        if enabled {
+            self.recorder.enter_phase(RdgFramePhase::RecordCommands);
+        }
+        for pass_index in 0..live_passes {
+            std::hint::black_box(pass_index);
+            if enabled {
+                self.recorder.record_executed_pass();
+            }
+        }
+        if enabled {
+            self.recorder.enter_phase(RdgFramePhase::Submit);
+            self.recorder.mark_queue_submitted();
+            self.recorder.mark_completed();
+            self.recorder.finish_renderer_attempt(attempt_id);
+        }
+
+        RdgRecorderLifecycleToken {
+            declared_passes: live_passes,
+            live_passes,
+            prepared_passes: live_passes,
+            executed_passes: live_passes,
+            queue_submitted: true,
+        }
+    }
+}
 
 /// How logical texture dependencies are distributed across benchmark plans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,17 +255,25 @@ pub struct DrawDemandBenchHarness {
     arena: FrameArena,
     plan_ids: Vec<DrawPlanId>,
     dependency_scratch: Vec<TextureNodeId>,
+    diagnostics_mode: RdgBenchDiagnosticsMode,
 }
 
 impl DrawDemandBenchHarness {
     /// Construct an empty reusable harness.
     #[must_use]
     pub fn new() -> Self {
+        Self::new_with_diagnostics(RdgBenchDiagnosticsMode::Enabled)
+    }
+
+    /// Construct a harness with an explicit diagnostics A/B route.
+    #[must_use]
+    pub fn new_with_diagnostics(diagnostics_mode: RdgBenchDiagnosticsMode) -> Self {
         Self {
             storage: GraphStorage::new(),
             arena: FrameArena::new(),
             plan_ids: Vec::new(),
             dependency_scratch: Vec::new(),
+            diagnostics_mode,
         }
     }
 
@@ -161,8 +288,8 @@ impl DrawDemandBenchHarness {
                 registered_resource_count: graph.storage.resources.len(),
                 d2_read_count: d2.reads.len(),
                 cube_read_count: cube.reads.len(),
-                d2_demand_count: d2.draw_plan_demands.len(),
-                cube_demand_count: cube.draw_plan_demands.len(),
+                d2_demand_count: graph.storage.pass_draw_plan_demands(indices.d2).len(),
+                cube_demand_count: graph.storage.pass_draw_plan_demands(indices.cube).len(),
                 compiled_pass_count: if spec.compile_topology {
                     graph.storage.execution_queue.len()
                 } else {
@@ -184,8 +311,16 @@ impl DrawDemandBenchHarness {
         self.run_iteration_with(spec, |graph, indices| {
             let draw_plans = &graph.storage.draw_plans;
             DrawDemandBenchObservation {
-                d2: observe_pass(&graph.storage.passes[indices.d2], draw_plans),
-                cube: observe_pass(&graph.storage.passes[indices.cube], draw_plans),
+                d2: observe_pass(
+                    &graph.storage.passes[indices.d2],
+                    graph.storage.pass_draw_plan_demands(indices.d2),
+                    draw_plans,
+                ),
+                cube: observe_pass(
+                    &graph.storage.passes[indices.cube],
+                    graph.storage.pass_draw_plan_demands(indices.cube),
+                    draw_plans,
+                ),
                 registered_pass_count: graph.storage.passes.len(),
                 registered_resource_count: graph.storage.resources.len(),
                 resource_consumer_edge_count: graph
@@ -223,12 +358,14 @@ impl DrawDemandBenchHarness {
             arena,
             plan_ids,
             dependency_scratch,
+            diagnostics_mode,
         } = self;
         arena.reset();
         plan_ids.clear();
         dependency_scratch.clear();
 
-        let mut graph = RenderGraph::new(storage, arena);
+        let mut graph =
+            RenderGraph::new_for_benchmark(storage, arena, diagnostics_mode.is_enabled());
         let texture_desc = dependency_desc();
 
         if spec.dependency_pattern == DrawDemandDependencyPattern::Shared {
@@ -392,15 +529,18 @@ fn add_output_root(
     Some(pass_index)
 }
 
-fn observe_pass(pass: &PassRecord, draw_plans: &DrawPlanStore) -> DrawDemandPassObservation {
+fn observe_pass(
+    pass: &PassRecord,
+    demands: &[DrawPlanId],
+    draw_plans: &DrawPlanStore,
+) -> DrawDemandPassObservation {
     DrawDemandPassObservation {
         logical_reads: pass
             .reads
             .iter()
             .map(|id| (id.index(), id.version()))
             .collect(),
-        demanded_plans: pass
-            .draw_plan_demands
+        demanded_plans: demands
             .iter()
             .map(|&id| resolve_plan_key(draw_plans, id))
             .collect(),
@@ -452,7 +592,8 @@ fn dependency_desc() -> TextureDesc {
 mod tests {
     use super::{
         DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern,
-        DrawDemandPlanKey, DrawDemandRoot, project_plan_key, shadow_plan_key,
+        DrawDemandPlanKey, DrawDemandRoot, RdgBenchDiagnosticsMode,
+        RdgRecorderLifecycleBenchHarness, project_plan_key, shadow_plan_key,
     };
 
     fn spec(
@@ -566,6 +707,52 @@ mod tests {
             assert!(none.live_plans.is_empty());
             assert_eq!(none.compiled_pass_count, 0);
             assert!(none.root_physical_dependencies.is_empty());
+        }
+    }
+
+    #[test]
+    fn diagnostics_ab_routes_preserve_exact_topology() {
+        for pattern in [
+            DrawDemandDependencyPattern::Shared,
+            DrawDemandDependencyPattern::Disjoint,
+        ] {
+            for root in [DrawDemandRoot::Both, DrawDemandRoot::None] {
+                let workload = spec(pattern, 1, true, root);
+                let mut enabled =
+                    DrawDemandBenchHarness::new_with_diagnostics(RdgBenchDiagnosticsMode::Enabled);
+                let mut disabled =
+                    DrawDemandBenchHarness::new_with_diagnostics(RdgBenchDiagnosticsMode::Disabled);
+
+                assert_eq!(
+                    enabled.run_observed_iteration(workload),
+                    disabled.run_observed_iteration(workload),
+                    "diagnostics routing changed the benchmark topology"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recorder_lifecycle_ab_routes_preserve_work_tokens() {
+        for live_passes in [0, 32, 64, 128] {
+            let mut enabled =
+                RdgRecorderLifecycleBenchHarness::new(RdgBenchDiagnosticsMode::Enabled);
+            let mut disabled =
+                RdgRecorderLifecycleBenchHarness::new(RdgBenchDiagnosticsMode::Disabled);
+            assert_eq!(
+                enabled.run_iteration(live_passes),
+                disabled.run_iteration(live_passes)
+            );
+
+            let snapshot = enabled
+                .recorder
+                .latest()
+                .expect("enabled recorder did not publish a terminal snapshot");
+            assert_eq!(snapshot.declared_passes(), live_passes);
+            assert_eq!(snapshot.live_passes(), Some(live_passes));
+            assert_eq!(snapshot.prepared_passes(), live_passes);
+            assert_eq!(snapshot.executed_passes(), live_passes);
+            assert!(snapshot.queue_submitted());
         }
     }
 }
