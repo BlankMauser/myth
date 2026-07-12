@@ -1,6 +1,7 @@
 //! Geometry operations
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::pipeline::vertex::GeneratedVertexLayout;
 use myth_assets::{AssetServer, GeometryHandle};
@@ -12,7 +13,9 @@ use super::ResourceManager;
 ///
 /// Vertex Buffer IDs are used for Pipeline cache validation and do not affect `BindGroup`
 pub struct GpuGeometry {
-    pub layout_info: GeneratedVertexLayout,
+    pub asset_version: u32,
+    pub asset_identity: u64,
+    pub layout_info: Arc<GeneratedVertexLayout>,
     pub layout_id: u64,
     pub vertex_buffers: Vec<wgpu::Buffer>,
     pub vertex_buffer_ids: Vec<u64>,
@@ -24,39 +27,32 @@ pub struct GpuGeometry {
     pub last_used_frame: u64,
 }
 
-/// Geometry preparation result
-///
-/// Vertex Buffer IDs are used for Pipeline cache validation and do not affect Object `BindGroup`
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct GeometryPrepareResult {
-    pub vertex_buffer_ids: Vec<u64>,
-    pub index_buffer_id: Option<u64>,
-    pub any_recreated: bool,
-}
-
 impl ResourceManager {
     /// Prepare Geometry GPU resources
     ///
-    /// Returns GeometryPrepareResult containing all physical resource IDs
+    /// Returns `false` only when the asset is unavailable or preparation did
+    /// not publish a GPU entry. Callers resolve exact physical IDs from the
+    /// persistent `GpuGeometry` after all shared buffers are frozen.
     pub(crate) fn prepare_geometry(
         &mut self,
         assets: &AssetServer,
         handle: GeometryHandle,
-    ) -> Option<GeometryPrepareResult> {
-        let geometry = assets.geometries.get(handle)?;
+    ) -> bool {
+        let Some((geometry, asset_version, asset_identity)) =
+            assets.geometries.get_entry_with_identity(handle)
+        else {
+            return false;
+        };
 
         // Fast path: check if any update is needed
         if let Some(gpu_geo) = self.resources.geometry_mut(handle)
+            && gpu_geo.asset_version == asset_version
+            && gpu_geo.asset_identity == asset_identity
             && geometry.structure_version() == gpu_geo.version
             && geometry.data_version() == gpu_geo.last_data_version
         {
             gpu_geo.last_used_frame = self.frame_index;
-            return Some(GeometryPrepareResult {
-                vertex_buffer_ids: gpu_geo.vertex_buffer_ids.clone(),
-                index_buffer_id: gpu_geo.index_buffer.as_ref().map(|(_, _, _, id)| *id),
-                any_recreated: false,
-            });
+            return true;
         }
 
         // Ensure all attribute buffers
@@ -71,10 +67,8 @@ impl ResourceManager {
             }
         }
 
-        let mut new_index_id = None;
         if let Some(indices) = geometry.index_attribute() {
             let result = self.prepare_index(indices);
-            new_index_id = Some(result.resource_id);
             if result.was_recreated {
                 any_buffer_recreated = true;
             }
@@ -82,7 +76,9 @@ impl ResourceManager {
 
         // Check if GpuGeometry needs to be rebuilt
         let needs_rebuild = if let Some(gpu_geo) = self.resources.geometry(handle) {
-            geometry.structure_version() > gpu_geo.version
+            gpu_geo.asset_version != asset_version
+                || gpu_geo.asset_identity != asset_identity
+                || geometry.structure_version() != gpu_geo.version
                 || any_buffer_recreated
                 || gpu_geo.vertex_buffer_ids != new_vertex_ids
         } else {
@@ -90,27 +86,31 @@ impl ResourceManager {
         };
 
         if needs_rebuild {
-            self.create_gpu_geometry(&geometry, handle);
+            self.create_gpu_geometry(&geometry, handle, asset_version, asset_identity);
         } else {
             // Only update the data version
             if let Some(gpu_geo) = self.resources.geometry_mut(handle) {
                 gpu_geo.last_data_version = geometry.data_version();
+                gpu_geo.asset_version = asset_version;
+                gpu_geo.asset_identity = asset_identity;
             }
         }
 
         if let Some(gpu_geo) = self.resources.geometry_mut(handle) {
             gpu_geo.last_used_frame = self.frame_index;
-            Some(GeometryPrepareResult {
-                vertex_buffer_ids: gpu_geo.vertex_buffer_ids.clone(),
-                index_buffer_id: new_index_id,
-                any_recreated: any_buffer_recreated || needs_rebuild,
-            })
+            true
         } else {
-            None
+            false
         }
     }
 
-    fn create_gpu_geometry(&mut self, geometry: &Geometry, handle: GeometryHandle) {
+    fn create_gpu_geometry(
+        &mut self,
+        geometry: &Geometry,
+        handle: GeometryHandle,
+        asset_version: u32,
+        asset_identity: u64,
+    ) {
         let layout_info = crate::pipeline::vertex::generate_vertex_layout(geometry);
 
         let layout_id = self.get_or_create_vertex_layout_id(&layout_info);
@@ -152,7 +152,9 @@ impl ResourceManager {
         }
 
         let gpu_geo = GpuGeometry {
-            layout_info,
+            asset_version,
+            asset_identity,
+            layout_info: Arc::new(layout_info),
             layout_id,
             vertex_buffers,
             vertex_buffer_ids,

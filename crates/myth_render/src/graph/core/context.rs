@@ -7,7 +7,7 @@ use crate::core::gpu::{
     BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
     MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
-use crate::graph::frame::{DrawPlanResolver, DrawPlanStore, RenderLists};
+use crate::graph::frame::{DrawPlanResolver, DrawPlanStore, PreparedDrawStore, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
 use crate::pipeline::ComputePipelineId;
 use crate::pipeline::RenderPipelineId;
@@ -27,22 +27,22 @@ use super::types::{
 };
 use super::{AssetTextureImportId, AssetTextureResolver};
 
-// ─── Extract Context (Feature Pre-RDG Phase) ────────────────────────────────
+// ─── Legacy/template pre-RDG compatibility context ─────────────────────────
 
-/// Rich context available during the **Feature extract-and-prepare** phase.
+/// Compatibility context for template/custom code that explicitly prepares a
+/// pipeline before graph compilation.
 ///
-/// Each `Feature::extract_and_prepare(&mut self, ctx: &mut ExtractContext)`
-/// is called **before** the render graph is built.  The context provides full
-/// access to GPU infrastructure, scene data, and the asset server so that
-/// features can:
+/// Built-in runtime Features do not use this path: they return lightweight
+/// snapshots during graph construction and perform physical work through
+/// [`PrepareContext`] only after DPE. Calling a `*_with_extract` template API
+/// intentionally opts out of that demand-driven boundary. The context remains
+/// available for source compatibility and provides full access to:
 ///
 /// - Create / cache `wgpu::BindGroupLayout`s
 /// - Compile pipelines via [`PipelineCache`]
 /// - Upload non-transient GPU data (uniform buffers, noise textures, etc.)
 ///
-/// After this phase, Features hold only lightweight pipeline IDs.  The
-/// per-frame ephemeral `PassNode` created by `Feature::add_to_graph()`
-/// carries those IDs into the graph.
+/// New code should prefer logical graph inputs plus deferred prepare.
 pub struct ExtractContext<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
@@ -69,7 +69,9 @@ pub struct ExtractContext<'a> {
 pub(crate) struct SceneDrawPrepareContext<'a> {
     pub(crate) render_lists: &'a RenderLists,
     pub(crate) extracted_scene: &'a ExtractedScene,
+    pub(crate) prepared_draws: &'a PreparedDrawStore,
     pub(crate) depth_format: wgpu::TextureFormat,
+    pub(crate) pipeline_settings_version: u64,
     pub(crate) draw_plans: &'a mut DrawPlanStore,
 }
 

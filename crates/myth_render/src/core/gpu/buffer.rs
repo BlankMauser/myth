@@ -19,14 +19,14 @@
 //! consumers (e.g. `ResourceIdSet` fingerprints) that the physical resource has
 //! changed and dependent `BindGroup`s must be rebuilt.
 
-use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
+use myth_assets::AssetServer;
 use myth_resources::buffer::BufferRef;
 use myth_resources::texture::TextureSource;
 
 use super::environment::{snapshot_attachment_texture_source, snapshot_ready_asset_texture_source};
 use super::{
-    AssetTextureMaterialization, AssetTextureSnapshot, EnsureResult, GpuGeometry, GpuImageSpec,
-    GpuMaterial, InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
+    AssetTextureMaterialization, AssetTextureSnapshot, EnsureResult, GpuImageSpec,
+    InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
     materialize_asset_texture_snapshot,
 };
 
@@ -114,24 +114,6 @@ impl<'a> BufferUploadContext<'a> {
     #[allow(dead_code)]
     pub(crate) fn get_gpu_buffer(&self, handle: GpuBufferHandle) -> Option<&GpuBuffer> {
         self.resources.buffer(handle)
-    }
-
-    /// Resolve an already-materialized geometry selected by the scene extract
-    /// path. This is an immutable post-DPE capability; it cannot create or
-    /// replace asset resources.
-    #[inline]
-    #[must_use]
-    pub(crate) fn get_geometry(&self, handle: GeometryHandle) -> Option<&GpuGeometry> {
-        self.resources.geometry(handle)
-    }
-
-    /// Resolve an already-materialized material selected by the scene extract
-    /// path. This is intentionally paired with [`Self::get_geometry`] so live
-    /// draw-plan preparation does not require the monolithic ResourceManager.
-    #[inline]
-    #[must_use]
-    pub(crate) fn get_material(&self, handle: MaterialHandle) -> Option<&GpuMaterial> {
-        self.resources.material(handle)
     }
 
     /// Materialize the exact CPU-only asset snapshot selected during graph

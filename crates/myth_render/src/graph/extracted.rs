@@ -16,17 +16,18 @@ use std::collections::HashSet;
 use glam::{Mat4, Vec3};
 
 use bitflags::{Flags, bitflags};
+use smallvec::SmallVec;
 
-use crate::core::view::{RenderView, ViewTarget};
-use crate::core::{BindGroupContext, ResourceManager};
+use crate::core::ResourceManager;
+use crate::graph::frame::{DrawPlanStore, PreparedDrawSource, PreparedDrawStore};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
-use myth_resources::BoundingBox;
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::material::AlphaMode;
 use myth_resources::shader_defines::ShaderDefines;
 use myth_resources::uniforms::{
     DynamicModelUniforms, EnvironmentUniforms, GpuLightStorage, LightBufferMetadata, Mat3Uniform,
 };
+use myth_resources::{BoundingBox, RenderableMaterialTrait};
 use myth_scene::background::BackgroundMode;
 use myth_scene::camera::RenderCamera;
 use myth_scene::environment::Environment;
@@ -54,6 +55,12 @@ pub struct ExtractedRenderItem {
     pub geometry: GeometryHandle,
     /// Material handle (8 bytes)
     pub material: MaterialHandle,
+    /// Exact loaded asset stamps captured with the CPU snapshot. Public
+    /// versions alone can ABA when a reserved slot is repopulated.
+    pub(crate) geometry_asset_version: u32,
+    pub(crate) geometry_asset_identity: u64,
+    pub(crate) material_asset_version: u32,
+    pub(crate) material_asset_identity: u64,
 
     /// Exact skeleton selected while the Scene is still borrowed.
     pub(crate) skeleton: Option<SkeletonKey>,
@@ -61,24 +68,13 @@ pub struct ExtractedRenderItem {
     pub item_variant_flags: u32,
 
     pub item_shader_defines: ShaderDefines,
+    pub(crate) item_shader_defines_hash: u64,
 
     pub cast_shadows: bool,
     pub receive_shadows: bool,
 
     /// World-space axis-aligned bounding box.
     pub world_aabb: BoundingBox,
-}
-
-/// Physical per-item state prepared after CPU extraction.
-///
-/// This store stays parallel to [`ExtractedScene::render_items`]. Keeping the
-/// WGPU bind group out of [`ExtractedRenderItem`] preserves a CPU-only scene
-/// snapshot while allowing every view of one source item to share one model
-/// uniform slot.
-#[derive(Clone)]
-pub(crate) struct PreparedRenderItem {
-    pub(crate) object_bind_group: BindGroupContext,
-    pub(crate) dynamic_offset: u32,
 }
 
 #[derive(Clone)]
@@ -149,9 +145,6 @@ pub struct ExtractedScene {
     /// All active render items (NOT frustum-culled).
     /// Each `RenderView` in the Cull phase filters and culls from this list.
     pub render_items: Vec<ExtractedRenderItem>,
-    /// Physical state indexed exactly like `render_items`.
-    prepared_render_items: Vec<Option<PreparedRenderItem>>,
-    draw_resources_prepared: bool,
     /// Scene's shader macro definitions
     pub scene_id: u32,
     pub scene_variants: SceneFeatures,
@@ -178,6 +171,12 @@ pub struct ExtractedScene {
 
 struct CollectedMesh {
     pub node_handle: NodeHandle,
+    pub geometry: GeometryHandle,
+    pub material: MaterialHandle,
+    pub geometry_asset_version: u32,
+    pub geometry_asset_identity: u64,
+    pub material_asset_version: u32,
+    pub material_asset_identity: u64,
     pub skeleton: Option<SkeletonKey>,
 
     pub world_matrix: Mat4,
@@ -194,8 +193,6 @@ impl ExtractedScene {
     pub fn new() -> Self {
         Self {
             render_items: Vec::new(),
-            prepared_render_items: Vec::new(),
-            draw_resources_prepared: false,
             scene_id: 0,
             scene_variants: SceneFeatures::empty(),
             scene_defines: ShaderDefines::new(),
@@ -236,8 +233,6 @@ impl ExtractedScene {
     pub fn with_capacity(item_capacity: usize) -> Self {
         Self {
             render_items: Vec::with_capacity(item_capacity),
-            prepared_render_items: Vec::with_capacity(item_capacity),
-            draw_resources_prepared: false,
             scene_id: 0,
             scene_variants: SceneFeatures::empty(),
             scene_defines: ShaderDefines::new(),
@@ -276,8 +271,6 @@ impl ExtractedScene {
     /// Clear data for reuse
     pub fn clear(&mut self) {
         self.render_items.clear();
-        self.prepared_render_items.clear();
-        self.draw_resources_prepared = false;
         self.scene_defines.clear();
         self.scene_id = 0;
         self.lights.clear();
@@ -577,6 +570,12 @@ impl ExtractedScene {
 
                 self.collected_meshes.push(CollectedMesh {
                     node_handle,
+                    geometry: mesh.geometry,
+                    material: mesh.material,
+                    geometry_asset_version: geometry.version,
+                    geometry_asset_identity: geometry.identity,
+                    material_asset_version: material.version,
+                    material_asset_identity: material.identity,
                     skeleton: skeleton_key,
                     world_matrix,
                     prev_world_matrix,
@@ -592,16 +591,12 @@ impl ExtractedScene {
         // Phase 2: Build CPU-only render items (no asset lock)
         // =========================================================
         for item in &self.collected_meshes {
-            let Some(mesh) = scene.meshes.get(item.node_handle) else {
-                continue;
-            };
-
             let mut item_shader_defines = ShaderDefines::with_capacity(1);
 
             if item.skeleton.is_some() {
                 item_shader_defines.set("HAS_SKINNING", "1");
             }
-            if mesh.receive_shadows {
+            if item.receive_shadows {
                 item_shader_defines.set("RECEIVE_SHADOWS", "1");
             }
 
@@ -609,10 +604,15 @@ impl ExtractedScene {
                 node_handle: item.node_handle,
                 world_matrix: item.world_matrix,
                 prev_world_matrix: item.prev_world_matrix,
-                geometry: mesh.geometry,
-                material: mesh.material,
+                geometry: item.geometry,
+                material: item.material,
+                geometry_asset_version: item.geometry_asset_version,
+                geometry_asset_identity: item.geometry_asset_identity,
+                material_asset_version: item.material_asset_version,
+                material_asset_identity: item.material_asset_identity,
                 skeleton: item.skeleton,
                 item_variant_flags: item.item_variant_flags,
+                item_shader_defines_hash: item_shader_defines.compute_hash(),
                 item_shader_defines,
                 cast_shadows: item.cast_shadows,
                 receive_shadows: item.receive_shadows,
@@ -621,64 +621,104 @@ impl ExtractedScene {
         }
     }
 
-    /// Prepare the physical resources consumed by central draw-list building.
+    /// Resolve CPU-visible materials before graph construction.
     ///
-    /// Model slots are allocated once per source item that reaches at least
-    /// one main or shadow view, then flushed before any object bind group is
-    /// selected. If the model buffer grows,
-    /// `flush_model_buffers` therefore invalidates the old object cache before
-    /// this frame obtains its bind groups, never after commands have captured
-    /// them. Main, prepass, and every shadow view share the resulting offset.
+    /// This is the one intentionally retained pre-DPE physical boundary:
+    /// first-time material preparation can enqueue texture mipmap producers,
+    /// and those requests must exist before Composer snapshots them into the
+    /// graph. Geometry, model data, skeletons, object bindings, and pipelines
+    /// remain untouched here and are gated by the live-source union below.
+    pub(crate) fn prepare_draw_materials(
+        &self,
+        assets: &AssetServer,
+        resource_manager: &mut ResourceManager,
+        visible_source_indices: &[u32],
+    ) {
+        let mut prepared_materials = HashSet::new();
+        let mut previous = None;
+        for &source_item_index in visible_source_indices {
+            assert!(
+                previous.is_none_or(|previous| previous < source_item_index),
+                "visible draw source indices must be sorted and deduplicated"
+            );
+            previous = Some(source_item_index);
+
+            let item = self
+                .render_items
+                .get(source_item_index as usize)
+                .expect("visible draw source index exceeds the extracted item table");
+            if assets.materials.get_version_and_identity(item.material)
+                != Some((item.material_asset_version, item.material_asset_identity))
+            {
+                continue;
+            }
+            if prepared_materials.insert(item.material) {
+                resource_manager.prepare_material(assets, item.material);
+            }
+        }
+    }
+
+    /// Materialize the exact source union selected by DPE-live draw plans.
+    ///
+    /// Every source receives one model slot shared by main, prepass, and all
+    /// shadow views. All slots are allocated before the single model-buffer
+    /// flush; object BindGroups therefore capture only the final physical
+    /// buffer. Exact geometry/material/object resources are interned into the
+    /// graph-attempt [`DrawPlanStore`], while [`PreparedDrawStore`] keeps the
+    /// interface metadata needed by live pipeline derivation.
     pub(crate) fn prepare_draw_resources(
-        &mut self,
+        &self,
         scene: &mut Scene,
         assets: &AssetServer,
         resource_manager: &mut ResourceManager,
-        active_views: &[RenderView],
+        live_source_indices: &[u32],
+        prepared_draws: &mut PreparedDrawStore,
+        draw_plans: &mut DrawPlanStore,
     ) {
-        assert!(
-            !self.draw_resources_prepared,
-            "draw resources may be prepared only once per extracted frame"
-        );
-        self.draw_resources_prepared = true;
+        let prepared_table_len = live_source_indices.last().map_or(0, |&index| {
+            usize::try_from(index)
+                .expect("source index must fit the target pointer width")
+                .checked_add(1)
+                .expect("prepared draw source table length overflowed")
+        });
+        prepared_draws.begin_sources(prepared_table_len);
 
-        assert_eq!(
-            active_views
-                .iter()
-                .filter(|view| matches!(view.target, ViewTarget::MainCamera))
-                .count(),
-            1,
-            "central draw preparation requires exactly one main-camera view"
-        );
-
-        let mut dynamic_offsets = Vec::with_capacity(self.render_items.len());
+        let mut dynamic_offsets = Vec::with_capacity(live_source_indices.len());
         let mut required_skeletons = HashSet::<SkeletonKey>::default();
-        for item in &self.render_items {
-            if !Self::item_reaches_any_draw_view(item, active_views) {
-                dynamic_offsets.push(None);
-                continue;
-            }
+        let mut previous = None;
+        for &source_item_index in live_source_indices {
+            assert!(
+                previous.is_none_or(|previous| previous < source_item_index),
+                "live draw source indices must be sorted and deduplicated"
+            );
+            previous = Some(source_item_index);
+            let item = self
+                .render_items
+                .get(source_item_index as usize)
+                .expect("live draw source index exceeds the extracted item table");
 
             let world_matrix_inverse = item.world_matrix.inverse();
             let normal_matrix = Mat3Uniform::from_mat4(world_matrix_inverse.transpose());
-            dynamic_offsets.push(Some(resource_manager.allocate_model_uniform(
-                DynamicModelUniforms {
-                    world_matrix: item.world_matrix,
-                    world_matrix_inverse,
-                    normal_matrix,
-                    previous_world_matrix: item.prev_world_matrix,
-                    ..Default::default()
-                },
-            )));
+            let dynamic_offset = resource_manager.allocate_model_uniform(DynamicModelUniforms {
+                world_matrix: item.world_matrix,
+                world_matrix_inverse,
+                normal_matrix,
+                previous_world_matrix: item.prev_world_matrix,
+                ..Default::default()
+            });
+            dynamic_offsets.push((source_item_index, dynamic_offset));
             if let Some(skeleton) = item.skeleton {
                 required_skeletons.insert(skeleton);
             }
         }
 
-        // This is the only model-buffer flush for central scene draws. It must
-        // precede object bind-group lookup because a capacity growth replaces
-        // the physical WGPU buffer and clears the persistent object cache.
-        resource_manager.flush_model_buffers();
+        if !dynamic_offsets.is_empty() {
+            // This is the only model-buffer flush for central scene draws. It
+            // precedes every object BindGroup lookup because a capacity growth
+            // replaces the physical WGPU buffer and clears the persistent
+            // object cache.
+            resource_manager.flush_model_buffers();
+        }
 
         for skeleton_key in &required_skeletons {
             if let Some(skeleton) = scene.skeleton_pool.get(*skeleton_key) {
@@ -686,73 +726,164 @@ impl ExtractedScene {
             }
         }
 
-        self.prepared_render_items
-            .resize_with(self.render_items.len(), || None);
-
         let skeleton_pool = &scene.skeleton_pool;
         let meshes = &mut scene.meshes;
-        for (source_item_index, item) in self.render_items.iter().enumerate() {
-            let Some(dynamic_offset) = dynamic_offsets[source_item_index] else {
-                continue;
-            };
+        for (source_item_index, dynamic_offset) in dynamic_offsets {
+            let item = &self.render_items[source_item_index as usize];
             let skeleton = item.skeleton.and_then(|key| skeleton_pool.get(key));
             let Some(mesh) = meshes.get_mut(item.node_handle) else {
                 continue;
             };
+            if (mesh.geometry, mesh.material) != (item.geometry, item.material) {
+                // The Scene changed after extraction. Never combine the old
+                // intent classification with a different physical mesh.
+                continue;
+            }
+            let Some((geometry_asset, geometry_asset_version, geometry_asset_identity)) =
+                assets.geometries.get_entry_with_identity(item.geometry)
+            else {
+                continue;
+            };
+            let Some((material_asset, material_asset_version, material_asset_identity)) =
+                assets.materials.get_entry_with_identity(item.material)
+            else {
+                continue;
+            };
+            if (geometry_asset_version, geometry_asset_identity)
+                != (item.geometry_asset_version, item.geometry_asset_identity)
+                || (material_asset_version, material_asset_identity)
+                    != (item.material_asset_version, item.material_asset_identity)
+                || !resource_manager
+                    .get_material(item.material)
+                    .is_some_and(|gpu_material| {
+                        (gpu_material.asset_version, gpu_material.asset_identity)
+                            == (material_asset_version, material_asset_identity)
+                            && gpu_material.version == material_asset.data.version()
+                    })
+            {
+                // A material changed after the pre-graph producer snapshot.
+                // Defer it to the next frame instead of creating an untracked
+                // texture/mipmap request after graph compilation.
+                continue;
+            }
 
             // Pack current/previous morph weights only after target acquire.
             // Temporal history remains unchanged until successful submit.
             mesh.prepare_morph_uniforms();
-            let Some(object_bind_group) = resource_manager.prepare_mesh(assets, mesh, skeleton)
+            let Some(object_bind_group) =
+                resource_manager.prepare_draw_object(assets, mesh, skeleton)
             else {
                 continue;
             };
+            if assets.geometries.get_version_and_identity(item.geometry)
+                != Some((geometry_asset_version, geometry_asset_identity))
+                || assets.materials.get_version_and_identity(item.material)
+                    != Some((material_asset_version, material_asset_identity))
+            {
+                // An asynchronous replacement raced physical preparation.
+                // The persistent cache may warm, but this graph attempt never
+                // publishes a mixed old/new source record.
+                continue;
+            }
 
-            self.prepared_render_items[source_item_index] = Some(PreparedRenderItem {
-                object_bind_group,
-                dynamic_offset,
-            });
+            let Some(gpu_geometry) = resource_manager.get_geometry(item.geometry) else {
+                continue;
+            };
+            let Some(gpu_material) = resource_manager.get_material(item.material) else {
+                continue;
+            };
+            if (gpu_geometry.asset_version, gpu_geometry.asset_identity)
+                != (geometry_asset_version, geometry_asset_identity)
+                || (gpu_material.asset_version, gpu_material.asset_identity)
+                    != (material_asset_version, material_asset_identity)
+                || gpu_geometry.version != geometry_asset.structure_version()
+                || gpu_material.version != material_asset.data.version()
+            {
+                continue;
+            }
+            assert_eq!(
+                gpu_geometry.vertex_buffers.len(),
+                gpu_geometry.vertex_buffer_ids.len(),
+                "geometry buffer handles and physical IDs must stay aligned"
+            );
+
+            let mut vertex_buffers = SmallVec::with_capacity(gpu_geometry.vertex_buffers.len());
+            for (buffer, &id) in gpu_geometry
+                .vertex_buffers
+                .iter()
+                .zip(&gpu_geometry.vertex_buffer_ids)
+            {
+                vertex_buffers.push(draw_plans.intern_buffer(buffer, id));
+            }
+            let index_buffer =
+                gpu_geometry
+                    .index_buffer
+                    .as_ref()
+                    .map(|(buffer, format, count, id)| {
+                        (draw_plans.intern_buffer(buffer, *id), *format, *count)
+                    });
+            let material_bind_group =
+                draw_plans.intern_bind_group(&gpu_material.bind_group, gpu_material.bind_group_id);
+            let object_bind_group_slot = draw_plans.intern_bind_group(
+                &object_bind_group.bind_group,
+                object_bind_group.bind_group_id,
+            );
+            let geometry_layout_version = geometry_asset.layout_version();
+
+            prepared_draws.insert_source(
+                source_item_index,
+                PreparedDrawSource {
+                    geometry_asset,
+                    material_asset,
+                    geometry_asset_version,
+                    geometry_asset_identity,
+                    material_asset_version,
+                    material_asset_identity,
+                    vertex_buffers,
+                    index_buffer,
+                    material_bind_group,
+                    material_bind_group_id: gpu_material.bind_group_id,
+                    object_bind_group: (object_bind_group_slot, dynamic_offset),
+                    draw_range: gpu_geometry.draw_range.clone(),
+                    instance_range: gpu_geometry.instance_range.clone(),
+                    geometry_layout_info: gpu_geometry.layout_info.clone(),
+                    geometry_layout_id: gpu_geometry.layout_id,
+                    geometry_version: gpu_geometry.version,
+                    geometry_layout_version,
+                    material_layout: gpu_material.layout.clone(),
+                    material_layout_id: gpu_material.layout_id,
+                    material_binding_wgsl: gpu_material.binding_wgsl.clone(),
+                    material_binding_wgsl_hash: gpu_material.binding_wgsl_hash,
+                    material_version: gpu_material.version,
+                    object_layout: object_bind_group.layout,
+                    object_layout_id: object_bind_group.layout_id,
+                    object_binding_wgsl: object_bind_group.binding_wgsl,
+                    object_binding_wgsl_hash: object_bind_group.binding_wgsl_hash,
+                },
+            );
         }
     }
 
     /// Advance CPU morph history for draw resources consumed by a submitted
     /// frame. Abandoned composers and failed target acquisition never call
     /// this commit boundary.
-    pub(crate) fn commit_prepared_draw_history(&self, scene: &mut Scene) {
-        for (source_item_index, prepared) in self.prepared_render_items.iter().enumerate() {
-            if prepared.is_none() {
+    pub(crate) fn commit_prepared_draw_history(
+        &self,
+        scene: &mut Scene,
+        draw_plans: &DrawPlanStore,
+    ) {
+        let mut committed_sources = HashSet::new();
+        for source_item_index in draw_plans.emitted_source_indices() {
+            if !committed_sources.insert(source_item_index) {
                 continue;
             }
-            let Some(item) = self.render_items.get(source_item_index) else {
+            let Some(item) = self.render_items.get(source_item_index as usize) else {
                 continue;
             };
             if let Some(mesh) = scene.meshes.get_mut(item.node_handle) {
                 mesh.commit_morph_history();
             }
         }
-    }
-
-    #[inline]
-    #[must_use]
-    pub(crate) fn prepared_render_item(
-        &self,
-        source_item_index: usize,
-    ) -> Option<&PreparedRenderItem> {
-        self.prepared_render_items
-            .get(source_item_index)
-            .and_then(Option::as_ref)
-    }
-
-    #[inline]
-    fn item_reaches_any_draw_view(item: &ExtractedRenderItem, active_views: &[RenderView]) -> bool {
-        active_views.iter().any(|view| {
-            let participates = match view.target {
-                ViewTarget::MainCamera => true,
-                ViewTarget::ShadowLight { .. } => item.cast_shadows,
-            };
-            participates
-                && (!item.world_aabb.is_finite() || view.frustum.intersects_aabb(&item.world_aabb))
-        })
     }
 
     /// Extract environment data

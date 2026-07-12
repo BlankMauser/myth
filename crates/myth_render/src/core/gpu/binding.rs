@@ -168,14 +168,45 @@ impl ResourceManager {
         mesh: &Mesh,
         skeleton: Option<&Skeleton>,
     ) -> Option<BindGroupContext> {
+        self.prepare_mesh_internal(assets, mesh, skeleton, true)
+    }
+
+    /// Prepare geometry and the per-object binding after the material was
+    /// resolved before RDG construction.
+    ///
+    /// Live DrawPlan materialization uses this entry point after DPE. It must
+    /// not discover a new material texture/mipmap producer after topology has
+    /// already been compiled, so a missing pre-resolved material fails closed.
+    pub(crate) fn prepare_draw_object(
+        &mut self,
+        assets: &AssetServer,
+        mesh: &Mesh,
+        skeleton: Option<&Skeleton>,
+    ) -> Option<BindGroupContext> {
+        self.prepare_mesh_internal(assets, mesh, skeleton, false)
+    }
+
+    fn prepare_mesh_internal(
+        &mut self,
+        assets: &AssetServer,
+        mesh: &Mesh,
+        skeleton: Option<&Skeleton>,
+        prepare_material: bool,
+    ) -> Option<BindGroupContext> {
         // Object bindings are valid only after every source item has reserved
         // its dynamic slot and the model buffer can no longer grow this frame.
         self.model_allocator.assert_frozen();
 
         // === Ensure phase: ensure all resources are uploaded ===
         self.ensure_buffer(&mesh.morph_uniforms);
-        self.prepare_geometry(assets, mesh.geometry);
-        self.prepare_material(assets, mesh.material);
+        if !self.prepare_geometry(assets, mesh.geometry) {
+            return None;
+        }
+        if prepare_material {
+            self.prepare_material(assets, mesh.material);
+        } else if self.get_material(mesh.material).is_none() {
+            return None;
+        }
 
         let geometry = assets.geometries.get(mesh.geometry)?;
 
@@ -237,6 +268,7 @@ impl ResourceManager {
         // Cache miss: reuse the exact builder that was prepared and
         // fingerprinted above to create the physical BindGroup.
         let binding_wgsl = builder.generate_wgsl(2);
+        let binding_wgsl_hash = super::hash_binding_wgsl(&binding_wgsl);
         let layout = newly_created_layout.unwrap_or_else(|| {
             let (layout, resolved_layout_id) = self.get_or_create_layout(&layout_entries);
             debug_assert_eq!(layout_id, resolved_layout_id);
@@ -250,6 +282,7 @@ impl ResourceManager {
             bind_group,
             bind_group_id,
             binding_wgsl: binding_wgsl.into(),
+            binding_wgsl_hash,
         };
 
         self.bind_groups.cache_object_bind_group(
@@ -596,13 +629,15 @@ impl ResourceManager {
             NEXT_GLOBAL_STATE_ID.fetch_add(1, Ordering::Relaxed)
         };
 
+        let binding_wgsl = builder.generate_wgsl(0);
         let gpu_state = GpuGlobalState {
             id: new_id,
             bind_group,
             bind_group_id,
             layout,
             layout_id,
-            binding_wgsl: builder.generate_wgsl(0),
+            binding_wgsl_hash: super::hash_binding_wgsl(&binding_wgsl),
+            binding_wgsl,
             resource_ids,
             last_used_frame: self.frame_index,
         };

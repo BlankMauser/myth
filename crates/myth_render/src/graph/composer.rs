@@ -114,7 +114,7 @@ pub struct ComposerContext<'a> {
 
     pub global_bind_group_cache: &'a mut GlobalBindGroupCache,
 
-    /// Render lists (populated by `SceneCullPass`)
+    /// CPU-only per-view draw intents and active render views.
     pub render_lists: &'a mut RenderLists,
 
     // External scene data
@@ -496,28 +496,24 @@ impl<'a> FrameComposer<'a> {
             return;
         }
 
-        // ━━━ 2a. Derive central scene draw sources ━━━━━━━━━━━━━━━━━━━━━━
+        // ━━━ 2a. Collect CPU-only central draw intents ━━━━━━━━━━━━━━━━━━
         //
-        // Keep main/shadow pipeline derivation, model-uniform allocation, and
-        // model-buffer upload behind both Composer ownership and successful
-        // render-target acquisition. A Composer dropped by the caller, or a
-        // failed surface acquire, therefore performs none of this GPU work.
-        self.ctx.extracted_scene.prepare_draw_resources(
-            self.ctx.scene,
-            self.ctx.assets,
-            self.ctx.resource_manager,
-            &self.ctx.render_lists.active_views,
-        );
-        crate::graph::culling::cull_and_sort(
+        // Intent collection determines topology-affecting transmission and
+        // per-view source membership without touching WGPU resources. Material
+        // resolution remains the one compatibility boundary here because its
+        // first use can enqueue texture/mipmap producers that must be captured
+        // by the graph built below.
+        crate::graph::culling::collect_draw_intents(
             self.ctx.extracted_scene,
-            self.ctx.render_state,
-            self.ctx.wgpu_ctx,
-            self.ctx.resource_manager,
-            self.ctx.pipeline_cache,
-            self.ctx.shader_manager,
             self.ctx.render_lists,
             &self.ctx.camera,
             self.ctx.assets,
+        );
+        let visible_draw_sources = self.ctx.render_lists.all_source_indices();
+        self.ctx.extracted_scene.prepare_draw_materials(
+            self.ctx.assets,
+            self.ctx.resource_manager,
+            &visible_draw_sources,
         );
 
         // ━━━ 2b. Build Unified RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1745,16 +1741,36 @@ impl<'a> FrameComposer<'a> {
                         pmrem_override,
                     );
             }
-            self.ctx.render_lists.gpu_global_bind_group = Some(
-                self.ctx
-                    .resource_manager
-                    .get_global_state(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id)
-                    .expect("global state missing after PMREM refresh")
-                    .bind_group
-                    .clone(),
+            let global_state = self
+                .ctx
+                .resource_manager
+                .get_global_state(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id)
+                .expect("global state missing after PMREM refresh");
+            graph
+                .storage
+                .prepared_global_bind_group
+                .stage(&global_state.bind_group);
+
+            // ─── 3a. Materialize the DPE-live central source union ───────
+            //
+            // Draw-plan demand marks are the sole liveness authority. Main,
+            // Prepass, and any number of shadow views share one source slot;
+            // dead plan branches never allocate model data, geometry, object
+            // bindings, or pipelines.
+            let live_draw_sources = self
+                .ctx
+                .render_lists
+                .live_source_indices(graph.storage.draw_plans.live_keys());
+            self.ctx.extracted_scene.prepare_draw_resources(
+                self.ctx.scene,
+                self.ctx.assets,
+                self.ctx.resource_manager,
+                &live_draw_sources,
+                &mut graph.storage.prepared_draws,
+                &mut graph.storage.draw_plans,
             );
 
-            // ─── 3a. RDG Prepare: live-pass deferred preparation ───────────
+            // ─── 3b. RDG Prepare: live-pass deferred preparation ───────────
             //
             // Only the swapchain surface is truly external — all other textures
             // (scene_color, scene_depth, etc.) are RDG transient resources.
@@ -1782,7 +1798,9 @@ impl<'a> FrameComposer<'a> {
                     scene_draws: SceneDrawPrepareContext {
                         render_lists: self.ctx.render_lists,
                         extracted_scene: self.ctx.extracted_scene,
+                        prepared_draws: &graph.storage.prepared_draws,
                         depth_format: self.ctx.wgpu_ctx.depth_format,
+                        pipeline_settings_version: self.ctx.wgpu_ctx.pipeline_settings_version,
                         draw_plans: &mut graph.storage.draw_plans,
                     },
                     mipmap_generator,
@@ -1819,17 +1837,20 @@ impl<'a> FrameComposer<'a> {
             // physical resource tables and compact command ranges.
             crate::graph::bake::finalize_live_draw_plans(
                 &mut graph.storage.draw_plans,
+                &graph.storage.prepared_draws,
                 self.ctx.render_lists,
+                self.ctx.extracted_scene,
+                self.ctx.render_state,
+                self.ctx.wgpu_ctx,
                 self.ctx.resource_manager,
                 self.ctx.pipeline_cache,
+                self.ctx.shader_manager,
+                &self.ctx.camera,
             );
-            graph.storage.prepared_global_bind_group.stage(
-                self.ctx
-                    .render_lists
-                    .gpu_global_bind_group
-                    .as_ref()
-                    .expect("global bind group was not built before graph execution"),
-            );
+            // Execute consumes only finalized DrawCommands. Release exact CPU
+            // asset/interface owners as soon as every live plan is baked;
+            // DrawPlanStore continues to own the physical WGPU handles.
+            graph.storage.prepared_draws.clear();
 
             // ─── 3d. Execute ───────────────────────────────────────────────
 
@@ -1883,7 +1904,7 @@ impl<'a> FrameComposer<'a> {
             // reports an internal error.
             self.ctx
                 .extracted_scene
-                .commit_prepared_draw_history(self.ctx.scene);
+                .commit_prepared_draw_history(self.ctx.scene, &graph.storage.draw_plans);
             graph.commit_submitted_asset_texture_mipmaps();
             if let Some(batch) = mipmap_batch {
                 let committed = graph.commit_submitted_mipmap_batch(batch);

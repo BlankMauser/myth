@@ -13,7 +13,9 @@ use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
-use crate::graph::frame::{DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedGlobalBindGroup};
+use crate::graph::frame::{
+    DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedDrawStore, PreparedGlobalBindGroup,
+};
 
 use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
@@ -201,6 +203,9 @@ pub struct GraphStorage {
     /// Destructor-aware physical resources and compact commands for scene
     /// draws selected during post-prepare baking.
     pub(crate) draw_plans: DrawPlanStore,
+    /// Graph-attempt source records materialized only for the source-item
+    /// union selected by DPE-live draw plans.
+    pub(crate) prepared_draws: PreparedDrawStore,
     /// Pass-level scene-global bind group, staged independently from draw
     /// plans because it is not per-command state.
     pub(crate) prepared_global_bind_group: PreparedGlobalBindGroup,
@@ -252,6 +257,7 @@ impl GraphStorage {
             mipmap_encode_coordinator: MipmapEncodeCoordinator::default(),
             prepared_bind_groups: PreparedBindGroupStore::new(),
             draw_plans: DrawPlanStore::new(),
+            prepared_draws: PreparedDrawStore::new(),
             prepared_global_bind_group: PreparedGlobalBindGroup::default(),
             #[cfg(feature = "3dgs")]
             gaussian_frame_batches: Vec::new(),
@@ -296,6 +302,9 @@ impl GraphStorage {
         self.mipmap_batches.clear();
         self.mipmap_encode_coordinator.clear();
         self.prepared_bind_groups.clear();
+        // Source records address resource slots owned by draw_plans, so drop
+        // those records before resetting the sibling slot tables/token.
+        self.prepared_draws.clear();
         self.draw_plans.clear();
         self.prepared_global_bind_group.clear();
         #[cfg(feature = "3dgs")]
@@ -1813,11 +1822,14 @@ impl<'a> RenderGraph<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::core::{ResourceManager, WgpuContext};
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
     use crate::graph::{composer::GraphBuilderContext, core::context::ExecuteContext};
+    use crate::pipeline::vertex::GeneratedVertexLayout;
     use crate::settings::{RendererInitConfig, RendererSettings};
     use myth_assets::AssetServer;
     use myth_resources::image::{Image, ImageDimension, PixelFormat};
@@ -1881,10 +1893,51 @@ mod tests {
         assert_eq!(storage.draw_plans.buffer_owner_count(), 1);
         assert_eq!(storage.draw_plans.bind_group_owner_count(), 1);
 
+        storage.prepared_draws.begin_sources(1);
+        storage.prepared_draws.insert_source(
+            0,
+            crate::graph::frame::PreparedDrawSource {
+                geometry_asset: Arc::new(myth_resources::geometry::Geometry::default()),
+                material_asset: Arc::new(myth_resources::material::Material::new_unlit(
+                    glam::Vec4::ONE,
+                )),
+                geometry_asset_version: 0,
+                geometry_asset_identity: 0,
+                material_asset_version: 0,
+                material_asset_identity: 0,
+                vertex_buffers: smallvec::smallvec![buffer_slot],
+                index_buffer: None,
+                material_bind_group: bind_group_slot,
+                material_bind_group_id: 73,
+                object_bind_group: (bind_group_slot, 0),
+                draw_range: 0..3,
+                instance_range: 0..1,
+                geometry_layout_info: Arc::new(GeneratedVertexLayout {
+                    buffers: Vec::new(),
+                    vertex_input_code: String::new(),
+                    attribute_locations: rustc_hash::FxHashMap::default(),
+                }),
+                geometry_layout_id: 11,
+                geometry_version: 12,
+                geometry_layout_version: 0,
+                material_layout: layout.clone(),
+                material_layout_id: 13,
+                material_binding_wgsl: Arc::from(""),
+                material_binding_wgsl_hash: 0,
+                material_version: 14,
+                object_layout: layout.clone(),
+                object_layout_id: 15,
+                object_binding_wgsl: Arc::from(""),
+                object_binding_wgsl_hash: 0,
+            },
+        );
+        assert!(storage.prepared_draws.source(0).is_some());
+
         let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
         storage.draw_plans.mark_live(plan);
         let start = storage.draw_plans.begin_finalize(plan);
         storage.draw_plans.push_command(crate::graph::DrawCommand {
+            source_item_index: 0,
             sort_key: 0,
             pipeline_id: crate::pipeline::RenderPipelineId(0),
             vertex_buffers: smallvec::smallvec![buffer_slot],
@@ -1911,9 +1964,44 @@ mod tests {
         let _ = storage.prepared_global_bind_group.resolve();
 
         storage.release_frame_owners();
+        assert!(storage.prepared_draws.source(0).is_none());
+        // clear() resets the one-shot initialization barrier for a new graph
+        // attempt while retaining capacity.
+        storage.prepared_draws.begin_sources(1);
         assert!(storage.draw_plans.is_empty());
         assert!(storage.prepared_global_bind_group.is_empty());
         assert!(storage.draw_plans.resolve_plan(plan).is_none());
+    }
+
+    #[test]
+    fn render_graph_drop_releases_graph_attempt_state() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let generation = PhysicalImageGenerationKey {
+            physical: PhysicalImageId::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001)),
+            allocation: 17,
+            generation: 23,
+        };
+
+        let stale_plan;
+        {
+            let graph = RenderGraph::new(&mut storage, &arena);
+            assert!(
+                graph
+                    .storage
+                    .mipmap_encode_coordinator
+                    .try_claim(generation)
+            );
+            graph.storage.prepared_draws.begin_sources(0);
+            stale_plan = graph.storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
+            graph.storage.draw_plans.mark_live(stale_plan);
+        }
+
+        assert!(storage.mipmap_encode_coordinator.is_empty());
+        assert!(storage.draw_plans.is_empty());
+        assert!(storage.draw_plans.resolve_plan(stale_plan).is_none());
+        assert!(storage.prepared_draws.source(0).is_none());
+        storage.prepared_draws.begin_sources(0);
     }
 
     #[test]

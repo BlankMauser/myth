@@ -6,7 +6,7 @@
 //! - [`RenderState`]: Render state (camera, time, etc.)
 //! - [`ExtractedScene`]: Scene data extracted for GPU rendering
 //! - [`FrameComposer`]: Chainable API for frame composition (hook-based RDG)
-//! - [`RenderLists`]: Sorted render command lists
+//! - [`RenderLists`]: CPU-only main/shadow draw-intent lists
 
 pub mod bake;
 pub mod composer;
@@ -20,7 +20,9 @@ pub mod shadow_utils;
 
 pub use composer::FrameComposer;
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton};
-pub use frame::{DrawCommand, DrawPlanId, RenderCommand, RenderFrame, RenderKey, RenderLists};
+pub use frame::{
+    DrawCommand, DrawPlanId, RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,
+};
 #[cfg(feature = "debug_view")]
 pub use render_state::DebugViewTarget;
 pub use render_state::RenderState;

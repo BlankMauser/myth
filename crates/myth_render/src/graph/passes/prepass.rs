@@ -19,12 +19,13 @@ use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ExecuteContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
 };
-use crate::graph::frame::{DrawPlanId, DrawPlanKey};
+use crate::graph::frame::{DrawPlanId, DrawPlanKey, RenderKey};
 use crate::graph::passes::draw::submit_draw_commands;
 use crate::pipeline::{
     ColorTargetKey, DepthStencilKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
     SimpleGeometryPipelineKey,
 };
+use myth_assets::{GeometryHandle, MaterialHandle};
 use myth_resources::material::Side;
 
 /// Normal texture format — Rgba8Unorm ([-1,1] → [0,1] mapping).
@@ -72,8 +73,39 @@ pub struct PrepassOutputs {
 /// The Feature owns only cross-frame derived pipeline IDs. Missing variants
 /// are compiled by a live [`PrepassPassNode`] after DPE.
 pub struct PrepassFeature {
-    /// Pipeline cache: (main_pipeline_id, needs_normal, needs_feature_id, needs_velocity) → prepass pipeline.
-    local_cache: FxHashMap<(RenderPipelineId, bool, bool, bool), RenderPipelineId>,
+    /// Feature-local L1 over canonical Prepass inputs. It is intentionally
+    /// independent from a main-pass pipeline ID, so a Prepass-only live graph
+    /// never has to create an otherwise dead Opaque pipeline.
+    local_cache: FxHashMap<PrepassPipelineL1Key, RenderPipelineId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PrepassPipelineL1Key {
+    geometry_handle: GeometryHandle,
+    geometry_asset_version: u32,
+    geometry_asset_identity: u64,
+    geometry_layout_version: u64,
+    material_handle: MaterialHandle,
+    material_asset_version: u32,
+    material_asset_identity: u64,
+    material_version: u64,
+    item_variants: u32,
+    item_shader_defines_hash: u64,
+    shader_source_identity: u64,
+    scene_defines_hash: u64,
+    pipeline_settings_version: u64,
+    global_binding_wgsl_hash: u64,
+    material_binding_wgsl_hash: u64,
+    object_binding_wgsl_hash: u64,
+    vertex_layout_id: u64,
+    bind_group_layout_ids: [u64; 3],
+    depth_format: wgpu::TextureFormat,
+    topology: wgpu::PrimitiveTopology,
+    cull_mode: Option<wgpu::Face>,
+    front_face: wgpu::FrontFace,
+    needs_normal: bool,
+    needs_feature_id: bool,
+    needs_velocity: bool,
 }
 
 impl Default for PrepassFeature {
@@ -113,203 +145,244 @@ impl PrepassFeature {
         }
     }
 
-    /// Ensure prepass pipelines for the live plan's unique source pipelines.
-    fn ensure_pipelines(&mut self, ctx: &mut PrepareContext<'_>, snapshot: PrepassSnapshot) {
+    /// Derive missing Prepass variants and bake the live plan directly from
+    /// CPU intents plus graph-attempt source records.
+    #[allow(clippy::too_many_lines)]
+    fn prepare_draw_plan(
+        &mut self,
+        ctx: &mut PrepareContext<'_>,
+        snapshot: PrepassSnapshot,
+        plan: DrawPlanId,
+    ) {
+        if ctx.scene_draws.draw_plans.resolve_plan(plan).is_some() {
+            return;
+        }
+
+        let start = ctx.scene_draws.draw_plans.begin_finalize(plan);
         let Some(gpu_world) = ctx.global_states.get(snapshot.global_state_key) else {
+            ctx.scene_draws.draw_plans.finish_finalize(plan, start);
             return;
         };
-
+        let global_layout_id = gpu_world.layout_id;
+        let global_binding_wgsl_hash = gpu_world.binding_wgsl_hash;
         let depth_format = ctx.scene_draws.depth_format;
-        let gpu_world_binding_wgsl = gpu_world.binding_wgsl.clone();
-        let gpu_world_layout_clone = gpu_world.layout.clone();
+        let scene_defines_hash = ctx.scene_draws.extracted_scene.scene_defines.compute_hash();
+        let pipeline_settings_version = ctx.scene_draws.pipeline_settings_version;
+        let shader_source = ShaderSource::File("entry/utility/depth_prepass");
+        let shader_source_identity = ctx.shader_manager.source_identity_hash(shader_source);
 
-        let geo_guard = ctx.assets.geometries.read_lock();
-        let mat_guard = ctx.assets.materials.read_lock();
-
-        for cmd in &ctx.scene_draws.render_lists.opaque {
-            if self.local_cache.contains_key(&(
-                cmd.pipeline_id,
-                snapshot.needs_normal,
-                snapshot.needs_feature_id,
-                snapshot.needs_velocity,
-            )) {
-                continue;
-            }
-
-            let Some(geometry) = geo_guard.get_loaded(cmd.geometry_handle) else {
+        for intent in &ctx.scene_draws.render_lists.opaque {
+            let Some(source) = ctx
+                .scene_draws
+                .prepared_draws
+                .source(intent.source_item_index)
+            else {
                 continue;
             };
-            let Some(material) = mat_guard.get_loaded(cmd.material_handle) else {
-                continue;
-            };
-
-            if material.is_transparent() {
-                continue;
-            }
-
-            let Some(gpu_geometry) = ctx.uploads.get_geometry(cmd.geometry_handle) else {
-                continue;
-            };
-            let Some(gpu_material) = ctx.uploads.get_material(cmd.material_handle) else {
-                continue;
-            };
-
-            let source_index = usize::try_from(cmd.source_item_index)
-                .expect("RenderCommand source index must fit usize");
-            let extracted_item = ctx
+            let Some(extracted_item) = ctx
                 .scene_draws
                 .extracted_scene
                 .render_items
-                .get(source_index)
-                .expect("RenderCommand source index must address the extracted scene");
-            assert_eq!(
-                (extracted_item.geometry, extracted_item.material),
-                (cmd.geometry_handle, cmd.material_handle),
-                "RenderCommand source identity drifted after culling"
-            );
-            let item_variant_flags = extracted_item.item_variant_flags;
-            let item_shader_defines = &extracted_item.item_shader_defines;
-
-            // ── Shader defines ─────────────────────────────────────────
-            let geo_defines = geometry.shader_defines();
-            let mat_defines = material.shader_defines();
-
-            let mut options = ShaderCompilationOptions::from_merged(
-                &mat_defines,
-                geo_defines,
-                &ctx.scene_draws.extracted_scene.scene_defines,
-                item_shader_defines,
-            );
-
-            options.add_define("IS_PREPASS", "1");
-
-            if snapshot.needs_normal {
-                options.add_define("OUTPUT_NORMAL", "1");
+                .get(intent.source_item_index as usize)
+            else {
+                continue;
+            };
+            if !source.matches_extracted(
+                extracted_item,
+                intent.geometry_handle,
+                intent.material_handle,
+            ) {
+                continue;
             }
-            if snapshot.needs_velocity {
-                options.add_define("HAS_VELOCITY_TARGET", "1");
+            if !source.pipeline_state_is_current() {
+                continue;
             }
-            if snapshot.needs_feature_id {
-                options.add_define("OUTPUT_FEATURE_ID", "1");
+            let geometry = &source.geometry_asset;
+            let material = &source.material_asset;
+            if material.is_transparent() || material.use_transmission() {
+                continue;
             }
-
-            // ── Shader generation ──────────────────────────────────────
-            let binding_code = format!(
-                "{}\n{}\n{}",
-                gpu_world_binding_wgsl,
-                gpu_material.binding_wgsl,
-                cmd.object_bind_group.binding_wgsl
-            );
-
-            options.inject_code(
-                "vertex_input_code",
-                &gpu_geometry.layout_info.vertex_input_code,
-            );
-            options.inject_code("binding_code", binding_code);
-            options.inject_code(
-                "scene_lighting_structs",
-                myth_resources::uniforms::scene_lighting_structs_wgsl(),
-            );
-
-            let (shader_module, shader_hash) = ctx.shader_manager.get_or_compile(
-                ctx.device,
-                ShaderSource::File("entry/utility/depth_prepass"),
-                &options,
-            );
-
-            // ── Pipeline layout ────────────────────────────────────────
-            let layout = ctx
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Prepass Pipeline Layout"),
-                    bind_group_layouts: &[
-                        Some(&gpu_world_layout_clone),
-                        Some(&gpu_material.layout),
-                        Some(&cmd.object_bind_group.layout),
-                    ],
-                    immediate_size: 0,
-                });
-
-            let vertex_buffers_layout: Vec<_> = gpu_geometry
-                .layout_info
-                .buffers
-                .iter()
-                .map(|l| l.as_wgpu())
-                .collect();
 
             let cull_mode = match material.side() {
                 Side::Front => Some(wgpu::Face::Back),
                 Side::Back => Some(wgpu::Face::Front),
                 Side::Double => None,
             };
-
-            let front_face = if item_variant_flags & 0x1 != 0 {
+            let front_face = if extracted_item.item_variant_flags & 0x1 != 0 {
                 wgpu::FrontFace::Cw
             } else {
                 wgpu::FrontFace::Ccw
             };
-
-            // ── Color targets ──────────────────────────────────────────
-            let mut color_targets: smallvec::SmallVec<[ColorTargetKey; 3]> = smallvec::smallvec![];
-
-            if snapshot.needs_normal {
-                color_targets.push(ColorTargetKey::from(wgpu::ColorTargetState {
-                    format: NORMAL_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }));
-            }
-            if snapshot.needs_feature_id {
-                color_targets.push(ColorTargetKey::from(wgpu::ColorTargetState {
-                    format: FEATURE_ID_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }));
-            }
-            if snapshot.needs_velocity {
-                color_targets.push(ColorTargetKey::from(wgpu::ColorTargetState {
-                    format: VELOCITY_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }));
-            }
-
-            let prepass_key = SimpleGeometryPipelineKey {
-                shader_hash,
-                vertex_layout_id: gpu_geometry.layout_id,
-                color_targets,
-                depth_stencil: DepthStencilKey::from(wgpu::DepthStencilState {
-                    format: depth_format,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Greater),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
+            let l1_key = PrepassPipelineL1Key {
+                geometry_handle: intent.geometry_handle,
+                geometry_asset_version: source.geometry_asset_version,
+                geometry_asset_identity: source.geometry_asset_identity,
+                geometry_layout_version: source.geometry_layout_version,
+                material_handle: intent.material_handle,
+                material_asset_version: source.material_asset_version,
+                material_asset_identity: source.material_asset_identity,
+                material_version: source.material_version,
+                item_variants: extracted_item.item_variant_flags,
+                item_shader_defines_hash: extracted_item.item_shader_defines_hash,
+                shader_source_identity,
+                scene_defines_hash,
+                pipeline_settings_version,
+                global_binding_wgsl_hash,
+                material_binding_wgsl_hash: source.material_binding_wgsl_hash,
+                object_binding_wgsl_hash: source.object_binding_wgsl_hash,
+                vertex_layout_id: source.geometry_layout_id,
+                bind_group_layout_ids: [
+                    global_layout_id,
+                    source.material_layout_id,
+                    source.object_layout_id,
+                ],
+                depth_format,
                 topology: geometry.topology,
                 cull_mode,
                 front_face,
-                sample_count: 1,
+                needs_normal: snapshot.needs_normal,
+                needs_feature_id: snapshot.needs_feature_id,
+                needs_velocity: snapshot.needs_velocity,
             };
 
-            let pipeline_id = ctx.pipeline_cache.get_or_create_simple_geometry(
-                ctx.device,
-                shader_module,
-                &layout,
-                &prepass_key,
-                "Prepass Pipeline",
-                &vertex_buffers_layout,
-            );
+            let (pipeline_id, publish_l1) =
+                if let Some(&pipeline_id) = self.local_cache.get(&l1_key) {
+                    (pipeline_id, false)
+                } else {
+                    let geo_defines = geometry.shader_defines();
+                    let mat_defines = material.shader_defines();
+                    let mut options = ShaderCompilationOptions::from_merged(
+                        &mat_defines,
+                        geo_defines,
+                        &ctx.scene_draws.extracted_scene.scene_defines,
+                        &extracted_item.item_shader_defines,
+                    );
+                    options.add_define("IS_PREPASS", "1");
+                    if snapshot.needs_normal {
+                        options.add_define("OUTPUT_NORMAL", "1");
+                    }
+                    if snapshot.needs_velocity {
+                        options.add_define("HAS_VELOCITY_TARGET", "1");
+                    }
+                    if snapshot.needs_feature_id {
+                        options.add_define("OUTPUT_FEATURE_ID", "1");
+                    }
+                    options.inject_code(
+                        "vertex_input_code",
+                        &source.geometry_layout_info.vertex_input_code,
+                    );
+                    options.inject_code(
+                        "binding_code",
+                        format!(
+                            "{}\n{}\n{}",
+                            gpu_world.binding_wgsl,
+                            source.material_binding_wgsl,
+                            source.object_binding_wgsl
+                        ),
+                    );
+                    options.inject_code(
+                        "scene_lighting_structs",
+                        myth_resources::uniforms::scene_lighting_structs_wgsl(),
+                    );
+                    let (shader_module, shader_hash) =
+                        ctx.shader_manager
+                            .get_or_compile(ctx.device, shader_source, &options);
+                    let layout =
+                        ctx.device
+                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                                label: Some("Prepass Pipeline Layout"),
+                                bind_group_layouts: &[
+                                    Some(&gpu_world.layout),
+                                    Some(&source.material_layout),
+                                    Some(&source.object_layout),
+                                ],
+                                immediate_size: 0,
+                            });
+                    let vertex_buffers_layout: Vec<_> = source
+                        .geometry_layout_info
+                        .buffers
+                        .iter()
+                        .map(|layout| layout.as_wgpu())
+                        .collect();
+                    let mut color_targets = smallvec::smallvec![];
+                    if snapshot.needs_normal {
+                        color_targets.push(ColorTargetKey::from(wgpu::ColorTargetState {
+                            format: NORMAL_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }));
+                    }
+                    if snapshot.needs_feature_id {
+                        color_targets.push(ColorTargetKey::from(wgpu::ColorTargetState {
+                            format: FEATURE_ID_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }));
+                    }
+                    if snapshot.needs_velocity {
+                        color_targets.push(ColorTargetKey::from(wgpu::ColorTargetState {
+                            format: VELOCITY_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }));
+                    }
+                    let canonical_key = SimpleGeometryPipelineKey {
+                        shader_hash,
+                        vertex_layout_id: source.geometry_layout_id,
+                        bind_group_layout_ids: [
+                            global_layout_id,
+                            source.material_layout_id,
+                            source.object_layout_id,
+                        ],
+                        color_targets,
+                        depth_stencil: DepthStencilKey::from(wgpu::DepthStencilState {
+                            format: depth_format,
+                            depth_write_enabled: Some(true),
+                            depth_compare: Some(wgpu::CompareFunction::Greater),
+                            stencil: wgpu::StencilState::default(),
+                            bias: wgpu::DepthBiasState::default(),
+                        }),
+                        topology: geometry.topology,
+                        cull_mode,
+                        front_face,
+                        sample_count: 1,
+                    };
+                    let pipeline_id = ctx.pipeline_cache.get_or_create_simple_geometry(
+                        ctx.device,
+                        shader_module,
+                        &layout,
+                        &canonical_key,
+                        "Prepass Pipeline",
+                        &vertex_buffers_layout,
+                    );
+                    (pipeline_id, true)
+                };
 
-            self.local_cache.insert(
-                (
-                    cmd.pipeline_id,
-                    snapshot.needs_normal,
-                    snapshot.needs_feature_id,
-                    snapshot.needs_velocity,
-                ),
+            if !source.pipeline_state_is_current() {
+                continue;
+            }
+            if publish_l1 {
+                self.local_cache.insert(l1_key, pipeline_id);
+            }
+
+            let sort_key = RenderKey::new(
                 pipeline_id,
+                intent.material_index,
+                intent.distance_sq,
+                false,
+            );
+            crate::graph::bake::push_prepared_source_command(
+                ctx.scene_draws.draw_plans,
+                intent.source_item_index,
+                source,
+                pipeline_id,
+                sort_key.bits(),
+                None,
             );
         }
+
+        ctx.scene_draws.draw_plans.sort_commands_from(start);
+        ctx.scene_draws.draw_plans.finish_finalize(plan, start);
     }
 
     /// Build the ephemeral pass node, register resources, and insert it
@@ -438,28 +511,8 @@ pub struct PrepassPassNode<'a> {
 
 impl<'a> PassNode<'a> for PrepassPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
-        self.feature.ensure_pipelines(ctx, self.snapshot);
-
-        if ctx
-            .scene_draws
-            .draw_plans
-            .resolve_plan(self.draw_plan)
-            .is_some()
-        {
-            return;
-        }
-
-        crate::graph::bake::finalize_prepass_draw_plan(
-            self.draw_plan,
-            &ctx.scene_draws.render_lists.opaque,
-            ctx.scene_draws.draw_plans,
-            &ctx.uploads,
-            ctx.pipeline_cache,
-            &self.feature.local_cache,
-            self.snapshot.needs_normal,
-            self.snapshot.needs_feature_id,
-            self.snapshot.needs_velocity,
-        );
+        self.feature
+            .prepare_draw_plan(ctx, self.snapshot, self.draw_plan);
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {

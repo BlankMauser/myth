@@ -327,6 +327,11 @@ pub struct SimpleGeometryPipelineKey {
     pub shader_hash: u128,
     /// Distinguishes different vertex buffer layouts (static, skinned, morphed…).
     pub vertex_layout_id: u64,
+    /// `[Pass-global, Material, Object]` physical layout identities.
+    ///
+    /// WGSL equality alone does not capture WGPU-only contracts such as
+    /// dynamic offsets, visibility, or minimum binding sizes.
+    pub bind_group_layout_ids: [u64; 3],
     pub color_targets: smallvec::SmallVec<[ColorTargetKey; 3]>,
     pub depth_stencil: DepthStencilKey,
     pub topology: wgpu::PrimitiveTopology,

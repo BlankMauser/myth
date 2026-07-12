@@ -168,12 +168,6 @@ impl GpuResourceStore {
     }
 
     #[inline]
-    #[must_use]
-    pub(super) fn contains_material(&self, handle: MaterialHandle) -> bool {
-        self.gpu_materials.contains_key(handle)
-    }
-
-    #[inline]
     pub(super) fn insert_material(&mut self, handle: MaterialHandle, material: GpuMaterial) {
         self.gpu_materials.insert(handle, material);
     }

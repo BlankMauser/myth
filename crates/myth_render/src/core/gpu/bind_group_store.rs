@@ -50,6 +50,7 @@ pub struct GpuGlobalState {
     pub layout: wgpu::BindGroupLayout,
     pub layout_id: u64,
     pub binding_wgsl: String,
+    pub binding_wgsl_hash: u64,
     /// Set of physical IDs of all dependent resources (used for automatic change detection)
     pub resource_ids: ResourceIdSet,
     pub last_used_frame: u64,
@@ -126,6 +127,7 @@ pub struct BindGroupContext {
     pub bind_group: wgpu::BindGroup,
     pub bind_group_id: u64,
     pub binding_wgsl: Arc<str>,
+    pub binding_wgsl_hash: u64,
 }
 
 struct CachedObjectBindGroup {
@@ -226,6 +228,11 @@ impl BindGroupStore {
     #[must_use]
     pub(super) fn cached_bind_group(&self, bind_group_id: u64) -> Option<&BindGroupContext> {
         self.bind_group_id_lookup.get(&bind_group_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_object_bind_group_ids(&self) -> Vec<u64> {
+        self.bind_group_id_lookup.keys().copied().collect()
     }
 
     pub(super) fn get_or_create_layout(

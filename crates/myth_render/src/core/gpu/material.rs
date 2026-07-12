@@ -16,6 +16,8 @@
 //! 3. **Pipeline state (`RenderPipeline`)**: Tracked by `Material.version()`
 //!    - Depth write/transparency/double-sided rendering changes -> switch Pipeline
 
+use std::sync::Arc;
+
 use crate::core::gpu::EnsureResult;
 use crate::core::gpu::texture::ResourceState;
 use myth_assets::{AssetServer, MaterialHandle};
@@ -41,13 +43,16 @@ use super::{ResourceIdSet, ResourceManager, hash_layout_entries};
 /// 3. **Pipeline state (`RenderPipeline`)**: Tracked by `version`
 ///    - Depth write/transparency/double-sided rendering changes -> switch Pipeline
 pub struct GpuMaterial {
+    pub asset_version: u32,
+    pub asset_identity: u64,
     pub bind_group: wgpu::BindGroup,
     pub bind_group_id: u64,
     pub layout: wgpu::BindGroupLayout,
     pub layout_id: u64,
     /// Hash of layout entries (for fast comparison to determine if Layout rebuild is needed)
     pub layout_hash: u64,
-    pub binding_wgsl: String,
+    pub binding_wgsl: Arc<str>,
+    pub binding_wgsl_hash: u64,
     /// Set of physical IDs of all dependent resources (guards `BindGroup` validity)
     pub resource_ids: ResourceIdSet,
     /// Records the Material version when this `GpuMaterial` was generated (for Pipeline cache)
@@ -72,13 +77,18 @@ impl ResourceManager {
     /// `last_verified_frame` is intentionally *not* updated, ensuring the
     /// material is re-checked on the next frame.
     pub(crate) fn prepare_material(&mut self, assets: &AssetServer, handle: MaterialHandle) {
-        let Some(material) = assets.materials.get(handle) else {
+        let Some((material, asset_version, asset_identity)) =
+            assets.materials.get_entry_with_identity(handle)
+        else {
             return;
         };
 
         // [Fast Path] Per-frame cache check
         if let Some(gpu_mat) = self.resources.material(handle)
             && gpu_mat.last_verified_frame == self.frame_index
+            && gpu_mat.asset_version == asset_version
+            && gpu_mat.asset_identity == asset_identity
+            && gpu_mat.version == material.data.version()
         {
             return;
         }
@@ -87,25 +97,42 @@ impl ResourceManager {
         let (mut current_resource_ids, has_pending_textures) =
             self.ensure_material_resources(assets, &material);
 
-        let needs_rebuild_bindgroup =
-            if has_pending_textures && self.resources.contains_material(handle) {
-                // lagging sync: if textures are still loading, do not trigger a rebuild based on resource ID mismatch
+        let needs_rebuild_bindgroup = if let Some(gpu_mat) = self.resources.material(handle) {
+            let same_asset =
+                gpu_mat.asset_version == asset_version && gpu_mat.asset_identity == asset_identity;
+            let same_pipeline_state = gpu_mat.version == material.data.version();
+            if has_pending_textures && same_asset && same_pipeline_state {
+                // Retaining the old physical group is valid only while the
+                // exact material's shader/binding topology is unchanged.
+                // A version change must rebuild against fallback textures.
                 false
-            } else if let Some(gpu_mat) = self.resources.material(handle) {
+            } else if !same_asset || !same_pipeline_state {
+                true
+            } else {
                 let mut cached_ids = gpu_mat.resource_ids.clone();
                 !current_resource_ids.matches(&mut cached_ids)
-            } else {
-                true
-            };
+            }
+        } else {
+            true
+        };
 
         if needs_rebuild_bindgroup {
             // 3. Rebuild phase: rebuild BindGroup (expensive operation)
-            self.rebuild_material_bindgroup(assets, handle, &material, current_resource_ids);
+            self.rebuild_material_bindgroup(
+                assets,
+                handle,
+                &material,
+                current_resource_ids,
+                asset_version,
+                asset_identity,
+            );
         }
 
         // 4. Update version number and frame counter (very fast operation)
         if let Some(gpu_mat) = self.resources.material_mut(handle) {
             gpu_mat.version = material.data.version();
+            gpu_mat.asset_version = asset_version;
+            gpu_mat.asset_identity = asset_identity;
             gpu_mat.last_used_frame = self.frame_index;
             // If textures are pending (first-time creation with fallbacks),
             // do not mark as verified so we re-check next frame.
@@ -176,6 +203,8 @@ impl ResourceManager {
         handle: MaterialHandle,
         material: &Material,
         resource_ids: ResourceIdSet,
+        asset_version: u32,
+        asset_identity: u64,
     ) {
         let mut builder = ResourceBuilder::new();
         material.define_bindings(&mut builder);
@@ -201,14 +230,18 @@ impl ResourceManager {
 
         let (bind_group, bg_id) = self.create_bind_group(&layout, &builder);
         let binding_wgsl = builder.generate_wgsl(1);
+        let binding_wgsl_hash = super::hash_binding_wgsl(&binding_wgsl);
 
         let gpu_mat = GpuMaterial {
+            asset_version,
+            asset_identity,
             bind_group,
             bind_group_id: bg_id,
             layout,
             layout_id,
             layout_hash,
-            binding_wgsl,
+            binding_wgsl: binding_wgsl.into(),
+            binding_wgsl_hash,
             resource_ids,
             version: material.data.version(),
             last_used_frame: self.frame_index,

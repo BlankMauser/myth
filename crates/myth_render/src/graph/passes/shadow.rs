@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! RenderLists::active_views (shadow views)     ← built by scene extraction
-//! RenderLists::shadow_queues (per-view cmds)   ← built by culling::cull_and_sort
+//! RenderLists::shadow_queues (CPU intents)     ← built by collect_draw_intents
 //!         │
 //!         ▼
 //!  Shadow_VP_Upload (transient uniform producer)

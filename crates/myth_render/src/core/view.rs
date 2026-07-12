@@ -17,7 +17,7 @@
 //! # Data Flow
 //!
 //! ```text
-//! SceneCullPass::prepare()
+//! CPU draw-intent collection
 //!     ├── build main camera RenderView
 //!     ├── build shadow RenderViews (via shadow_utils)
 //!     └── per-view frustum culling → RenderLists

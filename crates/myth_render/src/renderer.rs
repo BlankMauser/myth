@@ -1105,6 +1105,7 @@ impl Renderer {
 mod tests {
     use super::*;
 
+    use crate::graph::core::{ExecuteContext, GraphBlackboard, HookStage, PassNode, TextureDesc};
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::{AssetServer, SceneExt};
     use myth_core::SkeletonKey;
@@ -1117,6 +1118,12 @@ mod tests {
     use myth_scene::camera::Camera;
     use myth_scene::light::Light;
     use myth_scene::{BindMode, Scene};
+
+    struct DepthOnlyTestRoot;
+
+    impl PassNode<'_> for DepthOnlyTestRoot {
+        fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
 
     fn init_headless_renderer() -> Renderer {
         let mut renderer =
@@ -1214,6 +1221,14 @@ mod tests {
             .passes
             .iter()
             .any(|pass| pass.name == name)
+    }
+
+    fn execution_contains_pass(state: &RendererState, name: &str) -> bool {
+        state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .any(|&index| state.graph_storage.passes[index].name == name)
     }
 
     #[cfg(feature = "3dgs")]
@@ -2319,6 +2334,11 @@ mod tests {
                 .count(),
             1,
         );
+        assert_eq!(
+            state.resource_manager.model_allocator.len(),
+            1,
+            "main, Prepass, directional cascades, and point-light faces must share one model slot for the caster source"
+        );
     }
 
     #[test]
@@ -2332,6 +2352,92 @@ mod tests {
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert!(!state.mipmap_pass.generator_initialized());
         assert!(!graph_contains_pass(state, "Asset_Mipmap_Generation"));
+    }
+
+    #[test]
+    fn visible_material_texture_queues_first_frame_mipmaps_before_opaque_draw() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![144; 8 * 8 * 4]),
+        ));
+        let mut texture = Texture::new_2d(Some("Visible Material Mip Test"), image_handle);
+        texture.color_space = ColorSpace::Linear;
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+        let material = PhysicalMaterial::new(Vec4::ONE);
+        material.set_map(Some(texture_handle));
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let gpu_image = state
+            .resource_manager
+            .get_texture_image(texture_handle)
+            .expect("the visible material must materialize its texture");
+        let physical_image_id = gpu_image.id;
+        assert_eq!(gpu_image.mip_level_count, 4);
+        assert!(gpu_image.mipmaps_submitted());
+        assert!(state.mipmap_pass.generator_initialized());
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Mipmap_Generation")
+                .count(),
+            1,
+            "the material compatibility boundary must enqueue exactly one legacy producer"
+        );
+        assert!(!graph_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
+        assert!(!graph_contains_pass(state, "Skybox_Pass"));
+
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let mipmap = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Mipmap_Generation")
+            .expect("material mipmap producer missing from execution queue");
+        let opaque = execution_names
+            .iter()
+            .position(|&name| name == "Opaque_Pass")
+            .expect("opaque consumer missing from execution queue");
+        assert!(mipmap < opaque);
+        assert!(
+            state
+                .graph_storage
+                .mipmap_batches
+                .iter()
+                .all(Option::is_none),
+            "submitted mipmap batches must release their physical owners"
+        );
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(!graph_contains_pass(state, "Asset_Mipmap_Generation"));
+        assert_eq!(
+            state
+                .resource_manager
+                .get_texture_image(texture_handle)
+                .expect("material texture must remain resident")
+                .id,
+            physical_image_id
+        );
     }
 
     #[test]
@@ -2520,6 +2626,183 @@ mod tests {
     }
 
     #[test]
+    fn prepass_only_live_graph_does_not_derive_a_dead_main_pipeline() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let camera = make_camera();
+        let initial_main_l1_count = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .pipeline_cache
+            .fast_pipeline_count();
+
+        renderer
+            .begin_frame(&mut scene, camera, &assets, FrameTime::default())
+            .expect("frame composer must exist")
+            .add_custom_pass(HookStage::BeforePostProcess, |graph, blackboard| {
+                let depth = blackboard
+                    .scene_depth
+                    .expect("HighFidelity graph must publish Prepass depth");
+                let output = graph.add_pass("Depth_Only_Test_Root", |builder| {
+                    builder.read_texture(depth);
+                    let output = builder.create_texture(
+                        "Depth_Only_Test_Output",
+                        TextureDesc::new_2d(
+                            128,
+                            128,
+                            crate::HDR_TEXTURE_FORMAT,
+                            wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                        ),
+                    );
+                    (DepthOnlyTestRoot, output)
+                });
+                GraphBlackboard {
+                    scene_color: Some(output),
+                    ..blackboard
+                }
+            })
+            .render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(execution_contains_pass(state, "Pre_Pass"));
+        assert!(execution_contains_pass(state, "Depth_Only_Test_Root"));
+        assert!(!execution_contains_pass(state, "Opaque_Pass"));
+        assert!(state.prepass.cached_pipeline_count() > 0);
+        assert_eq!(
+            state.pipeline_cache.fast_pipeline_count(),
+            initial_main_l1_count,
+            "a dead Opaque DrawPlan must not derive or cache a main pipeline"
+        );
+        assert_eq!(
+            state.resource_manager.model_allocator.len(),
+            1,
+            "the visible source must still be materialized for the live Prepass plan"
+        );
+    }
+
+    #[test]
+    fn same_handle_asset_reloads_refresh_gpu_state_and_l1_without_duplicate_l2_pipelines() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            PhysicalMaterial::new(Vec4::new(0.7, 0.7, 0.7, 1.0)),
+            &assets,
+        );
+        let (geometry_handle, material_handle) = {
+            let mesh = scene.meshes.get(mesh_node).expect("test mesh missing");
+            (mesh.geometry, mesh.material)
+        };
+        let camera = make_camera();
+
+        // Warm every steady-state L1/L2 path before recording the baseline.
+        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+
+        let (
+            initial_geometry_identity,
+            initial_geometry_layout,
+            initial_vertex_buffers,
+            initial_material_identity,
+            initial_material_layout,
+            initial_material_bind_group,
+            initial_prepass_l1_count,
+            initial_l2_count,
+        ) = {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            let geometry = state
+                .resource_manager
+                .get_geometry(geometry_handle)
+                .expect("GPU geometry missing");
+            let material = state
+                .resource_manager
+                .get_material(material_handle)
+                .expect("GPU material missing");
+            (
+                geometry.asset_identity,
+                geometry.layout_id,
+                geometry.vertex_buffer_ids.clone(),
+                material.asset_identity,
+                material.layout_id,
+                material.bind_group_id,
+                state.prepass.cached_pipeline_count(),
+                state.pipeline_cache.render_pipeline_count(),
+            )
+        };
+
+        assets.geometries.insert_ready(
+            geometry_handle,
+            myth_resources::Geometry::new_box(1.0, 1.0, 1.0),
+        );
+        let (_, reloaded_geometry_version, reloaded_geometry_identity) = assets
+            .geometries
+            .get_entry_with_identity(geometry_handle)
+            .expect("reloaded geometry missing");
+        assert_eq!(reloaded_geometry_version, 1);
+        assert_ne!(reloaded_geometry_identity, initial_geometry_identity);
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let geometry = state
+            .resource_manager
+            .get_geometry(geometry_handle)
+            .expect("reloaded GPU geometry missing");
+        assert_eq!(geometry.asset_identity, reloaded_geometry_identity);
+        assert_ne!(geometry.vertex_buffer_ids, initial_vertex_buffers);
+        assert_eq!(geometry.layout_id, initial_geometry_layout);
+        assert_eq!(
+            state.prepass.cached_pipeline_count(),
+            initial_prepass_l1_count + 1,
+            "exact geometry identity must specialize the persistent Prepass L1"
+        );
+        assert_eq!(
+            state.pipeline_cache.render_pipeline_count(),
+            initial_l2_count,
+            "an equivalent replacement should reuse canonical physical pipelines"
+        );
+
+        assets.materials.insert_ready(
+            material_handle,
+            myth_resources::Material::from(PhysicalMaterial::new(Vec4::new(0.7, 0.7, 0.7, 1.0))),
+        );
+        let (_, reloaded_material_version, reloaded_material_identity) = assets
+            .materials
+            .get_entry_with_identity(material_handle)
+            .expect("reloaded material missing");
+        assert_eq!(reloaded_material_version, 1);
+        assert_ne!(reloaded_material_identity, initial_material_identity);
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 3);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let material = state
+            .resource_manager
+            .get_material(material_handle)
+            .expect("reloaded GPU material missing");
+        assert_eq!(material.asset_identity, reloaded_material_identity);
+        assert_ne!(material.bind_group_id, initial_material_bind_group);
+        assert_eq!(material.layout_id, initial_material_layout);
+        assert_eq!(
+            state.prepass.cached_pipeline_count(),
+            initial_prepass_l1_count + 2,
+            "exact material identity must specialize the persistent Prepass L1"
+        );
+        assert_eq!(
+            state.pipeline_cache.render_pipeline_count(),
+            initial_l2_count,
+            "the canonical L2 must still deduplicate equivalent replacement state"
+        );
+    }
+
+    #[test]
     fn offscreen_draw_sources_do_not_materialize_gpu_assets() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
@@ -2543,6 +2826,7 @@ mod tests {
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert!(state.render_lists.opaque.is_empty());
         assert!(state.render_lists.transparent.is_empty());
+        assert_eq!(state.resource_manager.model_allocator.len(), 0);
         assert!(
             state
                 .resource_manager
@@ -2599,6 +2883,103 @@ mod tests {
                 .resource_manager
                 .get_material(pending_material)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn same_version_asset_replacement_after_extract_fails_the_graph_attempt_closed() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let (geometry_handle, material_handle) = {
+            let mesh = scene.meshes.get(mesh_node).expect("test mesh missing");
+            (mesh.geometry, mesh.material)
+        };
+        let camera = make_camera();
+
+        let composer = renderer
+            .begin_frame(&mut scene, camera, &assets, FrameTime::default())
+            .expect("frame composer must exist");
+        assets.geometries.insert_ready(
+            geometry_handle,
+            myth_resources::Geometry::new_box(1.0, 1.0, 1.0),
+        );
+        assert_eq!(assets.geometries.get_version(geometry_handle), Some(1));
+        composer.render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.render_lists.opaque.is_empty());
+        assert_eq!(state.resource_manager.model_allocator.len(), 0);
+        assert!(
+            state
+                .resource_manager
+                .get_geometry(geometry_handle)
+                .is_none()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .is_none()
+        );
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+        let old_gpu_material_identity = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .resource_manager
+            .get_material(material_handle)
+            .expect("material should recover on the next frame")
+            .asset_identity;
+
+        let composer = renderer
+            .begin_frame(
+                &mut scene,
+                camera,
+                &assets,
+                FrameTime {
+                    frame_count: 2,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("frame composer must exist");
+        assets.materials.insert_ready(
+            material_handle,
+            myth_resources::Material::from(PhysicalMaterial::new(Vec4::ONE)),
+        );
+        let (_, replacement_version, replacement_identity) = assets
+            .materials
+            .get_entry_with_identity(material_handle)
+            .expect("replacement material missing");
+        assert_eq!(replacement_version, 1);
+        assert_ne!(replacement_identity, old_gpu_material_identity);
+        composer.render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.render_lists.opaque.is_empty());
+        assert_eq!(state.resource_manager.model_allocator.len(), 0);
+        assert_eq!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .expect("the previous persistent GPU material may remain cached")
+                .asset_identity,
+            old_gpu_material_identity,
+            "the stale graph attempt must not publish the replacement into mixed old/new state"
+        );
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 3);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.render_lists.opaque.len(), 1);
+        assert_eq!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .expect("replacement material should recover on the next extraction")
+                .asset_identity,
+            replacement_identity
         );
     }
 
@@ -2730,7 +3111,11 @@ mod tests {
 
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert_eq!(state.render_lists.opaque.len(), 1);
-        let old_object_bind_group_id = state.render_lists.opaque[0].object_bind_group.bind_group_id;
+        let old_object_bind_group_ids = state.resource_manager.cached_object_bind_group_ids();
+        assert!(
+            !old_object_bind_group_ids.is_empty(),
+            "the first submitted draw must populate the persistent object cache"
+        );
         let model_buffer = state
             .resource_manager
             .get_gpu_buffer_by_cpu_id(state.resource_manager.model_buffer_id())
@@ -2753,25 +3138,28 @@ mod tests {
             .expect("resized model buffer missing");
         assert!(model_buffer.size > old_model_size);
         assert_ne!(model_buffer.id, old_model_physical_id);
-        assert!(
-            state
-                .resource_manager
-                .get_cached_bind_group(old_object_bind_group_id)
-                .is_none(),
-            "resizing must evict every object BindGroup that owns the old buffer"
-        );
-
-        let stride = crate::core::gpu::ModelBufferAllocator::uniform_stride().get();
-        for command in &state.render_lists.opaque {
-            assert_ne!(
-                command.object_bind_group.bind_group_id, old_object_bind_group_id,
-                "this frame must capture a BindGroup built after the resize"
-            );
+        for old_object_bind_group_id in &old_object_bind_group_ids {
             assert!(
-                u64::from(command.dynamic_offset) + stride <= model_buffer.size,
-                "every dynamic model range must fit the final physical buffer"
+                state
+                    .resource_manager
+                    .get_cached_bind_group(*old_object_bind_group_id)
+                    .is_none(),
+                "resizing must evict every object BindGroup that owns the old buffer"
             );
         }
+
+        let stride = crate::core::gpu::ModelBufferAllocator::uniform_stride().get();
+        assert!(
+            state.render_lists.opaque.len() as u64 * stride <= model_buffer.size,
+            "every live source model range must fit the final physical buffer"
+        );
+        let new_object_bind_group_ids = state.resource_manager.cached_object_bind_group_ids();
+        assert!(!new_object_bind_group_ids.is_empty());
+        assert!(
+            new_object_bind_group_ids
+                .iter()
+                .all(|id| !old_object_bind_group_ids.contains(id))
+        );
     }
 
     #[test]
@@ -2783,7 +3171,11 @@ mod tests {
         render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
 
         let state = renderer.context.as_mut().expect("renderer state missing");
-        let old_object_bind_group_id = state.render_lists.opaque[0].object_bind_group.bind_group_id;
+        let old_object_bind_group_id = *state
+            .resource_manager
+            .cached_object_bind_group_ids()
+            .first()
+            .expect("submitted draw did not populate the object cache");
         let logical_id = state.resource_manager.model_buffer_id();
         let initial_physical_id = state
             .resource_manager

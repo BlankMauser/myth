@@ -29,8 +29,7 @@ use myth_scene::DebugViewMode;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use crate::core::BindGroupContext;
-use crate::core::gpu::{GpuGlobalState, GpuMaterial, Tracked};
+use crate::core::gpu::{GpuGlobalState, Tracked};
 use crate::graph::extracted::SceneFeatures;
 use crate::pipeline::pipeline_id::{ComputePipelineId, RenderPipelineId};
 use crate::pipeline::pipeline_key::{
@@ -49,12 +48,26 @@ use myth_resources::uniforms::{clustered_lighting_structs_wgsl, scene_lighting_s
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub struct FastPipelineKey {
     pub material_handle: MaterialHandle,
+    pub material_asset_version: u32,
+    pub material_asset_identity: u64,
     pub material_version: u64,
     pub geometry_handle: GeometryHandle,
+    pub geometry_asset_version: u32,
+    pub geometry_asset_identity: u64,
     pub geometry_version: u64,
+    pub vertex_layout_id: u64,
     pub instance_variants: u32,
+    pub item_shader_defines_hash: u64,
+    pub shader_source_identity: u64,
     pub global_state_id: u32,
+    pub global_layout_id: u64,
+    pub global_binding_wgsl_hash: u64,
+    pub material_layout_id: u64,
+    pub material_binding_wgsl_hash: u64,
+    pub object_layout_id: u64,
+    pub object_binding_wgsl_hash: u64,
     pub scene_variants: SceneFeatures,
+    pub scene_defines_hash: u64,
     pub taa_enabled: bool,
     pub pipeline_settings_version: u64,
     #[cfg(feature = "debug_view")]
@@ -65,10 +78,22 @@ pub struct FastPipelineKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub struct FastShadowPipelineKey {
     pub material_handle: MaterialHandle,
+    pub material_asset_version: u32,
+    pub material_asset_identity: u64,
     pub material_version: u64,
     pub geometry_handle: GeometryHandle,
+    pub geometry_asset_version: u32,
+    pub geometry_asset_identity: u64,
     pub geometry_version: u64,
+    pub vertex_layout_id: u64,
     pub instance_variants: u32,
+    pub item_shader_defines_hash: u64,
+    pub shader_source_identity: u64,
+    pub shadow_global_layout_id: u64,
+    pub material_layout_id: u64,
+    pub material_binding_wgsl_hash: u64,
+    pub object_layout_id: u64,
+    pub object_binding_wgsl_hash: u64,
     pub pipeline_settings_version: u64,
 }
 
@@ -289,7 +314,7 @@ impl PipelineCache {
 
     /// Look up or create a material-driven geometry pipeline.
     ///
-    /// This is the main entry point for `SceneCullPass`.
+    /// This is the main entry point for post-DPE scene draw preparation.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn get_or_create_graphics(
         &mut self,
@@ -299,8 +324,10 @@ impl PipelineCache {
         canonical_key: &GraphicsPipelineKey,
         options: &ShaderCompilationOptions,
         vertex_layout: &GeneratedVertexLayout,
-        gpu_material: &GpuMaterial,
-        object_bind_group: &BindGroupContext,
+        material_layout: &wgpu::BindGroupLayout,
+        material_binding_wgsl: &str,
+        object_layout: &wgpu::BindGroupLayout,
+        object_binding_wgsl: &str,
         gpu_world: &GpuGlobalState,
         screen_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> RenderPipelineId {
@@ -312,7 +339,7 @@ impl PipelineCache {
         // Compile shader via ShaderManager
         let binding_code = format!(
             "{}\n{}\n{}",
-            gpu_world.binding_wgsl, gpu_material.binding_wgsl, object_bind_group.binding_wgsl
+            gpu_world.binding_wgsl, material_binding_wgsl, object_binding_wgsl
         );
 
         let mut opts = options.clone();
@@ -331,8 +358,8 @@ impl PipelineCache {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[
                 Some(&gpu_world.layout),
-                Some(&gpu_material.layout),
-                Some(&object_bind_group.layout),
+                Some(material_layout),
+                Some(object_layout),
                 Some(screen_bind_group_layout),
             ],
             immediate_size: 0,
@@ -692,6 +719,12 @@ impl PipelineCache {
         self.render_pipelines.len()
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn fast_pipeline_count(&self) -> usize {
+        self.fast_cache.len()
+    }
+
     /// Number of cached compute pipelines.
     #[must_use]
     pub fn compute_pipeline_count(&self) -> usize {
@@ -712,5 +745,163 @@ impl PipelineCache {
         self.compute_pipelines.push(pipeline);
         self.compute_layouts.push(None);
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use slotmap::Key;
+
+    use super::*;
+
+    fn main_key() -> FastPipelineKey {
+        FastPipelineKey {
+            material_handle: MaterialHandle::null(),
+            material_asset_version: 1,
+            material_asset_identity: 11,
+            material_version: 2,
+            geometry_handle: GeometryHandle::null(),
+            geometry_asset_version: 1,
+            geometry_asset_identity: 21,
+            geometry_version: 3,
+            vertex_layout_id: 31,
+            instance_variants: 4,
+            item_shader_defines_hash: 41,
+            shader_source_identity: 51,
+            global_state_id: 6,
+            global_layout_id: 61,
+            global_binding_wgsl_hash: 71,
+            material_layout_id: 81,
+            material_binding_wgsl_hash: 91,
+            object_layout_id: 101,
+            object_binding_wgsl_hash: 111,
+            scene_variants: SceneFeatures::empty(),
+            scene_defines_hash: 121,
+            taa_enabled: false,
+            pipeline_settings_version: 131,
+            #[cfg(feature = "debug_view")]
+            debug_view_mode: DebugViewMode::None,
+        }
+    }
+
+    fn shadow_key() -> FastShadowPipelineKey {
+        FastShadowPipelineKey {
+            material_handle: MaterialHandle::null(),
+            material_asset_version: 1,
+            material_asset_identity: 11,
+            material_version: 2,
+            geometry_handle: GeometryHandle::null(),
+            geometry_asset_version: 1,
+            geometry_asset_identity: 21,
+            geometry_version: 3,
+            vertex_layout_id: 31,
+            instance_variants: 4,
+            item_shader_defines_hash: 41,
+            shader_source_identity: 51,
+            shadow_global_layout_id: 61,
+            material_layout_id: 71,
+            material_binding_wgsl_hash: 81,
+            object_layout_id: 91,
+            object_binding_wgsl_hash: 101,
+            pipeline_settings_version: 111,
+        }
+    }
+
+    #[test]
+    fn main_l1_rejects_asset_aba_and_item_shader_variant_changes() {
+        let mut cache = PipelineCache::new();
+        let key = main_key();
+        let pipeline = RenderPipelineId(7);
+        cache.insert_pipeline_fast(key, pipeline);
+        assert_eq!(cache.get_pipeline_fast(key), Some(pipeline));
+
+        let mut changed = key;
+        changed.geometry_asset_identity += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.material_asset_identity += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.item_shader_defines_hash += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.shader_source_identity += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.global_layout_id += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.global_binding_wgsl_hash += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.scene_defines_hash += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.material_layout_id += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.material_binding_wgsl_hash += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.object_layout_id += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.object_binding_wgsl_hash += 1;
+        assert_eq!(cache.get_pipeline_fast(changed), None);
+    }
+
+    #[test]
+    fn shadow_l1_rejects_asset_aba_and_item_shader_variant_changes() {
+        let mut cache = PipelineCache::new();
+        let key = shadow_key();
+        let pipeline = RenderPipelineId(8);
+        cache.insert_shadow_pipeline_fast(key, pipeline);
+        assert_eq!(cache.get_shadow_pipeline_fast(key), Some(pipeline));
+
+        let mut changed = key;
+        changed.geometry_asset_identity += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.material_asset_identity += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.item_shader_defines_hash += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.shader_source_identity += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.shadow_global_layout_id += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.material_layout_id += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.material_binding_wgsl_hash += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.object_layout_id += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
+
+        changed = key;
+        changed.object_binding_wgsl_hash += 1;
+        assert_eq!(cache.get_shadow_pipeline_fast(changed), None);
     }
 }

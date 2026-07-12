@@ -1,85 +1,74 @@
 //! Render frame management.
 //!
-//! `RenderFrame` is responsible for:
-//! - Holding extracted scene data ([`ExtractedScene`]) and render state ([`RenderState`])
-//! - Running the Extract and Prepare phases of the frame pipeline
+//! `RenderFrame` owns the frame's CPU scene snapshot, render state, light/view
+//! metadata, and the small set of scene-global inputs that must exist before
+//! graph construction. Feature-local physical preparation is deferred until
+//! after DPE by [`FrameComposer`].
 //!
 //! # Three-Phase Rendering Architecture
 //!
 //! The rendering pipeline is divided into three distinct phases:
 //!
-//! 1. **Prepare**: `extract_and_prepare()` — extract scene data and prepare GPU resources
-//! 2. **Compose**: Chain render nodes via [`FrameComposer`]
-//! 3. **Execute**: `FrameComposer::render()` — acquire the surface and submit GPU commands
+//! 1. **Snapshot**: `extract_and_prepare()` captures scene/light/view state and
+//!    refreshes the shared global interface.
+//! 2. **Compose + Compile**: [`FrameComposer`] collects CPU draw intents,
+//!    declares topology, and runs DPE.
+//! 3. **Deferred prepare**: only live passes and their exact draw-source union
+//!    materialize physical resources and pipelines.
+//! 4. **Execute + Commit**: blind commands are recorded; temporal/producer
+//!    state is published only after submission.
 //!
 
 use glam::Mat4;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
+use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::gpu::Tracked;
-use crate::core::{BindGroupContext, RenderView, ResourceManager};
+use crate::core::{RenderView, ResourceManager};
 use crate::pipeline::RenderPipelineId;
+use crate::pipeline::vertex::GeneratedVertexLayout;
 use crate::renderer::FrameTime;
 use crate::settings::{ClusteredShadingMode, RenderPath};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
+use myth_resources::RenderableMaterialTrait;
 use myth_resources::buffer::CpuBuffer;
+use myth_resources::geometry::Geometry;
+use myth_resources::material::Material;
 use myth_scene::Scene;
 use myth_scene::camera::RenderCamera;
 
-use super::extracted::{ExtractedScene, SceneFeatures};
+use super::extracted::{ExtractedRenderItem, ExtractedScene, SceneFeatures};
 use super::render_state::RenderState;
 use super::shadow_utils;
 
 // ============================================================================
-// RenderCommand & RenderLists
+// Render intents, physical commands, and render lists
 // ============================================================================
 
-/// A single render command.
+/// CPU-only main-view draw intent.
 ///
-/// Contains all information needed to draw one object. Produced by `CullPass`,
-/// consumed by `OpaquePass` / `TransparentPass`.
-///
-/// # Performance Notes
-/// - Pipeline is obtained via `clone` (`wgpu::RenderPipeline` is internally `Arc`)
-/// - `dynamic_offset` supports dynamic uniform buffering
-/// - `sort_key` enables efficient sorting (front-to-back / back-to-front)
-pub struct RenderCommand {
-    /// Exact index of the originating item in
-    /// [`ExtractedScene::render_items`](super::extracted::ExtractedScene).
-    ///
-    /// Geometry and material handles are not sufficient source identity:
-    /// multiple instances may share both while differing in per-item shader
-    /// variants such as skinning or negative-scale front-face selection.
+/// This is produced before RDG compilation and contains no WGPU owner or
+/// pipeline ID. `source_item_index` is the exact identity used to join the
+/// intent with graph-attempt physical preparation after DPE.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderIntent {
     pub source_item_index: u32,
-    /// Per-object bind group (model matrix, skeleton, etc.)
-    pub object_bind_group: BindGroupContext,
-    /// Geometry handle
     pub geometry_handle: GeometryHandle,
-    /// Material handle
     pub material_handle: MaterialHandle,
-    /// Pipeline handle (index into [`PipelineCache`] storage).
-    ///
-    /// Resolve to a `&wgpu::RenderPipeline` via
-    /// [`PipelineCache::get_render_pipeline`] during the execute phase.
-    pub pipeline_id: RenderPipelineId,
-    /// Sort key
-    pub sort_key: RenderKey,
-    /// Dynamic uniform offset
-    pub dynamic_offset: u32,
+    pub material_index: u32,
+    pub distance_sq: f32,
 }
 
-pub struct ShadowRenderCommand {
-    /// Exact originating item in `ExtractedScene::render_items`.
+/// CPU-only per-shadow-view draw intent.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowRenderIntent {
     pub source_item_index: u32,
-    pub object_bind_group: BindGroupContext,
     pub geometry_handle: GeometryHandle,
     pub material_handle: MaterialHandle,
-    /// Pipeline handle (index into [`PipelineCache`] storage).
-    pub pipeline_id: RenderPipelineId,
-    pub dynamic_offset: u32,
 }
 
 /// Frame-scoped feature inputs that affect scene shader variants.
@@ -167,8 +156,12 @@ pub(crate) struct DrawPlanMeta {
 /// can be trivially parallelised in the future.
 ///
 /// [`bake::finalize_live_draw_plans`]: super::bake::finalize_live_draw_plans
-/// [`submit_draw_commands`]: super::rdg::draw::submit_draw_commands
+/// [`submit_draw_commands`]: super::passes::draw::submit_draw_commands
 pub struct DrawCommand {
+    /// Exact extracted source used only by the post-submit history commit.
+    /// Execute remains blind to this logical identity.
+    pub(crate) source_item_index: u32,
+
     /// Composite sort key for minimising GPU state switches.
     ///
     /// * Opaque — Pipeline › Material › Depth (front-to-back).
@@ -205,6 +198,142 @@ pub struct DrawCommand {
 
     /// Instance range.
     pub instance_range: std::ops::Range<u32>,
+}
+
+/// Exact graph-attempt physical state for one extracted draw source.
+///
+/// Buffer and bind-group slots are owned by the sibling [`DrawPlanStore`].
+/// This record retains only compact slots plus the cloned layout/interface
+/// metadata required to derive live pipelines after DPE. It deliberately owns
+/// no vertex buffer or material/object BindGroup directly.
+pub(crate) struct PreparedDrawSource {
+    /// Exact CPU assets selected for this graph attempt. These Arc owners close
+    /// the same-handle/same-version ABA gap during deferred pipeline creation.
+    pub(crate) geometry_asset: Arc<Geometry>,
+    pub(crate) material_asset: Arc<Material>,
+    pub(crate) geometry_asset_version: u32,
+    pub(crate) geometry_asset_identity: u64,
+    pub(crate) material_asset_version: u32,
+    pub(crate) material_asset_identity: u64,
+
+    pub(crate) vertex_buffers: SmallVec<[DrawBufferSlot; 2]>,
+    pub(crate) index_buffer: Option<(DrawBufferSlot, wgpu::IndexFormat, u32)>,
+    pub(crate) material_bind_group: DrawBindGroupSlot,
+    pub(crate) material_bind_group_id: u64,
+    pub(crate) object_bind_group: (DrawBindGroupSlot, u32),
+    pub(crate) draw_range: Range<u32>,
+    pub(crate) instance_range: Range<u32>,
+
+    /// Shared immutable vertex interface. Sources that reuse one geometry
+    /// clone only this Arc rather than reallocating the generated layout.
+    pub(crate) geometry_layout_info: Arc<GeneratedVertexLayout>,
+    pub(crate) geometry_layout_id: u64,
+    pub(crate) geometry_version: u64,
+    pub(crate) geometry_layout_version: u64,
+    pub(crate) material_layout: wgpu::BindGroupLayout,
+    pub(crate) material_layout_id: u64,
+    pub(crate) material_binding_wgsl: Arc<str>,
+    pub(crate) material_binding_wgsl_hash: u64,
+    pub(crate) material_version: u64,
+    pub(crate) object_layout: wgpu::BindGroupLayout,
+    pub(crate) object_layout_id: u64,
+    pub(crate) object_binding_wgsl: Arc<str>,
+    pub(crate) object_binding_wgsl_hash: u64,
+}
+
+impl PreparedDrawSource {
+    #[inline]
+    pub(crate) fn matches_extracted(
+        &self,
+        item: &ExtractedRenderItem,
+        geometry_handle: GeometryHandle,
+        material_handle: MaterialHandle,
+    ) -> bool {
+        (item.geometry, item.material) == (geometry_handle, material_handle)
+            && (item.geometry_asset_version, item.geometry_asset_identity)
+                == (self.geometry_asset_version, self.geometry_asset_identity)
+            && (item.material_asset_version, item.material_asset_identity)
+                == (self.material_asset_version, self.material_asset_identity)
+    }
+
+    /// Validate shader/raster-relevant interior versions around deferred
+    /// derivation. Exact Arc identity closes storage ABA; these counters close
+    /// concurrent in-place mutation of the same allocation.
+    #[inline]
+    pub(crate) fn pipeline_state_is_current(&self) -> bool {
+        self.geometry_asset.structure_version() == self.geometry_version
+            && self.geometry_asset.layout_version() == self.geometry_layout_version
+            && self.material_asset.data.version() == self.material_version
+    }
+}
+
+/// Graph-attempt-scoped source preparation indexed by `source_item_index`.
+///
+/// The parallel `Option` array preserves exact extracted-item identity while
+/// allowing unavailable or DPE-dead sources to remain unprepared. All physical
+/// Buffer/BindGroup owners live in [`DrawPlanStore`], so clearing both stores
+/// deterministically releases one graph attempt.
+pub(crate) struct PreparedDrawStore {
+    sources: Vec<Option<PreparedDrawSource>>,
+    sources_initialized: bool,
+}
+
+impl PreparedDrawStore {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            sources: Vec::with_capacity(512),
+            sources_initialized: false,
+        }
+    }
+
+    /// Release graph-attempt metadata while retaining the parallel array's
+    /// allocation for the next frame.
+    pub(crate) fn clear(&mut self) {
+        self.sources.clear();
+        self.sources_initialized = false;
+    }
+
+    /// Initialize the exact parallel source table once for this graph attempt.
+    pub(crate) fn begin_sources(&mut self, source_count: usize) {
+        assert!(
+            !self.sources_initialized,
+            "prepared draw sources may be initialized only once per graph attempt"
+        );
+        debug_assert!(self.sources.is_empty());
+        self.sources.resize_with(source_count, || None);
+        self.sources_initialized = true;
+    }
+
+    /// Publish one exact physical source after its resources have been interned
+    /// into the sibling [`DrawPlanStore`].
+    pub(crate) fn insert_source(&mut self, source_item_index: u32, source: PreparedDrawSource) {
+        assert!(
+            self.sources_initialized,
+            "prepared draw source table must be initialized before insertion"
+        );
+        let index = source_item_index as usize;
+        let slot = self
+            .sources
+            .get_mut(index)
+            .expect("prepared draw source index exceeds the extracted item table");
+        assert!(slot.is_none(), "prepared draw source was inserted twice");
+        *slot = Some(source);
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn source(&self, source_item_index: u32) -> Option<&PreparedDrawSource> {
+        self.sources
+            .get(source_item_index as usize)
+            .and_then(Option::as_ref)
+    }
+}
+
+impl Default for PreparedDrawStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Graph-attempt-scoped pre-baked draw plans.
@@ -316,6 +445,17 @@ impl DrawPlanStore {
         self.plan(id)
             .expect("draw plan ID does not belong to this graph attempt")
             .live
+    }
+
+    /// Iterate canonical keys demanded by passes that survived DPE.
+    ///
+    /// The iterator copies POD keys only; it does not expose mutable plan state
+    /// or make source metadata participate in graph liveness.
+    pub(crate) fn live_keys(&self) -> impl Iterator<Item = DrawPlanKey> + '_ {
+        self.plans
+            .iter()
+            .filter(|plan| plan.live)
+            .map(|plan| plan.key)
     }
 
     /// Return Copy metadata for a reservation-table slot.
@@ -464,6 +604,14 @@ impl DrawPlanStore {
         Some(&self.commands[range.start as usize..range.end as usize])
     }
 
+    /// Source identities of commands that were actually emitted into at least
+    /// one live plan. The caller deduplicates shared main/prepass/shadow uses.
+    pub(crate) fn emitted_source_indices(&self) -> impl Iterator<Item = u32> + '_ {
+        self.commands
+            .iter()
+            .map(|command| command.source_item_index)
+    }
+
     fn plan(&self, id: DrawPlanId) -> Option<&DrawPlanRecord> {
         if id.attempt_token != self.attempt_token {
             return None;
@@ -609,33 +757,34 @@ pub struct ShadowLightInstance {
     pub is_point: bool,
 }
 
-/// Render lists.
+/// CPU-only render intent lists plus shared frame metadata.
 ///
-/// Stores culled and sorted render commands. Populated by `SceneCullPass`,
-/// consumed by `OpaquePass`, `TransparentPass`, and `SimpleForwardPass`.
+/// Intent lists are populated before RDG compilation. After DPE, live
+/// [`DrawPlanKey`] values select an exact, deduplicated source-item union for
+/// physical preparation. Physical slots and finalized commands belong to the
+/// graph-attempt [`PreparedDrawStore`] and [`DrawPlanStore`].
 ///
 /// # Design Principles
 /// - **Data-logic separation**: stores data only, contains no rendering logic
 /// - **Inter-frame reuse**: pre-allocated memory, cleared via `clear()` each frame
 /// - **Extensible**: can add `alpha_test`, `shadow_casters`, etc. in the future
 pub struct RenderLists {
-    /// Opaque command list (front-to-back sorted)
-    pub opaque: Vec<RenderCommand>,
-    /// Transparent command list (back-to-front sorted)
-    pub transparent: Vec<RenderCommand>,
-    /// Shadow command queues, keyed by `(light_id, layer_index)` for per-view culling.
+    /// Main-view opaque intents.
+    pub opaque: Vec<RenderIntent>,
+    /// Main-view transparent intents.
+    pub transparent: Vec<RenderIntent>,
+    /// Shadow intent queues, keyed by `(light_id, layer_index)` for exact
+    /// per-view demand projection.
     ///
     /// Each cascade of a directional light (or each spot light) gets its own queue.
-    pub shadow_queues: FxHashMap<(u64, u32), Vec<ShadowRenderCommand>>,
+    pub shadow_queues: FxHashMap<(u64, u32), Vec<ShadowRenderIntent>>,
 
     /// All active render views for the current frame.
     ///
-    /// Populated by `SceneCullPass`, consumed by `ShadowPass` and other passes.
+    /// Populated during CPU extraction, consumed by intent collection and
+    /// shadow graph construction.
     /// Contains main camera view + all shadow views.
     pub active_views: Vec<RenderView>,
-
-    /// Global bind group (camera, lighting, environment, etc.)
-    pub gpu_global_bind_group: Option<wgpu::BindGroup>,
 
     /// Stable per-frame scene-light metadata buffer for RDG imports.
     pub gpu_local_light_metadata_buffer: Option<Tracked<wgpu::Buffer>>,
@@ -656,7 +805,6 @@ impl RenderLists {
             transparent: Vec::with_capacity(128),
             shadow_queues: FxHashMap::default(),
             active_views: Vec::with_capacity(16),
-            gpu_global_bind_group: None,
             gpu_local_light_metadata_buffer: None,
             gpu_local_light_storage_buffer: None,
             use_transmission: false,
@@ -670,31 +818,80 @@ impl RenderLists {
         self.transparent.clear();
         self.shadow_queues.clear();
         self.active_views.clear();
-        self.gpu_global_bind_group = None;
         self.gpu_local_light_metadata_buffer = None;
         self.gpu_local_light_storage_buffer = None;
         self.use_transmission = false;
     }
 
-    /// Inserts an opaque render command.
+    /// Inserts an opaque render intent.
     #[inline]
-    pub fn insert_opaque(&mut self, cmd: RenderCommand) {
-        self.opaque.push(cmd);
+    pub fn insert_opaque(&mut self, intent: RenderIntent) {
+        self.opaque.push(intent);
     }
 
-    /// Inserts a transparent render command.
+    /// Inserts a transparent render intent.
     #[inline]
-    pub fn insert_transparent(&mut self, cmd: RenderCommand) {
-        self.transparent.push(cmd);
+    pub fn insert_transparent(&mut self, intent: RenderIntent) {
+        self.transparent.push(intent);
     }
 
-    /// Sorts command lists.
-    ///
-    /// - Opaque: by Pipeline > Material > Depth (front-to-back)
-    /// - Transparent: by Depth (back-to-front) > Pipeline > Material
-    pub fn sort(&mut self) {
-        self.opaque.sort_unstable_by_key(|a| a.sort_key);
-        self.transparent.sort_unstable_by_key(|a| a.sort_key);
+    /// Return the exact sorted and deduplicated source-item union selected by
+    /// DPE-live draw-plan keys.
+    #[must_use]
+    pub(crate) fn live_source_indices(
+        &self,
+        live_keys: impl IntoIterator<Item = DrawPlanKey>,
+    ) -> Vec<u32> {
+        let mut sources = Vec::new();
+        for key in live_keys {
+            self.extend_sources_for_key(key, &mut sources);
+        }
+        sort_and_dedup_sources(&mut sources);
+        sources
+    }
+
+    /// Return every intent's source index, independent of DPE liveness.
+    #[must_use]
+    pub(crate) fn all_source_indices(&self) -> Vec<u32> {
+        let mut sources = Vec::with_capacity(
+            self.opaque.len()
+                + self.transparent.len()
+                + self.shadow_queues.values().map(Vec::len).sum::<usize>(),
+        );
+        sources.extend(self.opaque.iter().map(|intent| intent.source_item_index));
+        sources.extend(
+            self.transparent
+                .iter()
+                .map(|intent| intent.source_item_index),
+        );
+        for queue in self.shadow_queues.values() {
+            sources.extend(queue.iter().map(|intent| intent.source_item_index));
+        }
+        sort_and_dedup_sources(&mut sources);
+        sources
+    }
+
+    fn extend_sources_for_key(&self, key: DrawPlanKey, sources: &mut Vec<u32>) {
+        match key {
+            DrawPlanKey::Opaque | DrawPlanKey::Prepass { .. } => {
+                sources.extend(self.opaque.iter().map(|intent| intent.source_item_index));
+            }
+            DrawPlanKey::Transparent => {
+                sources.extend(
+                    self.transparent
+                        .iter()
+                        .map(|intent| intent.source_item_index),
+                );
+            }
+            DrawPlanKey::Shadow {
+                light_id,
+                layer_index,
+            } => {
+                if let Some(queue) = self.shadow_queues.get(&(light_id, layer_index)) {
+                    sources.extend(queue.iter().map(|intent| intent.source_item_index));
+                }
+            }
+        }
     }
 
     /// Returns `true` if both lists are empty.
@@ -709,6 +906,12 @@ impl Default for RenderLists {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[inline]
+fn sort_and_dedup_sources(sources: &mut Vec<u32>) {
+    sources.sort_unstable();
+    sources.dedup();
 }
 
 // ============================================================================
@@ -1270,12 +1473,14 @@ fn tracked_cpu_buffer<T: myth_resources::buffer::GpuData>(
 #[cfg(test)]
 mod draw_plan_tests {
     use super::*;
+    use slotmap::Key;
 
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     fn assert_copy<T: Copy>() {}
 
     fn test_command(sort_key: u64) -> DrawCommand {
         DrawCommand {
+            source_item_index: 0,
             sort_key,
             pipeline_id: RenderPipelineId(0),
             vertex_buffers: SmallVec::new(),
@@ -1285,6 +1490,24 @@ mod draw_plan_tests {
             stencil_reference: None,
             vertex_range: 0..3,
             instance_range: 0..1,
+        }
+    }
+
+    fn render_intent(source_item_index: u32) -> RenderIntent {
+        RenderIntent {
+            source_item_index,
+            geometry_handle: GeometryHandle::null(),
+            material_handle: MaterialHandle::null(),
+            material_index: source_item_index,
+            distance_sq: source_item_index as f32,
+        }
+    }
+
+    fn shadow_intent(source_item_index: u32) -> ShadowRenderIntent {
+        ShadowRenderIntent {
+            source_item_index,
+            geometry_handle: GeometryHandle::null(),
+            material_handle: MaterialHandle::null(),
         }
     }
 
@@ -1382,5 +1605,60 @@ mod draw_plan_tests {
             vec![10, 30]
         );
         assert_eq!(store.plan_count(), 2);
+    }
+
+    #[test]
+    fn live_prepass_and_exact_shadow_select_only_their_deduplicated_sources() {
+        let mut lists = RenderLists::new();
+        lists.opaque = vec![render_intent(2), render_intent(1)];
+        lists.transparent = vec![render_intent(3)];
+        lists
+            .shadow_queues
+            .insert((10, 0), vec![shadow_intent(4), shadow_intent(2)]);
+        lists.shadow_queues.insert((20, 3), vec![shadow_intent(5)]);
+
+        let mut plans = DrawPlanStore::new();
+        let dead_transparent = plans.reserve_plan(DrawPlanKey::Transparent);
+        let prepass = plans.reserve_plan(DrawPlanKey::Prepass {
+            needs_normal: true,
+            needs_feature_id: false,
+            needs_velocity: true,
+        });
+        let live_shadow = plans.reserve_plan(DrawPlanKey::Shadow {
+            light_id: 10,
+            layer_index: 0,
+        });
+        let dead_shadow = plans.reserve_plan(DrawPlanKey::Shadow {
+            light_id: 20,
+            layer_index: 3,
+        });
+
+        plans.mark_live(prepass);
+        plans.mark_live(live_shadow);
+
+        assert!(!plans.is_live(dead_transparent));
+        assert!(!plans.is_live(dead_shadow));
+        assert_eq!(
+            lists.live_source_indices(plans.live_keys()),
+            vec![1, 2, 4],
+            "Prepass must select opaque sources, the exact live shadow must add only its queue, and shared source 2 must be deduplicated"
+        );
+        assert_eq!(lists.all_source_indices(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn an_empty_live_plan_has_an_empty_source_union() {
+        let lists = RenderLists::new();
+        let mut plans = DrawPlanStore::new();
+        let empty_prepass = plans.reserve_plan(DrawPlanKey::Prepass {
+            needs_normal: false,
+            needs_feature_id: false,
+            needs_velocity: false,
+        });
+        plans.mark_live(empty_prepass);
+
+        assert_eq!(plans.live_keys().count(), 1);
+        assert!(lists.live_source_indices(plans.live_keys()).is_empty());
+        assert!(lists.all_source_indices().is_empty());
     }
 }

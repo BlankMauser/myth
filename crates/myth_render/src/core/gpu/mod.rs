@@ -41,6 +41,7 @@ mod system_textures;
 mod texture;
 mod tracked;
 
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::core::gpu::buffer::{BufferUploadContext, GpuBufferHandle};
@@ -84,6 +85,13 @@ pub fn generate_gpu_resource_id() -> u64 {
             value.checked_add(1)
         })
         .expect("GPU resource ID space exhausted")
+}
+
+#[inline]
+pub(crate) fn hash_binding_wgsl(binding_wgsl: &str) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    binding_wgsl.hash(&mut hasher);
+    hasher.finish()
 }
 
 // ============================================================================
@@ -237,6 +245,11 @@ impl ResourceManager {
     #[inline]
     pub fn get_cached_bind_group(&self, cached_bind_group_id: u64) -> Option<&BindGroupContext> {
         self.bind_groups.cached_bind_group(cached_bind_group_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_object_bind_group_ids(&self) -> Vec<u64> {
+        self.bind_groups.cached_object_bind_group_ids()
     }
 
     pub fn prune(&mut self, ttl_frames: u64) {
