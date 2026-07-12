@@ -35,7 +35,6 @@ use crate::renderer::FrameTime;
 use crate::settings::{ClusteredShadingMode, RenderPath};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::RenderableMaterialTrait;
-use myth_resources::buffer::CpuBuffer;
 use myth_resources::geometry::Geometry;
 use myth_resources::material::Material;
 use myth_scene::Scene;
@@ -858,12 +857,6 @@ pub struct RenderLists {
     /// Contains main camera view + all shadow views.
     pub active_views: Vec<RenderView>,
 
-    /// Stable per-frame scene-light metadata buffer for RDG imports.
-    pub gpu_local_light_metadata_buffer: Option<Tracked<wgpu::Buffer>>,
-
-    /// Stable per-frame scene-light storage buffer for RDG imports.
-    pub gpu_local_light_storage_buffer: Option<Tracked<wgpu::Buffer>>,
-
     /// Whether a transmission copy is needed this frame
     pub use_transmission: bool,
 }
@@ -877,8 +870,6 @@ impl RenderLists {
             transparent: Vec::with_capacity(128),
             shadow_queues: FxHashMap::default(),
             active_views: Vec::with_capacity(16),
-            gpu_local_light_metadata_buffer: None,
-            gpu_local_light_storage_buffer: None,
             use_transmission: false,
         }
     }
@@ -890,8 +881,6 @@ impl RenderLists {
         self.transparent.clear();
         self.shadow_queues.clear();
         self.active_views.clear();
-        self.gpu_local_light_metadata_buffer = None;
-        self.gpu_local_light_storage_buffer = None;
         self.use_transmission = false;
     }
 
@@ -1194,11 +1183,7 @@ impl RenderFrame {
         render_lists.active_views.extend(shadow_views);
 
         // ── 6. Update light storage buffer with shadow metadata ────────
-        Self::update_light_shadow_metadata(
-            &render_lists.active_views,
-            &mut self.extracted_scene,
-            resource_manager,
-        );
+        Self::update_light_shadow_metadata(&render_lists.active_views, &mut self.extracted_scene);
 
         // ── 7. Global GPU resources ────────────────────────────────────
         self.render_state.update(
@@ -1213,16 +1198,6 @@ impl RenderFrame {
             &self.extracted_scene,
             &self.render_state,
             published_pmrem_view,
-        );
-        resource_manager.ensure_buffer(&self.extracted_scene.local_light_metadata_buffer);
-        resource_manager.ensure_buffer(&self.extracted_scene.local_light_storage_buffer);
-        render_lists.gpu_local_light_metadata_buffer = tracked_cpu_buffer(
-            resource_manager,
-            &self.extracted_scene.local_light_metadata_buffer,
-        );
-        render_lists.gpu_local_light_storage_buffer = tracked_cpu_buffer(
-            resource_manager,
-            &self.extracted_scene.local_light_storage_buffer,
         );
     }
 
@@ -1377,7 +1352,6 @@ impl RenderFrame {
     fn update_light_shadow_metadata(
         active_views: &[crate::core::view::RenderView],
         extracted_scene: &mut ExtractedScene,
-        resource_manager: &mut ResourceManager,
     ) {
         use crate::core::view::ViewTarget;
         use crate::graph::shadow_utils::MAX_CASCADES;
@@ -1392,10 +1366,6 @@ impl RenderFrame {
             .iter()
             .any(crate::core::view::RenderView::is_shadow);
         if !has_shadow_views {
-            // Keep the normal ensure path for first-frame materialization,
-            // resource residency and stable external RDG imports.
-            resource_manager.ensure_buffer(&extracted_scene.local_light_storage_buffer);
-            resource_manager.ensure_buffer(&extracted_scene.directional_light_storage_buffer);
             return;
         }
 
@@ -1519,9 +1489,6 @@ impl RenderFrame {
                 d2_layer_counter += view_count;
             }
         }
-
-        resource_manager.ensure_buffer(&extracted_scene.local_light_storage_buffer);
-        resource_manager.ensure_buffer(&extracted_scene.directional_light_storage_buffer);
     }
 
     /// Periodically prune stale resources.
@@ -1531,15 +1498,6 @@ impl RenderFrame {
             resource_manager.prune(6000);
         }
     }
-}
-
-fn tracked_cpu_buffer<T: myth_resources::buffer::GpuData>(
-    resource_manager: &ResourceManager,
-    cpu_buffer: &CpuBuffer<T>,
-) -> Option<Tracked<wgpu::Buffer>> {
-    resource_manager
-        .get_gpu_buffer_by_cpu_id(cpu_buffer.id())
-        .map(|gpu_buffer| Tracked::with_id(gpu_buffer.buffer.clone(), gpu_buffer.id))
 }
 
 #[cfg(test)]

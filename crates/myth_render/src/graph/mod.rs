@@ -25,7 +25,7 @@ pub mod shadow_utils;
 pub use composer::FrameComposer;
 pub use core::{
     MermaidDumpMode, RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
-    RdgSurfaceAcquireFailure,
+    RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
 };
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton};
 pub use frame::{

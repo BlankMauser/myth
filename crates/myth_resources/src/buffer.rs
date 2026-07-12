@@ -13,6 +13,19 @@ pub trait GpuData {
     fn byte_size(&self) -> usize;
 }
 
+/// Coherent, allocation-free identity and content stamp for a [`CpuBuffer`].
+///
+/// Deferred systems can retain this Copy value across scheduling boundaries,
+/// then compare it with a later [`CpuBuffer::stamp`] without retaining a
+/// borrow or cloning payload data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CpuBufferStamp {
+    pub id: u64,
+    pub usage: wgpu::BufferUsages,
+    pub size: usize,
+    pub version: u64,
+}
+
 impl<T: Pod> GpuData for Vec<T> {
     fn as_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(self)
@@ -329,11 +342,40 @@ impl<T: GpuData> CpuBuffer<T> {
         self.inner.read().version
     }
 
+    /// Capture identity, descriptor, and version under one read lock.
+    #[inline]
+    #[must_use]
+    pub fn stamp(&self) -> CpuBufferStamp {
+        let state = self.inner.read();
+        CpuBufferStamp {
+            id: self.id,
+            usage: self.usage,
+            size: state.size,
+            version: state.version,
+        }
+    }
+
     /// Acquire data read lock
     pub fn read(&self) -> BufferReadGuard<'_, T> {
         BufferReadGuard {
             guard: self.inner.read(),
         }
+    }
+
+    /// Acquire the data read lock and capture its exact identity/version stamp.
+    ///
+    /// The returned guard keeps writers excluded, allowing a deferred uploader
+    /// to validate the stamp and consume bytes that are guaranteed to belong to
+    /// that same version.
+    pub fn read_stamped(&self) -> (CpuBufferStamp, BufferReadGuard<'_, T>) {
+        let guard = self.inner.read();
+        let stamp = CpuBufferStamp {
+            id: self.id,
+            usage: self.usage,
+            size: guard.size,
+            version: guard.version,
+        };
+        (stamp, BufferReadGuard { guard })
     }
     /// Acquire data write lock
     pub fn write(&self) -> BufferGuard<'_, T> {
@@ -379,5 +421,32 @@ impl<T: GpuData> std::ops::Deref for BufferReadGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         &self.guard.data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamped_read_describes_the_guarded_bytes() {
+        let buffer = CpuBuffer::new(
+            vec![1_u32, 2, 3],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            Some("stamped read test"),
+        );
+
+        let (stamp, data) = buffer.read_stamped();
+        assert_eq!(stamp.id, buffer.id());
+        assert_eq!(stamp.size, data.byte_size());
+        assert_eq!(stamp.version, 0);
+        assert_eq!(&*data, &[1, 2, 3]);
+        drop(data);
+        assert_eq!(stamp, buffer.stamp());
+
+        buffer.write().push(4);
+        let next = buffer.stamp();
+        assert_eq!(next.version, 1);
+        assert_eq!(next.size, 4 * std::mem::size_of::<u32>());
     }
 }

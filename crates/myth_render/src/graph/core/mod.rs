@@ -10,6 +10,7 @@ pub(crate) mod gaussian;
 pub mod graph;
 pub mod node;
 pub mod persistent;
+mod scene_buffer;
 pub mod template_pass;
 pub mod types;
 
@@ -27,7 +28,7 @@ pub use context::{
 };
 pub use diagnostics::{
     RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
-    RdgSurfaceAcquireFailure,
+    RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
 };
 pub(crate) use diagnostics::{
     RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgRendererAttemptGuard,
@@ -38,6 +39,10 @@ pub use persistent::{
     CacheCommitToken, CacheId, CacheKey, CachePlan, CachePublicationReceipt, HistoryCommitToken,
     HistoryPlan, HistoryRegistry, HistorySetId, HistoryTextureRef, PersistentTextureId,
     PersistentTextureRef, PersistentTextureSpec, TemporalDomainKey,
+};
+pub use scene_buffer::SceneBufferImportId;
+pub(crate) use scene_buffer::{
+    SceneBufferMaterializationFailure, SceneBufferResolver, SceneBufferSources,
 };
 pub use template_pass::{
     ComputePassBuilder, RenderPassBuilder, StandardComputeNode, StandardFullscreenNode,

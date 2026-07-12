@@ -95,6 +95,11 @@ impl PassBuilder<'_, '_> {
             "Asset Texture import root '{}' is a read-only lazy external input; use builder.mutate_texture() to produce a derived version",
             res.name
         );
+        assert!(
+            res.scene_buffer_import_id().is_none(),
+            "Scene Buffer import root '{}' is a read-only lazy external input",
+            res.name
+        );
 
         if let Some(existing_producer) = res.producer {
             panic!(

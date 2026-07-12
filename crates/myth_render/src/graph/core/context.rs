@@ -25,7 +25,7 @@ use super::types::{
     BufferNodeId, GraphResourceType, RenderTargetOps, ResourceKind, ResourceNodeId, ResourceRecord,
     TextureNodeId,
 };
-use super::{AssetTextureImportId, AssetTextureResolver};
+use super::{AssetTextureImportId, AssetTextureResolver, SceneBufferResolver};
 
 // ─── Legacy/template pre-RDG compatibility context ─────────────────────────
 
@@ -160,6 +160,7 @@ pub struct ViewResolver<'a> {
     pub pool: &'a mut TransientPool,
     pub persistent_resources: &'a HistoryRegistry,
     pub(crate) asset_textures: AssetTextureResolver<'a>,
+    pub(crate) scene_buffers: SceneBufferResolver<'a>,
 }
 
 #[inline]
@@ -274,6 +275,49 @@ fn with_buffer_binding_identity(
         .with_resource(offset)
         .with_resource(u64::from(size.is_some()))
         .with_resource(size.map_or(0, wgpu::BufferSize::get))
+}
+
+struct KeyedBufferBinding<'a> {
+    resource_id: u64,
+    binding: wgpu::BufferBinding<'a>,
+}
+
+impl<'a> KeyedBufferBinding<'a> {
+    #[inline]
+    fn extend_key(&self, key: BindGroupKey) -> BindGroupKey {
+        with_buffer_binding_identity(
+            key,
+            self.resource_id,
+            self.binding.offset,
+            self.binding.size,
+        )
+    }
+
+    #[inline]
+    fn into_resource(self) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::Buffer(self.binding)
+    }
+}
+
+fn keyed_screen_buffer_binding<'a>(
+    views: &'a ViewResolver<'_>,
+    graph_buffer: Option<BufferNodeId>,
+    fallback: &'a Tracked<wgpu::Buffer>,
+) -> KeyedBufferBinding<'a> {
+    graph_buffer.map_or_else(
+        || KeyedBufferBinding {
+            resource_id: fallback.id(),
+            binding: wgpu::BufferBinding {
+                buffer: fallback,
+                offset: 0,
+                size: None,
+            },
+        },
+        |id| KeyedBufferBinding {
+            resource_id: views.get_physical_buffer_uid(id),
+            binding: views.get_buffer_binding(id),
+        },
+    )
 }
 
 impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
@@ -767,6 +811,7 @@ fn is_graph_resource_allocated<T: GraphResourceType>(
     resources: &[ResourceRecord],
     persistent_resources: &HistoryRegistry,
     asset_textures: AssetTextureResolver<'_>,
+    scene_buffers: SceneBufferResolver<'_>,
     id: ResourceNodeId<T>,
 ) -> bool {
     let root_id = resolve_root_id(resources, id);
@@ -776,6 +821,9 @@ fn is_graph_resource_allocated<T: GraphResourceType>(
     }
     if let Some(id) = res.persistent_texture_id() {
         return persistent_resources.is_texture_materialized(id);
+    }
+    if let Some(id) = res.scene_buffer_import_id() {
+        return scene_buffers.buffer(id).is_some();
     }
     res.is_external || res.physical_index.is_some()
 }
@@ -907,6 +955,12 @@ impl ViewResolver<'_> {
         let (_, res) = resolve_buffer_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.scene_buffer_import_id() {
+                return self
+                    .scene_buffers
+                    .buffer(id)
+                    .expect("live Scene Buffer import did not materialize its buffer");
+            }
             let ptr = res
                 .external_buffer_ptr()
                 .expect("External buffer missing pointer!");
@@ -975,6 +1029,7 @@ impl ViewResolver<'_> {
             self.resources,
             self.persistent_resources,
             self.asset_textures,
+            self.scene_buffers,
             id,
         )
     }
@@ -1045,37 +1100,14 @@ pub fn build_screen_bind_group(
         &sys.screen_layout
     };
 
-    let (light_metadata_id, light_metadata_binding) = match clustered.light_metadata {
-        Some(id) => (
-            views.get_physical_buffer_uid(id),
-            wgpu::BindingResource::Buffer(views.get_buffer_binding(id)),
-        ),
-        None => (
-            sys.light_metadata.id(),
-            sys.light_metadata.as_entire_binding(),
-        ),
-    };
-    let (light_storage_id, light_storage_binding) = match clustered.lights {
-        Some(id) => (
-            views.get_physical_buffer_uid(id),
-            wgpu::BindingResource::Buffer(views.get_buffer_binding(id)),
-        ),
-        None => (
-            sys.light_storage.id(),
-            sys.light_storage.as_entire_binding(),
-        ),
-    };
-    let (atmosphere_bake_params_id, atmosphere_bake_params_binding) =
-        match clustered.atmosphere_bake_params {
-            Some(id) => (
-                views.get_physical_buffer_uid(id),
-                wgpu::BindingResource::Buffer(views.get_buffer_binding(id)),
-            ),
-            None => (
-                sys.atmosphere_bake_params.id(),
-                sys.atmosphere_bake_params.as_entire_binding(),
-            ),
-        };
+    let light_metadata =
+        keyed_screen_buffer_binding(views, clustered.light_metadata, &sys.light_metadata);
+    let light_storage = keyed_screen_buffer_binding(views, clustered.lights, &sys.light_storage);
+    let atmosphere_bake_params = keyed_screen_buffer_binding(
+        views,
+        clustered.atmosphere_bake_params,
+        &sys.atmosphere_bake_params,
+    );
 
     let base_key = BindGroupKey::new(layout.id())
         .with_resource(transmission_view.id())
@@ -1083,11 +1115,13 @@ pub fn build_screen_bind_group(
         .with_resource(ssao_view.id())
         .with_resource(shadow_view.id())
         .with_resource(shadow_cube_view.id())
-        .with_resource(sys.shadow_compare_sampler.id())
-        .with_resource(light_metadata_id)
-        .with_resource(light_storage_id)
-        .with_resource(atmosphere_transmittance_view.id())
-        .with_resource(atmosphere_bake_params_id)
+        .with_resource(sys.shadow_compare_sampler.id());
+    let base_key = light_metadata.extend_key(base_key);
+    let base_key = light_storage
+        .extend_key(base_key)
+        .with_resource(atmosphere_transmittance_view.id());
+    let base_key = atmosphere_bake_params
+        .extend_key(base_key)
         .with_resource(sys.blue_noise.id())
         .with_resource(sys.blue_noise_sampler.id());
 
@@ -1123,11 +1157,11 @@ pub fn build_screen_bind_group(
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: light_metadata_binding,
+                        resource: light_metadata.into_resource(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: light_storage_binding,
+                        resource: light_storage.into_resource(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 11,
@@ -1135,7 +1169,7 @@ pub fn build_screen_bind_group(
                     },
                     wgpu::BindGroupEntry {
                         binding: 12,
-                        resource: atmosphere_bake_params_binding,
+                        resource: atmosphere_bake_params.into_resource(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 13,
@@ -1150,41 +1184,16 @@ pub fn build_screen_bind_group(
         });
     }
 
-    let (cluster_params_id, cluster_params_binding) = match clustered.params {
-        Some(id) => (
-            views.get_physical_buffer_uid(id),
-            wgpu::BindingResource::Buffer(views.get_buffer_binding(id)),
-        ),
-        None => (
-            sys.clustered_params.id(),
-            sys.clustered_params.as_entire_binding(),
-        ),
-    };
-    let (cluster_records_id, cluster_records_binding) = match clustered.records {
-        Some(id) => (
-            views.get_physical_buffer_uid(id),
-            wgpu::BindingResource::Buffer(views.get_buffer_binding(id)),
-        ),
-        None => (
-            sys.clustered_records.id(),
-            sys.clustered_records.as_entire_binding(),
-        ),
-    };
-    let (cluster_light_indices_id, cluster_light_indices_binding) = match clustered.light_indices {
-        Some(id) => (
-            views.get_physical_buffer_uid(id),
-            wgpu::BindingResource::Buffer(views.get_buffer_binding(id)),
-        ),
-        None => (
-            sys.clustered_light_indices.id(),
-            sys.clustered_light_indices.as_entire_binding(),
-        ),
-    };
+    let cluster_params =
+        keyed_screen_buffer_binding(views, clustered.params, &sys.clustered_params);
+    let cluster_records =
+        keyed_screen_buffer_binding(views, clustered.records, &sys.clustered_records);
+    let cluster_light_indices =
+        keyed_screen_buffer_binding(views, clustered.light_indices, &sys.clustered_light_indices);
 
-    let key = base_key
-        .with_resource(cluster_params_id)
-        .with_resource(cluster_records_id)
-        .with_resource(cluster_light_indices_id);
+    let key = cluster_params.extend_key(base_key);
+    let key = cluster_records.extend_key(key);
+    let key = cluster_light_indices.extend_key(key);
 
     prepared.get_or_create(cache, key, || {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1217,23 +1226,23 @@ pub fn build_screen_bind_group(
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: light_metadata_binding,
+                    resource: light_metadata.into_resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: light_storage_binding,
+                    resource: light_storage.into_resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: cluster_params_binding,
+                    resource: cluster_params.into_resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: cluster_records_binding,
+                    resource: cluster_records.into_resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
-                    resource: cluster_light_indices_binding,
+                    resource: cluster_light_indices.into_resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
@@ -1241,7 +1250,7 @@ pub fn build_screen_bind_group(
                 },
                 wgpu::BindGroupEntry {
                     binding: 12,
-                    resource: atmosphere_bake_params_binding,
+                    resource: atmosphere_bake_params.into_resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 13,
@@ -1268,6 +1277,7 @@ pub struct ExecuteContext<'a> {
     pub pool: &'a TransientPool,
     pub persistent_resources: &'a HistoryRegistry,
     pub(crate) asset_textures: AssetTextureResolver<'a>,
+    pub(crate) scene_buffers: SceneBufferResolver<'a>,
     pub device: &'a Device,
     pub queue: &'a Queue,
     pub pipeline_cache: &'a PipelineCache,
@@ -1472,6 +1482,12 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_buffer_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.scene_buffer_import_id() {
+                return self
+                    .scene_buffers
+                    .buffer(id)
+                    .expect("live Scene Buffer import did not materialize its buffer");
+            }
             let ptr = res
                 .external_buffer_ptr()
                 .expect("External buffer missing pointer!");
@@ -1542,6 +1558,7 @@ impl ExecuteContext<'_> {
             self.resources,
             self.persistent_resources,
             self.asset_textures,
+            self.scene_buffers,
             id,
         )
     }
@@ -1725,6 +1742,7 @@ mod tests {
             .asset_texture_import_id()
             .unwrap();
         let asset_textures = graph.storage.asset_texture_imports.resolver();
+        let scene_buffers = graph.storage.scene_buffer_imports.resolver();
         asset_textures.materialize(import, AssetTextureMaterialization::unavailable());
 
         let histories = HistoryRegistry::new();
@@ -1734,6 +1752,7 @@ mod tests {
             pool: &mut pool,
             persistent_resources: &histories,
             asset_textures,
+            scene_buffers,
         };
 
         assert!(!views.is_resource_allocated(asset));
@@ -1741,6 +1760,7 @@ mod tests {
             &graph.storage.resources,
             &histories,
             asset_textures,
+            scene_buffers,
             asset,
         ));
         assert!(views.try_get_tracked_texture_view(asset).is_none());

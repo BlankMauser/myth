@@ -27,10 +27,28 @@ pub enum RdgAttemptOutcome {
     SurfaceAcquisitionFailed(RdgSurfaceAcquireFailure),
     /// Neither a window surface nor a headless target was configured.
     NoRenderTarget,
+    /// A DPE-live logical resource could not be materialized from the exact
+    /// CPU/GPU state captured for this graph attempt. No commands were
+    /// prepared, submitted, or presented.
+    ResourceMaterializationFailed(RdgResourceMaterializationFailure),
     /// The attempt ended before queue submission.
     Abandoned,
     /// Queue submission succeeded, but a later frame stage did not finish.
     SubmittedThenAbandoned,
+}
+
+/// Stable classification of failures at the post-DPE resource barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgResourceMaterializationFailure {
+    /// A scene buffer changed after graph construction captured its stamp.
+    SceneBufferSnapshotDrift,
+    /// ResourceManager already contains incompatible or newer physical state
+    /// for the exact scene-buffer snapshot requested by this attempt.
+    IncompatibleSceneBufferPhysicalState,
+    /// The live scene-buffer batch had already failed or could not publish a
+    /// complete set of graph-owned handles.
+    IncompleteSceneBufferBatch,
 }
 
 /// Stable engine-level classification of `wgpu` surface acquisition failures.
@@ -371,6 +389,15 @@ impl RdgDiagnosticsRecorder {
             .is_some_and(|latest| latest.outcome() == RdgAttemptOutcome::NoRenderTarget);
         self.request_outcome(RdgAttemptOutcome::NoRenderTarget);
         should_report
+    }
+
+    /// Terminates an attempt cleanly before prepare when an exact post-DPE
+    /// resource recipe can no longer be satisfied.
+    pub(crate) fn mark_resource_materialization_failed(
+        &self,
+        reason: RdgResourceMaterializationFailure,
+    ) {
+        self.request_outcome(RdgAttemptOutcome::ResourceMaterializationFailed(reason));
     }
 
     pub(crate) fn mark_queue_submitted(&self) {
@@ -717,6 +744,34 @@ mod tests {
         );
         assert!(snapshot.queue_submitted());
         assert_eq!(snapshot.phase(), RdgFramePhase::Publish);
+    }
+
+    #[test]
+    fn resource_materialization_failure_is_terminal_without_submission() {
+        let recorder = RdgDiagnosticsRecorder::default();
+        recorder.start_renderer_attempt(3);
+        let guard = RdgComposerAttemptGuard::new(&recorder);
+        recorder.enter_phase(RdgFramePhase::MaterializeResources);
+        recorder.record_declared_pass();
+        recorder.record_compiled_live_passes(1);
+        recorder.mark_resource_materialization_failed(
+            RdgResourceMaterializationFailure::SceneBufferSnapshotDrift,
+        );
+        drop(guard);
+
+        let snapshot = recorder.latest().expect("terminal snapshot missing");
+        assert_eq!(
+            snapshot.outcome(),
+            RdgAttemptOutcome::ResourceMaterializationFailed(
+                RdgResourceMaterializationFailure::SceneBufferSnapshotDrift
+            )
+        );
+        assert_eq!(snapshot.phase(), RdgFramePhase::MaterializeResources);
+        assert_eq!(snapshot.prepared_passes(), 0);
+        assert_eq!(snapshot.executed_passes(), 0);
+        assert!(!snapshot.queue_submitted());
+        assert!(!snapshot.presented());
+        assert!(!snapshot.panicked());
     }
 
     #[test]

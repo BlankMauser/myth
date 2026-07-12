@@ -49,7 +49,7 @@
 
 use crate::core::binding::GlobalBindGroupCache;
 use crate::core::gpu::{
-    AssetTextureSnapshot, CubeSourceType, GlobalStateKey, GlobalStateResolver,
+    AssetTextureSnapshot, BufferUploadContext, CubeSourceType, GlobalStateKey, GlobalStateResolver,
     MipmapRequestResolver, Tracked, snapshot_asset_texture,
 };
 use crate::core::{ResourceManager, WgpuContext};
@@ -64,8 +64,9 @@ use crate::graph::core::graph::FrameConfig;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GraphBlackboard, HistoryRegistry,
     HookStage, PrepareContext, RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgFramePhase,
-    RdgRenderTargetKind, RenderGraph, SceneDrawPrepareContext, TextureDesc, TransientPool,
-    ViewResolver,
+    RdgRenderTargetKind, RdgResourceMaterializationFailure, RenderGraph,
+    SceneBufferMaterializationFailure, SceneBufferSources, SceneDrawPrepareContext, TextureDesc,
+    TransientPool, ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
 use crate::graph::frame::RenderLists;
@@ -86,7 +87,6 @@ use crate::renderer::FrameTime;
 use crate::settings::RendererSettings;
 use myth_assets::{AssetServer, ImageHandle, TextureHandle};
 use myth_resources::texture::TextureSource;
-use myth_resources::uniforms::LightBufferMetadata;
 use myth_scene::Scene;
 use myth_scene::background::BackgroundMapping;
 use myth_scene::camera::RenderCamera;
@@ -303,37 +303,17 @@ pub struct GpuLightBuffers {
 
 fn import_scene_lighting(
     ctx: &mut GraphBuilderContext<'_, '_>,
-    render_lists: &RenderLists,
+    extracted_scene: &ExtractedScene,
 ) -> GpuLightBuffers {
-    let light_metadata_buffer = render_lists
-        .gpu_local_light_metadata_buffer
-        .as_ref()
-        .expect("scene light metadata buffer missing");
-    let light_storage_buffer = render_lists
-        .gpu_local_light_storage_buffer
-        .as_ref()
-        .expect("scene light storage buffer missing");
-
-    let light_metadata = ctx.graph.import_external_buffer(
-        "Scene_Local_Light_Metadata",
-        BufferDesc::new(
-            std::mem::size_of::<LightBufferMetadata>() as u64,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        ),
-        light_metadata_buffer,
-    );
-    let light_storage = ctx.graph.import_external_buffer(
-        "Scene_Local_Lights",
-        BufferDesc::new(
-            light_storage_buffer.size(),
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        ),
-        light_storage_buffer,
-    );
-
     GpuLightBuffers {
-        light_metadata,
-        light_storage,
+        light_metadata: ctx.graph.import_scene_light_metadata_buffer(
+            "Scene_Local_Light_Metadata",
+            &extracted_scene.local_light_metadata_buffer,
+        ),
+        light_storage: ctx.graph.import_scene_light_storage_buffer(
+            "Scene_Local_Lights",
+            &extracted_scene.local_light_storage_buffer,
+        ),
         indirect_count_buffer: None,
     }
 }
@@ -1243,7 +1223,7 @@ impl<'a> FrameComposer<'a> {
                 let (mut active_color, mut scene_depth, mut scene_hiz) =
                     graph_ctx.with_group("Scene", |c| {
                         let scene_lights = c.with_group("Scene_Lighting", |c| {
-                            import_scene_lighting(c, self.ctx.render_lists)
+                            import_scene_lighting(c, self.ctx.extracted_scene)
                         });
                         let injected_gpu_lights = self
                             .gpu_local_light_hook
@@ -1700,7 +1680,7 @@ impl<'a> FrameComposer<'a> {
 
                 let scene_color = graph_ctx.with_group("BasicForward", |c| {
                     let scene_lights = c.with_group("Scene_Lighting", |c| {
-                        import_scene_lighting(c, self.ctx.render_lists)
+                        import_scene_lighting(c, self.ctx.extracted_scene)
                     });
                     let injected_gpu_lights = self
                         .gpu_local_light_hook
@@ -1801,6 +1781,38 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 3. Compile & Execute RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             graph.compile(self.ctx.transient_pool, &self.ctx.wgpu_ctx.device);
+            let scene_buffers = {
+                let resource_manager = &mut *self.ctx.resource_manager;
+                let mut uploads = BufferUploadContext::new(
+                    &self.ctx.wgpu_ctx.device,
+                    &self.ctx.wgpu_ctx.queue,
+                    resource_manager.frame_index,
+                    &mut resource_manager.resources,
+                    &resource_manager.internal_textures,
+                );
+                graph.materialize_live_scene_buffers(
+                    SceneBufferSources {
+                        light_metadata: &self.ctx.extracted_scene.local_light_metadata_buffer,
+                        light_storage: &self.ctx.extracted_scene.local_light_storage_buffer,
+                    },
+                    &mut uploads,
+                )
+            };
+            if let Err(reason) = scene_buffers {
+                let reason = match reason {
+                    SceneBufferMaterializationFailure::SnapshotDrift => {
+                        RdgResourceMaterializationFailure::SceneBufferSnapshotDrift
+                    }
+                    SceneBufferMaterializationFailure::ConflictingPhysicalState => {
+                        RdgResourceMaterializationFailure::IncompatibleSceneBufferPhysicalState
+                    }
+                    SceneBufferMaterializationFailure::Unavailable => {
+                        RdgResourceMaterializationFailure::IncompleteSceneBufferBatch
+                    }
+                };
+                rdg_diagnostics.mark_resource_materialization_failed(reason);
+                return;
+            }
             graph.materialize_live_persistent_textures(
                 self.ctx.history_registry,
                 &self.ctx.wgpu_ctx.device,
@@ -1894,6 +1906,7 @@ impl<'a> FrameComposer<'a> {
                         pool: self.ctx.transient_pool,
                         persistent_resources: self.ctx.history_registry,
                         asset_textures: graph.storage.asset_texture_imports.resolver(),
+                        scene_buffers: graph.storage.scene_buffer_imports.resolver(),
                     },
                     device: &self.ctx.wgpu_ctx.device,
                     queue: &self.ctx.wgpu_ctx.queue,
@@ -1985,6 +1998,7 @@ impl<'a> FrameComposer<'a> {
                     pool: self.ctx.transient_pool,
                     persistent_resources: self.ctx.history_registry,
                     asset_textures: graph.storage.asset_texture_imports.resolver(),
+                    scene_buffers: graph.storage.scene_buffer_imports.resolver(),
                     device: &self.ctx.wgpu_ctx.device,
                     queue: &self.ctx.wgpu_ctx.queue,
                     pipeline_cache: self.ctx.pipeline_cache,

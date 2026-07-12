@@ -8,7 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::core::ResourceManager;
 use crate::core::binding::PreparedBindGroupStore;
 use crate::core::gpu::{
-    AssetTextureSnapshot, MipmapBatchId, MipmapRequest, MipmapRequestBatch,
+    AssetTextureSnapshot, BufferUploadContext, MipmapBatchId, MipmapRequest, MipmapRequestBatch,
     PhysicalImageGenerationKey, Tracked,
 };
 use crate::graph::core::allocator::TransientPool;
@@ -30,6 +30,10 @@ use super::node::{NodeSlot, PassNode, PassRecord};
 use super::persistent::{
     CacheCommitToken, CachePublicationReceipt, HistoryCommitToken, HistoryRegistry,
     PersistentTextureId, PersistentTextureRef,
+};
+use super::scene_buffer::{
+    SceneBufferImportStore, SceneBufferMaterializationFailure, SceneBufferRecipe,
+    SceneBufferSources,
 };
 use super::types::{
     BufferDesc, BufferNodeId, ErasedResourceNodeId, GraphResourceType, ResourceClass, ResourceKind,
@@ -270,6 +274,8 @@ pub struct GraphStorage {
     persistent_texture_lookup: FxHashMap<PersistentTextureId, PersistentTextureImport>,
     /// Logical asset roots and destructible live-prepare materialization slots.
     pub(crate) asset_texture_imports: AssetTextureImportStore,
+    /// Logical scene-buffer roots and destructible live materialization slots.
+    pub(crate) scene_buffer_imports: SceneBufferImportStore,
     /// Grouped history publications evaluated after DPE and applied post-submit.
     history_commit_requests: Vec<HistoryCommitRequest>,
     /// Ordinary cache publications evaluated after DPE and applied post-submit.
@@ -365,6 +371,7 @@ impl GraphStorage {
             topology_compiled: false,
             persistent_texture_lookup: FxHashMap::default(),
             asset_texture_imports: AssetTextureImportStore::new(),
+            scene_buffer_imports: SceneBufferImportStore::new(),
             history_commit_requests: Vec::new(),
             cache_commit_requests: Vec::new(),
             persistent_cache_finalization: None,
@@ -619,6 +626,7 @@ impl GraphStorage {
     /// them until the next graph is constructed.
     pub(crate) fn release_frame_owners(&mut self) {
         self.asset_texture_imports.clear();
+        self.scene_buffer_imports.clear();
         self.mipmap_batches.clear();
         self.mipmap_encode_coordinator.clear();
         self.prepared_bind_groups.clear();
@@ -1491,6 +1499,68 @@ impl<'a> RenderGraph<'a> {
         ))
     }
 
+    fn import_scene_buffer(
+        &mut self,
+        name: &'static str,
+        recipe: SceneBufferRecipe,
+        stamp: myth_resources::buffer::CpuBufferStamp,
+    ) -> BufferNodeId {
+        self.assert_topology_mutable();
+        let snapshot = recipe.snapshot(stamp);
+        let desc = snapshot.desc();
+        if let Some(id) = self.storage.scene_buffer_imports.find(snapshot) {
+            assert_eq!(
+                self.storage.scene_buffer_imports.snapshot(id),
+                Some(snapshot),
+                "scene buffer import key collided with a different snapshot"
+            );
+            let node = self
+                .storage
+                .scene_buffer_imports
+                .node(id)
+                .expect("current scene buffer import lost its node");
+            assert_eq!(
+                self.storage.resources[node.index() as usize].buffer_desc(),
+                desc,
+                "scene buffer imported with conflicting graph descriptors"
+            );
+            return node;
+        }
+
+        let import_id = self.storage.scene_buffer_imports.next_id();
+        let node = ResourceNodeId::from_erased(self.register_resource_with_root(
+            name,
+            ResourceKind::scene_buffer(desc, import_id),
+            true,
+            false,
+            0,
+        ));
+        self.storage
+            .scene_buffer_imports
+            .insert(import_id, node, snapshot, recipe);
+        node
+    }
+
+    /// Capture a CPU-only logical import of the local-light metadata buffer.
+    /// No upload or physical lookup occurs until the post-DPE barrier.
+    pub(crate) fn import_scene_light_metadata_buffer(
+        &mut self,
+        name: &'static str,
+        buffer: &myth_resources::buffer::CpuBuffer<myth_resources::uniforms::LightBufferMetadata>,
+    ) -> BufferNodeId {
+        self.import_scene_buffer(name, SceneBufferRecipe::LightMetadata, buffer.stamp())
+    }
+
+    /// Capture a CPU-only logical import of the local-light storage buffer.
+    /// No payload clone, upload, or physical lookup occurs here.
+    pub(crate) fn import_scene_light_storage_buffer(
+        &mut self,
+        name: &'static str,
+        buffer: &myth_resources::buffer::CpuBuffer<Vec<myth_resources::uniforms::GpuLightStorage>>,
+    ) -> BufferNodeId {
+        self.import_scene_buffer(name, SceneBufferRecipe::LightStorage, buffer.stamp())
+    }
+
     /// Import one exact CPU-only asset snapshot as a lazy external, non-root
     /// texture. A live read of this root is the materialization demand; the
     /// post-DPE graph batch fills its frame slot before any PassNode prepare
@@ -1716,6 +1786,27 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
+    /// Materialize only logical scene buffers touched by DPE-live passes.
+    ///
+    /// The explicit typed sources are borrowed only for this barrier; neither
+    /// GraphStorage nor PassNodes retain them. A typed failure requires the
+    /// caller to terminate the attempt before PassNode prepare begins.
+    pub(crate) fn materialize_live_scene_buffers(
+        &mut self,
+        sources: SceneBufferSources<'_>,
+        uploads: &mut BufferUploadContext<'_>,
+    ) -> Result<(), SceneBufferMaterializationFailure> {
+        assert!(
+            self.storage.topology_compiled,
+            "Scene Buffer materialization requires a compiled graph"
+        );
+        self.storage.scene_buffer_imports.materialize_live(
+            &self.storage.resources,
+            sources,
+            uploads,
+        )
+    }
+
     /// Register an atomic history publication. The bank is committed only if
     /// every required writer survives DPE and the command buffer is submitted.
     pub fn register_history_commit(
@@ -1814,6 +1905,10 @@ impl<'a> RenderGraph<'a> {
         assert!(
             root_res.persistent_texture_id().is_none(),
             "persistent textures cannot be versioned or mutated in place"
+        );
+        assert!(
+            root_res.scene_buffer_import_id().is_none(),
+            "scene buffer imports cannot be versioned or mutated in place"
         );
         let kind = root_res.kind.without_external_binding();
         let is_external = root_res.is_external;

@@ -25,7 +25,8 @@ use myth_resources::texture::TextureSource;
 
 use super::environment::{snapshot_attachment_texture_source, snapshot_ready_asset_texture_source};
 use super::{
-    EnsureResult, GpuImageSpec, InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
+    EnsureResult, GpuImageSpec, InternalTextureRegistry, ResourceManager, Tracked,
+    generate_gpu_resource_id,
 };
 
 /// Narrow post-compile capability for persistent CPU→GPU uploads and texture
@@ -106,6 +107,61 @@ impl<'a> BufferUploadContext<'a> {
         );
         cpu_buffer.set_gpu_handle(handle);
         (handle, result)
+    }
+
+    /// Materialize one exact stamped CPU snapshot without consulting or
+    /// publishing `CpuBuffer`'s process-wide cached handle.
+    ///
+    /// The canonical lookup is scoped to this ResourceManager's buffer arena.
+    /// A newer physical version is never accepted for an older graph snapshot;
+    /// that drift fails closed instead of binding latest data under a stale
+    /// logical stamp.
+    pub(crate) fn materialize_buffer_snapshot(
+        &mut self,
+        buffer_ref: &BufferRef,
+        bytes: &[u8],
+    ) -> Option<Tracked<wgpu::Buffer>> {
+        if !self.preflight_buffer_snapshot(buffer_ref, bytes) {
+            return None;
+        }
+
+        let (handle, _) = self.resources.write_buffer(
+            self.device,
+            self.queue,
+            self.frame_index,
+            buffer_ref,
+            bytes,
+        );
+        let gpu_buffer = self
+            .resources
+            .buffer(handle)
+            .expect("freshly ensured GPU buffer handle is missing");
+        (gpu_buffer.last_uploaded_version == buffer_ref.version
+            && gpu_buffer.usage == buffer_ref.usage()
+            && gpu_buffer.size >= bytes.len() as u64)
+            .then(|| Tracked::with_id(gpu_buffer.buffer.clone(), gpu_buffer.id))
+    }
+
+    /// Validate an exact snapshot without mutating ResourceManager state.
+    ///
+    /// This is deliberately separate from [`Self::materialize_buffer_snapshot`]
+    /// so a fixed-size batch can validate every live input before the first GPU
+    /// upload. An equal-version allocation must already cover the snapshot's
+    /// logical byte range because `write_buffer` correctly skips an upload for
+    /// an identical version and therefore cannot resize it afterward.
+    #[inline]
+    #[must_use]
+    pub(crate) fn preflight_buffer_snapshot(&self, buffer_ref: &BufferRef, bytes: &[u8]) -> bool {
+        if bytes.len() != buffer_ref.size() {
+            return false;
+        }
+        let Some(buffer) = self.resources.buffer_by_cpu_id(buffer_ref.id()) else {
+            return true;
+        };
+        buffer.usage == buffer_ref.usage()
+            && buffer.last_uploaded_version <= buffer_ref.version
+            && (buffer.last_uploaded_version != buffer_ref.version
+                || buffer.size >= bytes.len() as u64)
     }
 
     #[inline]

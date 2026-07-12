@@ -1206,6 +1206,106 @@ mod tests {
         camera.extract_render_camera()
     }
 
+    fn assert_local_light_buffers_unmaterialized(state: &RendererState) {
+        let scene = &state.render_frame.extracted_scene;
+        for (id, handle) in [
+            (
+                scene.local_light_metadata_buffer.id(),
+                scene.local_light_metadata_buffer.gpu_handle(),
+            ),
+            (
+                scene.local_light_storage_buffer.id(),
+                scene.local_light_storage_buffer.gpu_handle(),
+            ),
+        ] {
+            assert!(
+                handle.is_none(),
+                "pre-graph frame exit must not assign a local-light GPU handle"
+            );
+            assert!(
+                state
+                    .resource_manager
+                    .get_gpu_buffer_by_cpu_id(id)
+                    .is_none(),
+                "pre-graph frame exit must not create a local-light physical buffer"
+            );
+        }
+    }
+
+    fn assert_local_light_buffers_materialized(state: &RendererState) {
+        let scene = &state.render_frame.extracted_scene;
+        for (id, handle, stamp) in [
+            (
+                scene.local_light_metadata_buffer.id(),
+                scene.local_light_metadata_buffer.gpu_handle(),
+                scene.local_light_metadata_buffer.stamp(),
+            ),
+            (
+                scene.local_light_storage_buffer.id(),
+                scene.local_light_storage_buffer.gpu_handle(),
+                scene.local_light_storage_buffer.stamp(),
+            ),
+        ] {
+            assert!(
+                handle.is_none(),
+                "exact scene-buffer imports must not publish process-wide cached handles"
+            );
+            let gpu_buffer = state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(id)
+                .expect("live scene-light import has no resolvable physical buffer");
+            assert_eq!(gpu_buffer.last_uploaded_version, stamp.version);
+            assert_eq!(gpu_buffer.usage, stamp.usage);
+            assert!(
+                gpu_buffer.size >= stamp.size as u64,
+                "scene-light physical allocation is smaller than the captured snapshot"
+            );
+        }
+    }
+
+    fn local_light_gpu_state(state: &RendererState) -> [(u64, u64, u64, u64); 2] {
+        let scene = &state.render_frame.extracted_scene;
+        [
+            scene.local_light_metadata_buffer.id(),
+            scene.local_light_storage_buffer.id(),
+        ]
+        .map(|cpu_id| {
+            let gpu = state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(cpu_id)
+                .expect("local-light physical buffer missing");
+            (
+                gpu.id,
+                gpu.size,
+                gpu.last_uploaded_version,
+                gpu.last_used_frame,
+            )
+        })
+    }
+
+    fn local_light_storage_state(state: &RendererState) -> (u64, u64, u64, u64) {
+        let cpu = &state
+            .render_frame
+            .extracted_scene
+            .local_light_storage_buffer;
+        let stamp = cpu.stamp();
+        let gpu = state
+            .resource_manager
+            .get_gpu_buffer_by_cpu_id(stamp.id)
+            .expect("local-light storage physical buffer missing");
+        let logical_size = state
+            .graph_storage
+            .resources
+            .iter()
+            .find(|resource| resource.name == "Scene_Local_Lights")
+            .expect("logical scene-light storage import missing")
+            .buffer_desc()
+            .logical_size;
+        assert_eq!(logical_size, stamp.size as u64);
+        assert_eq!(gpu.last_uploaded_version, stamp.version);
+        (gpu.id, gpu.size, logical_size, stamp.version)
+    }
+
     #[cfg(feature = "3dgs")]
     fn pack_half2(left: f32, right: f32) -> u32 {
         u32::from(half::f16::from_f32(left).to_bits())
@@ -1286,6 +1386,9 @@ mod tests {
         assert!(diagnostics.queue_submitted());
         assert!(!diagnostics.presented());
         assert!(!diagnostics.panicked());
+        assert_local_light_buffers_materialized(
+            renderer.context.as_ref().expect("renderer state missing"),
+        );
     }
 
     #[test]
@@ -1318,6 +1421,9 @@ mod tests {
         assert_eq!(diagnostics.prepared_passes(), 0);
         assert_eq!(diagnostics.executed_passes(), 0);
         assert!(!diagnostics.queue_submitted());
+        assert_local_light_buffers_unmaterialized(
+            renderer.context.as_ref().expect("renderer state missing"),
+        );
     }
 
     #[test]
@@ -1357,6 +1463,112 @@ mod tests {
         assert_eq!(diagnostics.prepared_passes(), 0);
         assert_eq!(diagnostics.executed_passes(), 0);
         assert!(!diagnostics.queue_submitted());
+        assert_local_light_buffers_unmaterialized(
+            renderer.context.as_ref().expect("renderer state missing"),
+        );
+    }
+
+    #[test]
+    fn missing_target_does_not_touch_warm_scene_light_buffers() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let before =
+            local_light_gpu_state(renderer.context.as_ref().expect("renderer state missing"));
+        renderer
+            .context
+            .as_mut()
+            .expect("renderer state missing")
+            .wgpu_ctx
+            .headless_texture = None;
+
+        renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    frame_count: 1,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("frame composer missing")
+            .render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(local_light_gpu_state(state), before);
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("no-target diagnostics missing");
+        assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::NoRenderTarget);
+        assert!(!diagnostics.queue_submitted());
+    }
+
+    #[test]
+    fn basic_forward_materializes_live_scene_light_imports() {
+        let mut renderer = Renderer::new(
+            RendererInitConfig::default(),
+            RendererSettings {
+                path: RenderPath::BasicForward,
+                ..RendererSettings::default()
+            },
+        );
+        pollster::block_on(renderer.init_headless(128, 128, None))
+            .expect("headless renderer init failed");
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        assert_local_light_buffers_materialized(
+            renderer.context.as_ref().expect("renderer state missing"),
+        );
+    }
+
+    #[test]
+    fn local_light_resize_reuses_physical_high_water_with_exact_logical_ranges() {
+        let mut renderer = Renderer::new(
+            RendererInitConfig::default(),
+            RendererSettings {
+                path: RenderPath::BasicForward,
+                ..RendererSettings::default()
+            },
+        );
+        pollster::block_on(renderer.init_headless(128, 128, None))
+            .expect("headless renderer init failed");
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mut lights = (0..4)
+            .map(|_| scene.add_light(Light::new_point(Vec3::ONE, 1.0, 100.0)))
+            .collect::<Vec<_>>();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        let four =
+            local_light_storage_state(renderer.context.as_ref().expect("renderer state missing"));
+        let element_size = std::mem::size_of::<myth_resources::uniforms::GpuLightStorage>() as u64;
+        assert_eq!(four.2, 4 * element_size);
+
+        for light in lights.drain(1..) {
+            scene.remove_node(light);
+        }
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+        let one =
+            local_light_storage_state(renderer.context.as_ref().expect("renderer state missing"));
+        assert_eq!(one.2, element_size);
+        assert_eq!(one.0, four.0, "shrinking must retain physical identity");
+        assert_eq!(one.1, four.1, "shrinking must retain high-water capacity");
+
+        lights.extend((0..3).map(|_| scene.add_light(Light::new_point(Vec3::ONE, 1.0, 100.0))));
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
+        let four_again =
+            local_light_storage_state(renderer.context.as_ref().expect("renderer state missing"));
+        assert_eq!(four_again.2, four.2);
+        assert_eq!(four_again.0, four.0);
+        assert_eq!(four_again.1, four.1);
+        assert!(one.3 > four.3);
+        assert!(four_again.3 > one.3);
     }
 
     fn published_pmrem_view_id(state: &RendererState, scene_id: u32) -> Option<u64> {

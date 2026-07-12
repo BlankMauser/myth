@@ -4,6 +4,7 @@ use crate::core::gpu::Tracked;
 
 use super::asset_texture::AssetTextureImportId;
 use super::persistent::PersistentTextureId;
+use super::scene_buffer::SceneBufferImportId;
 
 pub trait GraphResourceType: 'static + Send + Sync + Copy + Clone {}
 
@@ -281,6 +282,18 @@ pub enum TextureBacking {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum BufferBacking {
+    Transient,
+    External(*const Tracked<wgpu::Buffer>),
+    /// Frame-scoped logical import of one exact scene-buffer stamp.
+    ///
+    /// Its physical handle is filled into GraphStorage only when DPE leaves a
+    /// consumer alive. Like Asset Texture roots, this is read-only and never
+    /// seeds liveness by itself.
+    Scene(SceneBufferImportId),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum ResourceKind {
     Texture {
         desc: TextureDesc,
@@ -288,7 +301,7 @@ pub enum ResourceKind {
     },
     Buffer {
         desc: BufferDesc,
-        external_buffer_ptr: Option<*const Tracked<wgpu::Buffer>>,
+        backing: BufferBacking,
     },
 }
 
@@ -337,7 +350,7 @@ impl ResourceKind {
     pub const fn buffer(desc: BufferDesc) -> Self {
         Self::Buffer {
             desc,
-            external_buffer_ptr: None,
+            backing: BufferBacking::Transient,
         }
     }
 
@@ -349,7 +362,16 @@ impl ResourceKind {
     ) -> Self {
         Self::Buffer {
             desc,
-            external_buffer_ptr: Some(external_buffer_ptr),
+            backing: BufferBacking::External(external_buffer_ptr),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn scene_buffer(desc: BufferDesc, id: SceneBufferImportId) -> Self {
+        Self::Buffer {
+            desc,
+            backing: BufferBacking::Scene(id),
         }
     }
 
@@ -429,11 +451,23 @@ impl ResourceKind {
     #[must_use]
     pub const fn external_buffer_ptr(&self) -> Option<*const Tracked<wgpu::Buffer>> {
         match self {
-            Self::Texture { .. } => None,
             Self::Buffer {
-                external_buffer_ptr,
+                backing: BufferBacking::External(ptr),
                 ..
-            } => *external_buffer_ptr,
+            } => Some(*ptr),
+            Self::Texture { .. } | Self::Buffer { .. } => None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn scene_buffer_import_id(&self) -> Option<SceneBufferImportId> {
+        match self {
+            Self::Buffer {
+                backing: BufferBacking::Scene(id),
+                ..
+            } => Some(*id),
+            Self::Texture { .. } | Self::Buffer { .. } => None,
         }
     }
 }
@@ -547,6 +581,12 @@ impl ResourceRecord {
     #[must_use]
     pub const fn external_buffer_ptr(&self) -> Option<*const Tracked<wgpu::Buffer>> {
         self.kind.external_buffer_ptr()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn scene_buffer_import_id(&self) -> Option<SceneBufferImportId> {
+        self.kind.scene_buffer_import_id()
     }
 }
 
