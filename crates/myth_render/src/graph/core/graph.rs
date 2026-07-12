@@ -36,6 +36,9 @@ use super::scene_buffer::{
     SceneBufferImportStore, SceneBufferMaterializationFailure, SceneBufferRecipe,
     SceneBufferSources,
 };
+use super::scene_submission::{
+    SceneSubmissionDependencies, SceneSubmissionPlanId, SceneSubmissionStore,
+};
 use super::types::{
     BufferDesc, BufferNodeId, ErasedResourceNodeId, GraphResourceType, ResourceClass, ResourceKind,
     ResourceNodeId, ResourceRecord, TextureDesc, TextureNodeId,
@@ -303,6 +306,10 @@ pub struct GraphStorage {
     /// Canonical per-pass plan demands in one capacity-retaining flat table.
     /// Pass records address this table by range.
     pub(crate) draw_plan_demands: Vec<DrawPlanId>,
+    /// Backend-neutral scene-submission plans reserved for this attempt.
+    pub(super) scene_submissions: SceneSubmissionStore,
+    /// Canonical per-pass scene-submission demands in first-occurrence order.
+    scene_submission_demands: Vec<SceneSubmissionPlanId>,
     /// Graph-attempt source records materialized only for the source-item
     /// union selected by DPE-live draw plans.
     pub(crate) prepared_draws: PreparedDrawStore,
@@ -336,10 +343,14 @@ pub struct GraphStorage {
     /// high-water marks and generation-cleared between operations.
     draw_plan_demand_scratch: DenseGenerationScratch,
     draw_plan_resource_scratch: DenseGenerationScratch,
+    scene_submission_demand_scratch: DenseGenerationScratch,
+    scene_submission_resource_scratch: DenseGenerationScratch,
     physical_dependency_scratch: DenseGenerationScratch,
     /// Raw demand IDs for the pass whose setup closure is currently running.
     /// Cleared without releasing capacity before each `add_pass` call.
     pub(crate) draw_plan_raw_demands: Vec<DrawPlanId>,
+    /// Raw opaque submission IDs for the pass whose setup is in progress.
+    pub(crate) scene_submission_raw_demands: Vec<SceneSubmissionPlanId>,
     /// Setup is deliberately non-reentrant. External callers cannot reach the
     /// graph through PassBuilder, and internal nested construction would make
     /// one-shot finalization and consumer-edge order ambiguous.
@@ -381,6 +392,8 @@ impl GraphStorage {
             prepared_bind_groups: PreparedBindGroupStore::new(),
             draw_plans: DrawPlanStore::new(),
             draw_plan_demands: Vec::with_capacity(64),
+            scene_submissions: SceneSubmissionStore::new(),
+            scene_submission_demands: Vec::with_capacity(64),
             prepared_draws: PreparedDrawStore::new(),
             material_plans: MaterialPlanStore::new(),
             global_state_attempt: GlobalStateAttempt::default(),
@@ -396,8 +409,11 @@ impl GraphStorage {
             compile_max_ext_indices: Vec::new(),
             draw_plan_demand_scratch: DenseGenerationScratch::default(),
             draw_plan_resource_scratch: DenseGenerationScratch::default(),
+            scene_submission_demand_scratch: DenseGenerationScratch::default(),
+            scene_submission_resource_scratch: DenseGenerationScratch::default(),
             physical_dependency_scratch: DenseGenerationScratch::default(),
             draw_plan_raw_demands: Vec::with_capacity(64),
+            scene_submission_raw_demands: Vec::with_capacity(64),
             pass_setup_active: false,
             #[cfg(feature = "rdg_inspector")]
             current_group_stack: Vec::new(),
@@ -418,6 +434,8 @@ impl GraphStorage {
         self.compile_reverse_cursors.clear();
         self.draw_plan_demands.clear();
         self.draw_plan_raw_demands.clear();
+        self.scene_submission_demands.clear();
+        self.scene_submission_raw_demands.clear();
         self.pass_setup_active = false;
         self.topology_compiled = false;
         self.persistent_texture_lookup.clear();
@@ -612,10 +630,95 @@ impl GraphStorage {
         }
     }
 
+    /// Canonicalize backend-neutral submission demands and attach their mixed
+    /// texture/buffer dependencies once after pass setup.
+    ///
+    /// Both dense sets retain capacity across attempts. Plan order follows
+    /// first demand; resource order follows the first occurrence across direct
+    /// reads, legacy DrawPlan dependencies, and submission dependencies.
+    fn finalize_pass_scene_submission_demands(&mut self, pass_index: usize) {
+        let canonical_start = self.scene_submission_demands.len();
+        if self.scene_submission_raw_demands.is_empty() {
+            self.passes[pass_index].scene_submission_demand_range =
+                canonical_start..canonical_start;
+            return;
+        }
+
+        self.scene_submission_demand_scratch
+            .begin(self.scene_submissions.plan_count());
+        let raw_demand_count = self.scene_submission_raw_demands.len();
+        let mut unique_demand_count = 0;
+        for raw_index in 0..raw_demand_count {
+            let id = self.scene_submission_raw_demands[raw_index];
+            let dense_index = self
+                .scene_submissions
+                .reserved_index(id)
+                .expect("scene-submission demand does not belong to this graph attempt");
+            if self.scene_submission_demand_scratch.insert(dense_index) {
+                self.scene_submission_raw_demands[unique_demand_count] = id;
+                unique_demand_count += 1;
+            }
+        }
+        self.scene_submission_raw_demands
+            .truncate(unique_demand_count);
+        self.scene_submission_demands
+            .extend_from_slice(&self.scene_submission_raw_demands);
+        let canonical_end = self.scene_submission_demands.len();
+        self.passes[pass_index].scene_submission_demand_range = canonical_start..canonical_end;
+
+        self.scene_submission_resource_scratch
+            .begin(self.resources.len());
+        let existing_read_count = self.pass_reads(pass_index).len();
+        for read_index in 0..existing_read_count {
+            let read = self.pass_reads(pass_index)[read_index];
+            self.scene_submission_resource_scratch
+                .insert(read.index() as usize);
+        }
+
+        for demand_index in canonical_start..canonical_end {
+            let id = self.scene_submission_demands[demand_index];
+            let dependencies = self
+                .scene_submissions
+                .dependencies(id)
+                .expect("canonical scene-submission demand became stale");
+            for &dependency in dependencies {
+                let resource_index = dependency.index() as usize;
+                assert!(
+                    resource_index < self.resources.len(),
+                    "pass '{}' demanded a scene-submission resource from another graph",
+                    self.passes[pass_index].name
+                );
+                if !self
+                    .scene_submission_resource_scratch
+                    .insert(resource_index)
+                {
+                    continue;
+                }
+                append_logical_read(
+                    &mut self.logical_reads,
+                    &mut self.passes[pass_index],
+                    &mut self.resources,
+                    dependency,
+                );
+            }
+        }
+    }
+
     #[inline]
     #[cfg(any(test, feature = "rdg_bench_support"))]
     pub(crate) fn pass_draw_plan_demands(&self, pass_index: usize) -> &[DrawPlanId] {
         &self.draw_plan_demands[self.passes[pass_index].draw_plan_demand_range.clone()]
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn pass_scene_submission_demands(
+        &self,
+        pass_index: usize,
+    ) -> &[SceneSubmissionPlanId] {
+        &self.scene_submission_demands[self.passes[pass_index]
+            .scene_submission_demand_range
+            .clone()]
     }
 
     /// Immediately releases Drop-bearing owners captured by one graph attempt.
@@ -635,6 +738,7 @@ impl GraphStorage {
         // those records before resetting the sibling slot tables/token.
         self.prepared_draws.clear();
         self.material_plans.clear();
+        self.scene_submissions.clear();
         self.draw_plans.clear();
         self.global_state_attempt.clear();
         #[cfg(feature = "3dgs")]
@@ -1092,6 +1196,7 @@ impl Drop for RenderGraph<'_> {
         // retained-topology inspection or a later attempt.
         self.storage.rollback_active_pass_reads();
         self.storage.draw_plan_raw_demands.clear();
+        self.storage.scene_submission_raw_demands.clear();
         self.storage.pass_setup_active = false;
         // NodeSlot erases the arena lifetime behind a raw trait-object pointer.
         // Remove every slot at the graph boundary so resetting FrameArena can
@@ -1317,6 +1422,67 @@ impl<'a> RenderGraph<'a> {
     pub(crate) fn reserve_draw_plan(&mut self, key: DrawPlanKey) -> DrawPlanId {
         self.assert_topology_mutable();
         self.storage.draw_plans.reserve_plan(key)
+    }
+
+    /// Wrap a valid legacy CPU-direct DrawPlan behind the backend-neutral
+    /// scene-submission contract.
+    ///
+    /// This is the M3 transition bridge: Features can migrate to opaque
+    /// submission IDs while the existing CPU command backend remains the
+    /// private adapter selected by the core coordinator.
+    #[allow(dead_code)] // Activated incrementally as Features migrate in M3.
+    pub(crate) fn reserve_cpu_direct_scene_submission(
+        &mut self,
+        draw_plan: DrawPlanId,
+        dependencies: &SceneSubmissionDependencies,
+    ) -> SceneSubmissionPlanId {
+        self.assert_topology_mutable();
+        for &dependency in dependencies.as_slice() {
+            assert!(
+                (dependency.index() as usize) < self.storage.resources.len(),
+                "scene-submission dependency belongs to another graph"
+            );
+        }
+        let draw_dependency_key = self.storage.draw_plans.mark_topology_demanded(draw_plan);
+        for &texture in self
+            .storage
+            .draw_plans
+            .texture_dependencies(draw_dependency_key)
+        {
+            assert!(
+                dependencies
+                    .as_slice()
+                    .iter()
+                    .any(|&dependency| dependency == texture.erase()),
+                "CpuDirect scene submission omitted a registered DrawPlan texture dependency"
+            );
+        }
+        self.storage.scene_submissions.reserve_cpu_direct(
+            &self.storage.draw_plans,
+            draw_plan,
+            dependencies,
+        )
+    }
+
+    /// Test-only topology backend proving that indirect instance/argument/
+    /// count buffers can participate as ordinary RDG dependencies without a
+    /// Feature knowing the selected submission backend.
+    #[cfg(test)]
+    fn reserve_indirect_scene_submission_for_test(
+        &mut self,
+        stub_key: u64,
+        dependencies: &SceneSubmissionDependencies,
+    ) -> SceneSubmissionPlanId {
+        self.assert_topology_mutable();
+        for &dependency in dependencies.as_slice() {
+            assert!(
+                (dependency.index() as usize) < self.storage.resources.len(),
+                "scene-submission dependency belongs to another graph"
+            );
+        }
+        self.storage
+            .scene_submissions
+            .reserve_indirect_stub(stub_key, dependencies)
     }
 
     /// Capture the sole logical Group 0 plan for this graph attempt.
@@ -2070,6 +2236,7 @@ impl<'a> RenderGraph<'a> {
         let pass_index = self.storage.passes.len();
         let logical_read_start = self.storage.logical_reads.len();
         self.storage.draw_plan_raw_demands.clear();
+        self.storage.scene_submission_raw_demands.clear();
 
         // Phase 1: placeholder record (node = None) so the PassBuilder can
         // reference the correct index.
@@ -2098,10 +2265,14 @@ impl<'a> RenderGraph<'a> {
         self.storage.pass_setup_active = false;
 
         // Phase 3: one-shot plan-demand canonicalization. The setup hot path
-        // records raw IDs only; texture reads and consumer edges are attached
-        // once, in deterministic first-occurrence order, after the closure no
-        // longer borrows the graph.
+        // records raw IDs only; mixed logical reads and consumer edges are
+        // attached once, in deterministic first-occurrence order, after the
+        // closure no longer borrows the graph. The legacy DrawPlan bridge runs
+        // first so already-migrated submission dependencies deduplicate against
+        // every compatibility edge too.
         self.storage.finalize_pass_draw_plan_demands(pass_index);
+        self.storage
+            .finalize_pass_scene_submission_demands(pass_index);
 
         // Phase 4: allocate the node on the frame arena (O(1) pointer bump).
         // let node_ref: &mut N = self.arena.alloc(node);
@@ -2123,6 +2294,7 @@ impl<'a> RenderGraph<'a> {
         self.topological_sort();
         self.collect_live_global_state_demand();
         self.collect_live_draw_plan_demands();
+        self.collect_live_scene_submission_demands();
 
         self.compute_resource_lifetimes();
         let live_passes = self.storage.execution_queue.len();
@@ -2554,6 +2726,40 @@ impl<'a> RenderGraph<'a> {
                 self.storage.draw_plans.mark_live(id);
                 debug_assert!(self.storage.draw_plans.is_live(id));
             }
+        }
+    }
+
+    /// Project backend-neutral submission liveness from the compiled queue,
+    /// then synchronize the transitional CPU-direct adapter with its private
+    /// legacy DrawPlan records.
+    fn collect_live_scene_submission_demands(&mut self) {
+        if self.storage.scene_submissions.plan_count() == 0 {
+            return;
+        }
+        self.storage.scene_submissions.reset_live();
+
+        for queue_index in 0..self.storage.execution_queue.len() {
+            let pass_index = self.storage.execution_queue[queue_index];
+            let demand_range = self.storage.passes[pass_index]
+                .scene_submission_demand_range
+                .clone();
+            for demand_index in demand_range {
+                let id = self.storage.scene_submission_demands[demand_index];
+                assert!(
+                    self.storage.scene_submissions.validate_reserved(id),
+                    "live pass '{}' retained a stale or foreign scene submission",
+                    self.storage.passes[pass_index].name
+                );
+                self.storage.scene_submissions.mark_live(id);
+                debug_assert!(self.storage.scene_submissions.is_live(id));
+            }
+        }
+
+        let scene_submissions = &self.storage.scene_submissions;
+        let draw_plans = &mut self.storage.draw_plans;
+        for direct in scene_submissions.live_cpu_direct_plans() {
+            draw_plans.mark_live(direct.draw_plan);
+            debug_assert!(draw_plans.is_live(direct.draw_plan));
         }
     }
 
@@ -3378,6 +3584,319 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[pass_index]
         );
+    }
+
+    #[test]
+    fn repeated_scene_submission_demand_is_canonical_and_projects_cpu_direct_live() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let dependency = graph.add_pass("Submission_Texture_Producer", |builder| {
+            let texture = builder.create_texture("Submission_Texture", dummy_desc());
+            (MockExec, texture)
+        });
+        let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let submission = graph.reserve_cpu_direct_scene_submission(
+            draw_plan,
+            &SceneSubmissionDependencies::new().with_texture(dependency),
+        );
+        let pass_index = graph.storage.passes.len();
+
+        graph.add_pass("Repeated_Submission_Consumer", |builder| {
+            builder.demand_scene_submission(submission);
+            builder.demand_scene_submission(submission);
+            builder.demand_scene_submission(submission);
+            assert_eq!(builder.graph.storage.scene_submission_raw_demands.len(), 3);
+            assert!(
+                builder
+                    .graph
+                    .storage
+                    .pass_reads(builder.pass_index)
+                    .is_empty(),
+                "submission dependencies must be finalized only after setup"
+            );
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        assert_eq!(
+            graph.storage.pass_scene_submission_demands(pass_index),
+            &[submission]
+        );
+        assert_eq!(graph.storage.pass_reads(pass_index), &[dependency.erase()]);
+        assert_eq!(
+            graph
+                .storage
+                .resource_consumers(dependency.index() as usize)
+                .collect::<Vec<_>>(),
+            &[pass_index]
+        );
+
+        graph.compile_topology();
+        assert!(graph.storage.scene_submissions.is_live(submission));
+        assert!(
+            graph.storage.draw_plans.is_live(draw_plan),
+            "the CpuDirect adapter must synchronize live submission state"
+        );
+    }
+
+    #[test]
+    fn cpu_direct_scene_submission_matches_legacy_draw_projection() {
+        fn observe(
+            use_submission: bool,
+        ) -> (
+            Vec<ErasedResourceNodeId>,
+            Vec<&'static str>,
+            Vec<DrawPlanKey>,
+        ) {
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let dependency = graph.add_pass("Direct_Projection_Texture", |builder| {
+                let texture = builder.create_texture("Direct_Projection_Input", dummy_desc());
+                (MockExec, texture)
+            });
+            graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [dependency]);
+            let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+            let submission = use_submission.then(|| {
+                graph.reserve_cpu_direct_scene_submission(
+                    draw_plan,
+                    &SceneSubmissionDependencies::new().with_texture(dependency),
+                )
+            });
+            let consumer_index = graph.storage.passes.len();
+            graph.add_pass("Direct_Projection_Consumer", |builder| {
+                if let Some(submission) = submission {
+                    builder.demand_scene_submission(submission);
+                } else {
+                    builder.demand_draw_plan(draw_plan);
+                }
+                builder.mark_side_effect();
+                (MockExec, ())
+            });
+            let reads = graph.storage.pass_reads(consumer_index).to_vec();
+            graph.compile_topology();
+            let execution = graph
+                .storage
+                .execution_queue
+                .iter()
+                .map(|&index| graph.storage.passes[index].name)
+                .collect();
+            let live_keys = graph.storage.draw_plans.live_keys().collect();
+            (reads, execution, live_keys)
+        }
+
+        assert_eq!(observe(true), observe(false));
+    }
+
+    #[test]
+    fn scene_submission_mixed_dependencies_preserve_first_occurrence_order() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture_a = graph.register_texture("Submission_Texture_A", dummy_desc(), false);
+        let buffer = graph.register_buffer(
+            "Submission_Buffer",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let texture_b = graph.register_texture("Submission_Texture_B", dummy_desc(), false);
+
+        let first_draw = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let first_submission = graph.reserve_cpu_direct_scene_submission(
+            first_draw,
+            &SceneSubmissionDependencies::new()
+                .with_texture(texture_a)
+                .with_buffer(buffer),
+        );
+        let second_draw = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let mut second_dependencies = SceneSubmissionDependencies::new()
+            .with_texture(texture_b)
+            .with_buffer(buffer);
+        second_dependencies.read_texture(texture_b);
+        let second_submission =
+            graph.reserve_cpu_direct_scene_submission(second_draw, &second_dependencies);
+        let pass_index = graph.storage.passes.len();
+
+        graph.add_pass("Mixed_Submission_Consumer", |builder| {
+            builder.demand_scene_submission(second_submission);
+            builder.demand_scene_submission(first_submission);
+            builder.demand_scene_submission(second_submission);
+            (MockExec, ())
+        });
+
+        assert_eq!(
+            graph.storage.pass_scene_submission_demands(pass_index),
+            &[second_submission, first_submission]
+        );
+        assert_eq!(
+            graph.storage.pass_reads(pass_index),
+            &[texture_b.erase(), buffer.erase(), texture_a.erase()],
+            "texture and buffer dependencies must share one ordered dedup domain"
+        );
+    }
+
+    #[test]
+    fn all_dead_scene_submission_demand_does_not_root_or_mark_backends_live() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let dependency = graph.add_pass("Dead_Submission_Producer", |builder| {
+            let texture = builder.create_texture("Dead_Submission_Texture", dummy_desc());
+            (MockExec, texture)
+        });
+        let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let submission = graph.reserve_cpu_direct_scene_submission(
+            draw_plan,
+            &SceneSubmissionDependencies::new().with_texture(dependency),
+        );
+        let indirect_dependency = graph.add_pass("Dead_Indirect_Args_Producer", |builder| {
+            let buffer = builder.create_buffer(
+                "Dead_Indirect_Args",
+                BufferDesc::new(
+                    16,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                ),
+            );
+            (MockExec, buffer)
+        });
+        let indirect = graph.reserve_indirect_scene_submission_for_test(
+            1,
+            &SceneSubmissionDependencies::new().with_buffer(indirect_dependency),
+        );
+        graph.add_pass("Dead_Submission_Consumer", |builder| {
+            builder.demand_scene_submission(submission);
+            builder.demand_scene_submission(indirect);
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        assert!(graph.storage.execution_queue.is_empty());
+        assert!(!graph.storage.scene_submissions.is_live(submission));
+        assert!(!graph.storage.scene_submissions.is_live(indirect));
+        assert_eq!(
+            graph.storage.scene_submissions.live_backend_counts(),
+            super::super::scene_submission::LiveSceneSubmissionCounts::default()
+        );
+        assert!(!graph.storage.draw_plans.is_live(draw_plan));
+    }
+
+    #[test]
+    fn indirect_stub_buffers_are_ordinary_ordered_dpe_dependencies() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let make_buffer = |graph: &mut RenderGraph<'_>, pass_name, resource_name, usage| {
+            graph.add_pass(pass_name, |builder| {
+                let buffer = builder.create_buffer(resource_name, BufferDesc::new(64, usage));
+                (MockExec, buffer)
+            })
+        };
+        let instance = make_buffer(
+            &mut graph,
+            "Indirect_Instance_Producer",
+            "Indirect_Instances",
+            wgpu::BufferUsages::STORAGE,
+        );
+        let args = make_buffer(
+            &mut graph,
+            "Indirect_Args_Producer",
+            "Indirect_Args",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+        );
+        let count = make_buffer(
+            &mut graph,
+            "Indirect_Count_Producer",
+            "Indirect_Count",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+        );
+        let submission = graph.reserve_indirect_scene_submission_for_test(
+            7,
+            &SceneSubmissionDependencies::new()
+                .with_buffer(instance)
+                .with_buffer(args)
+                .with_buffer(count),
+        );
+        let consumer_index = graph.storage.passes.len();
+        graph.add_pass("Indirect_Submission_Consumer", |builder| {
+            builder.demand_scene_submission(submission);
+            builder.demand_scene_submission(submission);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        assert_eq!(
+            graph.storage.pass_reads(consumer_index),
+            &[instance.erase(), args.erase(), count.erase()]
+        );
+        graph.compile_topology();
+
+        assert!(graph.storage.scene_submissions.is_live(submission));
+        let counts = graph.storage.scene_submissions.live_backend_counts();
+        assert_eq!(counts.cpu_direct, 0);
+        assert_eq!(counts.indirect_stub, 1);
+        assert!(
+            graph
+                .storage
+                .scene_submissions
+                .resolve_stream(submission, &graph.storage.draw_plans)
+                .is_none(),
+            "a topology-only indirect recipe must not invent a finalized stream"
+        );
+        let execution_names = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            execution_names,
+            [
+                "Indirect_Instance_Producer",
+                "Indirect_Args_Producer",
+                "Indirect_Count_Producer",
+                "Indirect_Submission_Consumer",
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "stale or foreign scene-submission plan")]
+    fn foreign_scene_submission_demand_is_rejected_during_setup() {
+        let mut first_storage = GraphStorage::new();
+        let first_arena = FrameArena::new();
+        let mut first_graph = begin_test_frame(&mut first_storage, &first_arena);
+        let draw_plan = first_graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let foreign = first_graph
+            .reserve_cpu_direct_scene_submission(draw_plan, &SceneSubmissionDependencies::new());
+
+        let mut second_storage = GraphStorage::new();
+        let second_arena = FrameArena::new();
+        let mut second_graph = begin_test_frame(&mut second_storage, &second_arena);
+        second_graph.add_pass("Foreign_Submission_Consumer", |builder| {
+            builder.demand_scene_submission(foreign);
+            (MockExec, ())
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "stale or foreign scene-submission plan")]
+    fn stale_scene_submission_demand_is_rejected_after_attempt_release() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let stale = {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+            graph
+                .reserve_cpu_direct_scene_submission(draw_plan, &SceneSubmissionDependencies::new())
+        };
+
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        graph.add_pass("Stale_Submission_Consumer", |builder| {
+            builder.demand_scene_submission(stale);
+            (MockExec, ())
+        });
     }
 
     #[test]

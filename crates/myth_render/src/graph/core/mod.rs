@@ -12,6 +12,7 @@ pub mod graph;
 pub mod node;
 pub mod persistent;
 mod scene_buffer;
+pub(crate) mod scene_submission;
 pub mod template_pass;
 pub mod types;
 

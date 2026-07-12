@@ -1,0 +1,519 @@
+//! Backend-neutral scene-submission identities and logical dependencies.
+//!
+//! This module is the contract boundary between render Features and the
+//! current CPU-direct command backend. Features receive opaque attempt-scoped
+//! IDs; backend tags and `DrawPlanId` values remain private to the core
+//! coordinator. No Feature migration is performed by this initial slice.
+
+// M3.0 deliberately lands the sealed contract before GraphStorage and Feature
+// migration. Remove this allowance when the representative backend adapter is
+// wired in the next independently reviewed slice.
+#![allow(dead_code)]
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+
+use crate::graph::frame::{DrawPlanId, DrawPlanStore};
+
+use super::types::{BufferNodeId, ErasedResourceNodeId, TextureNodeId};
+
+static NEXT_SCENE_SUBMISSION_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+
+fn next_attempt_token() -> u64 {
+    NEXT_SCENE_SUBMISSION_ATTEMPT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("scene-submission attempt token space exhausted")
+}
+
+/// Opaque graph-build/DPE identity for one scene-submission plan.
+///
+/// The private fields prevent Features from inspecting the selected backend.
+/// The process-unique attempt token rejects IDs retained across GraphStorage
+/// clear boundaries or originating in another renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SceneSubmissionPlanId {
+    attempt_token: u64,
+    index: u32,
+}
+
+/// Opaque post-finalize identity for an executable scene draw stream.
+///
+/// A plan becomes a stream only after DPE selected it and its backend reports
+/// successful finalization. Empty CPU-direct command ranges are valid streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DrawStreamId {
+    attempt_token: u64,
+    index: u32,
+}
+
+/// Typed logical dependency builder for every scene-submission backend.
+///
+/// Texture and Buffer handles are erased only after their resource class was
+/// checked by the typed method. Registration order and duplicates are
+/// preserved; GraphStorage's one-shot demand finalizer owns deduplication.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SceneSubmissionDependencies {
+    reads: SmallVec<[ErasedResourceNodeId; 8]>,
+}
+
+impl SceneSubmissionDependencies {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            reads: SmallVec::new(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_texture(mut self, texture: TextureNodeId) -> Self {
+        self.read_texture(texture);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_buffer(mut self, buffer: BufferNodeId) -> Self {
+        self.read_buffer(buffer);
+        self
+    }
+
+    pub(crate) fn read_texture(&mut self, texture: TextureNodeId) {
+        self.reads.push(texture.erase());
+    }
+
+    pub(crate) fn read_buffer(&mut self, buffer: BufferNodeId) {
+        self.reads.push(buffer.erase());
+    }
+
+    #[must_use]
+    pub(crate) fn as_slice(&self) -> &[ErasedResourceNodeId] {
+        &self.reads
+    }
+}
+
+/// Backend selection is deliberately private. Features cannot match or branch
+/// on it; only the graph coordinator may project a plan to backend work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SceneSubmissionBackend {
+    CpuDirect(DrawPlanId),
+    #[cfg(test)]
+    IndirectStub(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SceneSubmissionRecord {
+    backend: SceneSubmissionBackend,
+    dependency_start: u32,
+    dependency_end: u32,
+    live: bool,
+    #[cfg(test)]
+    indirect_finalized: bool,
+}
+
+/// Core-only projection of one live CPU-direct plan.
+///
+/// This type is visible only inside `graph::core`; Feature modules continue to
+/// see opaque scene-submission IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LiveCpuDirectPlan {
+    pub(super) submission: SceneSubmissionPlanId,
+    pub(super) draw_plan: DrawPlanId,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LiveSceneSubmissionCounts {
+    pub(super) cpu_direct: usize,
+    #[cfg(test)]
+    pub(super) indirect_stub: usize,
+}
+
+/// Capacity-retaining plan registry for one GraphStorage attempt.
+pub(super) struct SceneSubmissionStore {
+    attempt_token: u64,
+    plans: Vec<SceneSubmissionRecord>,
+    lookup: FxHashMap<SceneSubmissionBackend, SceneSubmissionPlanId>,
+    dependencies: Vec<ErasedResourceNodeId>,
+}
+
+impl Default for SceneSubmissionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SceneSubmissionStore {
+    #[must_use]
+    pub(super) fn new() -> Self {
+        Self {
+            attempt_token: next_attempt_token(),
+            plans: Vec::with_capacity(16),
+            lookup: FxHashMap::default(),
+            dependencies: Vec::with_capacity(64),
+        }
+    }
+
+    /// Release attempt records while retaining every backing allocation.
+    pub(super) fn clear(&mut self) {
+        self.plans.clear();
+        self.lookup.clear();
+        self.dependencies.clear();
+        self.attempt_token = next_attempt_token();
+    }
+
+    /// Reserve or recover the wrapper for one valid CPU-direct DrawPlan.
+    pub(super) fn reserve_cpu_direct(
+        &mut self,
+        draw_plans: &DrawPlanStore,
+        draw_plan: DrawPlanId,
+        dependencies: &SceneSubmissionDependencies,
+    ) -> SceneSubmissionPlanId {
+        assert!(
+            draw_plans.validate_reserved(draw_plan),
+            "scene submission cannot wrap a stale or foreign DrawPlanId"
+        );
+        self.reserve_backend(
+            SceneSubmissionBackend::CpuDirect(draw_plan),
+            dependencies.as_slice(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserve_indirect_stub(
+        &mut self,
+        stub_key: u64,
+        dependencies: &SceneSubmissionDependencies,
+    ) -> SceneSubmissionPlanId {
+        self.reserve_backend(
+            SceneSubmissionBackend::IndirectStub(stub_key),
+            dependencies.as_slice(),
+        )
+    }
+
+    fn reserve_backend(
+        &mut self,
+        backend: SceneSubmissionBackend,
+        dependencies: &[ErasedResourceNodeId],
+    ) -> SceneSubmissionPlanId {
+        if let Some(&id) = self.lookup.get(&backend) {
+            assert_eq!(
+                self.dependencies(id),
+                Some(dependencies),
+                "one scene-submission backend plan was registered with conflicting dependencies"
+            );
+            return id;
+        }
+
+        let start = u32::try_from(self.dependencies.len())
+            .expect("scene-submission dependency table exceeds u32");
+        self.dependencies.extend_from_slice(dependencies);
+        let end = u32::try_from(self.dependencies.len())
+            .expect("scene-submission dependency table exceeds u32");
+        let index = u32::try_from(self.plans.len())
+            .expect("one graph attempt cannot reserve more than u32::MAX scene submissions");
+        let id = SceneSubmissionPlanId {
+            attempt_token: self.attempt_token,
+            index,
+        };
+        self.plans.push(SceneSubmissionRecord {
+            backend,
+            dependency_start: start,
+            dependency_end: end,
+            live: false,
+            #[cfg(test)]
+            indirect_finalized: false,
+        });
+        assert!(self.lookup.insert(backend, id).is_none());
+        id
+    }
+
+    #[must_use]
+    pub(super) fn validate_reserved(&self, id: SceneSubmissionPlanId) -> bool {
+        id.attempt_token == self.attempt_token && (id.index as usize) < self.plans.len()
+    }
+
+    #[must_use]
+    pub(super) fn reserved_index(&self, id: SceneSubmissionPlanId) -> Option<usize> {
+        self.validate_reserved(id).then_some(id.index as usize)
+    }
+
+    #[must_use]
+    pub(super) fn plan_count(&self) -> usize {
+        self.plans.len()
+    }
+
+    #[must_use]
+    pub(super) fn dependencies(
+        &self,
+        id: SceneSubmissionPlanId,
+    ) -> Option<&[ErasedResourceNodeId]> {
+        let record = self.record(id)?;
+        Some(&self.dependencies[record.dependency_start as usize..record.dependency_end as usize])
+    }
+
+    pub(super) fn reset_live(&mut self) {
+        for plan in &mut self.plans {
+            plan.live = false;
+        }
+    }
+
+    pub(super) fn mark_live(&mut self, id: SceneSubmissionPlanId) {
+        self.record_mut(id)
+            .expect("scene-submission demand belongs to another graph attempt")
+            .live = true;
+    }
+
+    #[must_use]
+    pub(super) fn is_live(&self, id: SceneSubmissionPlanId) -> bool {
+        self.record(id)
+            .expect("scene-submission ID belongs to another graph attempt")
+            .live
+    }
+
+    /// Project only the current production backend to the private finalizer.
+    pub(super) fn live_cpu_direct_plans(&self) -> impl Iterator<Item = LiveCpuDirectPlan> + '_ {
+        let attempt_token = self.attempt_token;
+        self.plans
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, record)| {
+                if !record.live {
+                    return None;
+                }
+                match record.backend {
+                    SceneSubmissionBackend::CpuDirect(draw_plan) => Some(LiveCpuDirectPlan {
+                        submission: SceneSubmissionPlanId {
+                            attempt_token,
+                            index: u32::try_from(index).expect("validated plan index exceeds u32"),
+                        },
+                        draw_plan,
+                    }),
+                    #[cfg(test)]
+                    SceneSubmissionBackend::IndirectStub(_) => None,
+                }
+            })
+    }
+
+    #[must_use]
+    pub(super) fn live_backend_counts(&self) -> LiveSceneSubmissionCounts {
+        let mut counts = LiveSceneSubmissionCounts::default();
+        for record in self.plans.iter().filter(|record| record.live) {
+            match record.backend {
+                SceneSubmissionBackend::CpuDirect(_) => counts.cpu_direct += 1,
+                #[cfg(test)]
+                SceneSubmissionBackend::IndirectStub(_) => counts.indirect_stub += 1,
+            }
+        }
+        counts
+    }
+
+    /// Resolve a DPE-live, backend-finalized plan to an opaque execute stream.
+    #[must_use]
+    pub(super) fn resolve_stream(
+        &self,
+        id: SceneSubmissionPlanId,
+        draw_plans: &DrawPlanStore,
+    ) -> Option<DrawStreamId> {
+        let record = self.record(id)?;
+        if !record.live {
+            return None;
+        }
+        let finalized = match record.backend {
+            SceneSubmissionBackend::CpuDirect(draw_plan) => {
+                draw_plans.resolve_plan(draw_plan).is_some()
+            }
+            #[cfg(test)]
+            SceneSubmissionBackend::IndirectStub(_) => record.indirect_finalized,
+        };
+        finalized.then_some(DrawStreamId {
+            attempt_token: self.attempt_token,
+            index: id.index,
+        })
+    }
+
+    #[must_use]
+    pub(super) fn validate_stream(&self, id: DrawStreamId) -> bool {
+        id.attempt_token == self.attempt_token
+            && self
+                .plans
+                .get(id.index as usize)
+                .is_some_and(|plan| plan.live)
+    }
+
+    /// Core-only backend resolution. Feature code never receives DrawPlanId.
+    #[must_use]
+    pub(super) fn cpu_direct_stream(&self, stream: DrawStreamId) -> Option<DrawPlanId> {
+        if !self.validate_stream(stream) {
+            return None;
+        }
+        match self.plans[stream.index as usize].backend {
+            SceneSubmissionBackend::CpuDirect(draw_plan) => Some(draw_plan),
+            #[cfg(test)]
+            SceneSubmissionBackend::IndirectStub(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn finalize_indirect_stub(&mut self, id: SceneSubmissionPlanId) {
+        let record = self
+            .record_mut(id)
+            .expect("indirect stub belongs to another graph attempt");
+        assert!(record.live, "dead indirect stub cannot be finalized");
+        assert!(
+            matches!(record.backend, SceneSubmissionBackend::IndirectStub(_)),
+            "only an indirect stub may use test finalization"
+        );
+        record.indirect_finalized = true;
+    }
+
+    fn record(&self, id: SceneSubmissionPlanId) -> Option<&SceneSubmissionRecord> {
+        self.validate_reserved(id)
+            .then(|| self.plans.get(id.index as usize))
+            .flatten()
+    }
+
+    fn record_mut(&mut self, id: SceneSubmissionPlanId) -> Option<&mut SceneSubmissionRecord> {
+        if !self.validate_reserved(id) {
+            return None;
+        }
+        self.plans.get_mut(id.index as usize)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.plans.is_empty() && self.lookup.is_empty() && self.dependencies.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::core::{BufferNodeId, TextureNodeId};
+    use crate::graph::frame::DrawPlanKey;
+
+    fn finalized_empty_direct(draw_plans: &mut DrawPlanStore) -> DrawPlanId {
+        let draw_plan = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        draw_plans.mark_live(draw_plan);
+        let start = draw_plans.begin_finalize(draw_plan);
+        draw_plans.finish_finalize(draw_plan, start);
+        draw_plan
+    }
+
+    #[test]
+    fn stale_and_foreign_plan_and_stream_ids_fail_closed() {
+        let mut draw_plans = DrawPlanStore::new();
+        let draw_plan = finalized_empty_direct(&mut draw_plans);
+        let mut first = SceneSubmissionStore::new();
+        let dependencies = SceneSubmissionDependencies::new();
+        let plan = first.reserve_cpu_direct(&draw_plans, draw_plan, &dependencies);
+        first.mark_live(plan);
+        let stream = first
+            .resolve_stream(plan, &draw_plans)
+            .expect("finalized direct stream missing");
+        let plan_capacity = first.plans.capacity();
+        let dependency_capacity = first.dependencies.capacity();
+        let lookup_capacity = first.lookup.capacity();
+
+        let second = SceneSubmissionStore::new();
+        assert!(!second.validate_reserved(plan));
+        assert!(!second.validate_stream(stream));
+
+        first.clear();
+        assert!(first.is_empty());
+        assert_eq!(first.plans.capacity(), plan_capacity);
+        assert_eq!(first.dependencies.capacity(), dependency_capacity);
+        assert_eq!(first.lookup.capacity(), lookup_capacity);
+        assert!(!first.validate_reserved(plan));
+        assert!(!first.validate_stream(stream));
+        assert!(first.cpu_direct_stream(stream).is_none());
+    }
+
+    #[test]
+    fn dead_plan_has_no_stream_and_live_projection_is_exact() {
+        let mut draw_plans = DrawPlanStore::new();
+        let first_draw = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        let second_draw = draw_plans.reserve_plan(DrawPlanKey::Transparent);
+        let mut store = SceneSubmissionStore::new();
+        let dependencies = SceneSubmissionDependencies::new();
+        let dead = store.reserve_cpu_direct(&draw_plans, first_draw, &dependencies);
+        let live = store.reserve_cpu_direct(&draw_plans, second_draw, &dependencies);
+
+        store.reset_live();
+        store.mark_live(live);
+        assert!(!store.is_live(dead));
+        assert!(store.is_live(live));
+        assert_eq!(store.live_backend_counts().cpu_direct, 1);
+        assert_eq!(
+            store.live_cpu_direct_plans().collect::<Vec<_>>(),
+            vec![LiveCpuDirectPlan {
+                submission: live,
+                draw_plan: second_draw,
+            }]
+        );
+        assert!(store.resolve_stream(dead, &draw_plans).is_none());
+        assert!(store.resolve_stream(live, &draw_plans).is_none());
+    }
+
+    #[test]
+    fn finalized_empty_cpu_direct_plan_resolves_opaque_stream() {
+        let mut draw_plans = DrawPlanStore::new();
+        let draw_plan = finalized_empty_direct(&mut draw_plans);
+        let mut store = SceneSubmissionStore::new();
+        let plan =
+            store.reserve_cpu_direct(&draw_plans, draw_plan, &SceneSubmissionDependencies::new());
+        store.mark_live(plan);
+
+        let stream = store
+            .resolve_stream(plan, &draw_plans)
+            .expect("live empty direct plan must still be finalized");
+        assert!(store.validate_stream(stream));
+        assert_eq!(store.cpu_direct_stream(stream), Some(draw_plan));
+
+        // Re-reservation is idempotent and does not duplicate the record.
+        assert_eq!(
+            store.reserve_cpu_direct(&draw_plans, draw_plan, &SceneSubmissionDependencies::new(),),
+            plan
+        );
+        assert_eq!(store.plan_count(), 1);
+        assert_eq!(store.reserved_index(plan), Some(0));
+    }
+
+    #[test]
+    fn typed_dependencies_preserve_mixed_registration_order_and_duplicates() {
+        let texture_a = TextureNodeId::new(3, 0);
+        let buffer = BufferNodeId::new(7, 1);
+        let texture_b = TextureNodeId::new(11, 2);
+        let mut dependencies = SceneSubmissionDependencies::new()
+            .with_texture(texture_a)
+            .with_buffer(buffer);
+        dependencies.read_texture(texture_b);
+        dependencies.read_buffer(buffer);
+
+        assert_eq!(
+            dependencies.as_slice(),
+            &[
+                texture_a.erase(),
+                buffer.erase(),
+                texture_b.erase(),
+                buffer.erase(),
+            ]
+        );
+
+        let draw_plans = DrawPlanStore::new();
+        let mut store = SceneSubmissionStore::new();
+        let indirect = store.reserve_indirect_stub(41, &dependencies);
+        assert_eq!(store.dependencies(indirect), Some(dependencies.as_slice()));
+        store.mark_live(indirect);
+        assert_eq!(store.live_backend_counts().indirect_stub, 1);
+        assert!(store.resolve_stream(indirect, &draw_plans).is_none());
+        store.finalize_indirect_stub(indirect);
+        let stream = store
+            .resolve_stream(indirect, &draw_plans)
+            .expect("finalized indirect stub stream missing");
+        assert!(store.validate_stream(stream));
+        assert!(store.cpu_direct_stream(stream).is_none());
+    }
+}

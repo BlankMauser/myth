@@ -140,6 +140,11 @@ pub struct PassRecord {
     /// the compiled execution queue select plans for physical finalization.
     pub(crate) draw_plan_demand_range: Range<usize>,
 
+    /// Canonical backend-neutral scene-submission plans consumed by this
+    /// pass, addressed through GraphStorage's retained flat demand table.
+    /// Demand metadata never roots an otherwise dead pass.
+    pub(crate) scene_submission_demand_range: Range<usize>,
+
     /// Optional Group 0 demand projected only from DPE-live passes.
     /// Repeated declarations in one setup closure are idempotent; conflicting
     /// keys are rejected immediately by [`PassBuilder`](super::builder::PassBuilder).
@@ -181,6 +186,7 @@ impl PassRecord {
             writes: SmallVec::new(),
             creates: SmallVec::new(),
             draw_plan_demand_range: 0..0,
+            scene_submission_demand_range: 0..0,
             global_state_demand: None,
             physical_dependency_range: 0..0,
             has_side_effect: false,

@@ -3,6 +3,7 @@ use crate::core::gpu::Tracked;
 use crate::graph::frame::DrawPlanId;
 
 use super::graph::RenderGraph;
+use super::scene_submission::SceneSubmissionPlanId;
 use super::types::{
     BufferDesc, BufferNodeId, GraphResourceType, ResourceClass, ResourceNodeId, TextureDesc,
     TextureNodeId,
@@ -212,6 +213,22 @@ impl PassBuilder<'_, '_> {
             self.graph.storage.passes[self.pass_index].name
         );
         self.graph.storage.draw_plan_raw_demands.push(id);
+    }
+
+    /// Declare that this pass consumes one backend-neutral scene submission.
+    ///
+    /// The hot path records only the opaque attempt-scoped ID. After setup,
+    /// one-shot finalization deduplicates plans and attaches their ordered
+    /// texture/buffer dependencies as ordinary logical reads. Demand metadata
+    /// never roots an otherwise dead pass.
+    #[allow(dead_code)] // Activated incrementally as Features migrate in M3.
+    pub(crate) fn demand_scene_submission(&mut self, id: SceneSubmissionPlanId) {
+        assert!(
+            self.graph.storage.scene_submissions.validate_reserved(id),
+            "pass '{}' demanded a stale or foreign scene-submission plan",
+            self.graph.storage.passes[self.pass_index].name
+        );
+        self.graph.storage.scene_submission_raw_demands.push(id);
     }
 
     /// Declare that this pass consumes the scene-global Group 0 state.
