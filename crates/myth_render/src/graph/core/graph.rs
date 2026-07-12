@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use myth_assets::AssetServer;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::core::ResourceManager;
 use crate::core::binding::PreparedBindGroupStore;
 use crate::core::gpu::{
     AssetTextureSnapshot, MipmapBatchId, MipmapRequest, MipmapRequestBatch,
@@ -16,8 +18,9 @@ use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, Gau
 use crate::graph::frame::{
     DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedDrawStore, PreparedGlobalBindGroup,
 };
+use crate::graph::material_plan::MaterialPlanStore;
 
-use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
+use super::asset_texture::{AssetTextureImportId, AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
 use super::node::{NodeSlot, PassNode, PassRecord};
 use super::persistent::{
@@ -206,6 +209,9 @@ pub struct GraphStorage {
     /// Graph-attempt source records materialized only for the source-item
     /// union selected by DPE-live draw plans.
     pub(crate) prepared_draws: PreparedDrawStore,
+    /// Exact CPU material owners and texture snapshots captured before graph
+    /// construction, then opened only for the DPE-live source union.
+    pub(crate) material_plans: MaterialPlanStore,
     /// Pass-level scene-global bind group, staged independently from draw
     /// plans because it is not per-command state.
     pub(crate) prepared_global_bind_group: PreparedGlobalBindGroup,
@@ -258,6 +264,7 @@ impl GraphStorage {
             prepared_bind_groups: PreparedBindGroupStore::new(),
             draw_plans: DrawPlanStore::new(),
             prepared_draws: PreparedDrawStore::new(),
+            material_plans: MaterialPlanStore::new(),
             prepared_global_bind_group: PreparedGlobalBindGroup::default(),
             #[cfg(feature = "3dgs")]
             gaussian_frame_batches: Vec::new(),
@@ -305,6 +312,7 @@ impl GraphStorage {
         // Source records address resource slots owned by draw_plans, so drop
         // those records before resetting the sibling slot tables/token.
         self.prepared_draws.clear();
+        self.material_plans.clear();
         self.draw_plans.clear();
         self.prepared_global_bind_group.clear();
         #[cfg(feature = "3dgs")]
@@ -853,8 +861,8 @@ impl<'a> RenderGraph<'a> {
 
     /// Import one exact CPU-only asset snapshot as an external, non-root
     /// texture. A producer registered before its consumers must declare
-    /// `builder.write_texture(node)` and fill the import's frame slot from its
-    /// live prepare step.
+    /// `builder.write_texture(node)`; the post-DPE graph materialization batch
+    /// fills its frame slot before any PassNode prepare step.
     ///
     /// Repeated imports of the same logical snapshot return the same graph
     /// root. No asset lookup, upload, or WGPU allocation happens here.
@@ -891,35 +899,6 @@ impl<'a> RenderGraph<'a> {
             .asset_texture_imports
             .insert(import_id, node, snapshot);
         node
-    }
-
-    /// Attach a request drained from the legacy eager queue to this logical
-    /// import. The request remains independently owned even if live snapshot
-    /// materialization later fails because the CPU asset version drifted.
-    pub(crate) fn claim_asset_texture_mipmap_request(
-        &mut self,
-        node: TextureNodeId,
-        generation: PhysicalImageGenerationKey,
-        request: MipmapRequest,
-    ) {
-        self.assert_topology_mutable();
-        let import_id = self.storage.resources[node.index() as usize]
-            .asset_texture_import_id()
-            .expect("mip request claim target is not an asset texture import");
-        let (base_ready, mip_ready) = self.storage.asset_texture_imports.producer_chain(import_id);
-        assert!(
-            base_ready.is_none() || mip_ready.is_some(),
-            "a late mip request cannot attach to a finalized base-only asset chain"
-        );
-        self.storage
-            .asset_texture_imports
-            .claim_mipmap_request(import_id, generation, request);
-        if let Some(mip_ready) = mip_ready {
-            let producer = self.storage.resources[mip_ready.index() as usize]
-                .producer
-                .expect("asset mip-ready alias must have a producer");
-            self.storage.passes[producer].has_side_effect = true;
-        }
     }
 
     /// Publish exact mip generations encoded by live logical asset producers.
@@ -1064,6 +1043,42 @@ impl<'a> RenderGraph<'a> {
                 "persistent texture {id:?} graph descriptor disagrees with its import spec"
             );
             registry.materialize_texture(device, resource.name, id, import.spec);
+        }
+    }
+
+    /// Materialize only logical Asset Texture imports whose upload producer
+    /// survived DPE, then publish their exact sampler/view bindings before
+    /// central material preparation.
+    ///
+    /// The attempt-owned import slot records unavailable outcomes too, making
+    /// repeated calls idempotent. Physical base-level uploads may safely warm
+    /// the persistent cache on an aborted frame; mip completion remains owned
+    /// by the graph and is published only after submission.
+    pub(crate) fn materialize_live_asset_textures(
+        &mut self,
+        assets: &AssetServer,
+        resource_manager: &mut ResourceManager,
+    ) {
+        assert!(
+            self.storage.topology_compiled,
+            "Asset Texture materialization requires a compiled graph"
+        );
+        let resolver = self.storage.asset_texture_imports.resolver();
+        for index in 0..self.storage.asset_texture_imports.len() {
+            let id = AssetTextureImportId::from_index(index);
+            if resolver.materialization(id).is_some() {
+                continue;
+            }
+            let entry = self.storage.asset_texture_imports.entry(id);
+            let live = self.storage.resources[entry.node.index() as usize]
+                .producer
+                .is_some_and(|producer| self.storage.passes[producer].reference_count > 0);
+            if !live {
+                continue;
+            }
+            let materialization =
+                resource_manager.materialize_asset_texture_for_graph(assets, entry.snapshot);
+            resolver.materialize(id, materialization);
         }
     }
 
@@ -1858,6 +1873,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::core::gpu::snapshot_asset_texture;
     use crate::core::{ResourceManager, WgpuContext};
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
@@ -1998,43 +2014,13 @@ mod tests {
 
         storage.release_frame_owners();
         assert!(storage.prepared_draws.source(0).is_none());
+        assert!(storage.material_plans.is_empty());
         // clear() resets the one-shot initialization barrier for a new graph
         // attempt while retaining capacity.
         storage.prepared_draws.begin_sources(1);
         assert!(storage.draw_plans.is_empty());
         assert!(storage.prepared_global_bind_group.is_empty());
         assert!(storage.draw_plans.resolve_plan(plan).is_none());
-    }
-
-    #[test]
-    fn render_graph_drop_releases_graph_attempt_state() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let generation = PhysicalImageGenerationKey {
-            physical: PhysicalImageId::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001)),
-            allocation: 17,
-            generation: 23,
-        };
-
-        let stale_plan;
-        {
-            let graph = RenderGraph::new(&mut storage, &arena);
-            assert!(
-                graph
-                    .storage
-                    .mipmap_encode_coordinator
-                    .try_claim(generation)
-            );
-            graph.storage.prepared_draws.begin_sources(0);
-            stale_plan = graph.storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
-            graph.storage.draw_plans.mark_live(stale_plan);
-        }
-
-        assert!(storage.mipmap_encode_coordinator.is_empty());
-        assert!(storage.draw_plans.is_empty());
-        assert!(storage.draw_plans.resolve_plan(stale_plan).is_none());
-        assert!(storage.prepared_draws.source(0).is_none());
-        storage.prepared_draws.begin_sources(0);
     }
 
     #[test]
@@ -2367,6 +2353,97 @@ mod tests {
             .map(|&index| graph.storage.passes[index].name)
             .collect();
         assert_eq!(live, ["Asset_Upload", "Asset_Consumer"]);
+    }
+
+    #[test]
+    fn asset_texture_batch_materializes_only_dpe_live_imports() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resource_manager = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let live_image = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![11; 8 * 8 * 4]),
+        ));
+        let dead_image = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![22; 8 * 8 * 4]),
+        ));
+        let mut live_texture = Texture::new_2d(Some("live graph asset"), live_image);
+        live_texture.generate_mipmaps = true;
+        let live_handle = assets.textures.add(live_texture);
+        let dead_handle = assets
+            .textures
+            .add(Texture::new_2d(Some("dead graph asset"), dead_image));
+        let live_snapshot =
+            snapshot_asset_texture(&assets, live_handle).expect("live snapshot missing");
+        let dead_snapshot =
+            snapshot_asset_texture(&assets, dead_handle).expect("dead snapshot missing");
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        {
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let live = graph.import_asset_texture("Live_Asset", live_snapshot);
+            let dead = graph.import_asset_texture("Dead_Asset", dead_snapshot);
+            graph.add_pass("Live_Asset_Upload", |builder| {
+                builder.write_texture(live);
+                (MockExec, ())
+            });
+            graph.add_pass("Dead_Asset_Upload", |builder| {
+                builder.write_texture(dead);
+                (MockExec, ())
+            });
+            graph.add_pass("Live_Asset_Consumer", |builder| {
+                builder.read_texture(live);
+                builder.mark_side_effect();
+                (MockExec, ())
+            });
+
+            graph.compile_topology();
+            graph.materialize_live_asset_textures(&assets, &mut resource_manager);
+
+            assert!(resource_manager.get_texture_binding(live_handle).is_some());
+            assert!(resource_manager.get_texture_binding(dead_handle).is_none());
+            assert!(resource_manager.take_mipmap_requests().is_empty());
+
+            let live_id = graph.storage.resources[live.index() as usize]
+                .asset_texture_import_id()
+                .unwrap();
+            let dead_id = graph.storage.resources[dead.index() as usize]
+                .asset_texture_import_id()
+                .unwrap();
+            let resolver = graph.storage.asset_texture_imports.resolver();
+            assert!(resolver.materialization(live_id).is_some());
+            assert!(resolver.materialization(dead_id).is_none());
+            assert_eq!(resolver.mipmap_requests(live_id).count(), 1);
+        }
+        assert!(storage.asset_texture_imports.is_empty());
+        assert!(
+            !resource_manager
+                .get_texture_image(live_handle)
+                .expect("aborted live base upload should remain safely cached")
+                .mipmaps_submitted(),
+            "dropping an unsubmitted graph must not publish mip completion"
+        );
+        assert!(
+            !resource_manager.asset_snapshot_mipmaps_submitted(live_snapshot),
+            "the next graph must retry the unsubmitted logical mip producer"
+        );
     }
 
     #[test]

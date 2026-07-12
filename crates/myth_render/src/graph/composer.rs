@@ -66,7 +66,7 @@ use crate::graph::core::{
     ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
-use crate::graph::frame::{DrawPlanKey, RenderLists};
+use crate::graph::frame::RenderLists;
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
 use crate::graph::passes::ibl_compute::EnvironmentCacheSnapshot;
@@ -82,14 +82,13 @@ use crate::graph::passes::{
 use crate::pipeline::{PipelineCache, ShaderCompilationOptions, ShaderManager, ShaderSource};
 use crate::renderer::FrameTime;
 use crate::settings::RendererSettings;
-use myth_assets::{AssetServer, ImageHandle, MaterialHandle, TextureHandle};
-use myth_resources::RenderableMaterialTrait;
+use myth_assets::{AssetServer, ImageHandle, TextureHandle};
 use myth_resources::texture::TextureSource;
 use myth_resources::uniforms::LightBufferMetadata;
 use myth_scene::Scene;
 use myth_scene::background::BackgroundMapping;
 use myth_scene::camera::RenderCamera;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn present_then_reconfigure_if_needed<T>(
     output: T,
@@ -177,17 +176,6 @@ pub struct GraphBuilderContext<'a, 'g> {
     scene_local_light_count: u32,
 }
 
-/// CPU-only Asset Texture dependencies for one canonical draw recipe.
-///
-/// This compatibility snapshot is intentionally limited to topology. Material
-/// BindGroup preparation remains eager in this batch; a following migration
-/// will promote the exact material stamps and owners into a graph-attempt
-/// store and materialize only the DPE-live union.
-struct DrawTextureDependencyPlan {
-    key: DrawPlanKey,
-    textures: Vec<AssetTextureSnapshot>,
-}
-
 /// Collision-free exact identity used only while composing one graph.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct DrawAssetTextureKey {
@@ -198,14 +186,6 @@ struct DrawAssetTextureKey {
     image_version: u32,
     image_identity: u64,
     logical_version: u64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct DrawMaterialSnapshotKey {
-    handle: MaterialHandle,
-    asset_version: u32,
-    asset_identity: u64,
-    material_version: u64,
 }
 
 impl From<AssetTextureSnapshot> for DrawAssetTextureKey {
@@ -220,149 +200,6 @@ impl From<AssetTextureSnapshot> for DrawAssetTextureKey {
             logical_version: snapshot.logical_version,
         }
     }
-}
-
-fn snapshot_draw_texture_dependencies(
-    assets: &AssetServer,
-    extracted_scene: &ExtractedScene,
-    render_lists: &RenderLists,
-) -> Vec<DrawTextureDependencyPlan> {
-    let mut material_cache = FxHashMap::default();
-    let mut plans = Vec::with_capacity(2 + render_lists.shadow_queues.len());
-    plans.push(DrawTextureDependencyPlan {
-        key: DrawPlanKey::Opaque,
-        textures: snapshot_material_textures(
-            assets,
-            extracted_scene,
-            render_lists
-                .opaque
-                .iter()
-                .map(|intent| intent.source_item_index),
-            &mut material_cache,
-        ),
-    });
-    plans.push(DrawTextureDependencyPlan {
-        key: DrawPlanKey::Transparent,
-        textures: snapshot_material_textures(
-            assets,
-            extracted_scene,
-            render_lists
-                .transparent
-                .iter()
-                .map(|intent| intent.source_item_index),
-            &mut material_cache,
-        ),
-    });
-
-    let mut shadow_keys: Vec<_> = render_lists.shadow_queues.keys().copied().collect();
-    shadow_keys.sort_unstable();
-    for (light_id, layer_index) in shadow_keys {
-        let queue = &render_lists.shadow_queues[&(light_id, layer_index)];
-        plans.push(DrawTextureDependencyPlan {
-            key: DrawPlanKey::Shadow {
-                light_id,
-                layer_index,
-            },
-            textures: snapshot_material_textures(
-                assets,
-                extracted_scene,
-                queue.iter().map(|intent| intent.source_item_index),
-                &mut material_cache,
-            ),
-        });
-    }
-
-    plans
-}
-
-fn snapshot_material_textures(
-    assets: &AssetServer,
-    extracted_scene: &ExtractedScene,
-    source_indices: impl IntoIterator<Item = u32>,
-    material_cache: &mut FxHashMap<DrawMaterialSnapshotKey, Vec<AssetTextureSnapshot>>,
-) -> Vec<AssetTextureSnapshot> {
-    let mut visited_materials = FxHashSet::default();
-    let mut visited_textures = FxHashSet::default();
-    let mut snapshots = Vec::new();
-
-    for source_item_index in source_indices {
-        let Some(item) = extracted_scene.render_items.get(source_item_index as usize) else {
-            continue;
-        };
-        let Some((material, asset_version, asset_identity)) =
-            assets.materials.get_entry_with_identity(item.material)
-        else {
-            continue;
-        };
-        if (asset_version, asset_identity)
-            != (item.material_asset_version, item.material_asset_identity)
-            || material.data.version() != item.material_version
-        {
-            continue;
-        }
-        let material_key = DrawMaterialSnapshotKey {
-            handle: item.material,
-            asset_version: item.material_asset_version,
-            asset_identity: item.material_asset_identity,
-            material_version: item.material_version,
-        };
-        if !visited_materials.insert(material_key) {
-            continue;
-        }
-        let material_snapshots = material_cache
-            .entry(material_key)
-            .or_insert_with(|| snapshot_exact_material_textures(assets, material_key));
-        if material.data.version() != material_key.material_version
-            || assets
-                .materials
-                .get_version_and_identity(material_key.handle)
-                != Some((material_key.asset_version, material_key.asset_identity))
-        {
-            continue;
-        }
-        for &snapshot in material_snapshots.iter() {
-            if visited_textures.insert(DrawAssetTextureKey::from(snapshot)) {
-                snapshots.push(snapshot);
-            }
-        }
-    }
-
-    snapshots
-}
-
-fn snapshot_exact_material_textures(
-    assets: &AssetServer,
-    key: DrawMaterialSnapshotKey,
-) -> Vec<AssetTextureSnapshot> {
-    let Some((material, asset_version, asset_identity)) =
-        assets.materials.get_entry_with_identity(key.handle)
-    else {
-        return Vec::new();
-    };
-    if (asset_version, asset_identity) != (key.asset_version, key.asset_identity) {
-        return Vec::new();
-    }
-
-    if material.data.version() != key.material_version {
-        return Vec::new();
-    }
-    let mut snapshots = Vec::new();
-    material.data.visit_textures(&mut |source| {
-        let TextureSource::Asset(handle) = *source else {
-            return;
-        };
-        if let Some(snapshot) = snapshot_asset_texture(assets, handle) {
-            snapshots.push(snapshot);
-        }
-    });
-
-    if material.data.version() != key.material_version
-        || assets.materials.get_version_and_identity(key.handle)
-            != Some((asset_version, asset_identity))
-    {
-        return Vec::new();
-    }
-    snapshots
 }
 
 impl GraphBuilderContext<'_, '_> {
@@ -689,26 +526,12 @@ impl<'a> FrameComposer<'a> {
         // ━━━ 2a. Collect CPU-only central draw intents ━━━━━━━━━━━━━━━━━━
         //
         // Intent collection determines topology-affecting transmission and
-        // per-view source membership without touching WGPU resources. Material
-        // resolution remains the one compatibility boundary here because its
-        // first use can enqueue texture/mipmap producers that must be captured
-        // by the graph built below.
+        // per-view source membership without touching WGPU resources.
         crate::graph::culling::collect_draw_intents(
             self.ctx.extracted_scene,
             self.ctx.render_lists,
             &self.ctx.camera,
             self.ctx.assets,
-        );
-        let visible_draw_sources = self.ctx.render_lists.all_source_indices();
-        self.ctx.extracted_scene.prepare_draw_materials(
-            self.ctx.assets,
-            self.ctx.resource_manager,
-            &visible_draw_sources,
-        );
-        let draw_texture_dependencies = snapshot_draw_texture_dependencies(
-            self.ctx.assets,
-            self.ctx.extracted_scene,
-            self.ctx.render_lists,
         );
 
         // ━━━ 2b. Build Unified RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -725,6 +548,12 @@ impl<'a> FrameComposer<'a> {
         // Declared after the tracked external view so reverse drop order keeps
         // the raw external-view pointer valid for the graph's whole lifetime.
         let mut graph = RenderGraph::new(self.ctx.graph_storage, self.ctx.frame_arena);
+        graph.storage.material_plans.capture(
+            self.ctx.assets,
+            self.ctx.extracted_scene,
+            self.ctx.render_lists,
+        );
+        let draw_texture_dependencies = graph.storage.material_plans.take_topology_recipes();
 
         let surface_out =
             graph.import_external_resource("Surface_View", surface_desc, &surface_view_tracked);
@@ -1139,7 +968,7 @@ impl<'a> FrameComposer<'a> {
             let mut atmosphere_transmittance = None;
             let mut atmosphere_bake_params = None;
 
-            let mut mipmap_snapshot = self.ctx.mipmap_pass.extract(self.ctx.resource_manager);
+            let mipmap_snapshot = self.ctx.mipmap_pass.extract(self.ctx.resource_manager);
             let mut asset_texture_nodes = FxHashMap::default();
 
             // Build every material producer before any draw consumer. The
@@ -1156,20 +985,6 @@ impl<'a> FrameComposer<'a> {
                         let imported = graph_ctx
                             .graph
                             .import_asset_texture("Material_Asset_Texture", snapshot);
-                        let claimed = self
-                            .ctx
-                            .resource_manager
-                            .physical_generation_for_asset_snapshot(snapshot)
-                            .and_then(|generation| {
-                                mipmap_snapshot
-                                    .claim_for_generation(generation)
-                                    .map(|request| (generation, request))
-                            });
-                        if let Some((generation, request)) = claimed {
-                            graph_ctx
-                                .graph
-                                .claim_asset_texture_mipmap_request(imported, generation, request);
-                        }
                         let needs_mipmap_generation = snapshot.mip_count > 1
                             && !self
                                 .ctx
@@ -1200,20 +1015,6 @@ impl<'a> FrameComposer<'a> {
                             let imported = graph_ctx
                                 .graph
                                 .import_asset_texture("Skybox_Asset_Texture", snapshot);
-                            let claimed = self
-                                .ctx
-                                .resource_manager
-                                .physical_generation_for_asset_snapshot(snapshot)
-                                .and_then(|generation| {
-                                    mipmap_snapshot
-                                        .claim_for_generation(generation)
-                                        .map(|request| (generation, request))
-                                });
-                            if let Some((generation, request)) = claimed {
-                                graph_ctx.graph.claim_asset_texture_mipmap_request(
-                                    imported, generation, request,
-                                );
-                            }
                             let needs_mipmap_generation = snapshot.mip_count > 1
                                 && !self
                                     .ctx
@@ -1954,6 +1755,7 @@ impl<'a> FrameComposer<'a> {
                 self.ctx.history_registry,
                 &self.ctx.wgpu_ctx.device,
             );
+            graph.materialize_live_asset_textures(self.ctx.assets, self.ctx.resource_manager);
 
             // Group 0 keeps a stable layout/WGSL interface, but its PMREM
             // physical view is selected only after DPE has decided whether a
@@ -2012,11 +1814,18 @@ impl<'a> FrameComposer<'a> {
                 .ctx
                 .render_lists
                 .live_source_indices(graph.storage.draw_plans.live_keys());
+            graph.storage.material_plans.prepare_live(
+                self.ctx.assets,
+                self.ctx.resource_manager,
+                &live_draw_sources,
+            );
+            let material_plans = graph.storage.material_plans.resolver();
             self.ctx.extracted_scene.prepare_draw_resources(
                 self.ctx.scene,
                 self.ctx.assets,
                 self.ctx.resource_manager,
                 &live_draw_sources,
+                material_plans,
                 &mut graph.storage.prepared_draws,
                 &mut graph.storage.draw_plans,
             );

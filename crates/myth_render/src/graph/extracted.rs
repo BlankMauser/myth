@@ -20,6 +20,7 @@ use smallvec::SmallVec;
 
 use crate::core::ResourceManager;
 use crate::graph::frame::{DrawPlanStore, PreparedDrawSource, PreparedDrawStore};
+use crate::graph::material_plan::MaterialPlanResolver;
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::material::AlphaMode;
@@ -632,49 +633,6 @@ impl ExtractedScene {
         }
     }
 
-    /// Resolve CPU-visible materials before graph construction.
-    ///
-    /// This is the one intentionally retained pre-DPE physical boundary:
-    /// first-time material preparation can enqueue texture mipmap producers,
-    /// and those requests must exist before Composer snapshots them into the
-    /// graph. Geometry, model data, skeletons, object bindings, and pipelines
-    /// remain untouched here and are gated by the live-source union below.
-    pub(crate) fn prepare_draw_materials(
-        &self,
-        assets: &AssetServer,
-        resource_manager: &mut ResourceManager,
-        visible_source_indices: &[u32],
-    ) {
-        let mut prepared_materials = HashSet::new();
-        let mut previous = None;
-        for &source_item_index in visible_source_indices {
-            assert!(
-                previous.is_none_or(|previous| previous < source_item_index),
-                "visible draw source indices must be sorted and deduplicated"
-            );
-            previous = Some(source_item_index);
-
-            let item = self
-                .render_items
-                .get(source_item_index as usize)
-                .expect("visible draw source index exceeds the extracted item table");
-            let Some((material, asset_version, asset_identity)) =
-                assets.materials.get_entry_with_identity(item.material)
-            else {
-                continue;
-            };
-            if (asset_version, asset_identity)
-                != (item.material_asset_version, item.material_asset_identity)
-                || material.data.version() != item.material_version
-            {
-                continue;
-            }
-            if prepared_materials.insert(item.material) {
-                resource_manager.prepare_material(assets, item.material);
-            }
-        }
-    }
-
     /// Materialize the exact source union selected by DPE-live draw plans.
     ///
     /// Every source receives one model slot shared by main, prepass, and all
@@ -689,6 +647,7 @@ impl ExtractedScene {
         assets: &AssetServer,
         resource_manager: &mut ResourceManager,
         live_source_indices: &[u32],
+        material_plans: MaterialPlanResolver<'_>,
         prepared_draws: &mut PreparedDrawStore,
         draw_plans: &mut DrawPlanStore,
     ) {
@@ -713,6 +672,12 @@ impl ExtractedScene {
                 .render_items
                 .get(source_item_index as usize)
                 .expect("live draw source index exceeds the extracted item table");
+            if material_plans
+                .prepared_material(source_item_index, item)
+                .is_none()
+            {
+                continue;
+            }
 
             let world_matrix_inverse = item.world_matrix.inverse();
             let normal_matrix = Mat3Uniform::from_mat4(world_matrix_inverse.transpose());
@@ -747,6 +712,10 @@ impl ExtractedScene {
         let meshes = &mut scene.meshes;
         for (source_item_index, dynamic_offset) in dynamic_offsets {
             let item = &self.render_items[source_item_index as usize];
+            let Some(planned_material) = material_plans.prepared_material(source_item_index, item)
+            else {
+                continue;
+            };
             let skeleton = item.skeleton.and_then(|key| skeleton_pool.get(key));
             let Some(mesh) = meshes.get_mut(item.node_handle) else {
                 continue;
@@ -761,7 +730,7 @@ impl ExtractedScene {
             else {
                 continue;
             };
-            let Some((material_asset, material_asset_version, material_asset_identity)) =
+            let Some((current_material, material_asset_version, material_asset_identity)) =
                 assets.materials.get_entry_with_identity(item.material)
             else {
                 continue;
@@ -770,7 +739,8 @@ impl ExtractedScene {
                 != (item.geometry_asset_version, item.geometry_asset_identity)
                 || (material_asset_version, material_asset_identity)
                     != (item.material_asset_version, item.material_asset_identity)
-                || material_asset.data.version() != item.material_version
+                || !std::sync::Arc::ptr_eq(&current_material, planned_material)
+                || planned_material.data.version() != item.material_version
                 || !resource_manager
                     .get_material(item.material)
                     .is_some_and(|gpu_material| {
@@ -797,7 +767,7 @@ impl ExtractedScene {
                 != Some((geometry_asset_version, geometry_asset_identity))
                 || assets.materials.get_version_and_identity(item.material)
                     != Some((material_asset_version, material_asset_identity))
-                || material_asset.data.version() != item.material_version
+                || planned_material.data.version() != item.material_version
             {
                 // An asynchronous replacement raced physical preparation.
                 // The persistent cache may warm, but this graph attempt never
@@ -853,7 +823,7 @@ impl ExtractedScene {
                 source_item_index,
                 PreparedDrawSource {
                     geometry_asset,
-                    material_asset,
+                    material_asset: planned_material.clone(),
                     geometry_asset_version,
                     geometry_asset_identity,
                     material_asset_version,

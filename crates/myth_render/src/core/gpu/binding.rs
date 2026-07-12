@@ -171,12 +171,12 @@ impl ResourceManager {
         self.prepare_mesh_internal(assets, mesh, skeleton, true)
     }
 
-    /// Prepare geometry and the per-object binding after the material was
-    /// resolved before RDG construction.
+    /// Prepare geometry and the per-object binding after the graph-attempt
+    /// material plan was prepared post-DPE.
     ///
     /// Live DrawPlan materialization uses this entry point after DPE. It must
     /// not discover a new material texture/mipmap producer after topology has
-    /// already been compiled, so a missing pre-resolved material fails closed.
+    /// already been compiled, so a missing planned material fails closed.
     pub(crate) fn prepare_draw_object(
         &mut self,
         assets: &AssetServer,
@@ -343,38 +343,55 @@ impl ResourceManager {
         assets: &AssetServer,
         bindings: &[Binding<'_>],
     ) {
+        self.prepare_binding_buffers(bindings);
+
         for b in bindings {
             match &b.resource {
-                BindingResource::Buffer {
-                    buffer: buffer_ref,
-                    offset: _,
-                    size: _,
-                    data,
-                } => {
-                    let id = buffer_ref.id();
-                    if let Some(bytes) = data {
-                        self.resources.write_buffer(
-                            &self.device,
-                            &self.queue,
-                            self.frame_index,
-                            buffer_ref,
-                            bytes,
-                        );
-                    } else if !self.resources.touch_buffer_by_cpu_id(id, self.frame_index) {
-                        panic!(
-                            "ResourceManager: Trying to bind buffer {:?} (ID: {}) but it is not initialized!",
-                            buffer_ref.label(),
-                            id
-                        );
-                    }
-                }
                 BindingResource::Texture(Some(source)) => match source {
                     TextureSource::Asset(handle) => {
                         self.prepare_texture(assets, *handle);
                     }
                     TextureSource::Attachment(_, _) => {}
                 },
-                BindingResource::Texture(None) | BindingResource::_Phantom(_) => {}
+                BindingResource::Buffer { .. }
+                | BindingResource::Texture(None)
+                | BindingResource::_Phantom(_) => {}
+            }
+        }
+    }
+
+    /// Prepare only buffers referenced by a binding recipe.
+    ///
+    /// Graph-planned materials call this after their Asset Texture producers
+    /// have been fixed by RDG topology. Keeping texture discovery out of this
+    /// helper guarantees a BindGroup rebuild cannot enqueue a late legacy mip
+    /// request after graph compilation.
+    pub(crate) fn prepare_binding_buffers(&mut self, bindings: &[Binding<'_>]) {
+        for binding in bindings {
+            let BindingResource::Buffer {
+                buffer: buffer_ref,
+                offset: _,
+                size: _,
+                data,
+            } = &binding.resource
+            else {
+                continue;
+            };
+            let id = buffer_ref.id();
+            if let Some(bytes) = data {
+                self.resources.write_buffer(
+                    &self.device,
+                    &self.queue,
+                    self.frame_index,
+                    buffer_ref,
+                    bytes,
+                );
+            } else if !self.resources.touch_buffer_by_cpu_id(id, self.frame_index) {
+                panic!(
+                    "ResourceManager: Trying to bind buffer {:?} (ID: {}) but it is not initialized!",
+                    buffer_ref.label(),
+                    id
+                );
             }
         }
     }
@@ -439,22 +456,19 @@ impl ResourceManager {
                         .filter(|(name, _)| *name == b.name)
                         .map_or_else(
                             || {
-                                if let Some(source) = source_opt {
-                                    self.get_texture_view(source)
-                                } else if let BindingDesc::Texture { view_dimension, .. } = &b.desc
-                                {
-                                    match view_dimension {
-                                        wgpu::TextureViewDimension::D2Array => {
-                                            &self.system_textures.depth_d2array
-                                        }
-                                        wgpu::TextureViewDimension::Cube => {
-                                            &self.system_textures.black_cube
-                                        }
-                                        _ => &self.system_textures.black_2d,
-                                    }
-                                } else {
-                                    &self.system_textures.black_2d
-                                }
+                                self.resolve_binding_texture_view(
+                                    source_opt.as_ref(),
+                                    &b.desc,
+                                )
+                                .map_or_else(
+                                    || {
+                                        panic!(
+                                            "no compatible physical view or system fallback for texture binding '{}'",
+                                            b.name
+                                        )
+                                    },
+                                    |(view, _)| view,
+                                )
                             },
                             |(_, view)| view,
                         );
@@ -483,6 +497,74 @@ impl ResourceManager {
         });
 
         (bind_group, generate_gpu_resource_id())
+    }
+
+    /// Resolve the same descriptor-compatible texture view used by physical
+    /// BindGroup creation together with its stable resource ID.
+    ///
+    /// Planned material fingerprinting calls this helper before building a
+    /// candidate, so unsupported pending Cube/Array/Depth bindings fail closed
+    /// instead of reaching WGPU validation with a dimension-mismatched view.
+    pub(crate) fn resolve_binding_texture_view<'a>(
+        &'a self,
+        source: Option<&TextureSource>,
+        desc: &BindingDesc,
+    ) -> Option<(&'a wgpu::TextureView, u64)> {
+        let BindingDesc::Texture {
+            sample_type,
+            view_dimension,
+            ..
+        } = desc
+        else {
+            return None;
+        };
+
+        match source {
+            Some(TextureSource::Asset(handle)) if *handle != TextureHandle::dummy_env_map() => {
+                if let Some(image) = self.resources.texture_image(*handle)
+                    && image.default_view_dimension == *view_dimension
+                    && texture_sample_type_supports(
+                        image.format.sample_type(None, Some(self.device.features())),
+                        *sample_type,
+                    )
+                {
+                    return Some((&image.default_view, image.id));
+                }
+            }
+            Some(TextureSource::Attachment(id, source_dimension)) => {
+                if source_dimension == view_dimension
+                    && let Some(view) = self.internal_textures.get(*id)
+                {
+                    return Some((
+                        view,
+                        self.internal_textures
+                            .view_id(*id)
+                            .expect("registered internal texture is missing its view ID"),
+                    ));
+                }
+            }
+            Some(TextureSource::Asset(_)) | None => {}
+        }
+
+        match (*sample_type, *view_dimension) {
+            (wgpu::TextureSampleType::Float { .. }, wgpu::TextureViewDimension::D2) => Some((
+                &self.system_textures.black_2d,
+                self.system_textures.black_2d.id(),
+            )),
+            (wgpu::TextureSampleType::Float { .. }, wgpu::TextureViewDimension::Cube) => Some((
+                &self.system_textures.black_cube,
+                self.system_textures.black_cube.id(),
+            )),
+            (wgpu::TextureSampleType::Depth, wgpu::TextureViewDimension::D2Array) => Some((
+                &self.system_textures.depth_d2array,
+                self.system_textures.depth_d2array.id(),
+            )),
+            (wgpu::TextureSampleType::Depth, wgpu::TextureViewDimension::CubeArray) => Some((
+                &self.system_textures.depth_cube_array,
+                self.system_textures.depth_cube_array.id(),
+            )),
+            _ => None,
+        }
     }
 
     /// Resolves the `wgpu::Sampler` for a texture binding.
@@ -699,6 +781,22 @@ impl ResourceManager {
     }
 }
 
+fn texture_sample_type_supports(
+    actual: Option<wgpu::TextureSampleType>,
+    required: wgpu::TextureSampleType,
+) -> bool {
+    match (actual, required) {
+        (
+            Some(wgpu::TextureSampleType::Float { filterable: actual }),
+            wgpu::TextureSampleType::Float {
+                filterable: required,
+            },
+        ) => !required || actual,
+        (Some(actual), required) => actual == required,
+        (None, _) => false,
+    }
+}
+
 /// Builds the global bind-group fingerprint in binding dependency order.
 ///
 /// The base environment cube is deliberately absent: it has no binding in
@@ -742,8 +840,11 @@ fn assert_object_bindings_are_buffer_only(bindings: &[Binding<'_>]) {
 #[cfg(test)]
 mod tests {
     use super::{assert_object_bindings_are_buffer_only, global_resource_ids};
-    use myth_resources::ResourceBuilder;
+    use crate::core::{ResourceManager, WgpuContext};
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use myth_assets::TextureHandle;
     use myth_resources::texture::TextureSource;
+    use myth_resources::{BindingDesc, ResourceBuilder};
 
     #[test]
     fn global_fingerprint_contains_only_bound_resource_identities() {
@@ -765,5 +866,53 @@ mod tests {
         );
 
         assert_object_bindings_are_buffer_only(&builder.bindings);
+    }
+
+    #[test]
+    fn pending_texture_fallbacks_are_descriptor_compatible_or_unavailable() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let pending = TextureSource::Asset(TextureHandle::system_reserved(0xD35C));
+        let float_cube = BindingDesc::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::Cube,
+            sampler_binding_type: wgpu::SamplerBindingType::Filtering,
+        };
+        let float_cube_array = BindingDesc::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::CubeArray,
+            sampler_binding_type: wgpu::SamplerBindingType::Filtering,
+        };
+        let depth_array = BindingDesc::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            sampler_binding_type: wgpu::SamplerBindingType::Comparison,
+        };
+
+        assert_eq!(
+            resources
+                .resolve_binding_texture_view(Some(&pending), &float_cube)
+                .map(|(_, id)| id),
+            Some(resources.system_textures.black_cube.id())
+        );
+        assert!(
+            resources
+                .resolve_binding_texture_view(Some(&pending), &float_cube_array)
+                .is_none(),
+            "unsupported pending dimensions must fail before BindGroup creation"
+        );
+        assert_eq!(
+            resources
+                .resolve_binding_texture_view(Some(&pending), &depth_array)
+                .map(|(_, id)| id),
+            Some(resources.system_textures.depth_d2array.id())
+        );
     }
 }

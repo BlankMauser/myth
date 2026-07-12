@@ -420,19 +420,6 @@ impl GpuResourceStore {
         )
     }
 
-    /// Resolve the current physical generation selected by an exact asset
-    /// snapshot without creating or touching a logical lease.
-    #[must_use]
-    pub(super) fn physical_generation_for_spec(
-        &self,
-        spec: GpuImageSpec,
-    ) -> Option<PhysicalImageGenerationKey> {
-        let physical_id = *self.physical_image_index.get(&spec)?;
-        let entry = self.physical_images.get(physical_id)?;
-        (entry.spec == spec && !entry.members.is_empty())
-            .then(|| entry.image.generation_key(physical_id))
-    }
-
     /// Return whether the exact shared physical content selected by a CPU
     /// snapshot already has a submitted mip chain.
     #[must_use]

@@ -14,6 +14,7 @@ pub mod core;
 pub mod culling;
 pub mod extracted;
 pub mod frame;
+pub(crate) mod material_plan;
 pub mod passes;
 pub mod render_state;
 pub mod shadow_utils;

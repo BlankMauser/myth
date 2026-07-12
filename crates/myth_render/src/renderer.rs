@@ -2394,7 +2394,7 @@ mod tests {
                 .filter(|pass| pass.name == "Asset_Mipmap_Generation")
                 .count(),
             0,
-            "the material request must transfer into its logical producer chain"
+            "planned material mip work must be owned directly by its logical producer chain"
         );
         assert_eq!(
             state
@@ -3009,13 +3009,20 @@ mod tests {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
-        let mesh_node = scene.spawn_box(
-            1.0,
-            1.0,
-            1.0,
-            PhysicalMaterial::new(Vec4::new(0.6, 0.6, 0.6, 1.0)),
-            &assets,
-        );
+        let image = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![91; 8 * 8 * 4]),
+        ));
+        let mut texture_asset = Texture::new_2d(Some("offscreen material texture"), image);
+        texture_asset.generate_mipmaps = true;
+        let texture = assets.textures.add(texture_asset);
+        let material = PhysicalMaterial::new(Vec4::new(0.6, 0.6, 0.6, 1.0));
+        material.set_map(Some(texture));
+        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
         scene.node(&mesh_node).set_position(1_000_000.0, 0.0, 0.0);
         scene.update_matrix_world();
         let (geometry_handle, material_handle) = {
@@ -3041,6 +3048,12 @@ mod tests {
                 .get_material(material_handle)
                 .is_none()
         );
+        assert!(state.resource_manager.get_texture_image(texture).is_none());
+        assert!(!graph_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(!graph_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
     }
 
     #[test]
@@ -3601,7 +3614,7 @@ mod tests {
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert!(
             !graph_contains_pass(state, "Asset_Mipmap_Generation"),
-            "the logical import must claim the legacy request instead of encoding it twice"
+            "the shared logical import must not create a legacy mip request"
         );
         assert_eq!(
             state

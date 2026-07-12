@@ -25,9 +25,7 @@ use myth_resources::texture::TextureSource;
 
 use super::environment::{snapshot_attachment_texture_source, snapshot_ready_asset_texture_source};
 use super::{
-    AssetTextureMaterialization, AssetTextureSnapshot, EnsureResult, GpuImageSpec,
-    InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
-    materialize_asset_texture_snapshot,
+    EnsureResult, GpuImageSpec, InternalTextureRegistry, ResourceManager, generate_gpu_resource_id,
 };
 
 /// Narrow post-compile capability for persistent CPU→GPU uploads and texture
@@ -114,72 +112,6 @@ impl<'a> BufferUploadContext<'a> {
     #[allow(dead_code)]
     pub(crate) fn get_gpu_buffer(&self, handle: GpuBufferHandle) -> Option<&GpuBuffer> {
         self.resources.buffer(handle)
-    }
-
-    /// Materialize the exact CPU-only asset snapshot selected during graph
-    /// construction. Version drift is a normal unavailable result; no stale
-    /// physical view is published under the old logical identity.
-    pub(crate) fn materialize_asset_texture(
-        &mut self,
-        assets: &AssetServer,
-        snapshot: AssetTextureSnapshot,
-    ) -> AssetTextureMaterialization {
-        let Some((texture, texture_version, texture_identity)) = assets
-            .textures
-            .get_entry_with_identity(snapshot.texture_handle)
-        else {
-            return AssetTextureMaterialization::unavailable();
-        };
-        if texture_version != snapshot.texture_version
-            || texture_identity != snapshot.texture_identity
-            || texture.image != snapshot.image_handle
-        {
-            return AssetTextureMaterialization::unavailable();
-        }
-        let Some((image, image_version, image_identity)) =
-            assets.images.get_entry_with_identity(snapshot.image_handle)
-        else {
-            return AssetTextureMaterialization::unavailable();
-        };
-        let Some(current_snapshot) = super::snapshot_asset_texture(assets, snapshot.texture_handle)
-        else {
-            return AssetTextureMaterialization::unavailable();
-        };
-        if image_version != snapshot.image_version
-            || image_identity != snapshot.image_identity
-            || current_snapshot != snapshot
-        {
-            return AssetTextureMaterialization::unavailable();
-        }
-
-        let materialized = materialize_asset_texture_snapshot(
-            self.resources,
-            self.device,
-            self.queue,
-            self.frame_index,
-            snapshot,
-            &image,
-        );
-
-        let texture_unchanged = assets
-            .textures
-            .get_entry_with_identity(snapshot.texture_handle)
-            .is_some_and(|(current, version, identity)| {
-                version == snapshot.texture_version
-                    && identity == snapshot.texture_identity
-                    && current.image == snapshot.image_handle
-            });
-        let image_unchanged = assets
-            .images
-            .get_entry_with_identity(snapshot.image_handle)
-            .is_some_and(|(_, version, identity)| {
-                version == snapshot.image_version && identity == snapshot.image_identity
-            });
-        if !texture_unchanged || !image_unchanged {
-            return AssetTextureMaterialization::unavailable();
-        }
-
-        materialized
     }
 
     /// Materialize and resolve one texture source during live-node prepare.

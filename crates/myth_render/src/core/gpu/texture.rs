@@ -76,6 +76,23 @@ pub(crate) struct AssetTextureSnapshot {
     pub(crate) generate_mipmaps: bool,
 }
 
+/// Exact CPU-side state of one Asset Texture at graph construction time.
+///
+/// `ready == None` is still a meaningful snapshot. The surrounding stamps
+/// distinguish a genuinely unchanged pending/missing dependency from a
+/// same-handle replacement that also happens to be unavailable, closing the
+/// pending-state ABA hole without creating a GPU resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssetTextureStateSnapshot {
+    pub(crate) texture_handle: TextureHandle,
+    pub(crate) texture_version: Option<u32>,
+    pub(crate) texture_identity: Option<u64>,
+    pub(crate) image_handle: Option<ImageHandle>,
+    pub(crate) image_version: Option<u32>,
+    pub(crate) image_identity: Option<u64>,
+    pub(crate) ready: Option<AssetTextureSnapshot>,
+}
+
 impl AssetTextureSnapshot {
     fn from_loaded(
         texture_handle: TextureHandle,
@@ -165,6 +182,63 @@ pub(crate) fn snapshot_asset_texture(
     )
 }
 
+/// Capture both ready and unavailable Asset Texture states without touching
+/// GPU resources. Material plans use the complete value for exact post-DPE
+/// revalidation; only `ready` snapshots become logical RDG imports.
+#[must_use]
+pub(crate) fn snapshot_asset_texture_state(
+    assets: &AssetServer,
+    handle: TextureHandle,
+) -> AssetTextureStateSnapshot {
+    let Some((texture, texture_version, texture_identity)) =
+        assets.textures.get_entry_with_identity(handle)
+    else {
+        return AssetTextureStateSnapshot {
+            texture_handle: handle,
+            texture_version: None,
+            texture_identity: None,
+            image_handle: None,
+            image_version: None,
+            image_identity: None,
+            ready: None,
+        };
+    };
+
+    let image_handle = texture.image;
+    let Some((image, image_version, image_identity)) =
+        assets.images.get_entry_with_identity(image_handle)
+    else {
+        return AssetTextureStateSnapshot {
+            texture_handle: handle,
+            texture_version: Some(texture_version),
+            texture_identity: Some(texture_identity),
+            image_handle: Some(image_handle),
+            image_version: None,
+            image_identity: None,
+            ready: None,
+        };
+    };
+    let ready = AssetTextureSnapshot::from_loaded(
+        handle,
+        &texture,
+        texture_version,
+        texture_identity,
+        &image,
+        image_version,
+        image_identity,
+    );
+
+    AssetTextureStateSnapshot {
+        texture_handle: handle,
+        texture_version: Some(texture_version),
+        texture_identity: Some(texture_identity),
+        image_handle: Some(image_handle),
+        image_version: Some(image_version),
+        image_identity: Some(image_identity),
+        ready,
+    }
+}
+
 #[inline]
 fn requested_mip_count(width: u32, height: u32, generate_mipmaps: bool) -> u32 {
     if generate_mipmaps {
@@ -218,9 +292,8 @@ pub(crate) struct MaterializedAssetTexture {
 /// A drift-safe live materialization attempt.
 ///
 /// `texture == None` is a normal outcome when the CPU asset changed after its
-/// Composer snapshot. The optional request remains separate so graph storage
-/// can also merge a previously claimed legacy mip attempt without inventing a
-/// physical texture publication.
+/// Composer snapshot. The optional mip request remains graph-attempt-owned and
+/// is published only if its logical producer encodes and the frame submits.
 pub(crate) struct AssetTextureMaterialization {
     pub(crate) texture: Option<MaterializedAssetTexture>,
     pub(crate) mipmap_request: Option<MipmapRequest>,
@@ -492,19 +565,104 @@ pub(crate) fn materialize_asset_texture_snapshot(
 }
 
 impl ResourceManager {
-    /// Resolve an existing exact allocation for graph-time mip ownership
-    /// transfer without creating or touching a TextureHandle lease.
+    /// Materialize one DPE-live logical Asset Texture and publish the exact
+    /// sampler/view binding consumed by graph-planned materials.
     ///
-    /// The content generation may predate the snapshot: if live prepare
-    /// refreshes the same allocation, GraphStorage will prefer the newly
-    /// materialized generation and discard the superseded claimed attempt.
+    /// Unlike [`Self::prepare_texture`], this path never enqueues a legacy mip
+    /// request. The request remains inside the returned graph-attempt owner and
+    /// is published only after the containing command buffer is submitted.
+    pub(crate) fn materialize_asset_texture_for_graph(
+        &mut self,
+        assets: &AssetServer,
+        snapshot: AssetTextureSnapshot,
+    ) -> AssetTextureMaterialization {
+        let Some((texture, texture_version, texture_identity)) = assets
+            .textures
+            .get_entry_with_identity(snapshot.texture_handle)
+        else {
+            return AssetTextureMaterialization::unavailable();
+        };
+        if texture_version != snapshot.texture_version
+            || texture_identity != snapshot.texture_identity
+            || texture.image != snapshot.image_handle
+        {
+            return AssetTextureMaterialization::unavailable();
+        }
+        let Some((image, image_version, image_identity)) =
+            assets.images.get_entry_with_identity(snapshot.image_handle)
+        else {
+            return AssetTextureMaterialization::unavailable();
+        };
+        if image_version != snapshot.image_version
+            || image_identity != snapshot.image_identity
+            || snapshot_asset_texture(assets, snapshot.texture_handle) != Some(snapshot)
+        {
+            return AssetTextureMaterialization::unavailable();
+        }
+
+        let sampler_id = self.get_or_create_sampler(texture.sampler);
+        let materialized = materialize_asset_texture_snapshot(
+            &mut self.resources,
+            &self.device,
+            &self.queue,
+            self.frame_index,
+            snapshot,
+            &image,
+        );
+
+        // Dynamic images and AssetStorage entries may change while bytes are
+        // uploaded. Never publish a logical binding under a stale snapshot.
+        if snapshot_asset_texture(assets, snapshot.texture_handle) != Some(snapshot) {
+            return AssetTextureMaterialization::unavailable();
+        }
+        let Some(materialized_texture) = materialized.texture.as_ref() else {
+            return AssetTextureMaterialization::unavailable();
+        };
+        self.resources.insert_texture_binding(
+            snapshot.texture_handle,
+            TextureBinding {
+                view_id: materialized_texture.generation_key.allocation,
+                image_handle: snapshot.image_handle,
+                sampler_id,
+                texture_version: snapshot.texture_version,
+                texture_identity: snapshot.texture_identity,
+                image_version: snapshot.image_version,
+                image_identity: snapshot.image_identity,
+            },
+        );
+
+        materialized
+    }
+
+    /// Whether the persistent binding currently installed for an Asset
+    /// Texture is the exact logical and physical state captured by the graph.
     #[must_use]
-    pub(crate) fn physical_generation_for_asset_snapshot(
+    pub(crate) fn asset_texture_binding_matches_snapshot(
         &self,
         snapshot: AssetTextureSnapshot,
-    ) -> Option<PhysicalImageGenerationKey> {
-        self.resources
-            .physical_generation_for_spec(snapshot.physical_spec())
+    ) -> bool {
+        let Some(binding) = self.resources.texture_binding(snapshot.texture_handle) else {
+            return false;
+        };
+        let Some(image) = self.resources.texture_image(snapshot.texture_handle) else {
+            return false;
+        };
+        binding.image_handle == snapshot.image_handle
+            && binding.texture_version == snapshot.texture_version
+            && binding.texture_identity == snapshot.texture_identity
+            && binding.image_version == snapshot.image_version
+            && binding.image_identity == snapshot.image_identity
+            && binding.view_id == image.id
+            && image.image_handle == snapshot.image_handle
+            && image.image_version == snapshot.image_version
+            && image.image_identity == snapshot.image_identity
+            && image.size == snapshot.extent
+            && image.format == snapshot.format
+            && image.dimension == snapshot.dimension
+            && image.default_view_dimension == snapshot.view_dimension
+            && image.mip_level_count == snapshot.mip_count
+            && image.sample_count == 1
+            && image.usage == snapshot.usage
     }
 
     /// Whether the exact physical content selected by this snapshot already
@@ -754,6 +912,31 @@ mod tests {
         assert_eq!(second.mip_count, 4);
         assert_eq!(second.format, wgpu::TextureFormat::Rgba8Unorm);
         assert_ne!(first.logical_version, second.logical_version);
+    }
+
+    #[test]
+    fn unavailable_texture_states_reject_same_handle_pending_aba() {
+        let assets = AssetServer::new();
+        let first_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x101));
+        let second_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x202));
+        let texture_handle = assets
+            .textures
+            .add(Texture::new_2d(Some("pending A"), first_missing));
+
+        let first = snapshot_asset_texture_state(&assets, texture_handle);
+        assert!(first.ready.is_none());
+        assert_eq!(first.image_handle, Some(first_missing));
+
+        assets.textures.insert_ready(
+            texture_handle,
+            Texture::new_2d(Some("pending B"), second_missing),
+        );
+        let second = snapshot_asset_texture_state(&assets, texture_handle);
+        assert!(second.ready.is_none());
+        assert_eq!(second.texture_version, first.texture_version);
+        assert_ne!(second.texture_identity, first.texture_identity);
+        assert_eq!(second.image_handle, Some(second_missing));
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1328,9 +1511,9 @@ mod tests {
         assert_eq!(requests[0].key().allocation, replacement_physical_id);
 
         // A sampler-only same-version replacement reuses the physical view.
-        // Deferred materialization cannot create the new sampler binding, so
-        // the old binding must become invisible until normal texture prepare
-        // refreshes it.
+        // Graph-owned materialization must still publish the replacement's
+        // exact sampler binding without leaking its mip request into the
+        // legacy queue.
         let mut sampler_replacement = Texture::new_2d(Some("ABA nearest"), image_handle);
         sampler_replacement.uuid = original_texture_uuid;
         sampler_replacement.color_space = ColorSpace::Linear;
@@ -1341,19 +1524,9 @@ mod tests {
             .insert_ready(texture_handle, sampler_replacement);
         let sampler_snapshot =
             snapshot_asset_texture(&assets, texture_handle).expect("sampler snapshot missing");
-        let replacement_image = assets
-            .images
-            .get(image_handle)
-            .expect("replacement source image missing");
-        let deferred = materialize_asset_texture_snapshot(
-            &mut resources.resources,
-            &resources.device,
-            &resources.queue,
-            resources.frame_index,
-            sampler_snapshot,
-            &replacement_image,
-        );
+        let deferred = resources.materialize_asset_texture_for_graph(&assets, sampler_snapshot);
         assert!(deferred.texture.is_some());
+        assert!(deferred.mipmap_request.is_some());
         assert_eq!(
             resources
                 .get_texture_image(texture_handle)
@@ -1369,11 +1542,22 @@ mod tests {
                 .physical_id,
             replacement_pool_id
         );
+        let graph_binding = *resources
+            .get_texture_binding(texture_handle)
+            .expect("graph materialization did not publish its exact binding");
+        assert_ne!(graph_binding.sampler_id, replacement_binding.sampler_id);
+        assert_eq!(
+            graph_binding.texture_identity,
+            sampler_snapshot.texture_identity
+        );
         assert!(
-            resources.get_texture_binding(texture_handle).is_none(),
-            "deferred materialization must hide a binding from the old asset identity"
+            resources.take_mipmap_requests().is_empty(),
+            "graph materialization must not enqueue a legacy mip request"
         );
         drop(deferred);
+        // The graph attempt above deliberately did not submit its mip request;
+        // normal compatibility prepare therefore observes the same incomplete
+        // generation and may queue an independently owned retry.
         assert!(matches!(
             resources.prepare_texture(&assets, texture_handle),
             ResourceState::Ready
