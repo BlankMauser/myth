@@ -1300,9 +1300,10 @@ pub struct ExecuteContext<'a> {
     /// handle lookups via `resource_manager`.
     pub draw_plans: DrawPlanResolver<'a>,
 
-    /// Graph-attempt-owned scene-global bind group. Kept separate from draw
-    /// plans because it is pass-level state.
-    pub global_bind_group: &'a wgpu::BindGroup,
+    /// Graph-attempt-owned scene-global bind group, present only when at least
+    /// one DPE-live pass explicitly demanded the frame's GlobalState plan.
+    /// Shadow and local-Group-0-only graphs deliberately leave this absent.
+    pub global_bind_group: Option<&'a wgpu::BindGroup>,
 
     /// Full wgpu context — depth format, render path, etc.
     pub wgpu_ctx: &'a WgpuContext,

@@ -101,11 +101,9 @@ impl Bindings for RenderState {
 
 impl Bindings for Scene {
     fn define_bindings<'a>(&'a self, _builder: &mut ResourceBuilder<'a>) {
-        // Scene-level global bindings are now built by
-        // `ResourceManager::define_global_scene_bindings` which resolves
-        // environment textures from the GPU cache instead of from Environment.
-        // This impl is kept empty for trait coherence; the actual bindings
-        // are constructed in `ResourceManager::create_global_state`.
+        // Scene-level Group 0 bindings are defined by the RDG's process-static
+        // materialized interface and finalized only from DPE-live resources.
+        // This impl remains empty for trait coherence.
     }
 }
 

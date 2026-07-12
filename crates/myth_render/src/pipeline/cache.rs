@@ -59,7 +59,6 @@ pub struct FastPipelineKey {
     pub instance_variants: u32,
     pub item_shader_defines_hash: u64,
     pub shader_source_identity: u64,
-    pub global_state_id: u32,
     pub global_layout_id: u64,
     pub global_binding_wgsl_hash: u64,
     pub material_layout_id: u64,

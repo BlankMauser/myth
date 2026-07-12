@@ -408,7 +408,7 @@ impl Renderer {
         // Advance the bind-group cache's frame counter for TTL tracking.
         state.global_bind_group_cache.begin_frame();
 
-        // ── Phase 1: Extract scene, build shadow views, prepare global ──
+        // ── Phase 1: Extract a CPU-only frame snapshot ─────────────────
 
         frame_attempt.enter_phase(RdgFramePhase::Extract);
 
@@ -428,14 +428,6 @@ impl Renderer {
         let has_active_environment =
             matches!(&scene.background.mode, BackgroundMode::Procedural(_))
                 || scene.environment.has_env_map();
-        let published_pmrem_view = has_active_environment
-            .then(|| {
-                state
-                    .environment_cache
-                    .published_pmrem_view(scene.id(), &state.history_registry)
-                    .cloned()
-            })
-            .flatten();
         let published_pmrem_max_mip = has_active_environment
             .then(|| {
                 state
@@ -444,7 +436,7 @@ impl Renderer {
                     .map(|mip_count| mip_count.saturating_sub(1) as f32)
             })
             .flatten();
-        state.render_frame.extract_and_prepare(
+        state.render_frame.extract(
             &mut state.resource_manager,
             scene,
             &camera,
@@ -454,7 +446,6 @@ impl Renderer {
             surface_size,
             max_extracted_lights,
             feature_config,
-            published_pmrem_view.as_ref(),
             published_pmrem_max_mip,
         );
 
@@ -1158,7 +1149,7 @@ mod tests {
 
     use crate::graph::core::{
         ExecuteContext, GraphBlackboard, HookStage, PassNode, RdgAttemptOutcome, RdgFramePhase,
-        RdgRenderTargetKind, TextureDesc,
+        RdgRenderTargetKind, RdgSurfaceAcquireFailure, TextureDesc,
     };
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::{AssetServer, SceneExt};
@@ -1261,6 +1252,103 @@ mod tests {
                 "scene-light physical allocation is smaller than the captured snapshot"
             );
         }
+    }
+
+    fn global_buffer_ids(state: &RendererState) -> [u64; 3] {
+        [
+            state.render_frame.render_state.uniforms().id(),
+            state
+                .render_frame
+                .extracted_scene
+                .environment_uniforms_buffer
+                .id(),
+            state
+                .render_frame
+                .extracted_scene
+                .directional_light_storage_buffer
+                .id(),
+        ]
+    }
+
+    fn assert_global_state_unmaterialized(state: &RendererState, scene_id: u32) {
+        for cpu_id in global_buffer_ids(state) {
+            assert!(
+                state
+                    .resource_manager
+                    .get_gpu_buffer_by_cpu_id(cpu_id)
+                    .is_none(),
+                "pre-graph frame exit must not create a Group 0 physical buffer"
+            );
+        }
+        assert!(
+            state
+                .resource_manager
+                .get_global_state(state.render_frame.render_state.id, scene_id)
+                .is_none(),
+            "pre-graph frame exit must not create a persistent Group 0 state"
+        );
+    }
+
+    fn assert_global_state_materialized_exact(state: &RendererState, scene_id: u32) {
+        let stamps = [
+            state.render_frame.render_state.uniforms().stamp(),
+            state
+                .render_frame
+                .extracted_scene
+                .environment_uniforms_buffer
+                .stamp(),
+            state
+                .render_frame
+                .extracted_scene
+                .directional_light_storage_buffer
+                .stamp(),
+        ];
+        let global = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene_id)
+            .expect("DPE-live scene passes must finalize Group 0");
+        for (binding, stamp) in stamps.into_iter().enumerate() {
+            let gpu = state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(stamp.id)
+                .expect("DPE-live Group 0 buffer missing");
+            assert_eq!(gpu.last_uploaded_version, stamp.version);
+            assert_eq!(gpu.usage, stamp.usage);
+            assert!(gpu.size >= stamp.size as u64);
+            assert_eq!(global.resource_ids.as_slice()[binding], gpu.id);
+        }
+    }
+
+    fn global_gpu_state(
+        state: &RendererState,
+        scene_id: u32,
+    ) -> ([(u64, u64, u64, u64); 3], (u32, u64, u64, Vec<u64>, u64)) {
+        let buffers = global_buffer_ids(state).map(|cpu_id| {
+            let gpu = state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(cpu_id)
+                .expect("Group 0 physical buffer missing");
+            (
+                gpu.id,
+                gpu.size,
+                gpu.last_uploaded_version,
+                gpu.last_used_frame,
+            )
+        });
+        let global = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene_id)
+            .expect("persistent Group 0 state missing");
+        (
+            buffers,
+            (
+                global.id,
+                global.bind_group_id,
+                global.layout_id,
+                global.resource_ids.as_slice().to_vec(),
+                global.last_used_frame,
+            ),
+        )
     }
 
     fn local_light_gpu_state(state: &RendererState) -> [(u64, u64, u64, u64); 2] {
@@ -1389,6 +1477,10 @@ mod tests {
         assert_local_light_buffers_materialized(
             renderer.context.as_ref().expect("renderer state missing"),
         );
+        assert_global_state_materialized_exact(
+            renderer.context.as_ref().expect("renderer state missing"),
+            scene.id(),
+        );
     }
 
     #[test]
@@ -1423,6 +1515,10 @@ mod tests {
         assert!(!diagnostics.queue_submitted());
         assert_local_light_buffers_unmaterialized(
             renderer.context.as_ref().expect("renderer state missing"),
+        );
+        assert_global_state_unmaterialized(
+            renderer.context.as_ref().expect("renderer state missing"),
+            scene.id(),
         );
     }
 
@@ -1466,6 +1562,46 @@ mod tests {
         assert_local_light_buffers_unmaterialized(
             renderer.context.as_ref().expect("renderer state missing"),
         );
+        assert_global_state_unmaterialized(
+            renderer.context.as_ref().expect("renderer state missing"),
+            scene.id(),
+        );
+    }
+
+    #[test]
+    fn surface_acquisition_failure_does_not_materialize_global_state() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+
+        renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    frame_count: 31,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("frame composer missing")
+            .with_forced_surface_acquisition_failure(RdgSurfaceAcquireFailure::Timeout)
+            .render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_global_state_unmaterialized(state, scene.id());
+        assert_local_light_buffers_unmaterialized(state);
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("surface-failure diagnostics missing");
+        assert_eq!(
+            diagnostics.outcome(),
+            RdgAttemptOutcome::SurfaceAcquisitionFailed(RdgSurfaceAcquireFailure::Timeout)
+        );
+        assert_eq!(diagnostics.phase(), RdgFramePhase::AcquireTarget);
+        assert_eq!(diagnostics.declared_passes(), 0);
+        assert_eq!(diagnostics.live_passes(), None);
+        assert!(!diagnostics.queue_submitted());
     }
 
     #[test]
@@ -1477,6 +1613,10 @@ mod tests {
 
         let before =
             local_light_gpu_state(renderer.context.as_ref().expect("renderer state missing"));
+        let global_before = global_gpu_state(
+            renderer.context.as_ref().expect("renderer state missing"),
+            scene.id(),
+        );
         renderer
             .context
             .as_mut()
@@ -1499,6 +1639,7 @@ mod tests {
 
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert_eq!(local_light_gpu_state(state), before);
+        assert_eq!(global_gpu_state(state, scene.id()), global_before);
         let diagnostics = renderer
             .latest_rdg_diagnostics()
             .expect("no-target diagnostics missing");

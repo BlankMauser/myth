@@ -111,6 +111,7 @@ impl SsaoFeature {
             );
 
             let raw_tex = ctx.graph.add_pass("SSAO_Raw", |builder| {
+                builder.demand_global_state(snapshot.global_state_key);
                 builder.read_texture(scene_depth);
                 builder.read_texture(scene_normals);
                 let uniforms_buffer = builder.create_buffer(
@@ -180,7 +181,7 @@ impl SsaoRawFeature {
             "struct_definitions",
             SsaoUniforms::wgsl_struct_def("SsaoUniforms").as_str(),
         );
-        options.inject_code("binding_code", &global_state.binding_wgsl);
+        options.inject_code("binding_code", global_state.binding_wgsl.as_str());
         options.inject_code(
             "scene_lighting_structs",
             myth_resources::uniforms::scene_lighting_structs_wgsl(),
@@ -438,7 +439,13 @@ impl<'a> PassNode<'a> for SsaoRawNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "SSAO_Raw scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.raw_bind_group.expect("SSAO raw BG not prepared")),

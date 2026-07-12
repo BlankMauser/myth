@@ -8,23 +8,48 @@ use wgpu::ShaderStages;
 
 use myth_assets::{AssetServer, TextureHandle};
 use myth_resources::Mesh;
+use myth_resources::buffer::BufferRef;
 use myth_resources::texture::TextureSource;
-use myth_resources::uniforms::DynamicModelUniforms;
 use myth_resources::uniforms::WgslStruct;
+use myth_resources::uniforms::{DynamicModelUniforms, EnvironmentUniforms, RenderStateUniforms};
 use myth_scene::skeleton::Skeleton;
 
 use crate::core::binding::Bindings;
-use crate::graph::RenderState;
-use crate::graph::extracted::ExtractedScene;
 use myth_resources::builder::{Binding, BindingDesc};
 use myth_resources::{BindingResource, ResourceBuilder, WgslStructName};
 
+use super::bind_group_store::{GlobalBindingInterface, SharedBindingWgsl};
 use super::{
-    BindGroupContext, GlobalStateKey, GpuGlobalState, ModelBufferAllocator, ObjectBindGroupKey,
-    ResourceManager, Tracked, generate_gpu_resource_id,
+    BindGroupContext, CommonSampler, GlobalStateKey, GpuGlobalState, ModelBufferAllocator,
+    ObjectBindGroupKey, ResourceManager, Tracked, generate_gpu_resource_id,
 };
 
 static NEXT_GLOBAL_STATE_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Fixed Group 0 buffer slot involved in exact post-DPE validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalStateBufferSlot {
+    Camera,
+    Environment,
+    DirectionalLights,
+}
+
+/// A graph snapshot was not materialized exactly in this ResourceManager.
+///
+/// The post-DPE caller must fail the graph attempt closed. In particular, it
+/// must never fall back to a persistent `GpuGlobalState` from an older frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalStatePhysicalFailure {
+    MissingBuffer(GlobalStateBufferSlot),
+    VersionMismatch(GlobalStateBufferSlot),
+    UsageMismatch(GlobalStateBufferSlot),
+    SizeMismatch(GlobalStateBufferSlot),
+}
+
+struct MaterializedGlobalBuffer {
+    buffer: wgpu::Buffer,
+    physical_id: u64,
+}
 
 impl ResourceManager {
     // ========================================================================
@@ -602,171 +627,157 @@ impl ResourceManager {
     // Global bindings (Group 0)
     // ========================================================================
 
-    /// Prepare global binding resources
+    /// Build or reuse Group 0 from buffers already materialized by a live RDG
+    /// attempt.
     ///
-    /// Uses an "Ensure -> Collect IDs -> Check Fingerprint -> Rebind" pattern
-    pub fn prepare_global(
+    /// This entry point performs no CPU-buffer read, upload, asset lookup, or
+    /// generic binding-resource preparation. All three `BufferRef`s must name
+    /// the exact physical versions installed by the post-DPE materialization
+    /// barrier. A mismatch fails closed before either the persistent state or
+    /// its liveness timestamp is changed.
+    pub(crate) fn prepare_global_from_materialized(
         &mut self,
-        assets: &AssetServer,
-        extracted_scene: &ExtractedScene,
-        render_state: &RenderState,
-    ) -> u32 {
-        self.prepare_global_with_pmrem_override(assets, extracted_scene, render_state, None)
-    }
-
-    /// Rebuilds or reuses the current scene global state with an optional
-    /// directly borrowed PMREM view.
-    ///
-    /// This is the post-materialization entry point for an RDG-owned PMREM:
-    /// passing the same tracked view keeps the existing bind group, while a
-    /// different view identity rebuilds the bind group without changing the
-    /// stable [`GlobalStateKey`], global state ID, layout, or WGSL interface.
-    /// The view is bound directly and is never registered in
-    /// `InternalTextureRegistry`.
-    pub fn prepare_global_with_pmrem_override(
-        &mut self,
-        assets: &AssetServer,
-        extracted_scene: &ExtractedScene,
-        render_state: &RenderState,
+        state_key: GlobalStateKey,
+        camera: &BufferRef,
+        environment: &BufferRef,
+        directional_lights: &BufferRef,
         pmrem_override: Option<&Tracked<wgpu::TextureView>>,
-    ) -> u32 {
-        let has_active_environment = matches!(
-            extracted_scene.background,
-            myth_scene::background::BackgroundMode::Procedural(_)
-        ) || extracted_scene.envvironment.has_env_map();
-        let pmrem_override = has_active_environment.then_some(pmrem_override).flatten();
+    ) -> Result<u32, GlobalStatePhysicalFailure> {
+        let camera_physical = self.resolve_materialized_global_buffer(
+            camera,
+            GlobalStateBufferSlot::Camera,
+            wgpu::BufferUsages::UNIFORM,
+        )?;
+        let environment_physical = self.resolve_materialized_global_buffer(
+            environment,
+            GlobalStateBufferSlot::Environment,
+            wgpu::BufferUsages::UNIFORM,
+        )?;
+        let directional_lights_physical = self.resolve_materialized_global_buffer(
+            directional_lights,
+            GlobalStateBufferSlot::DirectionalLights,
+            wgpu::BufferUsages::STORAGE,
+        )?;
 
-        // === Ensure: upload all buffers, obtain physical resource IDs ===
-        let (_, camera_result) = self.ensure_buffer(render_state.uniforms());
-        let (_, directional_light_result) =
-            self.ensure_buffer(&extracted_scene.directional_light_storage_buffer);
-        let (_, scene_uniform_result) =
-            self.ensure_buffer(&extracted_scene.environment_uniforms_buffer);
-
-        // RDG persistent storage is the sole owner of scene PMREM textures.
-        // Before a cache has published (or when IBL is inactive), the stable
-        // system black cube preserves the same layout and WGSL interface.
-        let pmrem_map_id = if has_active_environment {
-            pmrem_override.map_or(self.system_textures.black_cube.id(), Tracked::id)
-        } else {
-            self.system_textures.black_cube.id()
-        };
-
-        // === Collect: gather all resource IDs ===
+        // Clone the selected view into this narrow materialization scope so
+        // no HistoryRegistry or SystemTextures borrow overlaps the persistent
+        // bind-group-store mutation below. The graph and resulting BindGroup
+        // remain the authoritative physical owners for their respective
+        // lifetimes.
+        let pmrem = pmrem_override
+            .cloned()
+            .unwrap_or_else(|| self.system_textures.black_cube.clone());
         let current_ids = global_resource_ids(
-            camera_result.resource_id,
-            scene_uniform_result.resource_id,
-            directional_light_result.resource_id,
-            pmrem_map_id,
+            camera_physical.physical_id,
+            environment_physical.physical_id,
+            directional_lights_physical.physical_id,
+            pmrem.id(),
         );
 
-        let state_id = GlobalStateKey::new(render_state.id, extracted_scene.scene_id);
-
-        // === Check: fast fingerprint comparison ===
-        if let Some(gpu_state) = self.bind_groups.global_state_mut(state_id)
+        if let Some(gpu_state) = self.bind_groups.global_state_mut(state_key)
             && gpu_state.resource_ids.matches_slice(current_ids.as_slice())
         {
             gpu_state.last_used_frame = self.frame_index;
-            return gpu_state.id;
+            return Ok(gpu_state.id);
         }
 
-        // === Rebind: fingerprint mismatch, rebuild BindGroup ===
-        self.create_global_state(
-            assets,
-            state_id,
-            render_state,
-            extracted_scene,
-            current_ids,
-            pmrem_override,
-        )
-    }
+        let interface =
+            self.ensure_materialized_global_interface(camera, environment, directional_lights);
+        let sampler = self.sampler_registry.get_common(CommonSampler::LinearClamp);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Global BindGroup"),
+            layout: &interface.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_physical.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: environment_physical.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: directional_lights_physical.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&pmrem),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
 
-    fn create_global_state(
-        &mut self,
-        assets: &AssetServer,
-        state_id: GlobalStateKey,
-        render_state: &RenderState,
-        extracted_scene: &ExtractedScene,
-        resource_ids: super::ResourceIdSet,
-        pmrem_override: Option<&Tracked<wgpu::TextureView>>,
-    ) -> u32 {
-        let mut builder = ResourceBuilder::new();
-        render_state.define_bindings(&mut builder);
-
-        // Build scene bindings (environment uniforms, lights, env textures)
-        Self::define_global_scene_bindings(&mut builder, extracted_scene);
-
-        self.prepare_binding_resources(assets, &builder.bindings);
-        let layout_entries = builder.generate_layout_entries();
-        let (layout, layout_id) = self.get_or_create_layout(&layout_entries);
-        let (bind_group, bind_group_id) = self.create_bind_group_with_texture_view_override(
-            &layout,
-            &builder,
-            pmrem_override.map(|view| ("pmrem_map", &**view)),
+        let id = self.bind_groups.global_state(state_key).map_or_else(
+            || NEXT_GLOBAL_STATE_ID.fetch_add(1, Ordering::Relaxed),
+            |existing| existing.id,
         );
-
-        let new_id = if let Some(existing) = self.bind_groups.global_state(state_id) {
-            existing.id
-        } else {
-            NEXT_GLOBAL_STATE_ID.fetch_add(1, Ordering::Relaxed)
-        };
-
-        let binding_wgsl = builder.generate_wgsl(0);
         let gpu_state = GpuGlobalState {
-            id: new_id,
+            id,
             bind_group,
-            bind_group_id,
-            layout,
-            layout_id,
-            binding_wgsl_hash: super::hash_binding_wgsl(&binding_wgsl),
-            binding_wgsl,
-            resource_ids,
+            bind_group_id: generate_gpu_resource_id(),
+            layout: interface.layout,
+            layout_id: interface.layout_id,
+            binding_wgsl: interface.binding_wgsl,
+            binding_wgsl_hash: interface.binding_wgsl_hash,
+            resource_ids: current_ids,
             last_used_frame: self.frame_index,
         };
-
-        self.bind_groups.insert_global_state(state_id, gpu_state);
-        new_id
+        self.bind_groups.insert_global_state(state_key, gpu_state);
+        Ok(id)
     }
 
-    /// Build the scene-level global bindings (Group 0, after `RenderState`).
-    ///
-    /// This replaces the old `Scene::define_bindings`, resolving environment
-    /// textures from `ResourceManager`'s caches instead of `Environment`.
-    fn define_global_scene_bindings<'a>(
-        builder: &mut ResourceBuilder<'a>,
-        extracted_scene: &'a ExtractedScene,
-    ) {
-        use myth_resources::uniforms::EnvironmentUniforms;
+    fn resolve_materialized_global_buffer(
+        &self,
+        buffer_ref: &BufferRef,
+        slot: GlobalStateBufferSlot,
+        required_usage: wgpu::BufferUsages,
+    ) -> Result<MaterializedGlobalBuffer, GlobalStatePhysicalFailure> {
+        let gpu_buffer = self
+            .resources
+            .buffer_by_cpu_id(buffer_ref.id())
+            .ok_or(GlobalStatePhysicalFailure::MissingBuffer(slot))?;
+        if gpu_buffer.last_uploaded_version != buffer_ref.version {
+            return Err(GlobalStatePhysicalFailure::VersionMismatch(slot));
+        }
+        if gpu_buffer.usage != buffer_ref.usage() || !buffer_ref.usage().contains(required_usage) {
+            return Err(GlobalStatePhysicalFailure::UsageMismatch(slot));
+        }
+        if buffer_ref.size() == 0 || gpu_buffer.size < buffer_ref.size() as u64 {
+            return Err(GlobalStatePhysicalFailure::SizeMismatch(slot));
+        }
+        Ok(MaterializedGlobalBuffer {
+            buffer: gpu_buffer.buffer.clone(),
+            physical_id: gpu_buffer.id,
+        })
+    }
 
-        // Environment Uniforms
-        builder.add_uniform_buffer(
-            "environment",
-            &extracted_scene.environment_uniforms_buffer.handle(),
-            None,
-            wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE,
-            false,
-            None,
-            Some(WgslStructName::Generator(
-                EnvironmentUniforms::wgsl_struct_def,
-            )),
-        );
+    fn ensure_materialized_global_interface(
+        &mut self,
+        camera: &BufferRef,
+        environment: &BufferRef,
+        directional_lights: &BufferRef,
+    ) -> GlobalBindingInterface {
+        if let Some(interface) = self.bind_groups.global_interface() {
+            return interface.clone();
+        }
 
-        builder.add_storage_buffer(
-            "directional_lights",
-            &extracted_scene.directional_light_storage_buffer.handle(),
-            None,
-            true,
-            wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE,
-            Some(WgslStructName::Name("Struct_lights".to_string())),
-        );
-
-        builder.add_texture(
-            "pmrem_map",
-            None::<TextureSource>,
-            wgpu::TextureSampleType::Float { filterable: true },
-            wgpu::TextureViewDimension::Cube,
-            wgpu::ShaderStages::FRAGMENT,
-        );
+        let mut builder = ResourceBuilder::new();
+        define_materialized_global_bindings(&mut builder, camera, environment, directional_lights);
+        let layout_entries = builder.generate_layout_entries();
+        let (layout, layout_id) = self.get_or_create_layout(&layout_entries);
+        let binding_wgsl = SharedBindingWgsl::from(builder.generate_wgsl(0));
+        let interface = GlobalBindingInterface {
+            layout,
+            layout_id,
+            binding_wgsl_hash: super::hash_binding_wgsl(binding_wgsl.as_str()),
+            binding_wgsl,
+        };
+        self.bind_groups.insert_global_interface(interface.clone());
+        interface
     }
 
     pub fn get_global_state(&self, render_state_id: u32, scene_id: u32) -> Option<&GpuGlobalState> {
@@ -816,6 +827,56 @@ fn global_resource_ids(
     ids
 }
 
+/// Define the process-static Group 0 interface without opening any CPU data or
+/// resolving any physical resource. Buffer identities are carried only so the
+/// existing ResourceBuilder can remain the single source of layout/WGSL truth.
+fn define_materialized_global_bindings(
+    builder: &mut ResourceBuilder<'_>,
+    camera: &BufferRef,
+    environment: &BufferRef,
+    directional_lights: &BufferRef,
+) {
+    let visibility =
+        wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE;
+    builder.add_uniform_buffer(
+        "render_state",
+        camera,
+        None,
+        visibility,
+        false,
+        None,
+        Some(WgslStructName::Generator(
+            RenderStateUniforms::wgsl_struct_def,
+        )),
+    );
+    builder.add_uniform_buffer(
+        "environment",
+        environment,
+        None,
+        visibility,
+        false,
+        None,
+        Some(WgslStructName::Generator(
+            EnvironmentUniforms::wgsl_struct_def,
+        )),
+    );
+    builder.add_storage_buffer(
+        "directional_lights",
+        directional_lights,
+        None,
+        true,
+        visibility,
+        Some(WgslStructName::Name("Struct_lights".to_string())),
+    );
+    builder.add_texture(
+        "pmrem_map",
+        None::<TextureSource>,
+        wgpu::TextureSampleType::Float { filterable: true },
+        wgpu::TextureViewDimension::Cube,
+        wgpu::ShaderStages::FRAGMENT,
+    );
+}
+
 /// Enforce the current Group 2 contract before resource preparation.
 ///
 /// Texture bindings expand to a view plus sampler and therefore require both
@@ -839,11 +900,17 @@ fn assert_object_bindings_are_buffer_only(bindings: &[Binding<'_>]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_object_bindings_are_buffer_only, global_resource_ids};
+    use super::{
+        GlobalStateBufferSlot, GlobalStatePhysicalFailure, assert_object_bindings_are_buffer_only,
+        global_resource_ids,
+    };
+    use crate::core::gpu::{GlobalStateKey, GlobalStateResolver, Tracked};
     use crate::core::{ResourceManager, WgpuContext};
     use crate::settings::{RendererInitConfig, RendererSettings};
     use myth_assets::TextureHandle;
+    use myth_resources::buffer::{BufferRef, CpuBuffer};
     use myth_resources::texture::TextureSource;
+    use myth_resources::uniforms::{EnvironmentUniforms, GpuLightStorage, RenderStateUniforms};
     use myth_resources::{BindingDesc, ResourceBuilder};
 
     #[test]
@@ -913,6 +980,164 @@ mod tests {
                 .resolve_binding_texture_view(Some(&pending), &depth_array)
                 .map(|(_, id)| id),
             Some(resources.system_textures.depth_d2array.id())
+        );
+    }
+
+    #[test]
+    fn exact_global_state_reuses_complete_fingerprint_and_rebinds_changes() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let uniform_usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+        let storage_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let camera = CpuBuffer::new(RenderStateUniforms::default(), uniform_usage, None);
+        let environment = CpuBuffer::new(EnvironmentUniforms::default(), uniform_usage, None);
+        let directional = CpuBuffer::new(vec![GpuLightStorage::default()], storage_usage, None);
+        resources.ensure_buffer(&camera);
+        resources.ensure_buffer(&environment);
+        resources.ensure_buffer(&directional);
+        let camera_ref = camera.handle();
+        let environment_ref = environment.handle();
+        let directional_ref = directional.handle();
+        let key = GlobalStateKey::new(7, 11);
+
+        let state_id = resources
+            .prepare_global_from_materialized(
+                key,
+                &camera_ref,
+                &environment_ref,
+                &directional_ref,
+                None,
+            )
+            .unwrap();
+        let first = resources.bind_groups.global_state(key).unwrap();
+        let first_bind_group = first.bind_group_id;
+        let first_layout = first.layout_id;
+        let first_wgsl = first.binding_wgsl.as_str().as_ptr();
+
+        resources.next_frame();
+        assert_eq!(
+            resources
+                .prepare_global_from_materialized(
+                    key,
+                    &camera_ref,
+                    &environment_ref,
+                    &directional_ref,
+                    None,
+                )
+                .unwrap(),
+            state_id
+        );
+        let reused = resources.bind_groups.global_state(key).unwrap();
+        assert_eq!(reused.bind_group_id, first_bind_group);
+        assert_eq!(reused.last_used_frame, resources.frame_index());
+
+        let texture = wgpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Global PMREM Test"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let pmrem = Tracked::new(texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        }));
+        resources
+            .prepare_global_from_materialized(
+                key,
+                &camera_ref,
+                &environment_ref,
+                &directional_ref,
+                Some(&pmrem),
+            )
+            .unwrap();
+        let rebound = resources.bind_groups.global_state(key).unwrap();
+        assert_ne!(rebound.bind_group_id, first_bind_group);
+        assert_eq!(rebound.id, state_id);
+        assert_eq!(rebound.layout_id, first_layout);
+        assert_eq!(rebound.binding_wgsl.as_str().as_ptr(), first_wgsl);
+        assert_eq!(rebound.resource_ids.as_slice()[3], pmrem.id());
+
+        assert!(
+            GlobalStateResolver::new(&resources.bind_groups, None)
+                .get(key)
+                .is_none()
+        );
+        assert!(
+            GlobalStateResolver::new(&resources.bind_groups, Some(key))
+                .get(key)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn exact_global_state_rejects_unmaterialized_or_inexact_buffers() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let uniform_usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+        let storage_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let camera = CpuBuffer::new(RenderStateUniforms::default(), uniform_usage, None);
+        let environment = CpuBuffer::new(EnvironmentUniforms::default(), uniform_usage, None);
+        let directional = CpuBuffer::new(vec![GpuLightStorage::default()], storage_usage, None);
+        resources.ensure_buffer(&environment);
+        resources.ensure_buffer(&directional);
+        let key = GlobalStateKey::new(3, 5);
+        assert_eq!(
+            resources.prepare_global_from_materialized(
+                key,
+                &camera.handle(),
+                &environment.handle(),
+                &directional.handle(),
+                None,
+            ),
+            Err(GlobalStatePhysicalFailure::MissingBuffer(
+                GlobalStateBufferSlot::Camera
+            ))
+        );
+        assert!(resources.bind_groups.global_interface().is_none());
+        assert!(resources.bind_groups.global_state(key).is_none());
+
+        resources.ensure_buffer(&camera);
+        let exact = camera.handle();
+        let stale = BufferRef::with_fixed_id(
+            exact.id(),
+            exact.size(),
+            exact.usage(),
+            exact.version + 1,
+            None,
+        );
+        assert_eq!(
+            resources.prepare_global_from_materialized(
+                key,
+                &stale,
+                &environment.handle(),
+                &directional.handle(),
+                None,
+            ),
+            Err(GlobalStatePhysicalFailure::VersionMismatch(
+                GlobalStateBufferSlot::Camera
+            ))
         );
     }
 }

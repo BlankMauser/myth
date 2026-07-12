@@ -238,7 +238,7 @@ impl ToneMappingFeature {
             "struct_definitions",
             ToneMappingUniforms::wgsl_struct_def("Uniforms").as_str(),
         );
-        options.inject_code("binding_code", &global_state.binding_wgsl);
+        options.inject_code("binding_code", global_state.binding_wgsl.as_str());
         options.inject_code(
             "scene_lighting_structs",
             myth_resources::uniforms::scene_lighting_structs_wgsl(),
@@ -303,6 +303,7 @@ impl ToneMappingFeature {
         );
 
         ctx.graph.add_pass("ToneMap_Pass", |builder| {
+            builder.demand_global_state(snapshot.global_state_key);
             builder.read_texture(input_hdr);
             let params_buffer = builder.create_buffer(
                 "ToneMap_Params",
@@ -415,7 +416,13 @@ impl<'a> PassNode<'a> for ToneMapPassNode<'a> {
                     .expect("ToneMap pipeline missing after prepare"),
             ),
         );
-        rpass.set_bind_group(0, ctx.global_bind_group, &[]);
+        rpass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "ToneMap_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         rpass.set_bind_group(1, static_bg, &[]);
         rpass.set_bind_group(2, transient_bg, &[]);
         rpass.draw(0..3, 0..1);

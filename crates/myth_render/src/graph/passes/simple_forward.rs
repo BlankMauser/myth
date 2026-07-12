@@ -23,6 +23,7 @@
 //! [`BasicForward`]: crate::settings::RenderPath::BasicForward
 
 use crate::core::binding::PreparedBindGroupId;
+use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
@@ -52,6 +53,7 @@ impl SimpleForwardFeature {
     pub(crate) fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        global_state_key: GlobalStateKey,
         // surface_out: TextureNodeId,
         clear_color: wgpu::Color,
         skybox: Option<SkyboxDrawRequest<'a>>,
@@ -80,6 +82,7 @@ impl SimpleForwardFeature {
         let transparent_draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Transparent);
 
         ctx.graph.add_pass("SimpleForward_Pass", |builder| {
+            builder.demand_global_state(global_state_key);
             builder.demand_draw_plan(opaque_draw_plan);
             builder.demand_draw_plan(transparent_draw_plan);
             let out = builder.create_texture("Scene_Color", out_desc);
@@ -192,7 +195,9 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group.expect(
+            "SimpleForward_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+        );
 
         let (color_view, resolve_target) = if let Some(msaa_view) = self.msaa_view {
             (msaa_view, Some(self.surface_out))

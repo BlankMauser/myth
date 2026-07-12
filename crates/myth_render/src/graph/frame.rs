@@ -1,16 +1,15 @@
 //! Render frame management.
 //!
 //! `RenderFrame` owns the frame's CPU scene snapshot, render state, light/view
-//! metadata, and the small set of scene-global inputs that must exist before
-//! graph construction. Feature-local physical preparation is deferred until
-//! after DPE by [`FrameComposer`].
+//! metadata, and scene-global CPU inputs required for graph construction.
+//! All physical preparation is deferred until after DPE by [`FrameComposer`].
 //!
-//! # Three-Phase Rendering Architecture
+//! # Four-Phase Rendering Architecture
 //!
-//! The rendering pipeline is divided into three distinct phases:
+//! The rendering pipeline is divided into four distinct phases:
 //!
-//! 1. **Snapshot**: `extract_and_prepare()` captures scene/light/view state and
-//!    refreshes the shared global interface.
+//! 1. **Snapshot**: `extract()` captures scene/light/view state without GPU
+//!    uploads or bind-group creation.
 //! 2. **Compose + Compile**: [`FrameComposer`] collects CPU draw intents,
 //!    declares topology, and runs DPE.
 //! 3. **Deferred prepare**: only live passes and their exact draw-source union
@@ -773,38 +772,6 @@ impl<'a> DrawPlanResolver<'a> {
     }
 }
 
-/// Attempt-scoped owner for the scene-global bind group used by render passes.
-///
-/// This is intentionally separate from [`DrawPlanStore`]: the global binding
-/// is pass-level state, not a draw-plan resource slot.
-#[derive(Default)]
-pub(crate) struct PreparedGlobalBindGroup {
-    bind_group: Option<wgpu::BindGroup>,
-}
-
-impl PreparedGlobalBindGroup {
-    pub(crate) fn stage(&mut self, bind_group: &wgpu::BindGroup) {
-        self.bind_group = Some(bind_group.clone());
-    }
-
-    #[must_use]
-    pub(crate) fn resolve(&self) -> &wgpu::BindGroup {
-        self.bind_group
-            .as_ref()
-            .expect("global bind group was not staged for this graph attempt")
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.bind_group = None;
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bind_group.is_none()
-    }
-}
-
 static NEXT_DRAW_PLAN_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 fn next_draw_plan_attempt() -> u64 {
@@ -1097,7 +1064,7 @@ impl RenderFrame {
         &self.extracted_scene
     }
 
-    /// Extract scene data, build shadow views, and prepare global GPU resources.
+    /// Extract scene data and build shadow views without physical GPU work.
     ///
     /// # Phases
     ///
@@ -1115,14 +1082,14 @@ impl RenderFrame {
     ///    cascade matrices and split distances into the directional / local
     ///    light tracks so both the global bind group and the RDG local-light
     ///    path already contain correct data.
-    /// 6. **Global Prepare** — Upload camera / scene / light uniforms and
-    ///    create the global bind group (Group 0).
+    /// 6. **Global Snapshot** — Update the CPU camera state consumed by the
+    ///    post-DPE `GlobalStatePlan`.
     ///
     /// # Note
     ///
     /// Surface acquisition is deferred to `FrameComposer::render()` to
     /// minimise swap-chain buffer hold time.
-    pub fn extract_and_prepare(
+    pub fn extract(
         &mut self,
         resource_manager: &mut ResourceManager,
         scene: &mut Scene,
@@ -1133,7 +1100,6 @@ impl RenderFrame {
         surface_size: (u32, u32),
         max_extracted_lights: usize,
         feature_config: RenderFrameFeatureConfig,
-        published_pmrem_view: Option<&Tracked<wgpu::TextureView>>,
         published_pmrem_max_mip: Option<f32>,
     ) {
         use crate::core::view::RenderView;
@@ -1185,19 +1151,13 @@ impl RenderFrame {
         // ── 6. Update light storage buffer with shadow metadata ────────
         Self::update_light_shadow_metadata(&render_lists.active_views, &mut self.extracted_scene);
 
-        // ── 7. Global GPU resources ────────────────────────────────────
+        // ── 7. Global CPU snapshot ─────────────────────────────────────
         self.render_state.update(
             scene.id(),
             camera,
             frame_time,
             resource_manager.frame_index(),
             surface_size,
-        );
-        resource_manager.prepare_global_with_pmrem_override(
-            assets,
-            &self.extracted_scene,
-            &self.render_state,
-            published_pmrem_view,
         );
     }
 

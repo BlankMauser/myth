@@ -31,6 +31,7 @@
 //! Transparent commands are sorted back-to-front for correct alpha blending.
 
 use crate::core::binding::PreparedBindGroupId;
+use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
@@ -69,6 +70,7 @@ impl TransparentFeature {
     pub fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        global_state_key: GlobalStateKey,
         color_target: TextureNodeId,
         depth_target: TextureNodeId,
         transmission_tex: Option<TextureNodeId>,
@@ -81,6 +83,7 @@ impl TransparentFeature {
         let draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Transparent);
 
         ctx.graph.add_pass("Transparent_Pass", |builder| {
+            builder.demand_global_state(global_state_key);
             builder.demand_draw_plan(draw_plan);
             let color_output = builder.mutate_texture(color_target, "Scene_Color_Transparent");
 
@@ -207,7 +210,9 @@ impl<'a> PassNode<'a> for TransparentPassNode {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group.expect(
+            "Transparent_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+        );
 
         let color_att =
             ctx.get_color_attachment(self.out_color, RenderTargetOps::Load, self.resolve_target);

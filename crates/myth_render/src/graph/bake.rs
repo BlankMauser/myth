@@ -236,7 +236,6 @@ fn bake_main_intents(
             instance_variants: item.item_variant_flags,
             item_shader_defines_hash: item.item_shader_defines_hash,
             shader_source_identity,
-            global_state_id: gpu_world.id,
             global_layout_id: gpu_world.layout_id,
             global_binding_wgsl_hash: gpu_world.binding_wgsl_hash,
             material_layout_id: source.material_layout_id,

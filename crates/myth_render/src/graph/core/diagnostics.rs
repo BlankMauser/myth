@@ -49,6 +49,15 @@ pub enum RdgResourceMaterializationFailure {
     /// The live scene-buffer batch had already failed or could not publish a
     /// complete set of graph-owned handles.
     IncompleteSceneBufferBatch,
+    /// A Group 0 CPU source changed after graph construction captured its
+    /// coherent three-buffer snapshot.
+    GlobalStateSnapshotDrift,
+    /// ResourceManager contains physical buffer state incompatible with the
+    /// exact DPE-live Group 0 snapshot.
+    IncompatibleGlobalStatePhysicalState,
+    /// The live Group 0 batch had already failed or could not publish a
+    /// complete graph-attempt-owned physical set.
+    IncompleteGlobalStateBatch,
 }
 
 /// Stable engine-level classification of `wgpu` surface acquisition failures.

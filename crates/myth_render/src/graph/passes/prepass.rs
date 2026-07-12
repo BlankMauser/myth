@@ -275,7 +275,7 @@ impl PrepassFeature {
                         "binding_code",
                         format!(
                             "{}\n{}\n{}",
-                            gpu_world.binding_wgsl,
+                            gpu_world.binding_wgsl.as_str(),
                             source.material_binding_wgsl,
                             source.object_binding_wgsl
                         ),
@@ -465,6 +465,7 @@ impl PrepassFeature {
             draw_plan,
         };
         ctx.graph.add_pass("Pre_Pass", |builder| {
+            builder.demand_global_state(snapshot.global_state_key);
             builder.demand_draw_plan(draw_plan);
             builder.write_texture(scene_depth);
             if let Some(n) = scene_normals {
@@ -516,7 +517,9 @@ impl<'a> PassNode<'a> for PrepassPassNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group.expect(
+            "Pre_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+        );
 
         let mut color_attachments: smallvec::SmallVec<
             [Option<wgpu::RenderPassColorAttachment>; 3],

@@ -346,6 +346,7 @@ impl SsgiFeature {
             );
 
             let (raw_indirect, uniforms_buffer) = ctx.graph.add_pass("SSGI_Raw", |builder| {
+                builder.demand_global_state(snapshot.global_state_key);
                 builder.read_texture(scene_depth);
                 builder.read_texture(scene_hiz);
                 builder.read_texture(scene_normals);
@@ -992,7 +993,13 @@ impl<'a> PassNode<'a> for SsgiRawNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.pipeline_id.expect("SSGI raw pipeline not prepared")),
         );
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "SSGI_Raw scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.bind_group.expect("SSGI raw BG missing")),

@@ -290,6 +290,7 @@ impl SsrFeature {
 
             let (raw_reflection, raw_diagnostic, uniforms_buffer) =
                 ctx.graph.add_pass("SSR_Trace", |builder| {
+                    builder.demand_global_state(snapshot.global_state_key);
                     builder.read_texture(scene_depth);
                     builder.read_texture(scene_normals);
                     builder.read_texture(current_color);
@@ -328,6 +329,7 @@ impl SsrFeature {
                 });
 
             ctx.graph.add_pass("SSR_Temporal", |builder| {
+                builder.demand_global_state(snapshot.global_state_key);
                 builder.read_texture(raw_reflection);
                 builder.read_texture(previous_reflection);
                 builder.read_texture(scene_depth);
@@ -400,6 +402,7 @@ impl SsrFeature {
                     | wgpu::TextureUsages::COPY_SRC,
             );
             let merged_color = ctx.graph.add_pass("SSR_Merge", |builder| {
+                builder.demand_global_state(snapshot.global_state_key);
                 builder.read_texture(current_color);
                 builder.read_texture(clean_reflection);
                 builder.read_texture(material_mrt);
@@ -988,7 +991,13 @@ impl<'a> PassNode<'a> for SsrTraceNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.pipeline_id.expect("SSR trace pipeline not prepared")),
         );
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "SSR_Trace scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.bind_group.expect("SSR trace BG missing")),
@@ -1053,7 +1062,13 @@ impl<'a> PassNode<'a> for SsrTemporalNode<'a> {
                     .expect("SSR temporal pipeline not prepared"),
             ),
         );
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "SSR_Temporal scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.bind_group.expect("SSR temporal BG missing")),
@@ -1161,7 +1176,13 @@ impl<'a> PassNode<'a> for SsrMergeNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.pipeline_id.expect("SSR merge pipeline not prepared")),
         );
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "SSR_Merge scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.bind_group.expect("SSR merge BG missing")),

@@ -49,8 +49,9 @@
 
 use crate::core::binding::GlobalBindGroupCache;
 use crate::core::gpu::{
-    AssetTextureSnapshot, BufferUploadContext, CubeSourceType, GlobalStateKey, GlobalStateResolver,
-    MipmapRequestResolver, Tracked, snapshot_asset_texture,
+    AssetTextureSnapshot, BufferUploadContext, CubeSourceType, GlobalStateKey,
+    GlobalStatePhysicalFailure, GlobalStateResolver, MipmapRequestResolver, Tracked,
+    snapshot_asset_texture,
 };
 use crate::core::{ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
@@ -62,11 +63,11 @@ use crate::graph::core::GraphStorage;
 use crate::graph::core::gaussian::GaussianFrameResolver;
 use crate::graph::core::graph::FrameConfig;
 use crate::graph::core::{
-    BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GraphBlackboard, HistoryRegistry,
-    HookStage, PrepareContext, RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgFramePhase,
-    RdgRenderTargetKind, RdgResourceMaterializationFailure, RenderGraph,
-    SceneBufferMaterializationFailure, SceneBufferSources, SceneDrawPrepareContext, TextureDesc,
-    TransientPool, ViewResolver,
+    BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GlobalStateMaterializationFailure,
+    GlobalStateSources, GraphBlackboard, HistoryRegistry, HookStage, PrepareContext,
+    RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgFramePhase, RdgRenderTargetKind,
+    RdgResourceMaterializationFailure, RenderGraph, SceneBufferMaterializationFailure,
+    SceneBufferSources, SceneDrawPrepareContext, TextureDesc, TransientPool, ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
 use crate::graph::frame::RenderLists;
@@ -337,6 +338,8 @@ pub struct FrameComposer<'a> {
             Option<Box<dyn FnOnce(&mut RenderGraph<'a>, GraphBlackboard) -> GraphBlackboard + 'a>>,
         ); 4],
     >,
+    #[cfg(test)]
+    forced_surface_acquisition_failure: Option<RdgSurfaceAcquireFailure>,
     // Declared last so hook captures and every other Composer field are
     // released before the terminal attempt snapshot is published.
     _attempt_guard: RdgComposerAttemptGuard<'a>,
@@ -375,7 +378,20 @@ impl<'a> FrameComposer<'a> {
             frame_config,
             gpu_local_light_hook: None,
             hooks: smallvec::SmallVec::new(),
+            #[cfg(test)]
+            forced_surface_acquisition_failure: None,
         }
+    }
+
+    /// Test-only acquisition seam. It exercises the exact early-return path
+    /// without requiring a platform window surface to fail nondeterministically.
+    #[cfg(test)]
+    pub(crate) fn with_forced_surface_acquisition_failure(
+        mut self,
+        reason: RdgSurfaceAcquireFailure,
+    ) -> Self {
+        self.forced_surface_acquisition_failure = Some(reason);
+        self
     }
 
     /// Returns a reference to the wgpu device.
@@ -462,6 +478,12 @@ impl<'a> FrameComposer<'a> {
 
         let rdg_diagnostics = self.ctx.rdg_diagnostics;
         rdg_diagnostics.enter_phase(RdgFramePhase::AcquireTarget);
+
+        #[cfg(test)]
+        if let Some(reason) = self.forced_surface_acquisition_failure {
+            rdg_diagnostics.mark_surface_acquisition_failed(reason);
+            return;
+        }
 
         let view_format = self.ctx.wgpu_ctx.surface_view_format;
 
@@ -577,6 +599,16 @@ impl<'a> FrameComposer<'a> {
             self.ctx.graph_storage,
             self.ctx.frame_arena,
             rdg_diagnostics,
+        );
+        let global_state_key =
+            GlobalStateKey::new(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id);
+        graph.capture_global_state_plan(
+            global_state_key,
+            GlobalStateSources {
+                camera: self.ctx.render_state.uniforms(),
+                environment: &self.ctx.extracted_scene.environment_uniforms_buffer,
+                directional_lights: &self.ctx.extracted_scene.directional_light_storage_buffer,
+            },
         );
         graph.storage.material_plans.capture(
             self.ctx.assets,
@@ -1303,6 +1335,7 @@ impl<'a> FrameComposer<'a> {
                         // 3. Opaque
                         let opaque_out = self.ctx.opaque_pass.add_to_graph(
                             c,
+                            global_state_key,
                             scene_depth,
                             self.ctx.extracted_scene.background.clear_color(),
                             ssss_enabled || ssr_enabled,
@@ -1506,6 +1539,7 @@ impl<'a> FrameComposer<'a> {
                         // 8. Transparent
                         let active_color = self.ctx.transparent_pass.add_to_graph(
                             c,
+                            global_state_key,
                             active_color,
                             opaque_out.active_depth,
                             transmission_tex,
@@ -1736,6 +1770,7 @@ impl<'a> FrameComposer<'a> {
                     };
                     self.ctx.simple_forward_pass.add_to_graph(
                         c,
+                        global_state_key,
                         self.ctx.extracted_scene.background.clear_color(),
                         skybox,
                         shadow_output.shadow_2d,
@@ -1781,7 +1816,7 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 3. Compile & Execute RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             graph.compile(self.ctx.transient_pool, &self.ctx.wgpu_ctx.device);
-            let scene_buffers = {
+            let (scene_buffers, global_buffers) = {
                 let resource_manager = &mut *self.ctx.resource_manager;
                 let mut uploads = BufferUploadContext::new(
                     &self.ctx.wgpu_ctx.device,
@@ -1790,13 +1825,29 @@ impl<'a> FrameComposer<'a> {
                     &mut resource_manager.resources,
                     &resource_manager.internal_textures,
                 );
-                graph.materialize_live_scene_buffers(
+                let scene_buffers = graph.materialize_live_scene_buffers(
                     SceneBufferSources {
                         light_metadata: &self.ctx.extracted_scene.local_light_metadata_buffer,
                         light_storage: &self.ctx.extracted_scene.local_light_storage_buffer,
                     },
                     &mut uploads,
-                )
+                );
+                let global_buffers = if scene_buffers.is_ok() {
+                    graph.materialize_live_global_state(
+                        GlobalStateSources {
+                            camera: self.ctx.render_state.uniforms(),
+                            environment: &self.ctx.extracted_scene.environment_uniforms_buffer,
+                            directional_lights: &self
+                                .ctx
+                                .extracted_scene
+                                .directional_light_storage_buffer,
+                        },
+                        &mut uploads,
+                    )
+                } else {
+                    Ok(())
+                };
+                (scene_buffers, global_buffers)
             };
             if let Err(reason) = scene_buffers {
                 let reason = match reason {
@@ -1808,6 +1859,21 @@ impl<'a> FrameComposer<'a> {
                     }
                     SceneBufferMaterializationFailure::Unavailable => {
                         RdgResourceMaterializationFailure::IncompleteSceneBufferBatch
+                    }
+                };
+                rdg_diagnostics.mark_resource_materialization_failed(reason);
+                return;
+            }
+            if let Err(reason) = global_buffers {
+                let reason = match reason {
+                    GlobalStateMaterializationFailure::SnapshotDrift => {
+                        RdgResourceMaterializationFailure::GlobalStateSnapshotDrift
+                    }
+                    GlobalStateMaterializationFailure::ConflictingPhysicalState => {
+                        RdgResourceMaterializationFailure::IncompatibleGlobalStatePhysicalState
+                    }
+                    GlobalStateMaterializationFailure::Unavailable => {
+                        RdgResourceMaterializationFailure::IncompleteGlobalStateBatch
                     }
                 };
                 rdg_diagnostics.mark_resource_materialization_failed(reason);
@@ -1836,35 +1902,33 @@ impl<'a> FrameComposer<'a> {
                 }
                 Some(self.ctx.history_registry.get_texture_view(texture.id))
             });
-            let desired_pmrem_id = pmrem_override.map_or(
-                self.ctx.resource_manager.system_textures.black_cube.id(),
-                Tracked::id,
-            );
-            let global_state_matches = self
-                .ctx
-                .resource_manager
-                .get_global_state(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id)
-                .and_then(|state| state.resource_ids.as_slice().get(3))
-                .is_some_and(|&id| id == desired_pmrem_id);
-            if !global_state_matches {
-                self.ctx
-                    .resource_manager
-                    .prepare_global_with_pmrem_override(
-                        self.ctx.assets,
-                        self.ctx.extracted_scene,
-                        self.ctx.render_state,
+            if let Some(key) = graph.global_state_allowed_key() {
+                let [camera, environment, directional_lights] = graph
+                    .materialized_global_buffer_refs()
+                    .expect("DPE-live global state lacks its atomic buffer batch");
+                let finalize_result: Result<u32, GlobalStatePhysicalFailure> =
+                    self.ctx.resource_manager.prepare_global_from_materialized(
+                        key,
+                        &camera,
+                        &environment,
+                        &directional_lights,
                         pmrem_override,
                     );
+                if finalize_result.is_err() {
+                    rdg_diagnostics.mark_resource_materialization_failed(
+                        RdgResourceMaterializationFailure::IncompatibleGlobalStatePhysicalState,
+                    );
+                    return;
+                }
+                let bind_group = self
+                    .ctx
+                    .resource_manager
+                    .get_global_state(key.render_state_id(), key.scene_id())
+                    .expect("finalized global state was not published")
+                    .bind_group
+                    .clone();
+                graph.stage_finalized_global_bind_group(key, &bind_group);
             }
-            let global_state = self
-                .ctx
-                .resource_manager
-                .get_global_state(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id)
-                .expect("global state missing after PMREM refresh");
-            graph
-                .storage
-                .prepared_global_bind_group
-                .stage(&global_state.bind_group);
 
             // ─── 3a. Materialize the DPE-live central source union ───────
             //
@@ -1900,6 +1964,7 @@ impl<'a> FrameComposer<'a> {
             // (scene_color, scene_depth, etc.) are RDG transient resources.
 
             {
+                let finalized_global_state_key = graph.finalized_global_state_key();
                 let mut prepare_ctx = PrepareContext {
                     views: ViewResolver {
                         resources: &graph.storage.resources,
@@ -1934,7 +1999,10 @@ impl<'a> FrameComposer<'a> {
                     gaussian_frames: GaussianFrameResolver::new(
                         &graph.storage.gaussian_frame_batches,
                     ),
-                    global_states: GlobalStateResolver::new(&self.ctx.resource_manager.bind_groups),
+                    global_states: GlobalStateResolver::new(
+                        &self.ctx.resource_manager.bind_groups,
+                        finalized_global_state_key,
+                    ),
                     sampler_registry: &self.ctx.resource_manager.sampler_registry,
                     system_textures: &self.ctx.resource_manager.system_textures,
                     global_bind_group_cache: self.ctx.global_bind_group_cache,
@@ -1993,6 +2061,7 @@ impl<'a> FrameComposer<'a> {
                     });
 
             {
+                let finalized_global_bind_group = graph.finalized_global_bind_group().cloned();
                 let mut execute_ctx = ExecuteContext {
                     resources: &graph.storage.resources,
                     pool: self.ctx.transient_pool,
@@ -2007,7 +2076,7 @@ impl<'a> FrameComposer<'a> {
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     mipmap_encode_coordinator: &graph.storage.mipmap_encode_coordinator,
                     draw_plans: graph.storage.draw_plans.resolver(),
-                    global_bind_group: graph.storage.prepared_global_bind_group.resolve(),
+                    global_bind_group: finalized_global_bind_group.as_ref(),
                     wgpu_ctx: &*self.ctx.wgpu_ctx,
                     current_timeline_index: 0,
                 };

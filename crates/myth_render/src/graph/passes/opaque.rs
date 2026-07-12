@@ -29,6 +29,7 @@
 
 use crate::HDR_TEXTURE_FORMAT;
 use crate::core::binding::PreparedBindGroupId;
+use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
@@ -71,6 +72,7 @@ impl OpaqueFeature {
     pub fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        global_state_key: GlobalStateKey,
         scene_depth_ss: TextureNodeId,
         clear_color: wgpu::Color,
         needs_specular_data: bool,
@@ -96,6 +98,7 @@ impl OpaqueFeature {
         let draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Opaque);
 
         ctx.graph.add_pass("Opaque_Pass", |builder| {
+            builder.demand_global_state(global_state_key);
             builder.demand_draw_plan(draw_plan);
             // ── Create color / depth / resolve targets ─────────────────
             let (color_target, depth_target) = if is_msaa {
@@ -360,7 +363,9 @@ impl<'a> PassNode<'a> for OpaquePassNode {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group.expect(
+            "Opaque_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+        );
 
         // ── Color attachments (auto-deduced LoadOp / StoreOp) ───────────
         let mut color_attachments: smallvec::SmallVec<

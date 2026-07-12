@@ -338,6 +338,7 @@ impl ClusteredLightingFeature {
             });
 
         let light_view_positions = ctx.graph.add_pass("Cluster_Light_View_Pass", |builder| {
+            builder.demand_global_state(snapshot.global_state_key);
             let light_metadata_buffer =
                 builder.read_buffer(final_lights.final_light_metadata_buffer);
             let light_data_buffer = builder.read_buffer(final_lights.final_light_data_buffer);
@@ -364,6 +365,7 @@ impl ClusteredLightingFeature {
         });
 
         ctx.graph.add_pass("Cluster_Cull_Pass", |builder| {
+            builder.demand_global_state(snapshot.global_state_key);
             let params_buffer = builder.read_buffer(params_buffer);
             let light_metadata_buffer =
                 builder.read_buffer(final_lights.final_light_metadata_buffer);
@@ -561,7 +563,7 @@ impl ClusterLightViewFeature {
             .get(global_state_key)
             .expect("cluster light-view requires prepared global binding state");
         let mut options = ShaderCompilationOptions::default();
-        options.inject_code("binding_code", &global_state.binding_wgsl);
+        options.inject_code("binding_code", global_state.binding_wgsl.as_str());
         options.inject_code("scene_lighting_structs", scene_lighting_structs_wgsl());
         let (module, shader_hash) = ctx.shader_manager.get_or_compile(
             ctx.device,
@@ -658,7 +660,7 @@ impl ClusterCullFeature {
             .get(global_state_key)
             .expect("cluster cull requires prepared global binding state");
         let mut options = ShaderCompilationOptions::default();
-        options.inject_code("binding_code", &global_state.binding_wgsl);
+        options.inject_code("binding_code", global_state.binding_wgsl.as_str());
         options.inject_code("scene_lighting_structs", scene_lighting_structs_wgsl());
         options.inject_code(
             "clustered_lighting_structs",
@@ -860,7 +862,13 @@ impl<'a> PassNode<'a> for ClusterLightViewPassNode<'a> {
             ctx.pipeline_cache
                 .get_compute_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "Cluster_Light_View_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(
@@ -926,7 +934,13 @@ impl<'a> PassNode<'a> for ClusterCullPassNode<'a> {
             ctx.pipeline_cache
                 .get_compute_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "Cluster_Cull_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.bind_group.expect("Cluster cull BG missing")),

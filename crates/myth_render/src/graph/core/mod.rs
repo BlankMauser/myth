@@ -7,6 +7,7 @@ pub mod context;
 mod diagnostics;
 #[cfg(feature = "3dgs")]
 pub(crate) mod gaussian;
+mod global_state;
 pub mod graph;
 pub mod node;
 pub mod persistent;
@@ -33,6 +34,7 @@ pub use diagnostics::{
 pub(crate) use diagnostics::{
     RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgRendererAttemptGuard,
 };
+pub(crate) use global_state::{GlobalStateMaterializationFailure, GlobalStateSources};
 pub use graph::{GraphStorage, MermaidDumpMode, RenderGraph};
 pub use node::PassNode;
 pub use persistent::{

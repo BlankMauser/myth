@@ -876,7 +876,7 @@ impl GaussianComputeResources {
             "GS_SORT_KEYS_PER_WG",
             &GaussianSortConfig::keys_per_wg_u32().to_string(),
         );
-        preprocess_options.inject_code("binding_code", &global_binding_wgsl);
+        preprocess_options.inject_code("binding_code", global_binding_wgsl.as_str());
         preprocess_options.inject_code(
             "scene_lighting_structs",
             myth_resources::uniforms::scene_lighting_structs_wgsl(),
@@ -1266,6 +1266,7 @@ impl GaussianSplattingFeature {
         } = self;
 
         let cloud_buffers = ctx.graph.add_pass("GS_Compute", |builder| {
+            builder.demand_global_state(snapshot.global_state_key);
             let mut graph_buffers = Vec::with_capacity(snapshot.plans.len());
             let mut compute_states = Vec::with_capacity(snapshot.plans.len());
 
@@ -1610,7 +1611,9 @@ impl<'a> PassNode<'a> for GaussianComputePassNode<'a> {
         let preprocess_pipeline = ctx
             .pipeline_cache
             .get_compute_pipeline(preprocess_pipeline_id);
-        let global_bind_group = ctx.global_bind_group;
+        let global_bind_group = ctx.global_bind_group.expect(
+            "GS_Compute scene Global Group 0 is missing; its demand was not declared or finalized",
+        );
 
         for cloud in self.clouds.iter() {
             let preprocess_workgroups = cloud.buffers.num_points.div_ceil(PREPROCESS_WG_SIZE);

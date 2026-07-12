@@ -8,16 +8,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::core::ResourceManager;
 use crate::core::binding::PreparedBindGroupStore;
 use crate::core::gpu::{
-    AssetTextureSnapshot, BufferUploadContext, MipmapBatchId, MipmapRequest, MipmapRequestBatch,
-    PhysicalImageGenerationKey, Tracked,
+    AssetTextureSnapshot, BufferUploadContext, GlobalStateKey, MipmapBatchId, MipmapRequest,
+    MipmapRequestBatch, PhysicalImageGenerationKey, Tracked,
 };
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
-use crate::graph::frame::{
-    DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedDrawStore, PreparedGlobalBindGroup,
-};
+use crate::graph::frame::{DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedDrawStore};
 use crate::graph::material_plan::MaterialPlanStore;
 
 use super::asset_texture::{AssetTextureImportId, AssetTextureImportStore, snapshot_texture_desc};
@@ -25,6 +23,9 @@ use super::builder::PassBuilder;
 use super::diagnostics::{
     RdgAttemptOwner, RdgDiagnosticsRecorder, RdgFrameDiagnostics, RdgFramePhase,
     RdgStandaloneAttempt, RdgStandaloneDiagnosticsStore,
+};
+use super::global_state::{
+    GlobalStateAttempt, GlobalStateMaterializationFailure, GlobalStatePlan, GlobalStateSources,
 };
 use super::node::{NodeSlot, PassNode, PassRecord};
 use super::persistent::{
@@ -308,9 +309,9 @@ pub struct GraphStorage {
     /// Exact CPU material owners and texture snapshots captured before graph
     /// construction, then opened only for the DPE-live source union.
     pub(crate) material_plans: MaterialPlanStore,
-    /// Pass-level scene-global bind group, staged independently from draw
-    /// plans because it is not per-command state.
-    pub(crate) prepared_global_bind_group: PreparedGlobalBindGroup,
+    /// Single logical Group 0 plan, projected DPE demand, and destructible
+    /// attempt-owned physical results.
+    pub(crate) global_state_attempt: GlobalStateAttempt,
 
     /// Exact Gaussian asset versions captured for this graph attempt. Arc
     /// owners live here because the frame arena intentionally skips Drop.
@@ -382,7 +383,7 @@ impl GraphStorage {
             draw_plan_demands: Vec::with_capacity(64),
             prepared_draws: PreparedDrawStore::new(),
             material_plans: MaterialPlanStore::new(),
-            prepared_global_bind_group: PreparedGlobalBindGroup::default(),
+            global_state_attempt: GlobalStateAttempt::default(),
             #[cfg(feature = "3dgs")]
             gaussian_frame_batches: Vec::new(),
             // resource_registry: FxHashMap::default(),
@@ -635,7 +636,7 @@ impl GraphStorage {
         self.prepared_draws.clear();
         self.material_plans.clear();
         self.draw_plans.clear();
-        self.prepared_global_bind_group.clear();
+        self.global_state_attempt.clear();
         #[cfg(feature = "3dgs")]
         self.gaussian_frame_batches.clear();
     }
@@ -1318,6 +1319,20 @@ impl<'a> RenderGraph<'a> {
         self.storage.draw_plans.reserve_plan(key)
     }
 
+    /// Capture the sole logical Group 0 plan for this graph attempt.
+    /// Repeating the identical capture is idempotent; a different plan is an
+    /// invalid multi-domain graph construction.
+    pub(crate) fn capture_global_state_plan(
+        &mut self,
+        key: GlobalStateKey,
+        sources: GlobalStateSources<'_>,
+    ) {
+        self.assert_topology_mutable();
+        self.storage
+            .global_state_attempt
+            .set_plan(GlobalStatePlan::capture(key, sources));
+    }
+
     /// Bind exact logical Asset Texture aliases to a canonical draw recipe.
     /// Passes that later demand the plan inherit these as normal RDG reads.
     pub(crate) fn set_draw_plan_texture_dependencies(
@@ -1807,6 +1822,78 @@ impl<'a> RenderGraph<'a> {
         )
     }
 
+    /// Materialize the fixed Group 0 buffer batch only when a DPE-live pass
+    /// declared the captured plan. Final bind-group creation is deliberately a
+    /// separate ResourceManager step performed by the Composer.
+    pub(crate) fn materialize_live_global_state(
+        &mut self,
+        sources: GlobalStateSources<'_>,
+        uploads: &mut BufferUploadContext<'_>,
+    ) -> Result<(), GlobalStateMaterializationFailure> {
+        assert!(
+            self.storage.topology_compiled,
+            "Global State materialization requires a compiled graph"
+        );
+        self.storage
+            .global_state_attempt
+            .materialize_live(sources, uploads)
+    }
+
+    /// Key authorized for ResourceManager Group 0 finalization after exact
+    /// DPE-live buffer materialization.
+    #[inline]
+    #[must_use]
+    pub(crate) fn global_state_allowed_key(&self) -> Option<GlobalStateKey> {
+        self.storage.global_state_attempt.allowed_key()
+    }
+
+    /// Physical IDs in Group 0 buffer binding order: camera, environment,
+    /// directional lights.
+    #[inline]
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn materialized_global_buffer_ids(&self) -> Option<[u64; 3]> {
+        self.storage.global_state_attempt.prepared.resource_ids()
+    }
+
+    /// Owned exact BufferRefs in Group 0 binding order: camera, environment,
+    /// directional lights. They remain hidden until the whole captured batch
+    /// has been successfully materialized.
+    #[inline]
+    #[must_use]
+    pub(crate) fn materialized_global_buffer_refs(
+        &self,
+    ) -> Option<[myth_resources::buffer::BufferRef; 3]> {
+        self.storage.global_state_attempt.materialized_buffer_refs()
+    }
+
+    /// Retain the finalized persistent Group 0 bind group for this attempt.
+    pub(crate) fn stage_finalized_global_bind_group(
+        &mut self,
+        key: GlobalStateKey,
+        bind_group: &wgpu::BindGroup,
+    ) {
+        let allowed_key = self.global_state_allowed_key();
+        self.storage
+            .global_state_attempt
+            .prepared
+            .stage_finalized(allowed_key, key, bind_group);
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn finalized_global_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.storage.global_state_attempt.prepared.bind_group()
+    }
+
+    /// Exact resolver whitelist key, visible only after its BindGroup has been
+    /// staged into the graph-attempt owner.
+    #[inline]
+    #[must_use]
+    pub(crate) fn finalized_global_state_key(&self) -> Option<GlobalStateKey> {
+        self.storage.global_state_attempt.prepared.finalized_key()
+    }
+
     /// Register an atomic history publication. The bank is committed only if
     /// every required writer survives DPE and the command buffer is submitted.
     pub fn register_history_commit(
@@ -2034,6 +2121,7 @@ impl<'a> RenderGraph<'a> {
         self.cull_dead_passes();
         self.validate_live_asset_texture_dependencies();
         self.topological_sort();
+        self.collect_live_global_state_demand();
         self.collect_live_draw_plan_demands();
 
         self.compute_resource_lifetimes();
@@ -2469,6 +2557,28 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
+    /// Project the unique Group 0 demand from passes already selected by DPE.
+    /// Demand metadata does not participate in rooting or dependency creation.
+    fn collect_live_global_state_demand(&mut self) {
+        let mut live_key = None;
+        for &pass_index in &self.storage.execution_queue {
+            let Some(key) = self.storage.passes[pass_index].global_state_demand else {
+                continue;
+            };
+            match live_key {
+                None => live_key = Some(key),
+                Some(current) if current == key => {}
+                Some(_) => panic!(
+                    "DPE-live passes demanded different global state keys (latest pass '{}')",
+                    self.storage.passes[pass_index].name
+                ),
+            }
+        }
+        self.storage
+            .global_state_attempt
+            .project_live_key(live_key, self.renderer_diagnostics.is_some());
+    }
+
     fn topological_sort(&mut self) {
         let pass_count = self.storage.passes.len();
 
@@ -2862,7 +2972,6 @@ mod tests {
             instance_range: 0..1,
         });
         storage.draw_plans.finish_finalize(plan, start);
-        storage.prepared_global_bind_group.stage(&bind_group);
         assert_eq!(storage.draw_plans.resolve_plan(plan).unwrap().len(), 1);
 
         drop(buffer);
@@ -2874,8 +2983,6 @@ mod tests {
             "the frame store must own the exact physical buffer through execute"
         );
         let _ = storage.draw_plans.resolver().bind_group(bind_group_slot);
-        let _ = storage.prepared_global_bind_group.resolve();
-
         storage.release_frame_owners();
         assert!(storage.prepared_draws.source(0).is_none());
         assert!(storage.material_plans.is_empty());
@@ -2883,7 +2990,7 @@ mod tests {
         // attempt while retaining capacity.
         storage.prepared_draws.begin_sources(1);
         assert!(storage.draw_plans.is_empty());
-        assert!(storage.prepared_global_bind_group.is_empty());
+        assert!(storage.global_state_attempt.prepared.is_empty());
         assert!(storage.draw_plans.resolve_plan(plan).is_none());
     }
 

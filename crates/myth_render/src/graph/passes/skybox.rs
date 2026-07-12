@@ -936,7 +936,7 @@ impl SkyboxFeature {
             ctx.shader_manager,
             &global_state.layout,
             global_state.layout_id,
-            &global_state.binding_wgsl,
+            global_state.binding_wgsl.as_str(),
             snapshot.variant,
             ProceduralStarboxKind::None,
             false,
@@ -990,7 +990,7 @@ impl SkyboxFeature {
             ctx.shader_manager,
             &global_state.layout,
             global_state.layout_id,
-            &global_state.binding_wgsl,
+            global_state.binding_wgsl.as_str(),
             SkyboxVariant::Gradient,
             ProceduralStarboxKind::None,
             false,
@@ -1066,7 +1066,7 @@ impl SkyboxFeature {
             ctx.shader_manager,
             &global_state.layout,
             global_state.layout_id,
-            &global_state.binding_wgsl,
+            global_state.binding_wgsl.as_str(),
             SkyboxVariant::Procedural,
             starbox_kind,
             moon_texture.is_some(),
@@ -1106,6 +1106,15 @@ impl SkyboxFeature {
 }
 
 impl<'a> SkyboxDrawRequest<'a> {
+    #[inline]
+    fn global_state_key(&self) -> GlobalStateKey {
+        match self {
+            Self::Texture { snapshot, .. } => snapshot.global_state_key,
+            Self::Gradient { snapshot, .. } => snapshot.global_state_key,
+            Self::Procedural { snapshot, .. } => snapshot.global_state_key,
+        }
+    }
+
     /// Declare the real resources sampled by this draw and turn the build-time
     /// request into node-local prepare state.
     pub(crate) fn build(self, builder: &mut PassBuilder<'_, 'a>) -> SkyboxDrawState<'a> {
@@ -1176,7 +1185,9 @@ impl<'a> SkyboxDrawRequest<'a> {
         scene_color: TextureNodeId,
         scene_depth: TextureNodeId,
     ) -> TextureNodeId {
+        let global_state_key = self.global_state_key();
         ctx.graph.add_pass("Skybox_Pass", |builder| {
+            builder.demand_global_state(global_state_key);
             let out_color = builder.mutate_texture(scene_color, "Scene_Color_Skybox");
             builder.read_texture(scene_depth);
             let draw = self.build(builder);
@@ -1249,7 +1260,13 @@ impl<'a> SkyboxDrawState<'a> {
             return;
         };
         pass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(pipeline_id));
-        pass.set_bind_group(0, ctx.global_bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            ctx.global_bind_group.expect(
+                "Skybox_Pass scene Global Group 0 is missing; its demand was not declared or finalized",
+            ),
+            &[],
+        );
         pass.set_bind_group(1, ctx.resolve_prepared_bind_group(bind_group), &[]);
         pass.draw(0..3, 0..1);
     }
@@ -1568,6 +1585,7 @@ mod tests {
             );
             simple_forward.add_to_graph(
                 &mut ctx,
+                GlobalStateKey::new(1, 1),
                 wgpu::Color::BLACK,
                 Some(skybox),
                 None,
@@ -1652,6 +1670,7 @@ mod tests {
             );
             simple_forward.add_to_graph(
                 &mut ctx,
+                GlobalStateKey::new(1, 1),
                 wgpu::Color::BLACK,
                 Some(skybox),
                 None,

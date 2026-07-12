@@ -12,6 +12,53 @@ use crate::pipeline::vertex::VertexLayoutSignature;
 
 use super::{ResourceIdSet, generate_gpu_resource_id};
 
+/// Shared source text for one generated binding interface.
+///
+/// The wrapper preserves the existing `String`-like call sites while making
+/// clones across persistent states allocation-free.
+#[derive(Clone)]
+pub struct SharedBindingWgsl(Arc<str>);
+
+impl SharedBindingWgsl {
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SharedBindingWgsl {
+    fn from(value: String) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<&SharedBindingWgsl> for String {
+    fn from(value: &SharedBindingWgsl) -> Self {
+        value.as_str().to_owned()
+    }
+}
+
+impl std::fmt::Display for SharedBindingWgsl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for SharedBindingWgsl {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::ops::Deref for SharedBindingWgsl {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Stable logical key for the scene-level global binding state.
 ///
 /// The key is lightweight snapshot data. It deliberately identifies the
@@ -49,7 +96,7 @@ pub struct GpuGlobalState {
     pub bind_group_id: u64,
     pub layout: wgpu::BindGroupLayout,
     pub layout_id: u64,
-    pub binding_wgsl: String,
+    pub binding_wgsl: SharedBindingWgsl,
     pub binding_wgsl_hash: u64,
     /// Set of physical IDs of all dependent resources (used for automatic change detection)
     pub resource_ids: ResourceIdSet,
@@ -140,24 +187,41 @@ struct CachedObjectBindGroup {
 #[derive(Clone, Copy)]
 pub struct GlobalStateResolver<'a> {
     store: &'a BindGroupStore,
+    allowed_key: Option<GlobalStateKey>,
 }
 
 impl<'a> GlobalStateResolver<'a> {
-    pub(crate) const fn new(store: &'a BindGroupStore) -> Self {
-        Self { store }
+    pub(crate) const fn new(
+        store: &'a BindGroupStore,
+        allowed_key: Option<GlobalStateKey>,
+    ) -> Self {
+        Self { store, allowed_key }
     }
 
     #[inline]
     #[must_use]
     pub fn get(self, key: GlobalStateKey) -> Option<&'a GpuGlobalState> {
-        self.store.global_state(key)
+        (self.allowed_key == Some(key))
+            .then(|| self.store.global_state(key))
+            .flatten()
     }
+}
+
+/// Process-lifetime Group 0 shader interface, created by the first live
+/// post-DPE global-state materialization.
+#[derive(Clone)]
+pub(super) struct GlobalBindingInterface {
+    pub(super) layout: wgpu::BindGroupLayout,
+    pub(super) layout_id: u64,
+    pub(super) binding_wgsl: SharedBindingWgsl,
+    pub(super) binding_wgsl_hash: u64,
 }
 
 /// Persistent bind-group, layout, and shader-interface caches.
 #[derive(Default)]
 pub(crate) struct BindGroupStore {
     global_states: FxHashMap<GlobalStateKey, GpuGlobalState>,
+    global_interface: Option<GlobalBindingInterface>,
     layout_cache: FxHashMap<Vec<wgpu::BindGroupLayoutEntry>, (wgpu::BindGroupLayout, u64)>,
     vertex_layout_cache: FxHashMap<VertexLayoutSignature, u64>,
     object_bind_group_cache: FxHashMap<ObjectBindGroupKey, CachedObjectBindGroup>,
@@ -165,6 +229,19 @@ pub(crate) struct BindGroupStore {
 }
 
 impl BindGroupStore {
+    #[inline]
+    #[must_use]
+    pub(super) fn global_interface(&self) -> Option<&GlobalBindingInterface> {
+        self.global_interface.as_ref()
+    }
+
+    pub(super) fn insert_global_interface(&mut self, interface: GlobalBindingInterface) {
+        assert!(
+            self.global_interface.replace(interface).is_none(),
+            "global binding interface initialized twice"
+        );
+    }
+
     pub(super) fn prune(&mut self, cutoff: u64) {
         self.global_states
             .retain(|_, v| v.last_used_frame >= cutoff);

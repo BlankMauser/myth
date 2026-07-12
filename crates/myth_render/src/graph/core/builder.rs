@@ -1,3 +1,4 @@
+use crate::core::gpu::GlobalStateKey;
 use crate::core::gpu::Tracked;
 use crate::graph::frame::DrawPlanId;
 
@@ -211,6 +212,22 @@ impl PassBuilder<'_, '_> {
             self.graph.storage.passes[self.pass_index].name
         );
         self.graph.storage.draw_plan_raw_demands.push(id);
+    }
+
+    /// Declare that this pass consumes the scene-global Group 0 state.
+    ///
+    /// Demand metadata never roots a pass. Topology compilation projects the
+    /// unique key only from passes already retained by DPE.
+    pub(crate) fn demand_global_state(&mut self, key: GlobalStateKey) {
+        let demand = &mut self.graph.storage.passes[self.pass_index].global_state_demand;
+        match *demand {
+            None => *demand = Some(key),
+            Some(current) if current == key => {}
+            Some(_) => panic!(
+                "pass '{}' demanded two different global state keys",
+                self.graph.storage.passes[self.pass_index].name
+            ),
+        }
     }
 
     /// Flags this pass as a pure forwarding (blit/present) node.

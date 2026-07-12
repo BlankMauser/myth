@@ -1,3 +1,4 @@
+use crate::core::gpu::GlobalStateKey;
 use crate::graph::core::context::{ExecuteContext, PrepareContext};
 use std::ops::Range;
 
@@ -139,6 +140,11 @@ pub struct PassRecord {
     /// the compiled execution queue select plans for physical finalization.
     pub(crate) draw_plan_demand_range: Range<usize>,
 
+    /// Optional Group 0 demand projected only from DPE-live passes.
+    /// Repeated declarations in one setup closure are idempotent; conflicting
+    /// keys are rejected immediately by [`PassBuilder`](super::builder::PassBuilder).
+    pub(crate) global_state_demand: Option<GlobalStateKey>,
+
     // Compile-time state
     /// Range into GraphStorage's capacity-retaining flat producer table.
     /// Entries preserve first-read producer order and are unique per pass.
@@ -175,6 +181,7 @@ impl PassRecord {
             writes: SmallVec::new(),
             creates: SmallVec::new(),
             draw_plan_demand_range: 0..0,
+            global_state_demand: None,
             physical_dependency_range: 0..0,
             has_side_effect: false,
             reference_count: 0,
