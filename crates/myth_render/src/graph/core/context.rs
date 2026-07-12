@@ -803,7 +803,7 @@ impl ViewResolver<'_> {
                 return self
                     .asset_textures
                     .view(id)
-                    .expect("live asset texture producer did not materialize its view");
+                    .expect("live Asset Texture import did not materialize its view");
             }
             if let Some(id) = res.persistent_texture_id() {
                 return self.persistent_resources.get_texture_view(id);
@@ -1344,7 +1344,7 @@ impl ExecuteContext<'_> {
                 return self
                     .asset_textures
                     .view(id)
-                    .expect("live asset texture producer did not materialize its view");
+                    .expect("live Asset Texture import did not materialize its view");
             }
             if let Some(id) = res.persistent_texture_id() {
                 return self.persistent_resources.get_texture_view(id);
@@ -1371,7 +1371,7 @@ impl ExecuteContext<'_> {
                 return self
                     .asset_textures
                     .view(id)
-                    .expect("live asset texture producer did not materialize its view");
+                    .expect("live Asset Texture import did not materialize its view");
             }
             if let Some(id) = res.persistent_texture_id() {
                 return self.persistent_resources.get_texture_view(id);
@@ -1402,7 +1402,7 @@ impl ExecuteContext<'_> {
                 return self
                     .asset_textures
                     .view(id)
-                    .expect("live asset texture producer did not materialize its view")
+                    .expect("live Asset Texture import did not materialize its view")
                     .texture();
             }
             if let Some(id) = res.persistent_texture_id() {

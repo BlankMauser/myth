@@ -189,7 +189,8 @@ pub(crate) struct GradientSkyboxSnapshot {
 ///
 /// The sampled texture is deliberately not stored here. Composer wires the
 /// validated, mip-ready logical texture directly into the draw request so the
-/// RDG can keep its upload/mipmap producer chain alive through a real read.
+/// RDG can demand its lazy import and optional Mipmap producer through a real
+/// read.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextureSkyboxSnapshot {
     params: SkyboxParamsUniforms,
@@ -203,10 +204,11 @@ pub(crate) struct TextureSkyboxSnapshot {
 
 /// Logical texture input selected by Composer.
 ///
-/// Asset-backed inputs enter through an RDG graph node so upload and mipmap
-/// producers participate in DPE. Attachment-backed inputs are already owned by
-/// the internal attachment registry and are resolved by exact revision during
-/// live prepare without inventing a graph producer.
+/// Asset-backed inputs enter through a lazy RDG import so physical
+/// materialization and optional Mipmap production participate in DPE.
+/// Attachment-backed inputs are already owned by the internal attachment
+/// registry and are resolved by exact revision during live prepare without
+/// inventing a graph producer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TextureSkyboxInput {
     Graph(TextureNodeId),
@@ -218,8 +220,8 @@ pub(crate) enum TextureSkyboxInput {
 
 /// Build-time request shared by the standalone and inline skybox paths.
 pub(crate) enum SkyboxDrawRequest<'a> {
-    /// Fully deferred texture path. `texture` is the logical mip-ready alias
-    /// produced by the asset texture chain.
+    /// Fully deferred texture path. `input` is the lazy root or logical
+    /// mip-ready alias selected by the asset texture chain.
     Texture {
         feature: &'a mut SkyboxFeature,
         snapshot: TextureSkyboxSnapshot,

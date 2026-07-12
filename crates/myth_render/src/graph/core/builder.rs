@@ -96,6 +96,12 @@ impl PassBuilder<'_, '_> {
             ResourceClass::Buffer => "Buffer",
         };
 
+        assert!(
+            res.asset_texture_import_id().is_none(),
+            "Asset Texture import root '{}' is a read-only lazy external input; use builder.mutate_texture() to produce a derived version",
+            res.name
+        );
+
         if let Some(existing_producer) = res.producer {
             panic!(
                 "SSA Violation in Pass '{}': {} '{}' already has a producer (Pass '{}'). \
@@ -196,9 +202,10 @@ impl PassBuilder<'_, '_> {
     /// Declare that this pass consumes a frame-local draw plan.
     ///
     /// The demand metadata never roots an otherwise dead pass. Any logical
-    /// Asset Texture aliases pre-registered for the plan are also declared as
-    /// ordinary reads, so a pass that survives for its outputs retains and is
-    /// ordered after the exact Upload/Mipmap producers it samples.
+    /// Asset Texture roots or aliases pre-registered for the plan are also
+    /// declared as ordinary reads. A surviving pass therefore demands exact
+    /// post-DPE root materialization and remains ordered after any optional
+    /// Mipmap producer it samples.
     pub(crate) fn demand_draw_plan(&mut self, id: DrawPlanId) {
         assert!(
             self.graph.storage.draw_plans.validate_reserved(id),

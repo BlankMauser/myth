@@ -63,16 +63,16 @@ impl MipmapFeature {
 
     /// Build the first-class logical asset texture chain.
     ///
-    /// `Asset_Texture_Upload` declares the imported base-level producer; the
-    /// post-DPE graph batch fills its attempt-owned physical slot before node
-    /// prepare. When the source requests mips, the second node mutates that
-    /// logical version into `MipReady`; a sampling consumer that reads the
-    /// returned alias therefore orders upload, generation, and draw through
-    /// ordinary physical dependencies.
+    /// The imported root is a lazy external input. Its compiled `first_use`
+    /// drives the post-DPE materialization batch, so base-level upload needs no
+    /// proxy PassNode. When the source requests mips, a real GPU node mutates
+    /// that root into `MipReady`; a sampling consumer that reads the returned
+    /// alias therefore orders generation and draw through ordinary physical
+    /// dependencies.
     ///
-    /// The attempt-local import entry coordinates the producer aliases as well
-    /// as the logical root. Repeated calls therefore share one SSA chain even
-    /// when a material and Skybox consume the same exact snapshot.
+    /// The attempt-local import entry coordinates the mip alias as well as the
+    /// logical root. Repeated calls therefore share one SSA chain even when a
+    /// material and Skybox consume the same exact snapshot.
     ///
     pub(crate) fn add_asset_texture_to_graph(
         ctx: &mut GraphBuilderContext<'_, '_>,
@@ -82,43 +82,19 @@ impl MipmapFeature {
         ctx.graph.assert_topology_mutable();
         let import = ctx.graph.storage.resources[imported.index() as usize]
             .asset_texture_import_id()
-            .expect("asset texture producer target is not an asset import");
-        let (existing_base, existing_mip) = ctx
-            .graph
-            .storage
-            .asset_texture_imports
-            .producer_chain(import);
-        let base_ready = if let Some(base_ready) = existing_base {
-            base_ready
-        } else {
-            let base_ready = ctx.graph.add_pass("Asset_Texture_Upload", |builder| {
-                builder.write_texture(imported);
-                (AssetTextureUploadNode { texture: imported }, imported)
-            });
-            ctx.graph
-                .storage
-                .asset_texture_imports
-                .set_base_ready(import, base_ready);
-            base_ready
-        };
-
+            .expect("asset texture chain target is not an asset import");
         if !needs_mipmap_generation {
-            return base_ready;
+            return imported;
         }
 
-        if let Some(mip_ready) = existing_mip {
+        if let Some(mip_ready) = ctx.graph.storage.asset_texture_imports.mip_ready(import) {
             mip_ready
         } else {
             let mip_ready = ctx
                 .graph
                 .add_pass("Asset_Texture_Mipmap_Generation", |builder| {
-                    let output = builder.mutate_texture(base_ready, "Asset_Texture_MipReady");
-                    (
-                        AssetTextureMipmapNode {
-                            texture: base_ready,
-                        },
-                        output,
-                    )
+                    let output = builder.mutate_texture(imported, "Asset_Texture_MipReady");
+                    (AssetTextureMipmapNode { texture: imported }, output)
                 });
             ctx.graph
                 .storage
@@ -135,29 +111,6 @@ impl MipmapFeature {
     }
 }
 
-/// Live producer for one exact CPU-only asset texture snapshot.
-///
-/// The node is deliberately POD. Drop-bearing views and mip requests are
-/// written into the GraphStorage-owned import slot.
-struct AssetTextureUploadNode {
-    texture: TextureNodeId,
-}
-
-impl PassNode<'_> for AssetTextureUploadNode {
-    fn prepare(&mut self, ctx: &mut PrepareContext<'_>) {
-        let import = ctx
-            .views
-            .asset_texture_import_id(self.texture)
-            .expect("asset upload node requires an Asset TextureBacking");
-        assert!(
-            ctx.views.asset_textures.materialization(import).is_some(),
-            "live Asset Texture imports must be batch-materialized before PassNode::prepare"
-        );
-    }
-
-    fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
-}
-
 /// Generates every exact physical request owned by one asset import and
 /// publishes those generations only after submission.
 struct AssetTextureMipmapNode {
@@ -170,6 +123,10 @@ impl PassNode<'_> for AssetTextureMipmapNode {
             .views
             .asset_texture_import_id(self.texture)
             .expect("asset mipmap node requires an Asset TextureBacking");
+        assert!(
+            ctx.views.asset_textures.materialization(import).is_some(),
+            "live Asset Texture imports must be batch-materialized before PassNode::prepare"
+        );
         for request in ctx.views.asset_textures.mipmap_requests(import) {
             ctx.mipmap_generator
                 .ensure_pipeline(ctx.device, request.format);
@@ -261,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn asset_texture_producer_chain_is_idempotent_monotonic_and_dpe_pure() {
+    fn asset_texture_mip_alias_is_idempotent_monotonic_and_dpe_pure() {
         let assets = AssetServer::new();
         let image = assets.images.add(Image::new(
             8,
@@ -284,6 +241,10 @@ mod tests {
             let mut ctx = GraphBuilderContext::new(&mut graph, &config, 0);
             let imported = ctx.graph.import_asset_texture("Asset", snapshot);
             let base_ready = MipmapFeature::add_asset_texture_to_graph(&mut ctx, imported, false);
+            assert!(
+                ctx.graph.storage.passes.is_empty(),
+                "base-ready lazy imports must not allocate a proxy pass"
+            );
             let mip_ready = MipmapFeature::add_asset_texture_to_graph(&mut ctx, imported, true);
             (imported, base_ready, mip_ready)
         };
@@ -296,7 +257,8 @@ mod tests {
             MipmapFeature::add_asset_texture_to_graph(&mut ctx, imported, false)
         };
 
-        assert_ne!(base_ready, mip_ready);
+        assert_eq!(base_ready, imported);
+        assert_ne!(imported, mip_ready);
         assert_eq!(mip_ready, repeated_mip_ready);
         assert_eq!(base_ready, repeated_base_ready);
         assert_eq!(
@@ -306,7 +268,7 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.name == "Asset_Texture_Upload")
                 .count(),
-            1
+            0
         );
         let mipmap_passes: Vec<_> = graph
             .storage
@@ -319,11 +281,17 @@ mod tests {
             !mipmap_passes[0].has_side_effect,
             "logical Asset Texture mip work must remain demand-driven"
         );
+
+        graph.compile_topology();
+        assert!(
+            graph.storage.execution_queue.is_empty(),
+            "an unconsumed mip alias must not keep its real GPU producer alive"
+        );
     }
 
     #[test]
     #[should_panic(expected = "render graph topology is frozen after compilation")]
-    fn asset_texture_producer_fast_path_rejects_post_compile_reuse() {
+    fn asset_texture_chain_fast_path_rejects_post_compile_reuse() {
         let assets = AssetServer::new();
         let image = assets.images.add(Image::new(
             4,

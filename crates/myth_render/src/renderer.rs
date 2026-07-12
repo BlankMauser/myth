@@ -763,10 +763,29 @@ impl Renderer {
         })
     }
 
+    /// Dumps a compact, human-oriented Mermaid view of the latest Render Graph.
+    ///
+    /// Lazy Asset Texture inputs are aggregated by consumer. Use
+    /// [`dump_graph_mermaid_with_mode`](Self::dump_graph_mermaid_with_mode)
+    /// with [`MermaidDumpMode::Full`](crate::graph::MermaidDumpMode::Full) for
+    /// exact per-resource topology.
     pub fn dump_graph_mermaid(&self) -> Option<String> {
         self.context
             .as_ref()
             .map(|s| s.graph_storage.dump_mermaid())
+    }
+
+    /// Dumps the current Render Graph using the requested level of detail.
+    ///
+    /// Compact mode aggregates high-cardinality lazy Asset Texture inputs;
+    /// Full mode preserves every logical resource edge for exact inspection.
+    pub fn dump_graph_mermaid_with_mode(
+        &self,
+        mode: crate::graph::MermaidDumpMode,
+    ) -> Option<String> {
+        self.context
+            .as_ref()
+            .map(|s| s.graph_storage.dump_mermaid_with_mode(mode))
     }
 
     // === Custom Shader Registration API ===
@@ -2394,7 +2413,7 @@ mod tests {
                 .filter(|pass| pass.name == "Asset_Mipmap_Generation")
                 .count(),
             0,
-            "planned material mip work must be owned directly by its logical producer chain"
+            "planned material mip work must be owned directly by its optional mip chain"
         );
         assert_eq!(
             state
@@ -2403,7 +2422,8 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.name == "Asset_Texture_Upload")
                 .count(),
-            1
+            0,
+            "lazy Asset Texture imports must not allocate proxy upload passes"
         );
         assert_eq!(
             state
@@ -2422,10 +2442,6 @@ mod tests {
             .iter()
             .map(|&index| state.graph_storage.passes[index].name)
             .collect();
-        let upload = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Upload")
-            .expect("logical material upload producer missing from execution queue");
         let mipmap = execution_names
             .iter()
             .position(|&name| name == "Asset_Texture_Mipmap_Generation")
@@ -2434,7 +2450,7 @@ mod tests {
             .iter()
             .position(|&name| name == "Opaque_Pass")
             .expect("opaque consumer missing from execution queue");
-        assert!(upload < mipmap && mipmap < opaque);
+        assert!(mipmap < opaque);
         assert!(
             state
                 .graph_storage
@@ -2459,8 +2475,8 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.name == "Asset_Texture_Upload")
                 .count(),
-            1,
-            "the stable exact import keeps only its lightweight upload dependency"
+            0,
+            "the stable exact import must remain a resource, not a proxy pass"
         );
         assert_eq!(
             state
@@ -2519,10 +2535,6 @@ mod tests {
             .iter()
             .map(|&index| state.graph_storage.passes[index].name)
             .collect();
-        let upload = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Upload")
-            .expect("newly ready material upload missing");
         let mipmap = execution_names
             .iter()
             .position(|&name| name == "Asset_Texture_Mipmap_Generation")
@@ -2531,7 +2543,7 @@ mod tests {
             .iter()
             .position(|&name| name == "Opaque_Pass")
             .expect("opaque consumer missing");
-        assert!(upload < mipmap && mipmap < opaque);
+        assert!(mipmap < opaque);
         assert!(
             state
                 .resource_manager
@@ -2542,7 +2554,7 @@ mod tests {
 
         render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
         let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(execution_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(!execution_contains_pass(state, "Asset_Texture_Upload"));
         assert!(!execution_contains_pass(
             state,
             "Asset_Texture_Mipmap_Generation"
@@ -2667,7 +2679,7 @@ mod tests {
         assert_eq!(gpu_image.mip_level_count, 4);
         assert!(gpu_image.mipmaps_submitted());
         assert!(state.mipmap_pass.generator_initialized());
-        assert!(graph_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(!graph_contains_pass(state, "Asset_Texture_Upload"));
         assert!(graph_contains_pass(
             state,
             "Asset_Texture_Mipmap_Generation"
@@ -2678,10 +2690,6 @@ mod tests {
             .iter()
             .map(|&index| state.graph_storage.passes[index].name)
             .collect();
-        let upload_position = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Upload")
-            .expect("asset upload pass missing from execution queue");
         let mipmap_position = execution_names
             .iter()
             .position(|&name| name == "Asset_Texture_Mipmap_Generation")
@@ -2690,7 +2698,6 @@ mod tests {
             .iter()
             .position(|&name| name == "Skybox_Pass")
             .expect("texture skybox pass missing from execution queue");
-        assert!(upload_position < mipmap_position);
         assert!(mipmap_position < skybox_position);
         assert!(
             state
@@ -2857,22 +2864,11 @@ mod tests {
         assert!(execution_contains_pass(state, "Pre_Pass"));
         assert!(execution_contains_pass(state, "Depth_Only_Test_Root"));
         assert!(!execution_contains_pass(state, "Opaque_Pass"));
-        assert!(execution_contains_pass(state, "Asset_Texture_Upload"));
-        let execution_names: Vec<_> = state
-            .graph_storage
-            .execution_queue
-            .iter()
-            .map(|&index| state.graph_storage.passes[index].name)
-            .collect();
-        let upload = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Upload")
-            .expect("opaque material upload must remain live for Prepass");
-        let prepass = execution_names
-            .iter()
-            .position(|&name| name == "Pre_Pass")
-            .expect("Prepass missing from execution queue");
-        assert!(upload < prepass);
+        assert!(!execution_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(
+            state.resource_manager.get_texture_image(texture).is_some(),
+            "the live Prepass must materialize its lazy material texture import"
+        );
         assert!(state.prepass.cached_pipeline_count() > 0);
         assert_eq!(
             state.pipeline_cache.fast_pipeline_count(),
@@ -3500,10 +3496,6 @@ mod tests {
             .iter()
             .map(|&index| state.graph_storage.passes[index].name)
             .collect();
-        let upload = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Upload")
-            .expect("asset upload pass missing");
         let mipmap = execution_names
             .iter()
             .position(|&name| name == "Asset_Texture_Mipmap_Generation")
@@ -3512,7 +3504,7 @@ mod tests {
             .iter()
             .position(|&name| name == "SimpleForward_Pass")
             .expect("BasicForward pass missing");
-        assert!(upload < mipmap && mipmap < forward);
+        assert!(mipmap < forward);
         assert!(state.graph_storage.asset_texture_imports.is_empty());
     }
 
@@ -3569,24 +3561,27 @@ mod tests {
             .iter()
             .map(|&index| state.graph_storage.passes[index].name)
             .collect();
-        let uploads: Vec<_> = execution_names
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &name)| (name == "Asset_Texture_Upload").then_some(index))
-            .collect();
-        let forward = execution_names
-            .iter()
-            .position(|&name| name == "SimpleForward_Pass")
-            .expect("BasicForward consumer missing");
-        assert_eq!(uploads.len(), 2);
-        assert!(uploads.into_iter().all(|upload| upload < forward));
+        assert!(execution_names.contains(&"SimpleForward_Pass"));
+        assert!(!execution_names.contains(&"Asset_Texture_Upload"));
         assert!(!execution_names.contains(&"Asset_Texture_Mipmap_Generation"));
+        assert!(
+            state
+                .resource_manager
+                .get_texture_image(opaque_texture)
+                .is_some()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_texture_image(transparent_texture)
+                .is_some()
+        );
         assert_eq!(state.render_lists.opaque.len(), 1);
         assert_eq!(state.render_lists.transparent.len(), 1);
     }
 
     #[test]
-    fn material_and_texture_skybox_share_one_logical_asset_producer_chain() {
+    fn material_and_texture_skybox_share_one_logical_asset_chain() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let image_handle = assets.images.add(Image::new(
@@ -3632,7 +3627,7 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.name == "Asset_Texture_Upload")
                 .count(),
-            1
+            0
         );
         let image = state
             .resource_manager
@@ -3701,8 +3696,8 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.name == "Asset_Texture_Upload")
                 .count(),
-            2,
-            "distinct logical snapshots keep independent import leases"
+            0,
+            "distinct logical snapshots remain import resources, not proxy passes"
         );
         assert_eq!(
             state
@@ -3725,7 +3720,7 @@ mod tests {
                 .iter()
                 .filter(|&&name| name == "Asset_Texture_Upload")
                 .count(),
-            2
+            0
         );
         assert_eq!(
             execution_names

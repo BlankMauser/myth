@@ -276,9 +276,9 @@ pub enum TextureBacking {
     Persistent(PersistentTextureId),
     /// Frame-scoped logical import of one exact asset-texture snapshot.
     ///
-    /// The physical view is filled into GraphStorage by a live upload node's
-    /// prepare step. Unlike an ordinary external output, writing this backing
-    /// does not seed DPE liveness.
+    /// The physical view is filled into GraphStorage by the post-DPE lazy
+    /// materialization barrier when the compiled root has a use. This root is
+    /// read-only and never seeds DPE liveness like an external output.
     Asset(AssetTextureImportId),
 }
 

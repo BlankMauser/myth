@@ -89,6 +89,19 @@ impl FrameConfig {
     }
 }
 
+/// Controls the level of detail emitted by Render Graph Mermaid dumps.
+///
+/// Compact mode preserves the executable pass topology while aggregating
+/// high-cardinality lazy Asset Texture inputs. Full mode emits every logical
+/// resource edge for exact forensic inspection.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MermaidDumpMode {
+    #[default]
+    Compact,
+    Full,
+}
+
 // ReadyNode is a helper struct used during topological sorting of the render graph. It represents a pass that is ready to be executed, along with its priority score for scheduling.
 #[derive(Eq, PartialEq)]
 struct ReadyNode {
@@ -371,9 +384,21 @@ impl GraphStorage {
             .expect("Gaussian frame batch already released");
     }
 
-    /// Dumps the current Render Graph topology as a Mermaid flowchart.
+    /// Dumps a compact, human-oriented Mermaid view of the current topology.
     #[must_use]
     pub fn dump_mermaid(&self) -> String {
+        self.dump_mermaid_with_mode(MermaidDumpMode::Compact)
+    }
+
+    /// Dumps the exact pass/resource topology as a Mermaid flowchart.
+    #[must_use]
+    pub fn dump_mermaid_full(&self) -> String {
+        self.dump_mermaid_with_mode(MermaidDumpMode::Full)
+    }
+
+    /// Dumps the current Render Graph topology using the requested detail.
+    #[must_use]
+    pub fn dump_mermaid_with_mode(&self, mode: MermaidDumpMode) -> String {
         use std::fmt::Write;
         let mut out = String::new();
 
@@ -384,6 +409,39 @@ impl GraphStorage {
             "    classDef alive fill:#2b3c5a,stroke:#4a6f9f,stroke-width:2px,color:#fff,rx:5,ry:5;"
         )
         .unwrap();
+
+        let compact_asset_inputs = matches!(mode, MermaidDumpMode::Compact);
+        let mut asset_input_edge_counts =
+            compact_asset_inputs.then(|| vec![0usize; self.passes.len()]);
+        let mut asset_input_edges = FxHashSet::default();
+        let mut declared_asset_inputs = 0usize;
+        let mut live_asset_inputs = 0usize;
+
+        if compact_asset_inputs {
+            for res in &self.resources {
+                let Some(import) = res.asset_texture_import_id() else {
+                    continue;
+                };
+                if !res.is_external || res.producer.is_some() || res.alias_of.is_some() {
+                    continue;
+                }
+                declared_asset_inputs += 1;
+                if res
+                    .consumers
+                    .iter()
+                    .any(|&pass| self.passes[pass].reference_count > 0)
+                {
+                    live_asset_inputs += 1;
+                }
+                for &consumer in &res.consumers {
+                    if asset_input_edges.insert((import, consumer)) {
+                        asset_input_edge_counts
+                            .as_mut()
+                            .expect("compact Asset Texture counts missing")[consumer] += 1;
+                    }
+                }
+            }
+        }
         writeln!(
             &mut out,
             "    classDef dead fill:#222,stroke:#555,stroke-width:2px,stroke-dasharray: 5 5,color:#777,rx:5,ry:5;"
@@ -399,6 +457,22 @@ impl GraphStorage {
             "    classDef external_in fill:#3c5a2b,stroke:#6f9f4a,stroke-width:2px,color:#fff;"
         )
         .unwrap();
+
+        if compact_asset_inputs && declared_asset_inputs > 0 {
+            if self.topology_compiled {
+                writeln!(
+                    &mut out,
+                    "    ASSET_TEXTURES_IN[\"Asset Textures<br/>declared {declared_asset_inputs} · live {live_asset_inputs}\"]:::external_in"
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    &mut out,
+                    "    ASSET_TEXTURES_IN[\"Asset Textures<br/>declared {declared_asset_inputs} · live pending\"]:::external_in"
+                )
+                .unwrap();
+            }
+        }
 
         #[cfg(feature = "rdg_inspector")]
         {
@@ -429,7 +503,13 @@ impl GraphStorage {
                     }
                 }
 
-                fn write_mermaid(&self, out: &mut String, storage: &GraphStorage, depth: usize) {
+                fn write_mermaid(
+                    &self,
+                    out: &mut String,
+                    storage: &GraphStorage,
+                    depth: usize,
+                    next_group_id: &mut usize,
+                ) {
                     use std::fmt::Write;
                     const STYLES: &[(&str, &str)] = &[
                         ("#3b82f614", "#3b82f6"),
@@ -442,10 +522,17 @@ impl GraphStorage {
                     ];
 
                     let indent = "    ".repeat(depth);
+                    let group_id = if self.name.is_empty() {
+                        None
+                    } else {
+                        let id = format!("G{}", *next_group_id);
+                        *next_group_id += 1;
+                        Some(id)
+                    };
 
-                    if !self.name.is_empty() {
-                        writeln!(out, "{indent}subgraph {} [\"{}\"]", self.name, self.name)
-                            .unwrap();
+                    if let Some(group_id) = &group_id {
+                        let label = GraphStorage::escape_mermaid_label(self.name);
+                        writeln!(out, "{indent}subgraph {group_id} [\"{label}\"]").unwrap();
                         writeln!(out, "{indent}    direction TB").unwrap();
                     }
 
@@ -473,10 +560,11 @@ impl GraphStorage {
                             } else {
                                 depth + 1
                             },
+                            next_group_id,
                         );
                     }
 
-                    if !self.name.is_empty() {
+                    if let Some(group_id) = &group_id {
                         writeln!(out, "{indent}end").unwrap();
 
                         let hash = self
@@ -488,8 +576,7 @@ impl GraphStorage {
 
                         writeln!(
                             out,
-                            "{indent}style {} fill:{},stroke:{},stroke-width:2px,stroke-dasharray: 5 5,color:#fff,rx:10,ry:10",
-                            self.name, bg, stroke
+                            "{indent}style {group_id} fill:{bg},stroke:{stroke},stroke-width:2px,stroke-dasharray: 5 5,color:#fff,rx:10,ry:10"
                         ).unwrap();
                     }
                 }
@@ -500,7 +587,8 @@ impl GraphStorage {
                 root.insert(&pass.groups, i);
             }
 
-            root.write_mermaid(&mut out, self, 1);
+            let mut next_group_id = 0;
+            root.write_mermaid(&mut out, self, 1, &mut next_group_id);
         }
 
         #[cfg(not(feature = "rdg_inspector"))]
@@ -515,21 +603,16 @@ impl GraphStorage {
 
         for (i, res) in self.resources.iter().enumerate() {
             if res.is_external {
-                if res.producer.is_none() {
-                    writeln!(
-                        &mut out,
-                        "    IN_{i}[\\\"{name}\"\\]:::external_in",
-                        name = res.name
-                    )
-                    .unwrap();
+                if compact_asset_inputs && res.asset_texture_import_id().is_some() {
+                    continue;
                 }
-                if res.consumers.is_empty() {
-                    writeln!(
-                        &mut out,
-                        "    OUT_{i}[/\"{name}\"/]:::external_out",
-                        name = res.name
-                    )
-                    .unwrap();
+                if res.producer.is_none() {
+                    let name = Self::escape_mermaid_label(res.name);
+                    writeln!(&mut out, "    IN_{i}[\"{name}\"]:::external_in").unwrap();
+                }
+                if Self::is_terminal_external_output(res) {
+                    let name = Self::escape_mermaid_label(res.name);
+                    writeln!(&mut out, "    OUT_{i}[/\"{name}\"/]:::external_out").unwrap();
                 }
             }
         }
@@ -538,6 +621,9 @@ impl GraphStorage {
             // External resources (read)
             for &read_id in &pass.reads {
                 let res = &self.resources[read_id.index() as usize];
+                if compact_asset_inputs && res.asset_texture_import_id().is_some() {
+                    continue;
+                }
                 if res.is_external && res.producer.is_none() {
                     writeln!(
                         &mut out,
@@ -553,21 +639,34 @@ impl GraphStorage {
 
                 for &consumer_idx in &res.consumers {
                     let edge_style = if res.alias_of.is_some() { "==>" } else { "-->" };
+                    let name = Self::escape_mermaid_label(res.name);
                     writeln!(
                         &mut out,
-                        "    P{pass_idx} {edge_style}|\"{}\"| P{consumer_idx};",
-                        res.name
+                        "    P{pass_idx} {edge_style}|\"{name}\"| P{consumer_idx};"
                     )
                     .unwrap();
                 }
 
-                if res.consumers.is_empty() && res.is_external {
+                if Self::is_terminal_external_output(res) {
                     writeln!(&mut out, "    P{pass_idx} --> OUT_{};", write_id.index()).unwrap();
                 }
             }
         }
 
-        log::info!("\n🌈 RDG Topology Mermaid Dump:\n{out}");
+        if let Some(asset_input_edge_counts) = asset_input_edge_counts {
+            for (pass_idx, count) in asset_input_edge_counts.into_iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                writeln!(
+                    &mut out,
+                    "    ASSET_TEXTURES_IN -.->|\"{count} texture{}\"| P{pass_idx};",
+                    if count == 1 { "" } else { "s" }
+                )
+                .unwrap();
+            }
+        }
+
         out
     }
 
@@ -578,12 +677,29 @@ impl GraphStorage {
         } else {
             "dead"
         };
-        writeln!(
-            out,
-            "{indent}P{index}([\"{name}\"]):::{class}",
-            name = pass.name
-        )
-        .unwrap();
+        let name = Self::escape_mermaid_label(pass.name);
+        writeln!(out, "{indent}P{index}([\"{name}\"]):::{class}").unwrap();
+    }
+
+    fn escape_mermaid_label(label: &str) -> String {
+        let mut escaped = String::with_capacity(label.len());
+        for character in label.chars() {
+            match character {
+                '&' => escaped.push_str("&amp;"),
+                '"' => escaped.push_str("&quot;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '\n' => escaped.push_str("<br/>"),
+                '\r' => {}
+                _ => escaped.push(character),
+            }
+        }
+        escaped
+    }
+
+    #[inline]
+    fn is_terminal_external_output(res: &ResourceRecord) -> bool {
+        res.is_external && res.is_output_root && res.producer.is_some() && res.consumers.is_empty()
     }
 }
 
@@ -859,10 +975,10 @@ impl<'a> RenderGraph<'a> {
         ))
     }
 
-    /// Import one exact CPU-only asset snapshot as an external, non-root
-    /// texture. A producer registered before its consumers must declare
-    /// `builder.write_texture(node)`; the post-DPE graph materialization batch
-    /// fills its frame slot before any PassNode prepare step.
+    /// Import one exact CPU-only asset snapshot as a lazy external, non-root
+    /// texture. A live read of this root is the materialization demand; the
+    /// post-DPE graph batch fills its frame slot before any PassNode prepare
+    /// step. Only derived SSA versions, such as `MipReady`, require a producer.
     ///
     /// Repeated imports of the same logical snapshot return the same graph
     /// root. No asset lookup, upload, or WGPU allocation happens here.
@@ -1046,8 +1162,8 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
-    /// Materialize only logical Asset Texture imports whose upload producer
-    /// survived DPE, then publish their exact sampler/view bindings before
+    /// Materialize only logical Asset Texture imports touched by the compiled
+    /// execution queue, then publish their exact sampler/view bindings before
     /// central material preparation.
     ///
     /// The attempt-owned import slot records unavailable outcomes too, making
@@ -1070,15 +1186,17 @@ impl<'a> RenderGraph<'a> {
                 continue;
             }
             let entry = self.storage.asset_texture_imports.entry(id);
-            let live = self.storage.resources[entry.node.index() as usize]
-                .producer
-                .is_some_and(|producer| self.storage.passes[producer].reference_count > 0);
+            let live = self.storage.resources[entry.node.index() as usize].first_use != usize::MAX;
             if !live {
                 continue;
             }
             let materialization =
                 resource_manager.materialize_asset_texture_for_graph(assets, entry.snapshot);
             resolver.materialize(id, materialization);
+            assert!(
+                resolver.materialization(id).is_some(),
+                "live Asset Texture import must record a materialization outcome"
+            );
         }
     }
 
@@ -1556,13 +1674,36 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
-    /// A logical asset has no physical view until its live producer prepares
-    /// it. Catch missing or late producers during topology compilation instead
-    /// of allowing a resolver panic deep in prepare/execute.
+    /// A logical asset root is a lazy external input materialized after DPE.
+    /// Derived SSA versions still require an earlier live producer. Catch a
+    /// missing or late derived producer during topology compilation instead of
+    /// allowing a resolver panic deep in prepare/execute.
     fn validate_live_asset_texture_dependencies(&self) {
         for (pass_idx, pass) in self.storage.passes.iter().enumerate() {
             if pass.reference_count == 0 {
                 continue;
+            }
+            for write in &pass.writes {
+                let write_idx = write.index() as usize;
+                let root_idx = self.resolve_alias_root(write_idx);
+                if self.storage.resources[root_idx]
+                    .asset_texture_import_id()
+                    .is_none()
+                {
+                    continue;
+                }
+                assert_ne!(
+                    write_idx, root_idx,
+                    "live pass '{}' cannot write a read-only Asset Texture import root",
+                    pass.name
+                );
+                assert!(
+                    pass.reads
+                        .iter()
+                        .any(|read| { self.resolve_alias_root(read.index() as usize) == root_idx }),
+                    "derived asset texture producer '{}' must read the lazy import chain it mutates",
+                    pass.name
+                );
             }
             for read in &pass.reads {
                 let read_idx = read.index() as usize;
@@ -1573,19 +1714,30 @@ impl<'a> RenderGraph<'a> {
                 {
                     continue;
                 }
+                if read_idx == root_idx {
+                    continue;
+                }
                 let producer = self.storage.resources[read_idx]
                     .producer
                     .unwrap_or_else(|| {
                         panic!(
-                            "live pass '{}' reads asset texture '{}' without a producer",
+                            "live pass '{}' reads derived asset texture '{}' without a producer",
                             pass.name, self.storage.resources[read_idx].name
                         )
                     });
                 assert!(
                     producer < pass_idx && self.storage.passes[producer].reference_count > 0,
-                    "asset texture producer '{}' must be registered before live consumer '{}'",
+                    "derived asset texture producer '{}' must be registered before live consumer '{}'",
                     self.storage.passes[producer].name,
                     pass.name
+                );
+                assert!(
+                    self.storage.passes[producer]
+                        .reads
+                        .iter()
+                        .any(|read| { self.resolve_alias_root(read.index() as usize) == root_idx }),
+                    "derived asset texture producer '{}' must read the lazy import chain it mutates",
+                    self.storage.passes[producer].name
                 );
             }
         }
@@ -1828,16 +1980,14 @@ impl<'a> RenderGraph<'a> {
             .collect();
 
         if current_names != self.storage.prev_execution_names {
-            log::info!(
-                "🌈 RDG Topology Changed! New Execution Order ({} passes): \n{:#?}",
-                current_names.len(),
-                current_names
-            );
-
-            log::info!("🌈 RDG Topology Changed! New Execution Order: {current_names:?}");
-
-            let dump = self.dump_mermaid();
-            log::info!("\n🌈 RDG Topology Mermaid Dump:\n{dump}");
+            if log::log_enabled!(log::Level::Info) {
+                log::info!(
+                    "🌈 RDG Topology Changed! New Execution Order ({} passes): {current_names:?}",
+                    current_names.len()
+                );
+                let dump = self.dump_mermaid();
+                log::info!("\n🌈 RDG Compact Topology Mermaid Dump:\n{dump}");
+            }
             self.storage.prev_execution_names = current_names;
         }
     }
@@ -1865,6 +2015,18 @@ impl<'a> RenderGraph<'a> {
             // visits each DPE-live pass sequentially after submission.
             unsafe { self.storage.passes[pass_idx].get_pass_mut() }.after_submit();
         }
+    }
+
+    /// Dumps the exact, unaggregated pass/resource topology.
+    #[must_use]
+    pub fn dump_mermaid_full(&self) -> String {
+        self.storage.dump_mermaid_full()
+    }
+
+    /// Dumps the topology using the requested detail level.
+    #[must_use]
+    pub fn dump_mermaid_with_mode(&self, mode: MermaidDumpMode) -> String {
+        self.storage.dump_mermaid_with_mode(mode)
     }
 }
 
@@ -2262,25 +2424,37 @@ mod tests {
     }
 
     #[test]
-    fn dead_asset_upload_is_eliminated_without_a_consumer() {
+    #[should_panic(expected = "is a read-only lazy external input")]
+    fn asset_texture_import_root_rejects_a_writer() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
         let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        graph.add_pass("Asset_Upload", |builder| {
+
+        graph.add_pass("Invalid_Asset_Writer", |builder| {
             builder.write_texture(asset);
             (MockExec, ())
         });
+    }
+
+    #[test]
+    fn dead_lazy_asset_import_does_not_root_the_graph() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
 
         graph.compile_topology();
 
         assert!(graph.storage.execution_queue.is_empty());
-        assert_eq!(graph.storage.passes[0].reference_count, 0);
+        assert_eq!(
+            graph.storage.resources[asset.index() as usize].first_use,
+            usize::MAX
+        );
     }
 
     #[test]
-    #[should_panic(expected = "reads asset texture 'Asset' without a producer")]
-    fn live_asset_import_requires_an_upload_producer() {
+    fn live_lazy_asset_import_requires_no_proxy_producer() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -2292,6 +2466,124 @@ mod tests {
         });
 
         graph.compile_topology();
+
+        assert_eq!(graph.storage.execution_queue, [0]);
+        assert_eq!(graph.storage.resources[asset.index() as usize].first_use, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reads derived asset texture 'Asset_Mip_Ready' without a producer")]
+    fn live_derived_asset_version_still_requires_a_producer() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let mip_ready = graph.add_pass("Broken_Mipmap", |builder| {
+            let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
+            (MockExec, output)
+        });
+        graph.storage.resources[mip_ready.index() as usize].producer = None;
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(mip_ready);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be registered before live consumer")]
+    fn derived_asset_producer_must_precede_its_consumer() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let mip_ready = graph.create_alias(asset, "Asset_Mip_Ready");
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(mip_ready);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.add_pass("Late_Mipmap", |builder| {
+            builder.read_texture(asset);
+            builder.write_texture(mip_ready);
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+    }
+
+    #[test]
+    #[should_panic(expected = "must read the lazy import chain it mutates")]
+    fn derived_asset_producer_cannot_replace_without_demanding_its_import() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let replaced = graph.add_pass("Invalid_Replacement", |builder| {
+            let output = builder.replace_texture(asset, "Asset_Replaced");
+            (MockExec, output)
+        });
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(replaced);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+    }
+
+    #[test]
+    #[should_panic(expected = "must read the lazy import chain it mutates")]
+    fn side_effect_asset_replacement_cannot_bypass_lazy_import_demand() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        graph.add_pass("Invalid_Side_Effect_Replacement", |builder| {
+            let _output = builder.replace_texture(asset, "Asset_Replaced");
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+    }
+
+    #[test]
+    fn high_cardinality_lazy_asset_inputs_add_no_proxy_passes_or_dependencies() {
+        const TEXTURE_COUNT: usize = 1_024;
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let mut imports = Vec::with_capacity(TEXTURE_COUNT);
+        for index in 0..TEXTURE_COUNT {
+            let mut snapshot = dummy_asset_snapshot();
+            snapshot.texture_identity = 1_000 + index as u64;
+            snapshot.logical_version = 0xA55E_8000 + index as u64;
+            imports.push(graph.import_asset_texture("Large_Asset_Set", snapshot));
+        }
+        graph.add_pass("Large_Asset_Consumer", |builder| {
+            for &import in &imports {
+                builder.read_texture(import);
+            }
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        assert_eq!(graph.storage.passes.len(), 1);
+        assert!(graph.storage.passes[0].physical_dependencies.is_empty());
+        assert_eq!(graph.storage.execution_queue, [0]);
+        let compact = graph.dump_mermaid();
+        assert!(compact.contains("declared 1024 · live 1024"));
+        assert!(compact.contains("1024 textures"));
+        assert!(
+            compact.len() < 4_096,
+            "Compact dump size must not scale with individual lazy imports"
+        );
     }
 
     #[test]
@@ -2327,17 +2619,13 @@ mod tests {
     }
 
     #[test]
-    fn live_asset_consumer_retains_its_upload_producer() {
+    fn live_asset_consumer_marks_only_the_lazy_import_live() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
         let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
         let repeated = graph.import_asset_texture("AssetAgain", dummy_asset_snapshot());
         assert_eq!(asset, repeated);
-        graph.add_pass("Asset_Upload", |builder| {
-            builder.write_texture(asset);
-            (MockExec, ())
-        });
         graph.add_pass("Asset_Consumer", |builder| {
             builder.read_texture(asset);
             builder.mark_side_effect();
@@ -2352,7 +2640,8 @@ mod tests {
             .iter()
             .map(|&index| graph.storage.passes[index].name)
             .collect();
-        assert_eq!(live, ["Asset_Upload", "Asset_Consumer"]);
+        assert_eq!(live, ["Asset_Consumer"]);
+        assert_eq!(graph.storage.resources[asset.index() as usize].first_use, 0);
     }
 
     #[test]
@@ -2400,14 +2689,6 @@ mod tests {
             let mut graph = begin_test_frame(&mut storage, &arena);
             let live = graph.import_asset_texture("Live_Asset", live_snapshot);
             let dead = graph.import_asset_texture("Dead_Asset", dead_snapshot);
-            graph.add_pass("Live_Asset_Upload", |builder| {
-                builder.write_texture(live);
-                (MockExec, ())
-            });
-            graph.add_pass("Dead_Asset_Upload", |builder| {
-                builder.write_texture(dead);
-                (MockExec, ())
-            });
             graph.add_pass("Live_Asset_Consumer", |builder| {
                 builder.read_texture(live);
                 builder.mark_side_effect();
@@ -2447,15 +2728,11 @@ mod tests {
     }
 
     #[test]
-    fn mip_ready_consumer_retains_asset_upload_and_mipmap_nodes() {
+    fn mip_ready_consumer_retains_only_the_real_mipmap_producer() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
         let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        graph.add_pass("Asset_Upload", |builder| {
-            builder.write_texture(asset);
-            (MockExec, ())
-        });
         let mip_ready = graph.add_pass("Asset_Mipmap", |builder| {
             let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
             (MockExec, output)
@@ -2474,7 +2751,12 @@ mod tests {
             .iter()
             .map(|&index| graph.storage.passes[index].name)
             .collect();
-        assert_eq!(live, ["Asset_Upload", "Asset_Mipmap", "Asset_Consumer"]);
+        assert_eq!(live, ["Asset_Mipmap", "Asset_Consumer"]);
+        assert_eq!(
+            graph.storage.resources[asset.index() as usize].first_use,
+            0,
+            "the live mip producer must demand materialization of its lazy root"
+        );
     }
 
     /// Helper: create a fresh RenderGraph for a test frame.
@@ -3858,10 +4140,6 @@ mod tests {
         let asset = graph.import_asset_texture("Asset", snapshot);
         let surface = graph.register_texture("Surface", snapshot_texture_desc(snapshot), true);
 
-        graph.add_pass("Asset_Upload", |builder| {
-            builder.write_texture(asset);
-            (MockExec, ())
-        });
         graph.add_pass("Present", |builder| {
             builder.read_texture(asset);
             let output = builder.replace_texture(surface, "Surface_Present");
@@ -3876,7 +4154,7 @@ mod tests {
             .iter()
             .map(|&index| graph.storage.passes[index].name)
             .collect();
-        assert_eq!(names, ["Asset_Upload", "Present"]);
+        assert_eq!(names, ["Present"]);
         assert!(
             graph.storage.resources[asset.index() as usize]
                 .alias_of
@@ -3896,6 +4174,126 @@ mod tests {
         let mut graph = begin_test_frame(&mut storage, &arena);
         let history = graph.import_persistent_texture("History", plan.next[0]);
         graph.create_alias(history, "Mutated_History");
+    }
+
+    #[test]
+    fn compact_mermaid_aggregates_lazy_asset_inputs_and_full_keeps_details() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let first = graph.import_asset_texture("Arbitrary_First", dummy_asset_snapshot());
+        let mut second_snapshot = dummy_asset_snapshot();
+        second_snapshot.texture_handle = myth_assets::TextureHandle::system_reserved(8);
+        second_snapshot.texture_identity = 34;
+        second_snapshot.logical_version = 0xA55E_7002;
+        let second = graph.import_asset_texture("Arbitrary_Second", second_snapshot);
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(first);
+            builder.read_texture(second);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        let precompile = graph.dump_mermaid();
+        assert!(precompile.contains("declared 2 · live pending"));
+        graph.compile_topology();
+
+        let compact = graph.dump_mermaid();
+        assert!(compact.contains("Asset Textures<br/>declared 2 · live 2"));
+        assert!(compact.contains("ASSET_TEXTURES_IN -.->|\"2 textures\"| P0;"));
+        assert!(!compact.contains(&format!("IN_{}[", first.index())));
+        assert!(!compact.contains(&format!("IN_{}[", second.index())));
+
+        let full = graph.dump_mermaid_with_mode(MermaidDumpMode::Full);
+        assert!(!full.contains("ASSET_TEXTURES_IN"));
+        assert!(full.contains(&format!("IN_{}[\"Arbitrary_First\"]", first.index())));
+        assert!(full.contains(&format!("IN_{}[\"Arbitrary_Second\"]", second.index())));
+    }
+
+    #[test]
+    fn compact_mermaid_deduplicates_repeated_asset_reads_and_summarizes_dead_imports() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let live = graph.import_asset_texture("Live_Asset", dummy_asset_snapshot());
+        let mut dead_snapshot = dummy_asset_snapshot();
+        dead_snapshot.texture_handle = myth_assets::TextureHandle::system_reserved(8);
+        dead_snapshot.texture_identity = 34;
+        dead_snapshot.logical_version = 0xA55E_7002;
+        graph.import_asset_texture("Dead_Asset", dead_snapshot);
+        graph.add_pass("Repeated_Consumer", |builder| {
+            builder.read_texture(live);
+            builder.read_texture(live);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+
+        let compact = graph.dump_mermaid();
+        assert!(compact.contains("Asset Textures<br/>declared 2 · live 1"));
+        assert!(compact.contains("ASSET_TEXTURES_IN -.->|\"1 texture\"| P0;"));
+    }
+
+    #[test]
+    fn compact_mermaid_preserves_real_mipmap_producer_edges() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let mip_ready = graph.add_pass("Real_Mipmap", |builder| {
+            let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
+            (MockExec, output)
+        });
+        graph.add_pass("Asset_Consumer", |builder| {
+            builder.read_texture(mip_ready);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+
+        let compact = graph.dump_mermaid();
+        assert!(compact.contains("ASSET_TEXTURES_IN -.->|\"1 texture\"| P0;"));
+        assert!(!compact.contains("ASSET_TEXTURES_IN -.->|\"1 texture\"| P1;"));
+        assert!(compact.contains("P0 ==>|\"Asset_Mip_Ready\"| P1;"));
+    }
+
+    #[test]
+    fn mermaid_does_not_invent_an_output_for_an_unconsumed_asset_alias() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let mip_ready = graph.add_pass("Side_Effect_Mipmap", |builder| {
+            let output = builder.mutate_texture(asset, "Unconsumed_Mip_Ready");
+            builder.mark_side_effect();
+            (MockExec, output)
+        });
+        graph.compile_topology();
+
+        for dump in [graph.dump_mermaid(), graph.dump_mermaid_full()] {
+            assert!(!dump.contains(&format!("OUT_{}", mip_ready.index())));
+            assert!(!dump.contains(&format!("P0 --> OUT_{}", mip_ready.index())));
+        }
+    }
+
+    #[test]
+    fn mermaid_escapes_custom_pass_and_resource_labels() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let output = graph.add_pass("Pass \"Quoted\"\nNext", |builder| {
+            let output = builder.create_texture("Color <HDR> & More", dummy_desc());
+            (MockExec, output)
+        });
+        graph.add_pass("Label_Consumer", |builder| {
+            builder.read_texture(output);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+
+        let dump = graph.dump_mermaid_full();
+        assert!(dump.contains("Pass &quot;Quoted&quot;<br/>Next"));
+        assert!(dump.contains("Color &lt;HDR&gt; &amp; More"));
     }
 
     #[cfg(feature = "rdg_inspector")]
@@ -3934,7 +4332,7 @@ mod tests {
         let mermaid = graph.dump_mermaid();
 
         assert!(
-            mermaid.contains("subgraph Bloom_System"),
+            mermaid.contains("subgraph G0 [\"Bloom_System\"]"),
             "Mermaid output should contain the Bloom_System subgraph"
         );
         assert!(

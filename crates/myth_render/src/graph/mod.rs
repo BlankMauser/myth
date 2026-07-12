@@ -20,6 +20,7 @@ pub mod render_state;
 pub mod shadow_utils;
 
 pub use composer::FrameComposer;
+pub use core::MermaidDumpMode;
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton};
 pub use frame::{
     DrawCommand, DrawPlanId, RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,

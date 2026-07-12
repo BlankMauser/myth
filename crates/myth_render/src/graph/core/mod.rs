@@ -24,7 +24,7 @@ pub use context::{
     GraphBinding, PrepareContext, RawBufferBinding, RawSamplerBinding, RawTextureViewBinding,
     ViewResolver, build_screen_bind_group,
 };
-pub use graph::{GraphStorage, RenderGraph};
+pub use graph::{GraphStorage, MermaidDumpMode, RenderGraph};
 pub use node::PassNode;
 pub use persistent::{
     CacheCommitToken, CacheId, CacheKey, CachePlan, CachePublicationReceipt, HistoryCommitToken,

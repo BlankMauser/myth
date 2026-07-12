@@ -1,10 +1,10 @@
 //! Frame-scoped logical imports for AssetServer textures.
 //!
 //! Graph construction captures an exact CPU-only [`AssetTextureSnapshot`]
-//! and registers an external, non-root texture. A producer node must declare a
-//! write to that root. After DPE, a graph-level batch fills only live frame
-//! slots before any `PassNode::prepare`; consumers then resolve the physical
-//! view through the Copy [`AssetTextureImportId`] stored in
+//! and registers an external, non-root texture. The root is a lazy import: its
+//! compiled `first_use` is the exact DPE demand signal. After DPE, a graph-level
+//! batch fills only live frame slots before any `PassNode::prepare`; consumers
+//! then resolve the physical view through the Copy [`AssetTextureImportId`] stored in
 //! [`TextureBacking`](super::types::TextureBacking).
 
 use std::sync::OnceLock;
@@ -74,7 +74,6 @@ impl From<AssetTextureSnapshot> for AssetTextureLookupKey {
 pub(crate) struct AssetTextureImportEntry {
     pub(crate) node: TextureNodeId,
     pub(crate) snapshot: AssetTextureSnapshot,
-    base_ready: Option<TextureNodeId>,
     mip_ready: Option<TextureNodeId>,
     materialization: OnceLock<AssetTextureMaterialization>,
     mipmaps_encoded: AtomicBool,
@@ -85,7 +84,6 @@ impl AssetTextureImportEntry {
         Self {
             node,
             snapshot,
-            base_ready: None,
             mip_ready: None,
             materialization: OnceLock::new(),
             mipmaps_encoded: AtomicBool::new(false),
@@ -155,30 +153,15 @@ impl AssetTextureImportStore {
         self.entries.len()
     }
 
-    /// Return the unique producer-chain aliases registered for this import.
+    /// Return the unique mip-ready alias registered for this lazy import.
     ///
-    /// The logical root is deduplicated independently from its producer
-    /// chain. Keeping both aliases in the same attempt-owned entry prevents a
-    /// second consumer (for example a material plus Skybox) from assigning a
-    /// second SSA writer to the shared root.
+    /// The root itself is the base-ready version and needs no proxy producer.
+    /// Keeping the optional alias in the attempt-owned entry prevents a second
+    /// consumer (for example a material plus Skybox) from assigning another
+    /// SSA writer to the shared root.
     #[must_use]
-    pub(crate) fn producer_chain(
-        &self,
-        id: AssetTextureImportId,
-    ) -> (Option<TextureNodeId>, Option<TextureNodeId>) {
-        let entry = self.entry(id);
-        (entry.base_ready, entry.mip_ready)
-    }
-
-    pub(crate) fn set_base_ready(&mut self, id: AssetTextureImportId, base_ready: TextureNodeId) {
-        let entry = self
-            .entries
-            .get_mut(id.index())
-            .expect("asset texture import ID is out of bounds");
-        assert!(
-            entry.base_ready.replace(base_ready).is_none(),
-            "asset texture import upload producer registered twice"
-        );
+    pub(crate) fn mip_ready(&self, id: AssetTextureImportId) -> Option<TextureNodeId> {
+        self.entry(id).mip_ready
     }
 
     pub(crate) fn set_mip_ready(&mut self, id: AssetTextureImportId, mip_ready: TextureNodeId) {

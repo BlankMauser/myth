@@ -971,10 +971,10 @@ impl<'a> FrameComposer<'a> {
             let mipmap_snapshot = self.ctx.mipmap_pass.extract(self.ctx.resource_manager);
             let mut asset_texture_nodes = FxHashMap::default();
 
-            // Build every material producer before any draw consumer. The
-            // import store coordinates repeated exact snapshots into one SSA
-            // Upload -> Mipmap chain; each canonical DrawPlan receives only
-            // the aliases sampled by its own source list.
+            // Register every lazy material import before its draw consumers.
+            // The import store coordinates repeated exact snapshots into one
+            // optional Mipmap SSA chain; each canonical DrawPlan receives only
+            // the roots or aliases sampled by its own source list.
             for plan in &draw_texture_dependencies {
                 let mut dependencies = Vec::with_capacity(plan.textures.len());
                 for &snapshot in &plan.textures {

@@ -362,10 +362,10 @@ impl ResourceManager {
 
     /// Prepare only buffers referenced by a binding recipe.
     ///
-    /// Graph-planned materials call this after their Asset Texture producers
-    /// have been fixed by RDG topology. Keeping texture discovery out of this
-    /// helper guarantees a BindGroup rebuild cannot enqueue a late legacy mip
-    /// request after graph compilation.
+    /// Graph-planned materials call this after their lazy Asset Texture
+    /// imports have been materialized from compiled DPE demand. Keeping texture
+    /// discovery out of this helper guarantees a BindGroup rebuild cannot
+    /// enqueue a late legacy mip request after graph compilation.
     pub(crate) fn prepare_binding_buffers(&mut self, bindings: &[Binding<'_>]) {
         for binding in bindings {
             let BindingResource::Buffer {

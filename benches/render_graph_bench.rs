@@ -12,9 +12,9 @@
 //! 2. Strict use of `black_box` to defeat LLVM dead-code elimination
 //! 3. Parameterised benchmarks for O(n) linearity verification
 
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use myth::renderer::graph::core::{
     ExecuteContext, FrameArena, GraphStorage, PassBuilder, PassNode, RenderGraph, TextureDesc,
 };
@@ -836,6 +836,297 @@ fn bench_compile_only(c: &mut Criterion) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Benchmark 12: High-Cardinality Asset Texture Topologies
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Asset textures are logical, lazy external inputs in the runtime graph. The
+// exact import API is crate-private because it also records asset snapshots,
+// so this CPU-only benchmark models an import as a producer-less, non-root
+// internal texture. This is a synthetic lower bound: it covers common
+// resource/pass/edge/DPE/toposort/lifetime work but deliberately does not run
+// AssetTextureImportStore lookup or asset-specific dependency validation. The
+// resident-vs-legacy comparison remains a fair measure of the N proxy passes
+// and N dependency edges removed by the lazy-import architecture; absolute
+// production timings require a future crate-private benchmark seam.
+//
+// Resident / no-mip:
+//   N lazy imports ────────────────→ Opaque → Backbuffer
+//
+// Legacy proxy upload:
+//   N lazy imports → N no-op Upload passes → Opaque → Backbuffer
+//
+// Cold / mip producer:
+//   N lazy imports → N Mipmap passes → Opaque → Backbuffer
+//
+// The cardinality sweeps keep every texture live, measuring the worst normal
+// material fan-in without conflating it with dead-import culling. A separate
+// fixed-10k group below covers 0%, 10%, and 100% live ratios. The resident
+// shape is the target steady-state after removing no-op per-texture upload
+// passes; the cold shape retains one real producer for every texture that needs
+// mip work.
+//
+// Each topology has paired measurements:
+// - `build`: resource registration and dependency wiring only.
+// - `build_and_compile`: the same work plus DPE, dependency construction,
+//   topological sorting, and lifetime computation.
+//
+// Their difference is a useful approximation of compilation cost. They are
+// kept as separate Criterion measurements instead of timing compilation with
+// `Instant` inside the benchmark loop, which would add timer overhead and make
+// the smaller cardinalities noisy.
+
+const ASSET_TEXTURE_COUNTS: &[usize] = &[128, 512, 1_000, 2_000, 5_000, 10_000];
+
+#[derive(Clone, Copy)]
+enum AssetTextureTopology {
+    ResidentNoMip,
+    LegacyProxyUpload,
+    ColdMip,
+}
+
+fn build_asset_texture_topology(
+    graph: &mut RenderGraph<'_>,
+    texture_count: usize,
+    topology: AssetTextureTopology,
+) {
+    build_asset_texture_topology_with_live_count(graph, texture_count, texture_count, topology);
+}
+
+fn build_asset_texture_topology_with_live_count(
+    graph: &mut RenderGraph<'_>,
+    texture_count: usize,
+    live_texture_count: usize,
+    topology: AssetTextureTopology,
+) {
+    assert!(live_texture_count <= texture_count);
+    let backbuffer = graph.register_texture("Backbuffer", bench_desc(), true);
+    let mut sampled_textures = Vec::with_capacity(live_texture_count);
+
+    for i in 0..texture_count {
+        // Producer-less and non-root approximates a lazy Asset Texture import.
+        // It becomes live only because the final draw pass reads it.
+        let imported = graph.register_texture("Asset_Texture_Import", bench_desc(), false);
+        let sampled = match topology {
+            AssetTextureTopology::ResidentNoMip => imported,
+            AssetTextureTopology::LegacyProxyUpload => {
+                graph.add_pass("Asset_Texture_Upload", |builder| {
+                    builder.write_texture(imported);
+                    (MockNode { tag: i as u32 }, imported)
+                })
+            }
+            AssetTextureTopology::ColdMip => {
+                graph.add_pass("Asset_Texture_Mipmap_Generation", |builder| {
+                    let mip_ready = builder.mutate_texture(imported, "Asset_Texture_MipReady");
+                    (MockNode { tag: i as u32 }, mip_ready)
+                })
+            }
+        };
+        if i < live_texture_count {
+            sampled_textures.push(sampled);
+        }
+    }
+
+    graph.add_pass("Opaque", |builder| {
+        for &texture in &sampled_textures {
+            builder.read_texture(texture);
+        }
+        builder.write_texture(backbuffer);
+        (MockNode { tag: u32::MAX }, ())
+    });
+}
+
+fn configure_high_cardinality_group(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
+    // The high-cardinality suites contain many measurements. Bound their
+    // per-measurement duration so a full manual run remains practical while
+    // retaining Criterion's minimum sample count.
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(250));
+    group.measurement_time(Duration::from_secs(1));
+}
+
+fn bench_asset_texture_resident_no_mip(c: &mut Criterion) {
+    let mut group = c.benchmark_group("AssetTexture_ResidentNoMip");
+    configure_high_cardinality_group(&mut group);
+
+    for &texture_count in ASSET_TEXTURE_COUNTS {
+        group.throughput(Throughput::Elements(texture_count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("build", texture_count),
+            &texture_count,
+            |b, &count| {
+                let mut storage = GraphStorage::new();
+                let mut arena = FrameArena::new();
+
+                b.iter(|| {
+                    arena.reset();
+                    let mut graph = RenderGraph::new(&mut storage, &arena);
+                    build_asset_texture_topology(
+                        &mut graph,
+                        count,
+                        AssetTextureTopology::ResidentNoMip,
+                    );
+                    black_box(&graph);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("build_and_compile", texture_count),
+            &texture_count,
+            |b, &count| {
+                let mut storage = GraphStorage::new();
+                let mut arena = FrameArena::new();
+
+                b.iter(|| {
+                    arena.reset();
+                    let mut graph = RenderGraph::new(&mut storage, &arena);
+                    build_asset_texture_topology(
+                        &mut graph,
+                        count,
+                        AssetTextureTopology::ResidentNoMip,
+                    );
+                    graph.compile_topology();
+                    black_box(&graph);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Baseline for the removed one-pass-per-texture proxy architecture.
+///
+/// Only the end-to-end measurement is retained because it is the number that
+/// should be compared with `AssetTexture_ResidentNoMip/build_and_compile`.
+/// It includes both the cost of constructing the redundant pass records and
+/// the compiler work induced by their N extra nodes and N dependency edges.
+fn bench_asset_texture_legacy_proxy_upload(c: &mut Criterion) {
+    let mut group = c.benchmark_group("AssetTexture_LegacyProxyUpload");
+    configure_high_cardinality_group(&mut group);
+
+    for &texture_count in ASSET_TEXTURE_COUNTS {
+        group.throughput(Throughput::Elements(texture_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("build_and_compile", texture_count),
+            &texture_count,
+            |b, &count| {
+                let mut storage = GraphStorage::new();
+                let mut arena = FrameArena::new();
+
+                b.iter(|| {
+                    arena.reset();
+                    let mut graph = RenderGraph::new(&mut storage, &arena);
+                    build_asset_texture_topology(
+                        &mut graph,
+                        count,
+                        AssetTextureTopology::LegacyProxyUpload,
+                    );
+                    graph.compile_topology();
+                    black_box(&graph);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_asset_texture_cold_mip(c: &mut Criterion) {
+    let mut group = c.benchmark_group("AssetTexture_ColdMip");
+    configure_high_cardinality_group(&mut group);
+
+    for &texture_count in ASSET_TEXTURE_COUNTS {
+        group.throughput(Throughput::Elements(texture_count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("build", texture_count),
+            &texture_count,
+            |b, &count| {
+                let mut storage = GraphStorage::new();
+                let mut arena = FrameArena::new();
+
+                b.iter(|| {
+                    arena.reset();
+                    let mut graph = RenderGraph::new(&mut storage, &arena);
+                    build_asset_texture_topology(&mut graph, count, AssetTextureTopology::ColdMip);
+                    black_box(&graph);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("build_and_compile", texture_count),
+            &texture_count,
+            |b, &count| {
+                let mut storage = GraphStorage::new();
+                let mut arena = FrameArena::new();
+
+                b.iter(|| {
+                    arena.reset();
+                    let mut graph = RenderGraph::new(&mut storage, &arena);
+                    build_asset_texture_topology(&mut graph, count, AssetTextureTopology::ColdMip);
+                    graph.compile_topology();
+                    black_box(&graph);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_asset_texture_dpe_live_ratio(c: &mut Criterion) {
+    const TEXTURE_COUNT: usize = 10_000;
+    const LIVE_RATIOS: &[(&str, usize)] = &[
+        ("live_0_percent", 0),
+        ("live_10_percent", TEXTURE_COUNT / 10),
+        ("live_100_percent", TEXTURE_COUNT),
+    ];
+    const SHAPES: &[(&str, AssetTextureTopology)] = &[
+        ("resident", AssetTextureTopology::ResidentNoMip),
+        ("legacy_proxy", AssetTextureTopology::LegacyProxyUpload),
+        ("cold_mip", AssetTextureTopology::ColdMip),
+    ];
+
+    let mut group = c.benchmark_group("AssetTexture_DpeLiveRatio_10k");
+    configure_high_cardinality_group(&mut group);
+    group.throughput(Throughput::Elements(TEXTURE_COUNT as u64));
+
+    for &(shape, topology) in SHAPES {
+        for &(ratio, live_texture_count) in LIVE_RATIOS {
+            let input = (topology, live_texture_count);
+            group.bench_with_input(
+                BenchmarkId::new(shape, ratio),
+                &input,
+                |b, &(topology, live_count)| {
+                    let mut storage = GraphStorage::new();
+                    let mut arena = FrameArena::new();
+
+                    b.iter(|| {
+                        arena.reset();
+                        let mut graph = RenderGraph::new(&mut storage, &arena);
+                        build_asset_texture_topology_with_live_count(
+                            &mut graph,
+                            TEXTURE_COUNT,
+                            live_count,
+                            topology,
+                        );
+                        graph.compile_topology();
+                        black_box(&graph);
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Register all benchmark groups
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -853,5 +1144,9 @@ criterion_group!(
     bench_high_fidelity_pipeline,
     bench_build_only,
     bench_compile_only,
+    bench_asset_texture_resident_no_mip,
+    bench_asset_texture_legacy_proxy_upload,
+    bench_asset_texture_cold_mip,
+    bench_asset_texture_dpe_live_ratio,
 );
 criterion_main!(benches);
