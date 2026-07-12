@@ -1776,9 +1776,9 @@ impl<'a> FrameComposer<'a> {
 
             // ─── 3c. Bake render commands ──────────────────────────────────
             //
-            // Resolve every asset handle (geometry, material, pipeline) to its
-            // physical wgpu reference.  After this point the execute phase is
-            // "blind" — it processes only pre-resolved GPU state.
+            // Resolve every asset handle into graph-attempt-owned physical
+            // resource tables and compact draw-plan ranges. After this point
+            // execute is "blind" to the asset/resource stores.
             let prepass_config = if is_high_fidelity {
                 Some(crate::graph::bake::PrepassBakeConfig {
                     local_cache: self.ctx.prepass.local_cache(),
@@ -1790,11 +1790,13 @@ impl<'a> FrameComposer<'a> {
                 None
             };
 
-            let baked_lists = crate::graph::bake::bake_render_lists(
+            crate::graph::bake::bake_render_lists(
+                &mut graph.storage.draw_plans,
+                &mut graph.storage.prepared_global_bind_group,
                 self.ctx.render_lists,
                 self.ctx.resource_manager,
                 self.ctx.pipeline_cache,
-                &prepass_config,
+                prepass_config.as_ref(),
             );
 
             // ─── 3d. Execute ───────────────────────────────────────────────
@@ -1820,7 +1822,8 @@ impl<'a> FrameComposer<'a> {
                     mipmap_generator: &*mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     mipmap_encode_coordinator: &graph.storage.mipmap_encode_coordinator,
-                    baked_lists: &baked_lists,
+                    draw_plans: graph.storage.draw_plans.resolver(),
+                    global_bind_group: graph.storage.prepared_global_bind_group.resolve(),
                     wgpu_ctx: &*self.ctx.wgpu_ctx,
                     current_timeline_index: 0,
                 };

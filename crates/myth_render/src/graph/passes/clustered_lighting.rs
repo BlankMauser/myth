@@ -860,7 +860,7 @@ impl<'a> PassNode<'a> for ClusterLightViewPassNode<'a> {
             ctx.pipeline_cache
                 .get_compute_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(0, ctx.global_bind_group, &[]);
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(
@@ -926,7 +926,7 @@ impl<'a> PassNode<'a> for ClusterCullPassNode<'a> {
             ctx.pipeline_cache
                 .get_compute_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(0, ctx.global_bind_group, &[]);
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.bind_group.expect("Cluster cull BG missing")),

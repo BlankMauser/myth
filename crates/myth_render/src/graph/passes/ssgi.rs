@@ -992,7 +992,7 @@ impl<'a> PassNode<'a> for SsgiRawNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.pipeline_id.expect("SSGI raw pipeline not prepared")),
         );
-        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(0, ctx.global_bind_group, &[]);
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.bind_group.expect("SSGI raw BG missing")),

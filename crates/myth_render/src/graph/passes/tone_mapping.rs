@@ -415,7 +415,7 @@ impl<'a> PassNode<'a> for ToneMapPassNode<'a> {
                     .expect("ToneMap pipeline missing after prepare"),
             ),
         );
-        rpass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        rpass.set_bind_group(0, ctx.global_bind_group, &[]);
         rpass.set_bind_group(1, static_bg, &[]);
         rpass.set_bind_group(2, transient_bg, &[]);
         rpass.draw(0..3, 0..1);

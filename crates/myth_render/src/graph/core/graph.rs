@@ -13,6 +13,7 @@ use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
+use crate::graph::frame::{DrawPlanStore, PreparedGlobalBindGroup};
 
 use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
@@ -191,6 +192,13 @@ pub struct GraphStorage {
     /// attempt. Pass nodes carry only generational IDs into this store.
     pub(crate) prepared_bind_groups: PreparedBindGroupStore,
 
+    /// Destructor-aware physical resources and compact commands for scene
+    /// draws selected during post-prepare baking.
+    pub(crate) draw_plans: DrawPlanStore,
+    /// Pass-level scene-global bind group, staged independently from draw
+    /// plans because it is not per-command state.
+    pub(crate) prepared_global_bind_group: PreparedGlobalBindGroup,
+
     /// Exact Gaussian asset versions captured for this graph attempt. Arc
     /// owners live here because the frame arena intentionally skips Drop.
     #[cfg(feature = "3dgs")]
@@ -236,6 +244,8 @@ impl GraphStorage {
             mipmap_batches: Vec::new(),
             mipmap_encode_coordinator: MipmapEncodeCoordinator::default(),
             prepared_bind_groups: PreparedBindGroupStore::new(),
+            draw_plans: DrawPlanStore::new(),
+            prepared_global_bind_group: PreparedGlobalBindGroup::default(),
             #[cfg(feature = "3dgs")]
             gaussian_frame_batches: Vec::new(),
             // resource_registry: FxHashMap::default(),
@@ -278,6 +288,8 @@ impl GraphStorage {
         self.mipmap_batches.clear();
         self.mipmap_encode_coordinator.clear();
         self.prepared_bind_groups.clear();
+        self.draw_plans.clear();
+        self.prepared_global_bind_group.clear();
         #[cfg(feature = "3dgs")]
         self.gaussian_frame_batches.clear();
     }
@@ -1789,6 +1801,78 @@ mod tests {
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
+    }
+
+    #[test]
+    fn release_frame_owners_clears_interned_draw_plan_resources() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let buffer = wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("draw-plan intern test"),
+            size: 16,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let layout = wgpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("draw-plan intern test"),
+                entries: &[],
+            });
+        let bind_group = wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("draw-plan intern test"),
+            layout: &layout,
+            entries: &[],
+        });
+
+        let mut storage = GraphStorage::new();
+        let buffer_slot = storage.draw_plans.intern_buffer(&buffer, 41);
+        let duplicate_buffer_slot = storage.draw_plans.intern_buffer(&buffer, 41);
+        let bind_group_slot = storage.draw_plans.intern_bind_group(&bind_group, 73);
+        let duplicate_bind_group_slot = storage.draw_plans.intern_bind_group(&bind_group, 73);
+        assert_eq!(buffer_slot, duplicate_buffer_slot);
+        assert_eq!(bind_group_slot, duplicate_bind_group_slot);
+        assert_eq!(storage.draw_plans.buffer_owner_count(), 1);
+        assert_eq!(storage.draw_plans.bind_group_owner_count(), 1);
+
+        let start = storage.draw_plans.begin_plan();
+        storage.draw_plans.push_command(crate::graph::DrawCommand {
+            sort_key: 0,
+            pipeline_id: crate::pipeline::RenderPipelineId(0),
+            vertex_buffers: smallvec::smallvec![buffer_slot],
+            index_buffer: None,
+            bind_group_1: Some(bind_group_slot),
+            bind_group_2: (bind_group_slot, 0),
+            stencil_reference: None,
+            vertex_range: 0..3,
+            instance_range: 0..1,
+        });
+        let plan = storage.draw_plans.finish_plan(start);
+        storage.draw_plans.set_opaque_plan(plan);
+        storage.prepared_global_bind_group.stage(&bind_group);
+        assert_eq!(storage.draw_plans.resolve_plan(plan).unwrap().len(), 1);
+
+        drop(buffer);
+        drop(bind_group);
+        drop(layout);
+        assert_eq!(
+            storage.draw_plans.resolver().buffer(buffer_slot).size(),
+            16,
+            "the frame store must own the exact physical buffer through execute"
+        );
+        let _ = storage.draw_plans.resolver().bind_group(bind_group_slot);
+        let _ = storage.prepared_global_bind_group.resolve();
+
+        storage.release_frame_owners();
+        assert!(storage.draw_plans.is_empty());
+        assert!(storage.prepared_global_bind_group.is_empty());
+        assert!(storage.draw_plans.resolve_plan(plan).is_none());
     }
 
     #[test]

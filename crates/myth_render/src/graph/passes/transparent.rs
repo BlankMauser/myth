@@ -200,7 +200,7 @@ impl<'a> PassNode<'a> for TransparentPassNode {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.baked_lists.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group;
 
         let color_att =
             ctx.get_color_attachment(self.out_color, RenderTargetOps::Load, self.resolve_target);
@@ -220,11 +220,12 @@ impl<'a> PassNode<'a> for TransparentPassNode {
 
         pass.set_bind_group(0, gpu_global_bind_group, &[]);
 
-        if !ctx.baked_lists.transparent.is_empty() {
+        let plan = ctx.draw_plans.transparent_plan();
+        if !ctx.draw_plans.is_empty(plan) {
             let screen_bg = ctx.resolve_prepared_bind_group(self.screen_bind_group.unwrap());
             pass.set_bind_group(3, screen_bg, &[]);
 
-            submit_draw_commands(&mut pass, &ctx.baked_lists.transparent);
+            submit_draw_commands(&mut pass, ctx.draw_plans, plan, ctx.pipeline_cache);
         }
     }
 }

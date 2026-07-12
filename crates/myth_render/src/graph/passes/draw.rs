@@ -1,120 +1,94 @@
 //! Unified Draw Command Submission
 //!
 //! Provides [`submit_draw_commands`], the single function responsible for
-//! translating a slice of pre-baked [`DrawCommand`]s into GPU render-pass
-//! calls.  All scene-drawing passes (opaque, transparent, shadow, prepass,
-//! simple-forward) invoke this function, ensuring consistent state management
-//! and eliminating duplicated draw-loop boilerplate.
+//! translating a pre-baked draw plan into GPU render-pass calls. All
+//! scene-drawing passes invoke this function, ensuring consistent state
+//! management and eliminating duplicated draw-loop boilerplate.
 //!
-//! # Zero-Cost State Tracking
-//!
-//! Since [`DrawCommand`] stores physical `&wgpu::RenderPipeline` and
-//! `&wgpu::BindGroup` references (which are `Arc`-backed, heap-stable),
-//! the raw pointer address is a perfect identity key.  Comparing two
-//! `*const T` is a single 64-bit integer comparison — true zero-cost.
-//!
-//! All tracking state lives in local variables (registers), eliminating
-//! the need for a wrapper struct.
+//! [`DrawCommand`] stores compact slots into a graph-attempt-owned resource
+//! table. Stable physical IDs carried by that table provide identity without
+//! depending on WGPU wrapper addresses.
 
-use crate::graph::frame::DrawCommand;
+use crate::graph::frame::{
+    DrawBindGroupSlot, DrawBufferSlot, DrawCommand, DrawPlanId, DrawPlanResolver,
+};
+use crate::pipeline::{PipelineCache, RenderPipelineId};
 
-/// Submit a batch of pre-baked [`DrawCommand`]s through a raw render pass.
+/// Submit a pre-baked draw plan through a raw render pass.
 ///
-/// # State Tracking via Pointer Identity
-///
-/// `wgpu` objects (`RenderPipeline`, `BindGroup`, `Buffer`) are
-/// `Arc`-backed with stable heap addresses.  Two references to the same
-/// logical object always share the same pointer, making `std::ptr::eq`
-/// the fastest possible identity check (< 1 ns, single CPU compare).
+/// The pipeline cache is append-only for the lifetime of a graph attempt.
+/// Its deprecated `clear()` API must not run between bake finalization and
+/// execute; the composer's immutable cache borrow enforces that contract on
+/// the current serial path. Pipelines are resolved only when their stable ID
+/// changes.
 ///
 /// # Bind Group Convention
 ///
-/// * **Group 0** (frame / camera / lights) — set by the caller before this
-///   function, and left untouched.
-/// * **Group 1** (material) — set per-command from [`DrawCommand::bind_group_1`].
-/// * **Group 2** (object / transform) — set per-command from
-///   [`DrawCommand::bind_group_2`] with its dynamic offset.
-/// * **Group 3** (screen / transient + clustered lighting) — set per-command from
-///   [`DrawCommand::bind_group_3`] when present.
-pub fn submit_draw_commands<'pass, 'cmd: 'pass>(
+/// * **Group 0** (frame / camera / lights) — set by the caller.
+/// * **Group 1** (material) — selected by the draw command.
+/// * **Group 2** (object / transform) — selected by the draw command with its
+///   dynamic offset.
+/// * **Group 3** (screen / transient + clustered lighting) — set by the
+///   caller at pass level.
+pub fn submit_draw_commands<'pass>(
     pass: &mut wgpu::RenderPass<'pass>,
-    commands: &'pass [DrawCommand<'cmd>],
+    draw_plans: DrawPlanResolver<'pass>,
+    plan: DrawPlanId,
+    pipeline_cache: &'pass PipelineCache,
 ) {
+    let commands: &'pass [DrawCommand] = draw_plans.commands(plan);
     if commands.is_empty() {
         return;
     }
 
-    // ── Bare state registers — zero allocation, zero indirection ────
-    let mut cur_pipeline: *const wgpu::RenderPipeline = std::ptr::null();
-    let mut cur_bg1: *const wgpu::BindGroup = std::ptr::null();
-    let mut cur_bg2: *const wgpu::BindGroup = std::ptr::null();
-    let mut cur_bg3: *const wgpu::BindGroup = std::ptr::null();
-    let mut cur_vertex_b: [*const wgpu::Buffer; 8] = [std::ptr::null(); 8];
-    let mut cur_index_b: *const wgpu::Buffer = std::ptr::null();
+    let mut cur_pipeline: Option<RenderPipelineId> = None;
+    let mut cur_bg1: Option<DrawBindGroupSlot> = None;
+    let mut cur_vertex_b: [Option<DrawBufferSlot>; 8] = [None; 8];
+    let mut cur_index_b: Option<(DrawBufferSlot, wgpu::IndexFormat)> = None;
     let mut cur_stencil: Option<u32> = None;
 
     for cmd in commands {
-        // ── Pipeline ────────────────────────────────────────────────
-        let pp = cmd.pipeline as *const wgpu::RenderPipeline;
-        if pp != cur_pipeline {
-            pass.set_pipeline(cmd.pipeline);
-            cur_pipeline = pp;
+        if Some(cmd.pipeline_id) != cur_pipeline {
+            pass.set_pipeline(pipeline_cache.get_render_pipeline(cmd.pipeline_id));
+            cur_pipeline = Some(cmd.pipeline_id);
         }
 
-        // ── Bind Group 1: Material ──────────────────────────────────
-        if let Some(bg1) = cmd.bind_group_1 {
-            let p = bg1 as *const wgpu::BindGroup;
-            if p != cur_bg1 {
-                pass.set_bind_group(1, bg1, &[]);
-                cur_bg1 = p;
-            }
-        }
-
-        // ── Bind Group 2: Object / Transform ───────────────────────
+        if let Some(slot) = cmd.bind_group_1
+            && Some(slot) != cur_bg1
         {
-            let (bg2, offset) = &cmd.bind_group_2;
-            let p = *bg2 as *const wgpu::BindGroup;
-            // Always re-set when pointer OR dynamic offset may differ.
+            let bind_group = draw_plans.bind_group(slot);
+            pass.set_bind_group(1, &**bind_group, &[]);
+            cur_bg1 = Some(slot);
+        }
+
+        {
+            let (slot, offset) = cmd.bind_group_2;
+            let bind_group = draw_plans.bind_group(slot);
             // Object bind groups are often shared across instances with
-            // different dynamic offsets, so we unconditionally set here.
-            if p != cur_bg2 {
-                cur_bg2 = p;
-            }
-            pass.set_bind_group(2, *bg2, &[*offset]);
+            // different dynamic offsets, so this remains unconditional.
+            pass.set_bind_group(2, &**bind_group, &[offset]);
         }
 
-        // ── Bind Group 3: Screen / Transient ────────────────────────
-        if let Some(bg3) = cmd.bind_group_3 {
-            let p = bg3 as *const wgpu::BindGroup;
-            if p != cur_bg3 {
-                pass.set_bind_group(3, bg3, &[]);
-                cur_bg3 = p;
-            }
-        }
-
-        // ── Stencil Reference ───────────────────────────────────────
         if cmd.stencil_reference != cur_stencil {
-            if let Some(val) = cmd.stencil_reference {
-                pass.set_stencil_reference(val);
+            if let Some(value) = cmd.stencil_reference {
+                pass.set_stencil_reference(value);
             }
             cur_stencil = cmd.stencil_reference;
         }
 
-        // ── Vertex Buffers ──────────────────────────────────────────
-        for (slot, buf) in cmd.vertex_buffers.iter().enumerate() {
-            let p = *buf as *const wgpu::Buffer;
-            if cur_vertex_b[slot] != p {
-                pass.set_vertex_buffer(slot as u32, buf.slice(..));
-                cur_vertex_b[slot] = p;
+        for (binding, &slot) in cmd.vertex_buffers.iter().enumerate() {
+            if cur_vertex_b[binding] != Some(slot) {
+                let buffer = draw_plans.buffer(slot);
+                pass.set_vertex_buffer(binding as u32, buffer.slice(..));
+                cur_vertex_b[binding] = Some(slot);
             }
         }
 
-        // ── Index Buffer + Draw ─────────────────────────────────────
-        if let Some((buf, fmt, count)) = cmd.index_buffer {
-            let p = buf as *const wgpu::Buffer;
-            if p != cur_index_b {
-                pass.set_index_buffer(buf.slice(..), fmt);
-                cur_index_b = p;
+        if let Some((slot, format, count)) = cmd.index_buffer {
+            if Some((slot, format)) != cur_index_b {
+                let buffer = draw_plans.buffer(slot);
+                pass.set_index_buffer(buffer.slice(..), format);
+                cur_index_b = Some((slot, format));
             }
             pass.draw_indexed(0..count, 0, cmd.instance_range.clone());
         } else {

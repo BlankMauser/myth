@@ -20,9 +20,7 @@ pub mod shadow_utils;
 
 pub use composer::FrameComposer;
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton};
-pub use frame::{
-    BakedRenderLists, DrawCommand, RenderCommand, RenderFrame, RenderKey, RenderLists,
-};
+pub use frame::{DrawCommand, DrawPlanId, RenderCommand, RenderFrame, RenderKey, RenderLists};
 #[cfg(feature = "debug_view")]
 pub use render_state::DebugViewTarget;
 pub use render_state::RenderState;

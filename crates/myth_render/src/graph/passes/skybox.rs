@@ -1247,7 +1247,7 @@ impl<'a> SkyboxDrawState<'a> {
             return;
         };
         pass.set_pipeline(ctx.pipeline_cache.get_render_pipeline(pipeline_id));
-        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(0, ctx.global_bind_group, &[]);
         pass.set_bind_group(1, ctx.resolve_prepared_bind_group(bind_group), &[]);
         pass.draw(0..3, 0..1);
     }

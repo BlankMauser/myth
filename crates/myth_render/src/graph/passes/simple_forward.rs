@@ -183,7 +183,7 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.baked_lists.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group;
 
         let (color_view, resolve_target) = if let Some(msaa_view) = self.msaa_view {
             (msaa_view, Some(self.surface_out))
@@ -216,7 +216,12 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
         pass.set_bind_group(3, screen_bg, &[]);
 
         // 1. Opaque (front-to-back)
-        submit_draw_commands(&mut pass, &ctx.baked_lists.opaque);
+        submit_draw_commands(
+            &mut pass,
+            ctx.draw_plans,
+            ctx.draw_plans.opaque_plan(),
+            ctx.pipeline_cache,
+        );
 
         // 2. Skybox (between opaque and transparent)
         if let Some(skybox) = &self.skybox {
@@ -227,6 +232,11 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
         }
 
         // 3. Transparent (back-to-front)
-        submit_draw_commands(&mut pass, &ctx.baked_lists.transparent);
+        submit_draw_commands(
+            &mut pass,
+            ctx.draw_plans,
+            ctx.draw_plans.transparent_plan(),
+            ctx.pipeline_cache,
+        );
     }
 }

@@ -438,7 +438,7 @@ impl<'a> PassNode<'a> for SsaoRawNode<'a> {
             ctx.pipeline_cache
                 .get_render_pipeline(self.feature.pipeline_id()),
         );
-        pass.set_bind_group(0, ctx.baked_lists.global_bind_group, &[]);
+        pass.set_bind_group(0, ctx.global_bind_group, &[]);
         pass.set_bind_group(
             1,
             ctx.resolve_prepared_bind_group(self.raw_bind_group.expect("SSAO raw BG not prepared")),

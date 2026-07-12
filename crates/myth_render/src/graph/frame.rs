@@ -15,6 +15,9 @@
 
 use glam::Mat4;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::gpu::Tracked;
 use crate::core::{BindGroupContext, RenderView, ResourceManager};
@@ -82,13 +85,35 @@ pub struct RenderFrameFeatureConfig {
 // DrawCommand — Baked Physical Draw Command
 // ============================================================================
 
-/// A single pre-baked draw command with all GPU references resolved to physical
-/// `wgpu` handles.
+/// Frame-local slot for one exact physical buffer owned by [`DrawPlanStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawBufferSlot(u32);
+
+/// Frame-local slot for one exact physical bind group owned by
+/// [`DrawPlanStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawBindGroupSlot(u32);
+
+/// Copy handle to one contiguous command range in a [`DrawPlanStore`].
+///
+/// The attempt token prevents an ID retained by a future pass-node API from
+/// aliasing a plan at the same vector index in a later graph attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DrawPlanId {
+    attempt_token: u64,
+    index: u32,
+}
+
+/// A single pre-baked draw command with all GPU resources resolved to
+/// frame-local physical-resource slots.
 ///
 /// Produced by [`bake::bake_render_lists`] after culling, consumed by the
 /// unified [`submit_draw_commands`] helper during the execute phase.  Contains
-/// **zero** asset handles — only physical references — so the execute phase
-/// never performs hash-map lookups or indirection.
+/// **zero** asset handles. Each unique WGPU buffer or bind group is cloned
+/// exactly once into the graph-attempt-owned [`DrawPlanStore`]; commands carry
+/// compact slots plus a stable [`RenderPipelineId`]. The execute phase never
+/// looks resources up through asset stores and cannot outlive the physical
+/// resources selected during baking.
 ///
 /// # Design Philosophy — "The Blind Execute Phase"
 ///
@@ -99,7 +124,7 @@ pub struct RenderFrameFeatureConfig {
 ///
 /// [`bake::bake_render_lists`]: super::bake::bake_render_lists
 /// [`submit_draw_commands`]: super::rdg::draw::submit_draw_commands
-pub struct DrawCommand<'a> {
+pub struct DrawCommand {
     /// Composite sort key for minimising GPU state switches.
     ///
     /// * Opaque — Pipeline › Material › Depth (front-to-back).
@@ -107,34 +132,26 @@ pub struct DrawCommand<'a> {
     /// * Shadow — Pipeline (state-switch minimisation).
     pub sort_key: u64,
 
-    /// Pre-resolved render pipeline.
-    ///
-    /// Redundant-state elimination is performed by comparing the raw
-    /// pointer address — `wgpu::RenderPipeline` is `Arc`-based so
-    /// identity ≡ pointer equality.
-    pub pipeline: &'a wgpu::RenderPipeline,
+    /// Stable handle for the pre-selected render pipeline.
+    pub pipeline_id: RenderPipelineId,
 
     /// Pre-resolved vertex buffer bindings.
     ///
-    /// Typically 1–2 entries.  Uses `Vec` (covariant in `'a`) to maintain
-    /// correct lifetime variance for the execute-phase borrow chain.
-    pub vertex_buffers: Vec<&'a wgpu::Buffer>,
+    /// Typically 1–2 entries, interned by stable physical resource ID.
+    pub(crate) vertex_buffers: SmallVec<[DrawBufferSlot; 2]>,
 
     /// Pre-resolved index buffer, or `None` for non-indexed draws.
     ///
     /// Tuple: `(buffer, format, index_count)`.
-    pub index_buffer: Option<(&'a wgpu::Buffer, wgpu::IndexFormat, u32)>,
+    pub(crate) index_buffer: Option<(DrawBufferSlot, wgpu::IndexFormat, u32)>,
 
     /// Material bind group (Group 1), or `None` when unused.
-    pub bind_group_1: Option<&'a wgpu::BindGroup>,
+    pub(crate) bind_group_1: Option<DrawBindGroupSlot>,
 
     /// Object / transform bind group (Group 2) with dynamic uniform offset.
     ///
     /// Tuple: `(bind_group, dynamic_offset)`.
-    pub bind_group_2: (&'a wgpu::BindGroup, u32),
-
-    /// Screen / transient bind group (Group 3), or `None` for shadow/prepass.
-    pub bind_group_3: Option<&'a wgpu::BindGroup>,
+    pub(crate) bind_group_2: (DrawBindGroupSlot, u32),
 
     /// Stencil reference value for feature-ID writing.  `None` when unused.
     pub stencil_reference: Option<u32>,
@@ -146,26 +163,303 @@ pub struct DrawCommand<'a> {
     pub instance_range: std::ops::Range<u32>,
 }
 
-/// Frame-scoped pre-baked render command lists.
+/// Graph-attempt-scoped pre-baked draw plans.
 ///
-/// All GPU handle lookups have been resolved to physical `wgpu` references.
-/// The execute phase iterates these contiguous `Vec`s without dictionary
-/// lookups, maximising CPU cache hit rate.
-pub struct BakedRenderLists<'a> {
-    /// Baked opaque draw commands (sorted front-to-back).
-    pub opaque: Vec<DrawCommand<'a>>,
+/// All GPU handle lookups have been resolved to owned physical WGPU clones.
+/// [`GraphStorage`](super::core::GraphStorage) owns this store and clears it
+/// on both successful completion and abandoned graph attempts.
+pub struct DrawPlanStore {
+    commands: Vec<DrawCommand>,
+    plans: Vec<std::ops::Range<u32>>,
+    opaque_plan: Option<DrawPlanId>,
+    transparent_plan: Option<DrawPlanId>,
+    prepass_plan: Option<DrawPlanId>,
+    shadow_plans: FxHashMap<(u64, u32), DrawPlanId>,
+    buffers: Vec<Tracked<wgpu::Buffer>>,
+    buffer_lookup: FxHashMap<u64, DrawBufferSlot>,
+    bind_groups: Vec<Tracked<wgpu::BindGroup>>,
+    bind_group_lookup: FxHashMap<u64, DrawBindGroupSlot>,
+    attempt_token: u64,
+}
 
-    /// Baked transparent draw commands (sorted back-to-front).
-    pub transparent: Vec<DrawCommand<'a>>,
+impl Default for DrawPlanStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    /// Baked Z-prepass draw commands (prepass-specific pipelines).
-    pub prepass: Vec<DrawCommand<'a>>,
+impl DrawPlanStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            commands: Vec::with_capacity(1024),
+            plans: Vec::with_capacity(16),
+            opaque_plan: None,
+            transparent_plan: None,
+            prepass_plan: None,
+            shadow_plans: FxHashMap::default(),
+            buffers: Vec::with_capacity(256),
+            buffer_lookup: FxHashMap::default(),
+            bind_groups: Vec::with_capacity(256),
+            bind_group_lookup: FxHashMap::default(),
+            attempt_token: next_draw_plan_attempt(),
+        }
+    }
 
-    /// Per-shadow-view baked draw commands, keyed by
-    /// `(light_id, layer_index)`.
-    pub shadow_queues: FxHashMap<(u64, u32), Vec<DrawCommand<'a>>>,
+    /// Releases all graph-attempt WGPU owners while retaining store capacity.
+    pub(crate) fn clear(&mut self) {
+        self.commands.clear();
+        self.plans.clear();
+        self.opaque_plan = None;
+        self.transparent_plan = None;
+        self.prepass_plan = None;
+        self.shadow_plans.clear();
+        self.buffer_lookup.clear();
+        self.buffers.clear();
+        self.bind_group_lookup.clear();
+        self.bind_groups.clear();
+        self.attempt_token = next_draw_plan_attempt();
+    }
 
-    pub global_bind_group: &'a wgpu::BindGroup,
+    pub(crate) fn reserve_commands(&mut self, additional: usize) {
+        self.commands.reserve(additional);
+    }
+
+    pub(crate) fn begin_plan(&self) -> u32 {
+        u32::try_from(self.commands.len())
+            .expect("one graph attempt cannot bake more than u32::MAX draw commands")
+    }
+
+    pub(crate) fn push_command(&mut self, command: DrawCommand) {
+        self.commands.push(command);
+    }
+
+    pub(crate) fn sort_commands_from(&mut self, start: u32) {
+        self.commands[start as usize..].sort_unstable_by_key(|command| command.sort_key);
+    }
+
+    pub(crate) fn finish_plan(&mut self, start: u32) -> DrawPlanId {
+        let end = u32::try_from(self.commands.len())
+            .expect("one graph attempt cannot bake more than u32::MAX draw commands");
+        let index = u32::try_from(self.plans.len())
+            .expect("one graph attempt cannot bake more than u32::MAX draw plans");
+        self.plans.push(start..end);
+        DrawPlanId {
+            attempt_token: self.attempt_token,
+            index,
+        }
+    }
+
+    pub(crate) fn set_opaque_plan(&mut self, plan: DrawPlanId) {
+        debug_assert!(self.resolve_plan(plan).is_some());
+        self.opaque_plan = Some(plan);
+    }
+
+    pub(crate) fn set_transparent_plan(&mut self, plan: DrawPlanId) {
+        debug_assert!(self.resolve_plan(plan).is_some());
+        self.transparent_plan = Some(plan);
+    }
+
+    pub(crate) fn set_prepass_plan(&mut self, plan: DrawPlanId) {
+        debug_assert!(self.resolve_plan(plan).is_some());
+        self.prepass_plan = Some(plan);
+    }
+
+    pub(crate) fn insert_shadow_plan(&mut self, key: (u64, u32), plan: DrawPlanId) {
+        debug_assert!(self.resolve_plan(plan).is_some());
+        let previous = self.shadow_plans.insert(key, plan);
+        debug_assert!(previous.is_none(), "shadow draw plan staged twice");
+    }
+
+    #[inline]
+    pub(crate) fn intern_buffer(&mut self, buffer: &wgpu::Buffer, id: u64) -> DrawBufferSlot {
+        match self.buffer_lookup.entry(id) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let slot = DrawBufferSlot(
+                    u32::try_from(self.buffers.len())
+                        .expect("one graph attempt cannot intern more than u32::MAX draw buffers"),
+                );
+                self.buffers.push(Tracked::with_id(buffer.clone(), id));
+                entry.insert(slot);
+                slot
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn intern_bind_group(
+        &mut self,
+        bind_group: &wgpu::BindGroup,
+        id: u64,
+    ) -> DrawBindGroupSlot {
+        match self.bind_group_lookup.entry(id) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let slot =
+                    DrawBindGroupSlot(u32::try_from(self.bind_groups.len()).expect(
+                        "one graph attempt cannot intern more than u32::MAX draw bind groups",
+                    ));
+                self.bind_groups
+                    .push(Tracked::with_id(bind_group.clone(), id));
+                entry.insert(slot);
+                slot
+            }
+        }
+    }
+
+    pub(crate) fn resolve_plan(&self, id: DrawPlanId) -> Option<&[DrawCommand]> {
+        if id.attempt_token != self.attempt_token {
+            return None;
+        }
+        let range = self.plans.get(id.index as usize)?;
+        Some(&self.commands[range.start as usize..range.end as usize])
+    }
+
+    fn resolve_buffer(&self, slot: DrawBufferSlot) -> Option<&Tracked<wgpu::Buffer>> {
+        self.buffers.get(slot.0 as usize)
+    }
+
+    fn resolve_bind_group(&self, slot: DrawBindGroupSlot) -> Option<&Tracked<wgpu::BindGroup>> {
+        self.bind_groups.get(slot.0 as usize)
+    }
+
+    #[must_use]
+    pub(crate) const fn resolver(&self) -> DrawPlanResolver<'_> {
+        DrawPlanResolver { store: self }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+            && self.plans.is_empty()
+            && self.opaque_plan.is_none()
+            && self.transparent_plan.is_none()
+            && self.prepass_plan.is_none()
+            && self.shadow_plans.is_empty()
+            && self.buffers.is_empty()
+            && self.buffer_lookup.is_empty()
+            && self.bind_groups.is_empty()
+            && self.bind_group_lookup.is_empty()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn buffer_owner_count(&self) -> usize {
+        self.buffers.len()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn bind_group_owner_count(&self) -> usize {
+        self.bind_groups.len()
+    }
+}
+
+/// Narrow immutable execute-time view over one graph attempt's draw plans.
+#[derive(Clone, Copy)]
+pub struct DrawPlanResolver<'a> {
+    store: &'a DrawPlanStore,
+}
+
+impl<'a> DrawPlanResolver<'a> {
+    #[must_use]
+    pub(crate) fn opaque_plan(self) -> DrawPlanId {
+        self.store
+            .opaque_plan
+            .expect("opaque draw plan was not baked")
+    }
+
+    #[must_use]
+    pub(crate) fn transparent_plan(self) -> DrawPlanId {
+        self.store
+            .transparent_plan
+            .expect("transparent draw plan was not baked")
+    }
+
+    #[must_use]
+    pub(crate) fn prepass_plan(self) -> DrawPlanId {
+        self.store
+            .prepass_plan
+            .expect("prepass draw plan was not baked")
+    }
+
+    #[must_use]
+    pub(crate) fn shadow_plan(self, key: (u64, u32)) -> Option<DrawPlanId> {
+        self.store.shadow_plans.get(&key).copied()
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) fn commands(self, id: DrawPlanId) -> &'a [DrawCommand] {
+        self.store
+            .resolve_plan(id)
+            .expect("draw plan ID does not belong to this graph attempt")
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(self, id: DrawPlanId) -> bool {
+        self.commands(id).is_empty()
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) fn buffer(self, slot: DrawBufferSlot) -> &'a Tracked<wgpu::Buffer> {
+        self.store
+            .resolve_buffer(slot)
+            .expect("draw buffer slot does not belong to this graph attempt")
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) fn bind_group(self, slot: DrawBindGroupSlot) -> &'a Tracked<wgpu::BindGroup> {
+        self.store
+            .resolve_bind_group(slot)
+            .expect("draw bind-group slot does not belong to this graph attempt")
+    }
+}
+
+/// Attempt-scoped owner for the scene-global bind group used by render passes.
+///
+/// This is intentionally separate from [`DrawPlanStore`]: the global binding
+/// is pass-level state, not a draw-plan resource slot.
+#[derive(Default)]
+pub(crate) struct PreparedGlobalBindGroup {
+    bind_group: Option<wgpu::BindGroup>,
+}
+
+impl PreparedGlobalBindGroup {
+    pub(crate) fn stage(&mut self, bind_group: &wgpu::BindGroup) {
+        self.bind_group = Some(bind_group.clone());
+    }
+
+    #[must_use]
+    pub(crate) fn resolve(&self) -> &wgpu::BindGroup {
+        self.bind_group
+            .as_ref()
+            .expect("global bind group was not staged for this graph attempt")
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.bind_group = None;
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bind_group.is_none()
+    }
+}
+
+static NEXT_DRAW_PLAN_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+
+fn next_draw_plan_attempt() -> u64 {
+    NEXT_DRAW_PLAN_ATTEMPT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("draw-plan attempt token space exhausted")
 }
 
 #[derive(Clone, Copy)]
@@ -842,4 +1136,33 @@ fn tracked_cpu_buffer<T: myth_resources::buffer::GpuData>(
     resource_manager
         .get_gpu_buffer_by_cpu_id(cpu_buffer.id())
         .map(|gpu_buffer| Tracked::with_id(gpu_buffer.buffer.clone(), gpu_buffer.id))
+}
+
+#[cfg(test)]
+mod draw_plan_tests {
+    use super::*;
+
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    fn assert_copy<T: Copy>() {}
+
+    #[test]
+    fn draw_plan_types_do_not_borrow_frame_resources() {
+        assert_send_sync_static::<DrawCommand>();
+        assert_send_sync_static::<DrawPlanId>();
+        assert_send_sync_static::<DrawPlanStore>();
+        assert_copy::<DrawPlanId>();
+        assert!(std::mem::needs_drop::<DrawPlanStore>());
+    }
+
+    #[test]
+    fn clearing_store_invalidates_attempt_scoped_plan_ids() {
+        let mut store = DrawPlanStore::new();
+        let start = store.begin_plan();
+        let plan = store.finish_plan(start);
+
+        assert!(store.resolve_plan(plan).is_some());
+        store.clear();
+        assert!(store.resolve_plan(plan).is_none());
+        assert!(store.is_empty());
+    }
 }

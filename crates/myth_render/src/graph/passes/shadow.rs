@@ -397,12 +397,11 @@ impl<'a> PassNode<'a> for Shadow2DPassNode<'a> {
             let dynamic_offset = uniform_idx as u32 * self.uniform_stride;
             pass.set_bind_group(0, bind_group, &[dynamic_offset]);
 
-            if let Some(commands) = ctx
-                .baked_lists
-                .shadow_queues
-                .get(&(shadow_light.light_id, shadow_light.view_layer_index))
+            if let Some(plan) = ctx
+                .draw_plans
+                .shadow_plan((shadow_light.light_id, shadow_light.view_layer_index))
             {
-                submit_draw_commands(&mut pass, commands);
+                submit_draw_commands(&mut pass, ctx.draw_plans, plan, ctx.pipeline_cache);
             }
         }
     }
@@ -470,12 +469,11 @@ impl<'a> PassNode<'a> for ShadowCubePassNode<'a> {
             let dynamic_offset = uniform_index * self.uniform_stride;
             pass.set_bind_group(0, bind_group, &[dynamic_offset]);
 
-            if let Some(commands) = ctx
-                .baked_lists
-                .shadow_queues
-                .get(&(shadow_light.light_id, shadow_light.view_layer_index))
+            if let Some(plan) = ctx
+                .draw_plans
+                .shadow_plan((shadow_light.light_id, shadow_light.view_layer_index))
             {
-                submit_draw_commands(&mut pass, commands);
+                submit_draw_commands(&mut pass, ctx.draw_plans, plan, ctx.pipeline_cache);
             }
         }
     }

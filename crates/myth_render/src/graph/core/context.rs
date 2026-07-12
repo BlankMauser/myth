@@ -7,7 +7,7 @@ use crate::core::gpu::{
     BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
     MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
-use crate::graph::frame::{BakedRenderLists, RenderLists};
+use crate::graph::frame::{DrawPlanResolver, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
 use crate::pipeline::ComputePipelineId;
 use crate::pipeline::RenderPipelineId;
@@ -1243,7 +1243,7 @@ pub fn build_screen_bind_group(
 /// Immutable context available during the RDG **execute** phase.
 ///
 /// Provides read-only access to the compiled render graph, physical resource
-/// pool, pipeline cache, render lists, and any external views injected before
+/// pool, pipeline cache, draw plans, and any external views injected before
 /// execution.
 pub struct ExecuteContext<'a> {
     pub resources: &'a [ResourceRecord],
@@ -1256,8 +1256,7 @@ pub struct ExecuteContext<'a> {
     pub(crate) prepared_bind_groups: &'a PreparedBindGroupStore,
 
     // ─── Scene Data (Phase 3: full RDG integration) ──────────────────
-    /// GPU resource manager (read-only) — used by compute, post-processing,
-    /// and skybox passes that have not yet been migrated to baked commands.
+    /// Shared mipmap generator used by logical and compatibility mip nodes.
     pub mipmap_generator: &'a MipmapGenerator,
     /// Frame-owned physical mipmap attempts addressed by Copy batch IDs.
     pub(crate) mipmap_requests: MipmapRequestResolver<'a>,
@@ -1265,12 +1264,17 @@ pub struct ExecuteContext<'a> {
     /// compatibility mipmap nodes.
     pub(crate) mipmap_encode_coordinator: &'a MipmapEncodeCoordinator,
 
-    /// Pre-baked draw command lists with all GPU handles resolved.
+    /// Attempt-scoped pre-baked draw plans with all physical resources
+    /// interned in graph-owned stores.
     ///
     /// Scene-drawing passes (opaque, transparent, shadow, prepass,
     /// simple-forward) consume these instead of performing per-command
     /// handle lookups via `resource_manager`.
-    pub baked_lists: &'a BakedRenderLists<'a>,
+    pub draw_plans: DrawPlanResolver<'a>,
+
+    /// Graph-attempt-owned scene-global bind group. Kept separate from draw
+    /// plans because it is pass-level state.
+    pub global_bind_group: &'a wgpu::BindGroup,
 
     /// Full wgpu context — depth format, render path, etc.
     pub wgpu_ctx: &'a WgpuContext,

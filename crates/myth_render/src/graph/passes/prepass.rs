@@ -458,7 +458,7 @@ pub struct PrepassPassNode {
 
 impl PassNode<'_> for PrepassPassNode {
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.baked_lists.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group;
 
         let mut color_attachments: smallvec::SmallVec<
             [Option<wgpu::RenderPassColorAttachment>; 3],
@@ -511,6 +511,11 @@ impl PassNode<'_> for PrepassPassNode {
 
         pass.set_bind_group(0, gpu_global_bind_group, &[]);
 
-        submit_draw_commands(&mut pass, &ctx.baked_lists.prepass);
+        submit_draw_commands(
+            &mut pass,
+            ctx.draw_plans,
+            ctx.draw_plans.prepass_plan(),
+            ctx.pipeline_cache,
+        );
     }
 }

@@ -353,7 +353,7 @@ impl<'a> PassNode<'a> for OpaquePassNode {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let gpu_global_bind_group = ctx.baked_lists.global_bind_group;
+        let gpu_global_bind_group = ctx.global_bind_group;
 
         // ── Color attachments (auto-deduced LoadOp / StoreOp) ───────────
         let mut color_attachments: smallvec::SmallVec<
@@ -409,6 +409,11 @@ impl<'a> PassNode<'a> for OpaquePassNode {
         let screen_bg = ctx.resolve_prepared_bind_group(self.screen_bind_group.unwrap());
         pass.set_bind_group(3, screen_bg, &[]);
 
-        submit_draw_commands(&mut pass, &ctx.baked_lists.opaque);
+        submit_draw_commands(
+            &mut pass,
+            ctx.draw_plans,
+            ctx.draw_plans.opaque_plan(),
+            ctx.pipeline_cache,
+        );
     }
 }

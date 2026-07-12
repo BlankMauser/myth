@@ -1610,7 +1610,7 @@ impl<'a> PassNode<'a> for GaussianComputePassNode<'a> {
         let preprocess_pipeline = ctx
             .pipeline_cache
             .get_compute_pipeline(preprocess_pipeline_id);
-        let global_bind_group = ctx.baked_lists.global_bind_group;
+        let global_bind_group = ctx.global_bind_group;
 
         for cloud in self.clouds.iter() {
             let preprocess_workgroups = cloud.buffers.num_points.div_ceil(PREPROCESS_WG_SIZE);
