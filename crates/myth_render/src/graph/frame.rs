@@ -20,7 +20,7 @@
 //!
 
 use glam::Mat4;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
@@ -41,9 +41,12 @@ use myth_resources::material::Material;
 use myth_scene::Scene;
 use myth_scene::camera::RenderCamera;
 
+use super::core::TextureNodeId;
 use super::extracted::{ExtractedRenderItem, ExtractedScene, SceneFeatures};
 use super::render_state::RenderState;
 use super::shadow_utils;
+
+const DRAW_TEXTURE_LINEAR_DEDUP_LIMIT: usize = 16;
 
 // ============================================================================
 // Render intents, physical commands, and render lists
@@ -126,6 +129,7 @@ struct DrawPlanRecord {
     key: DrawPlanKey,
     commands: Option<std::ops::Range<u32>>,
     live: bool,
+    topology_demanded: bool,
 }
 
 /// Copy metadata used by the post-compile draw-plan finalizer.
@@ -345,6 +349,7 @@ pub struct DrawPlanStore {
     commands: Vec<DrawCommand>,
     plans: Vec<DrawPlanRecord>,
     plan_lookup: FxHashMap<DrawPlanKey, DrawPlanId>,
+    texture_dependencies: FxHashMap<DrawPlanKey, SmallVec<[TextureNodeId; 8]>>,
     open_plan: Option<(DrawPlanId, u32)>,
     buffers: Vec<Tracked<wgpu::Buffer>>,
     buffer_lookup: FxHashMap<u64, DrawBufferSlot>,
@@ -366,6 +371,7 @@ impl DrawPlanStore {
             commands: Vec::with_capacity(1024),
             plans: Vec::with_capacity(16),
             plan_lookup: FxHashMap::default(),
+            texture_dependencies: FxHashMap::default(),
             open_plan: None,
             buffers: Vec::with_capacity(256),
             buffer_lookup: FxHashMap::default(),
@@ -380,6 +386,7 @@ impl DrawPlanStore {
         self.commands.clear();
         self.plans.clear();
         self.plan_lookup.clear();
+        self.texture_dependencies.clear();
         self.open_plan = None;
         self.buffer_lookup.clear();
         self.buffers.clear();
@@ -412,10 +419,74 @@ impl DrawPlanStore {
             key,
             commands: None,
             live: false,
+            topology_demanded: false,
         });
         let previous = self.plan_lookup.insert(key, id);
         debug_assert!(previous.is_none());
         id
+    }
+
+    /// Register the Asset Texture aliases sampled by one canonical plan.
+    ///
+    /// Prepass variants share the opaque material set, so their dependency
+    /// key is normalized to [`DrawPlanKey::Opaque`]. Registration must happen
+    /// before any pass demands that plan; otherwise its real RDG reads would
+    /// be incomplete and producer ordering could not be recovered later.
+    pub(crate) fn set_texture_dependencies(
+        &mut self,
+        key: DrawPlanKey,
+        dependencies: impl IntoIterator<Item = TextureNodeId>,
+    ) {
+        let key = draw_texture_dependency_key(key);
+        assert!(
+            self.plans.iter().all(|plan| {
+                !plan.topology_demanded || draw_texture_dependency_key(plan.key) != key
+            }),
+            "draw-plan texture dependencies must be registered before the first consumer"
+        );
+
+        let mut unique = SmallVec::<[TextureNodeId; 8]>::new();
+        let mut seen: Option<FxHashSet<TextureNodeId>> = None;
+        for dependency in dependencies {
+            if let Some(seen) = &mut seen {
+                if seen.insert(dependency) {
+                    unique.push(dependency);
+                }
+                continue;
+            }
+            if unique.contains(&dependency) {
+                continue;
+            }
+            unique.push(dependency);
+            if unique.len() == DRAW_TEXTURE_LINEAR_DEDUP_LIMIT {
+                seen = Some(unique.iter().copied().collect::<FxHashSet<_>>());
+            }
+        }
+        assert!(
+            self.texture_dependencies.insert(key, unique).is_none(),
+            "draw-plan texture dependencies registered twice for {key:?}"
+        );
+    }
+
+    /// Freeze and copy the logical texture reads for a pass demand.
+    ///
+    /// Returning owned POD IDs avoids borrowing the store while
+    /// [`PassBuilder`](super::core::PassBuilder) mutates graph records.
+    pub(crate) fn texture_dependencies_for_demand(
+        &mut self,
+        id: DrawPlanId,
+    ) -> SmallVec<[TextureNodeId; 8]> {
+        let key = {
+            let plan = self
+                .plan_mut(id)
+                .expect("draw plan demand does not belong to this graph attempt");
+            plan.topology_demanded = true;
+            draw_texture_dependency_key(plan.key)
+        };
+        self.texture_dependencies
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Return whether an ID addresses a reserved plan in this graph attempt.
@@ -645,6 +716,7 @@ impl DrawPlanStore {
         self.commands.is_empty()
             && self.plans.is_empty()
             && self.plan_lookup.is_empty()
+            && self.texture_dependencies.is_empty()
             && self.open_plan.is_none()
             && self.buffers.is_empty()
             && self.buffer_lookup.is_empty()
@@ -662,6 +734,14 @@ impl DrawPlanStore {
     #[must_use]
     pub(crate) fn bind_group_owner_count(&self) -> usize {
         self.bind_groups.len()
+    }
+}
+
+#[inline]
+fn draw_texture_dependency_key(key: DrawPlanKey) -> DrawPlanKey {
+    match key {
+        DrawPlanKey::Prepass { .. } => DrawPlanKey::Opaque,
+        key => key,
     }
 }
 

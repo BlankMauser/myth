@@ -2355,7 +2355,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_material_texture_queues_first_frame_mipmaps_before_opaque_draw() {
+    fn visible_material_texture_routes_first_frame_mipmaps_before_opaque_draw() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let image_handle = assets.images.add(Image::new(
@@ -2393,13 +2393,27 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.name == "Asset_Mipmap_Generation")
                 .count(),
-            1,
-            "the material compatibility boundary must enqueue exactly one legacy producer"
+            0,
+            "the material request must transfer into its logical producer chain"
         );
-        assert!(!graph_contains_pass(
-            state,
-            "Asset_Texture_Mipmap_Generation"
-        ));
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Texture_Upload")
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Texture_Mipmap_Generation")
+                .count(),
+            1
+        );
         assert!(!graph_contains_pass(state, "Skybox_Pass"));
 
         let execution_names: Vec<_> = state
@@ -2408,15 +2422,19 @@ mod tests {
             .iter()
             .map(|&index| state.graph_storage.passes[index].name)
             .collect();
+        let upload = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Upload")
+            .expect("logical material upload producer missing from execution queue");
         let mipmap = execution_names
             .iter()
-            .position(|&name| name == "Asset_Mipmap_Generation")
-            .expect("material mipmap producer missing from execution queue");
+            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
+            .expect("logical material mipmap producer missing from execution queue");
         let opaque = execution_names
             .iter()
             .position(|&name| name == "Opaque_Pass")
             .expect("opaque consumer missing from execution queue");
-        assert!(mipmap < opaque);
+        assert!(upload < mipmap && mipmap < opaque);
         assert!(
             state
                 .graph_storage
@@ -2430,6 +2448,20 @@ mod tests {
 
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert!(!graph_contains_pass(state, "Asset_Mipmap_Generation"));
+        assert!(!graph_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Texture_Upload")
+                .count(),
+            1,
+            "the stable exact import keeps only its lightweight upload dependency"
+        );
         assert_eq!(
             state
                 .resource_manager
@@ -2438,6 +2470,147 @@ mod tests {
                 .id,
             physical_image_id
         );
+    }
+
+    #[test]
+    fn pending_material_texture_enters_logical_chain_only_after_becoming_ready() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image_handle = assets.images.reserve();
+        let mut texture = Texture::new_2d(Some("Pending Material Texture"), image_handle);
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+        let material = PhysicalMaterial::new(Vec4::ONE);
+        material.set_map(Some(texture_handle));
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(!execution_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(!graph_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(!graph_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
+        assert!(
+            state
+                .resource_manager
+                .get_texture_image(texture_handle)
+                .is_none()
+        );
+
+        assets.images.insert_ready(
+            image_handle,
+            Image::new(
+                8,
+                8,
+                1,
+                ImageDimension::D2,
+                PixelFormat::Rgba8Unorm,
+                Some(vec![73; 8 * 8 * 4]),
+            ),
+        );
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let upload = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Upload")
+            .expect("newly ready material upload missing");
+        let mipmap = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
+            .expect("newly ready material mipmap producer missing");
+        let opaque = execution_names
+            .iter()
+            .position(|&name| name == "Opaque_Pass")
+            .expect("opaque consumer missing");
+        assert!(upload < mipmap && mipmap < opaque);
+        assert!(
+            state
+                .resource_manager
+                .get_texture_image(texture_handle)
+                .expect("newly ready texture missing")
+                .mipmaps_submitted()
+        );
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(execution_contains_pass(state, "Asset_Texture_Upload"));
+        assert!(!execution_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
+    }
+
+    #[test]
+    fn same_spec_image_refresh_reopens_logical_mipmap_generation() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![21; 8 * 8 * 4]),
+        ));
+        let mut texture = Texture::new_2d(Some("Dynamic Mip Material"), image_handle);
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+        let material = PhysicalMaterial::new(Vec4::ONE);
+        material.set_map(Some(texture_handle));
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        let initial_physical_id = renderer
+            .context
+            .as_ref()
+            .and_then(|state| state.resource_manager.get_texture_image(texture_handle))
+            .expect("initial material texture missing")
+            .id;
+
+        assert_eq!(
+            assets.images.update(
+                image_handle,
+                Image::new(
+                    8,
+                    8,
+                    1,
+                    ImageDimension::D2,
+                    PixelFormat::Rgba8Unorm,
+                    Some(vec![219; 8 * 8 * 4]),
+                ),
+            ),
+            Some(2)
+        );
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(execution_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
+        let refreshed = state
+            .resource_manager
+            .get_texture_image(texture_handle)
+            .expect("refreshed material texture missing");
+        assert_eq!(refreshed.id, initial_physical_id);
+        assert!(refreshed.mipmaps_submitted());
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(!execution_contains_pass(
+            state,
+            "Asset_Texture_Mipmap_Generation"
+        ));
     }
 
     #[test]
@@ -2629,8 +2802,21 @@ mod tests {
     fn prepass_only_live_graph_does_not_derive_a_dead_main_pipeline() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            4,
+            4,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![192; 4 * 4 * 4]),
+        ));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("Prepass DrawPlan Texture"), image));
+        let material = PhysicalMaterial::new(Vec4::ONE);
+        material.set_map(Some(texture));
         let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
         let camera = make_camera();
         let initial_main_l1_count = renderer
             .context
@@ -2671,6 +2857,22 @@ mod tests {
         assert!(execution_contains_pass(state, "Pre_Pass"));
         assert!(execution_contains_pass(state, "Depth_Only_Test_Root"));
         assert!(!execution_contains_pass(state, "Opaque_Pass"));
+        assert!(execution_contains_pass(state, "Asset_Texture_Upload"));
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let upload = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Upload")
+            .expect("opaque material upload must remain live for Prepass");
+        let prepass = execution_names
+            .iter()
+            .position(|&name| name == "Pre_Pass")
+            .expect("Prepass missing from execution queue");
+        assert!(upload < prepass);
         assert!(state.prepass.cached_pipeline_count() > 0);
         assert_eq!(
             state.pipeline_cache.fast_pipeline_count(),
@@ -3015,6 +3217,38 @@ mod tests {
     }
 
     #[test]
+    fn material_classification_epoch_drift_fails_the_frame_closed() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let material_handle = scene.meshes.get(mesh).expect("test mesh missing").material;
+
+        let composer = renderer
+            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
+            .expect("frame composer must exist");
+        let material = assets
+            .materials
+            .get(material_handle)
+            .expect("test material missing");
+        let myth_resources::material::MaterialType::Physical(physical) = &material.data else {
+            panic!("test material must be physical");
+        };
+        physical.set_alpha_mode(myth_resources::material::AlphaMode::Blend);
+        composer.render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.render_lists.opaque.is_empty());
+        assert!(state.render_lists.transparent.is_empty());
+        assert_eq!(state.resource_manager.model_allocator.len(), 0);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.render_lists.opaque.is_empty());
+        assert_eq!(state.render_lists.transparent.len(), 1);
+    }
+
+    #[test]
     fn abandoned_composer_does_not_commit_morph_history() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
@@ -3270,7 +3504,152 @@ mod tests {
     }
 
     #[test]
-    fn texture_skybox_claims_a_shared_generation_queued_by_another_handle() {
+    fn basic_forward_draw_plans_retain_opaque_and_transparent_material_textures() {
+        let mut renderer = Renderer::new(
+            RendererInitConfig::default(),
+            RendererSettings {
+                path: RenderPath::BasicForward,
+                ..RendererSettings::default()
+            },
+        );
+        pollster::block_on(renderer.init_headless(128, 128, None))
+            .expect("headless renderer init failed");
+        let assets = AssetServer::new();
+        let opaque_image = assets.images.add(Image::new(
+            4,
+            4,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![64; 4 * 4 * 4]),
+        ));
+        let transparent_image = assets.images.add(Image::new(
+            4,
+            4,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![192; 4 * 4 * 4]),
+        ));
+        let opaque_texture = assets
+            .textures
+            .add(Texture::new_2d(Some("BasicForward Opaque"), opaque_image));
+        let transparent_texture = assets.textures.add(Texture::new_2d(
+            Some("BasicForward Transparent"),
+            transparent_image,
+        ));
+        let opaque = PhysicalMaterial::new(Vec4::ONE);
+        opaque.set_map(Some(opaque_texture));
+        let transparent = PhysicalMaterial::new(Vec4::ONE)
+            .with_alpha_mode(myth_resources::material::AlphaMode::Blend);
+        transparent.set_map(Some(transparent_texture));
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, opaque, &assets);
+        scene.spawn_box(0.5, 0.5, 0.5, transparent, &assets);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let uploads: Vec<_> = execution_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &name)| (name == "Asset_Texture_Upload").then_some(index))
+            .collect();
+        let forward = execution_names
+            .iter()
+            .position(|&name| name == "SimpleForward_Pass")
+            .expect("BasicForward consumer missing");
+        assert_eq!(uploads.len(), 2);
+        assert!(uploads.into_iter().all(|upload| upload < forward));
+        assert!(!execution_names.contains(&"Asset_Texture_Mipmap_Generation"));
+        assert_eq!(state.render_lists.opaque.len(), 1);
+        assert_eq!(state.render_lists.transparent.len(), 1);
+    }
+
+    #[test]
+    fn material_and_texture_skybox_share_one_logical_asset_producer_chain() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![160; 8 * 8 * 4]),
+        ));
+        let mut material_texture = Texture::new_2d(Some("Shared Material"), image_handle);
+        material_texture.color_space = ColorSpace::Linear;
+        material_texture.generate_mipmaps = true;
+        let material_texture_handle = assets.textures.add(material_texture);
+        let material = PhysicalMaterial::new(Vec4::ONE);
+        material.set_map(Some(material_texture_handle));
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
+        scene
+            .background
+            .set_mode(BackgroundMode::planar(material_texture_handle, 1.0));
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(
+            !graph_contains_pass(state, "Asset_Mipmap_Generation"),
+            "the logical import must claim the legacy request instead of encoding it twice"
+        );
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Texture_Mipmap_Generation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Texture_Upload")
+                .count(),
+            1
+        );
+        let image = state
+            .resource_manager
+            .get_texture_image(material_texture_handle)
+            .expect("shared material/Skybox texture must remain resident");
+        assert!(image.mipmaps_submitted());
+
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let mipmap = execution_names
+            .iter()
+            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
+            .expect("shared logical mipmap producer missing");
+        let opaque = execution_names
+            .iter()
+            .position(|&name| name == "Opaque_Pass")
+            .expect("opaque consumer missing");
+        let skybox = execution_names
+            .iter()
+            .position(|&name| name == "Skybox_Pass")
+            .expect("Skybox consumer missing");
+        assert!(mipmap < opaque && mipmap < skybox);
+    }
+
+    #[test]
+    fn distinct_texture_handles_share_one_physical_mipmap_generation() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let image_handle = assets.images.add(Image::new(
@@ -3301,9 +3680,16 @@ mod tests {
         render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
 
         let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(
-            !graph_contains_pass(state, "Asset_Mipmap_Generation"),
-            "the logical import must claim the legacy request instead of encoding it twice"
+        assert!(!graph_contains_pass(state, "Asset_Mipmap_Generation"));
+        assert_eq!(
+            state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "Asset_Texture_Upload")
+                .count(),
+            2,
+            "distinct logical snapshots keep independent import leases"
         );
         assert_eq!(
             state
@@ -3312,7 +3698,28 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.name == "Asset_Texture_Mipmap_Generation")
                 .count(),
-            1
+            2,
+            "each logical import exposes readiness while physical encoding is coordinated"
+        );
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        assert_eq!(
+            execution_names
+                .iter()
+                .filter(|&&name| name == "Asset_Texture_Upload")
+                .count(),
+            2
+        );
+        assert_eq!(
+            execution_names
+                .iter()
+                .filter(|&&name| name == "Asset_Texture_Mipmap_Generation")
+                .count(),
+            2
         );
         let material_image = state
             .resource_manager
@@ -3321,7 +3728,7 @@ mod tests {
         let skybox_image = state
             .resource_manager
             .get_texture_image(skybox_texture_handle)
-            .expect("skybox texture must remain resident");
+            .expect("Skybox texture must remain resident");
         assert_eq!(material_image.id, skybox_image.id);
         assert!(material_image.mipmaps_submitted());
         assert!(skybox_image.mipmaps_submitted());

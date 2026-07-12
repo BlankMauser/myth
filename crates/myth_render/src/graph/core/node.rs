@@ -129,9 +129,11 @@ pub struct PassRecord {
     pub creates: SmallVec<[ErasedResourceNodeId; 4]>,
     /// Frame-local draw plans consumed by this pass.
     ///
-    /// These demands are metadata only: they never make a pass live and do
-    /// not create physical graph dependencies. After DPE, demands from the
-    /// compiled execution queue are used to select plans for finalization.
+    /// Demand metadata never makes a pass live. The builder may additionally
+    /// attach ordinary logical texture reads for resources sampled by the
+    /// plan; those edges retain producers only when this pass survives DPE.
+    /// After DPE, demands from the compiled execution queue select plans for
+    /// finalization.
     pub(crate) draw_plan_demands: SmallVec<[DrawPlanId; 4]>,
 
     // Compile-time state

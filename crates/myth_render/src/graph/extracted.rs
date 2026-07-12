@@ -61,6 +61,8 @@ pub struct ExtractedRenderItem {
     pub(crate) geometry_asset_identity: u64,
     pub(crate) material_asset_version: u32,
     pub(crate) material_asset_identity: u64,
+    /// Interior material epoch captured with classification-relevant state.
+    pub(crate) material_version: u64,
 
     /// Exact skeleton selected while the Scene is still borrowed.
     pub(crate) skeleton: Option<SkeletonKey>,
@@ -177,6 +179,7 @@ struct CollectedMesh {
     pub geometry_asset_identity: u64,
     pub material_asset_version: u32,
     pub material_asset_identity: u64,
+    pub material_version: u64,
     pub skeleton: Option<SkeletonKey>,
 
     pub world_matrix: Mat4,
@@ -568,6 +571,12 @@ impl ExtractedScene {
                     geometry.bounding_box.transform(&node_world)
                 };
 
+                let material_version = material.data.version();
+                let cast_shadows = mesh.cast_shadows && material.alpha_mode() != AlphaMode::Blend;
+                if material.data.version() != material_version {
+                    continue;
+                }
+
                 self.collected_meshes.push(CollectedMesh {
                     node_handle,
                     geometry: mesh.geometry,
@@ -576,12 +585,13 @@ impl ExtractedScene {
                     geometry_asset_identity: geometry.identity,
                     material_asset_version: material.version,
                     material_asset_identity: material.identity,
+                    material_version,
                     skeleton: skeleton_key,
                     world_matrix,
                     prev_world_matrix,
                     world_aabb,
                     item_variant_flags,
-                    cast_shadows: mesh.cast_shadows && material.alpha_mode() != AlphaMode::Blend,
+                    cast_shadows,
                     receive_shadows: mesh.receive_shadows,
                 });
             }
@@ -610,6 +620,7 @@ impl ExtractedScene {
                 geometry_asset_identity: item.geometry_asset_identity,
                 material_asset_version: item.material_asset_version,
                 material_asset_identity: item.material_asset_identity,
+                material_version: item.material_version,
                 skeleton: item.skeleton,
                 item_variant_flags: item.item_variant_flags,
                 item_shader_defines_hash: item_shader_defines.compute_hash(),
@@ -647,8 +658,14 @@ impl ExtractedScene {
                 .render_items
                 .get(source_item_index as usize)
                 .expect("visible draw source index exceeds the extracted item table");
-            if assets.materials.get_version_and_identity(item.material)
-                != Some((item.material_asset_version, item.material_asset_identity))
+            let Some((material, asset_version, asset_identity)) =
+                assets.materials.get_entry_with_identity(item.material)
+            else {
+                continue;
+            };
+            if (asset_version, asset_identity)
+                != (item.material_asset_version, item.material_asset_identity)
+                || material.data.version() != item.material_version
             {
                 continue;
             }
@@ -753,12 +770,13 @@ impl ExtractedScene {
                 != (item.geometry_asset_version, item.geometry_asset_identity)
                 || (material_asset_version, material_asset_identity)
                     != (item.material_asset_version, item.material_asset_identity)
+                || material_asset.data.version() != item.material_version
                 || !resource_manager
                     .get_material(item.material)
                     .is_some_and(|gpu_material| {
                         (gpu_material.asset_version, gpu_material.asset_identity)
                             == (material_asset_version, material_asset_identity)
-                            && gpu_material.version == material_asset.data.version()
+                            && gpu_material.version == item.material_version
                     })
             {
                 // A material changed after the pre-graph producer snapshot.
@@ -779,6 +797,7 @@ impl ExtractedScene {
                 != Some((geometry_asset_version, geometry_asset_identity))
                 || assets.materials.get_version_and_identity(item.material)
                     != Some((material_asset_version, material_asset_identity))
+                || material_asset.data.version() != item.material_version
             {
                 // An asynchronous replacement raced physical preparation.
                 // The persistent cache may warm, but this graph attempt never
@@ -797,7 +816,7 @@ impl ExtractedScene {
                 || (gpu_material.asset_version, gpu_material.asset_identity)
                     != (material_asset_version, material_asset_identity)
                 || gpu_geometry.version != geometry_asset.structure_version()
-                || gpu_material.version != material_asset.data.version()
+                || gpu_material.version != item.material_version
             {
                 continue;
             }

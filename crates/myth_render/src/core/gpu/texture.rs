@@ -507,6 +507,19 @@ impl ResourceManager {
             .physical_generation_for_spec(snapshot.physical_spec())
     }
 
+    /// Whether the exact physical content selected by this snapshot already
+    /// has submitted mip levels. This is generation/content based rather than
+    /// TextureHandle based, so a new logical lease can reuse a shared complete
+    /// chain without adding an empty RDG mip node.
+    #[must_use]
+    pub(crate) fn asset_snapshot_mipmaps_submitted(&self, snapshot: AssetTextureSnapshot) -> bool {
+        self.resources.physical_mipmaps_submitted_for_spec(
+            snapshot.physical_spec(),
+            snapshot.image_version,
+            snapshot.image_identity,
+        )
+    }
+
     /// Prepare GPU resources for a `Texture` asset.
     ///
     /// Performs a **two-level query**: first retrieves the `Texture` config

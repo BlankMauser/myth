@@ -12,6 +12,7 @@ use crate::core::view::ViewTarget;
 use crate::graph::extracted::ExtractedScene;
 use crate::graph::frame::{RenderIntent, RenderLists, ShadowRenderIntent};
 use myth_assets::AssetServer;
+use myth_resources::RenderableMaterialTrait;
 use myth_resources::material::AlphaMode;
 use myth_scene::camera::RenderCamera;
 
@@ -55,11 +56,16 @@ pub(crate) fn collect_draw_intents(
             != (item.geometry_asset_version, item.geometry_asset_identity)
             || (material.version, material.identity)
                 != (item.material_asset_version, item.material_asset_identity)
+            || material.data.version() != item.material_version
         {
             continue;
         }
 
         let use_transmission = material.use_transmission();
+        let is_transparent = material.is_transparent();
+        if material.data.version() != item.material_version {
+            continue;
+        }
         render_lists.use_transmission |= use_transmission;
 
         let item_pos = Vec3A::from(item.world_matrix.w_axis.truncate());
@@ -71,7 +77,7 @@ pub(crate) fn collect_draw_intents(
             distance_sq: camera_pos.distance_squared(item_pos),
         };
 
-        if material.is_transparent() || use_transmission {
+        if is_transparent || use_transmission {
             render_lists.insert_transparent(intent);
         } else {
             render_lists.insert_opaque(intent);
@@ -114,10 +120,12 @@ pub(crate) fn collect_draw_intents(
                 != (item.geometry_asset_version, item.geometry_asset_identity)
                 || (material.version, material.identity)
                     != (item.material_asset_version, item.material_asset_identity)
+                || material.data.version() != item.material_version
             {
                 continue;
             }
-            if material.alpha_mode() == AlphaMode::Blend {
+            let alpha_mode = material.alpha_mode();
+            if material.data.version() != item.material_version || alpha_mode == AlphaMode::Blend {
                 continue;
             }
 

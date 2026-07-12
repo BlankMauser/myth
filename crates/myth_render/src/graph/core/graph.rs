@@ -643,7 +643,7 @@ impl<'a> RenderGraph<'a> {
     pub fn finish(self) {}
 
     #[inline]
-    fn assert_topology_mutable(&self) {
+    pub(crate) fn assert_topology_mutable(&self) {
         assert!(
             self.storage.persistent_cache_finalization.is_none(),
             "render graph topology is frozen after persistent cache finalization"
@@ -689,6 +689,19 @@ impl<'a> RenderGraph<'a> {
     pub(crate) fn reserve_draw_plan(&mut self, key: DrawPlanKey) -> DrawPlanId {
         self.assert_topology_mutable();
         self.storage.draw_plans.reserve_plan(key)
+    }
+
+    /// Bind exact logical Asset Texture aliases to a canonical draw recipe.
+    /// Passes that later demand the plan inherit these as normal RDG reads.
+    pub(crate) fn set_draw_plan_texture_dependencies(
+        &mut self,
+        key: DrawPlanKey,
+        dependencies: impl IntoIterator<Item = TextureNodeId>,
+    ) {
+        self.assert_topology_mutable();
+        self.storage
+            .draw_plans
+            .set_texture_dependencies(key, dependencies);
     }
 
     /// Moves Drop-bearing WGPU request owners into persistent GraphStorage and
@@ -889,12 +902,24 @@ impl<'a> RenderGraph<'a> {
         generation: PhysicalImageGenerationKey,
         request: MipmapRequest,
     ) {
+        self.assert_topology_mutable();
         let import_id = self.storage.resources[node.index() as usize]
             .asset_texture_import_id()
             .expect("mip request claim target is not an asset texture import");
+        let (base_ready, mip_ready) = self.storage.asset_texture_imports.producer_chain(import_id);
+        assert!(
+            base_ready.is_none() || mip_ready.is_some(),
+            "a late mip request cannot attach to a finalized base-only asset chain"
+        );
         self.storage
             .asset_texture_imports
             .claim_mipmap_request(import_id, generation, request);
+        if let Some(mip_ready) = mip_ready {
+            let producer = self.storage.resources[mip_ready.index() as usize]
+                .producer
+                .expect("asset mip-ready alias must have a producer");
+            self.storage.passes[producer].has_side_effect = true;
+        }
     }
 
     /// Publish exact mip generations encoded by live logical asset producers.
@@ -1489,16 +1514,24 @@ impl<'a> RenderGraph<'a> {
     }
 
     fn build_physical_dependencies(&mut self) {
+        const LINEAR_DEDUP_LIMIT: usize = 16;
         for pass_idx in 0..self.storage.passes.len() {
             let num_reads = self.storage.passes[pass_idx].reads.len();
+            let mut seen = (num_reads > LINEAR_DEDUP_LIMIT)
+                .then(|| FxHashSet::with_capacity_and_hasher(num_reads, rustc_hash::FxBuildHasher));
             for read_i in 0..num_reads {
                 let res_id = self.storage.passes[pass_idx].reads[read_i];
 
                 if let Some(producer_idx) = self.storage.resources[res_id.index() as usize].producer
                     && producer_idx < pass_idx
-                    && !self.storage.passes[pass_idx]
-                        .physical_dependencies
-                        .contains(&producer_idx)
+                    && seen.as_mut().map_or_else(
+                        || {
+                            !self.storage.passes[pass_idx]
+                                .physical_dependencies
+                                .contains(&producer_idx)
+                        },
+                        |seen| seen.insert(producer_idx),
+                    )
                 {
                     self.storage.passes[pass_idx]
                         .physical_dependencies
@@ -2093,8 +2126,24 @@ mod tests {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
-        let dead = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let shared = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let dead_texture = graph.register_texture("Dead_Draw_Texture", dummy_desc(), false);
+        graph.add_pass("Dead_Texture_Producer", |builder| {
+            builder.write_texture(dead_texture);
+            (MockExec, ())
+        });
+        let shared_texture = graph.register_texture("Shared_Draw_Texture", dummy_desc(), false);
+        graph.add_pass("Shared_Texture_Producer", |builder| {
+            builder.write_texture(shared_texture);
+            (MockExec, ())
+        });
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [dead_texture]);
+        graph.set_draw_plan_texture_dependencies(
+            DrawPlanKey::Opaque,
+            [shared_texture, shared_texture],
+        );
+
+        let dead = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let shared = graph.reserve_draw_plan(DrawPlanKey::Opaque);
         let second = graph.reserve_draw_plan(DrawPlanKey::Prepass {
             needs_normal: true,
             needs_feature_id: false,
@@ -2118,7 +2167,12 @@ mod tests {
             (MockExec, ())
         });
 
-        assert_eq!(graph.storage.passes[2].draw_plan_demands.len(), 2);
+        assert_eq!(graph.storage.passes[4].draw_plan_demands.len(), 2);
+        assert_eq!(
+            graph.storage.passes[4].reads.as_slice(),
+            &[shared_texture.erase()],
+            "repeated demands and Prepass/Opaque sharing must add one physical read"
+        );
         graph.compile_topology();
 
         assert_eq!(graph.storage.passes[0].reference_count, 0);
@@ -2127,6 +2181,73 @@ mod tests {
         assert!(graph.storage.draw_plans.is_live(second));
         assert!(graph.storage.draw_plans.resolve_plan(shared).is_none());
         assert!(graph.storage.draw_plans.resolve_plan(second).is_none());
+        let live: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(
+            live,
+            [
+                "Shared_Texture_Producer",
+                "Live_Shared_Consumer",
+                "Live_Two_Plan_Consumer"
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "draw-plan texture dependencies must be registered before the first consumer"
+    )]
+    fn draw_plan_texture_dependencies_reject_late_registration() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        graph.add_pass("Consumer", |builder| {
+            builder.demand_draw_plan(plan);
+            (MockExec, ())
+        });
+        let texture = graph.register_texture("Late_Texture", dummy_desc(), false);
+        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
+    }
+
+    #[test]
+    fn large_draw_plan_texture_sets_use_deduplicated_physical_edges() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let mut textures = Vec::new();
+        for _ in 0..24 {
+            let texture = graph.register_texture("Draw_Texture", dummy_desc(), false);
+            graph.add_pass("Draw_Texture_Producer", |builder| {
+                builder.write_texture(texture);
+                (MockExec, ())
+            });
+            textures.push(texture);
+        }
+        graph.set_draw_plan_texture_dependencies(
+            DrawPlanKey::Opaque,
+            textures.iter().chain(&textures).copied(),
+        );
+        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let consumer = graph.storage.passes.len();
+        graph.add_pass("Large_Draw_Consumer", |builder| {
+            builder.demand_draw_plan(plan);
+            builder.demand_draw_plan(plan);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        assert_eq!(graph.storage.passes[consumer].reads.len(), textures.len());
+        graph.compile_topology();
+        assert_eq!(
+            graph.storage.passes[consumer].physical_dependencies.len(),
+            textures.len()
+        );
+        assert_eq!(graph.storage.execution_queue.len(), textures.len() + 1);
     }
 
     #[test]

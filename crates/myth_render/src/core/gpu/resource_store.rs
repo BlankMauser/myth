@@ -433,6 +433,27 @@ impl GpuResourceStore {
             .then(|| entry.image.generation_key(physical_id))
     }
 
+    /// Return whether the exact shared physical content selected by a CPU
+    /// snapshot already has a submitted mip chain.
+    #[must_use]
+    pub(super) fn physical_mipmaps_submitted_for_spec(
+        &self,
+        spec: GpuImageSpec,
+        image_version: u32,
+        image_identity: u64,
+    ) -> bool {
+        self.physical_image_index
+            .get(&spec)
+            .and_then(|&physical_id| self.physical_images.get(physical_id))
+            .is_some_and(|entry| {
+                entry.spec == spec
+                    && !entry.members.is_empty()
+                    && entry.image.image_version == image_version
+                    && entry.image.image_identity == image_identity
+                    && entry.image.mipmaps_submitted()
+            })
+    }
+
     #[inline]
     pub(super) fn remove_texture_image(&mut self, handle: TextureHandle) {
         self.texture_bindings.remove(handle);

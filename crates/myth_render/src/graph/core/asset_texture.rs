@@ -75,6 +75,8 @@ impl From<AssetTextureSnapshot> for AssetTextureLookupKey {
 pub(crate) struct AssetTextureImportEntry {
     pub(crate) node: TextureNodeId,
     pub(crate) snapshot: AssetTextureSnapshot,
+    base_ready: Option<TextureNodeId>,
+    mip_ready: Option<TextureNodeId>,
     materialization: OnceLock<AssetTextureMaterialization>,
     claimed_mipmap_request: Option<MipmapRequest>,
     mipmaps_encoded: AtomicBool,
@@ -85,6 +87,8 @@ impl AssetTextureImportEntry {
         Self {
             node,
             snapshot,
+            base_ready: None,
+            mip_ready: None,
             materialization: OnceLock::new(),
             claimed_mipmap_request: None,
             mipmaps_encoded: AtomicBool::new(false),
@@ -147,6 +151,48 @@ impl AssetTextureImportStore {
         self.entries
             .get(id.index())
             .expect("asset texture import ID is out of bounds")
+    }
+
+    /// Return the unique producer-chain aliases registered for this import.
+    ///
+    /// The logical root is deduplicated independently from its producer
+    /// chain. Keeping both aliases in the same attempt-owned entry prevents a
+    /// second consumer (for example a material plus Skybox) from assigning a
+    /// second SSA writer to the shared root.
+    #[must_use]
+    pub(crate) fn producer_chain(
+        &self,
+        id: AssetTextureImportId,
+    ) -> (Option<TextureNodeId>, Option<TextureNodeId>) {
+        let entry = self.entry(id);
+        (entry.base_ready, entry.mip_ready)
+    }
+
+    pub(crate) fn set_base_ready(&mut self, id: AssetTextureImportId, base_ready: TextureNodeId) {
+        let entry = self
+            .entries
+            .get_mut(id.index())
+            .expect("asset texture import ID is out of bounds");
+        assert!(
+            entry.base_ready.replace(base_ready).is_none(),
+            "asset texture import upload producer registered twice"
+        );
+    }
+
+    pub(crate) fn set_mip_ready(&mut self, id: AssetTextureImportId, mip_ready: TextureNodeId) {
+        let entry = self
+            .entries
+            .get_mut(id.index())
+            .expect("asset texture import ID is out of bounds");
+        assert!(
+            entry.mip_ready.replace(mip_ready).is_none(),
+            "asset texture import mipmap producer registered twice"
+        );
+    }
+
+    #[must_use]
+    pub(crate) fn has_claimed_mipmap_request(&self, id: AssetTextureImportId) -> bool {
+        self.entry(id).claimed_mipmap_request.is_some()
     }
 
     pub(crate) fn claim_mipmap_request(

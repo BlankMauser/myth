@@ -1,11 +1,14 @@
 use crate::core::gpu::Tracked;
 use crate::graph::frame::DrawPlanId;
+use rustc_hash::FxHashSet;
 
 use super::graph::RenderGraph;
 use super::types::{
     BufferDesc, BufferNodeId, GraphResourceType, ResourceClass, ResourceNodeId, TextureDesc,
     TextureNodeId,
 };
+
+const DRAW_TEXTURE_LINEAR_DEDUP_LIMIT: usize = 16;
 
 /// Builder for declaring a pass's resource dependencies during eager graph
 /// construction.
@@ -192,9 +195,10 @@ impl PassBuilder<'_, '_> {
 
     /// Declare that this pass consumes a frame-local draw plan.
     ///
-    /// A draw-plan demand is deliberately not a graph edge and never roots an
-    /// otherwise dead pass. Compilation collects demands only from passes that
-    /// survive DPE, then the post-prepare finalizer materializes those plans.
+    /// The demand metadata never roots an otherwise dead pass. Any logical
+    /// Asset Texture aliases pre-registered for the plan are also declared as
+    /// ordinary reads, so a pass that survives for its outputs retains and is
+    /// ordered after the exact Upload/Mipmap producers it samples.
     pub(crate) fn demand_draw_plan(&mut self, id: DrawPlanId) {
         assert!(
             self.graph.storage.draw_plans.validate_reserved(id),
@@ -202,9 +206,39 @@ impl PassBuilder<'_, '_> {
             self.graph.storage.passes[self.pass_index].name
         );
 
+        let texture_dependencies = self
+            .graph
+            .storage
+            .draw_plans
+            .texture_dependencies_for_demand(id);
+
         let demands = &mut self.graph.storage.passes[self.pass_index].draw_plan_demands;
         if !demands.contains(&id) {
             demands.push(id);
+        }
+
+        let read_count = self.graph.storage.passes[self.pass_index].reads.len();
+        if read_count + texture_dependencies.len() <= DRAW_TEXTURE_LINEAR_DEDUP_LIMIT {
+            for dependency in texture_dependencies {
+                let raw = dependency.erase();
+                if !self.graph.storage.passes[self.pass_index]
+                    .reads
+                    .contains(&raw)
+                {
+                    self.read_texture(dependency);
+                }
+            }
+        } else {
+            let mut reads: FxHashSet<_> = self.graph.storage.passes[self.pass_index]
+                .reads
+                .iter()
+                .copied()
+                .collect();
+            for dependency in texture_dependencies {
+                if reads.insert(dependency.erase()) {
+                    self.read_texture(dependency);
+                }
+            }
         }
     }
 
