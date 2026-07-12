@@ -18,6 +18,7 @@ pub use asset_texture::AssetTextureImportId;
 pub(crate) use asset_texture::AssetTextureResolver;
 pub use blackboard::{CustomPassHook, GraphBlackboard, HookStage};
 pub use builder::PassBuilder;
+pub(crate) use context::SceneDrawPrepareContext;
 pub use context::{
     BindGroupBuilder, BindableResource, ClusteredScreenBindings, ExecuteContext, ExtractContext,
     GraphBinding, PrepareContext, RawBufferBinding, RawSamplerBinding, RawTextureViewBinding,

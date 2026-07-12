@@ -28,6 +28,7 @@ use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
     TextureDesc, TextureNodeId, build_screen_bind_group,
 };
+use crate::graph::frame::{DrawPlanId, DrawPlanKey};
 use crate::graph::passes::draw::submit_draw_commands;
 use crate::graph::passes::skybox::{SkyboxDrawRequest, SkyboxDrawState};
 
@@ -75,8 +76,12 @@ impl SimpleForwardFeature {
 
         let out_desc = fc.create_surface_desc(wgpu::TextureUsages::TEXTURE_BINDING);
         let depth_desc = fc.create_depth_desc(wgpu::TextureUsages::TEXTURE_BINDING);
+        let opaque_draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let transparent_draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Transparent);
 
         ctx.graph.add_pass("SimpleForward_Pass", |builder| {
+            builder.demand_draw_plan(opaque_draw_plan);
+            builder.demand_draw_plan(transparent_draw_plan);
             let out = builder.create_texture("Scene_Color", out_desc);
             let scene_depth = builder.create_texture("Scene_Depth", depth_desc);
 
@@ -138,6 +143,8 @@ impl SimpleForwardFeature {
                 shadow_input: shadow_tex,
                 shadow_cube_input: shadow_cube_tex,
                 scene_lighting,
+                opaque_draw_plan,
+                transparent_draw_plan,
                 screen_bind_group: None,
             };
             (node, out)
@@ -163,6 +170,8 @@ pub struct SimpleForwardPassNode<'a> {
     pub shadow_input: Option<TextureNodeId>,
     pub shadow_cube_input: Option<TextureNodeId>,
     pub scene_lighting: ClusteredScreenBindings,
+    opaque_draw_plan: DrawPlanId,
+    transparent_draw_plan: DrawPlanId,
     screen_bind_group: Option<PreparedBindGroupId>,
 }
 
@@ -219,7 +228,7 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
         submit_draw_commands(
             &mut pass,
             ctx.draw_plans,
-            ctx.draw_plans.opaque_plan(),
+            self.opaque_draw_plan,
             ctx.pipeline_cache,
         );
 
@@ -235,7 +244,7 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
         submit_draw_commands(
             &mut pass,
             ctx.draw_plans,
-            ctx.draw_plans.transparent_plan(),
+            self.transparent_draw_plan,
             ctx.pipeline_cache,
         );
     }

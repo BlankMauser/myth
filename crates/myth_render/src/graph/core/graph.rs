@@ -13,7 +13,7 @@ use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
-use crate::graph::frame::{DrawPlanStore, PreparedGlobalBindGroup};
+use crate::graph::frame::{DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedGlobalBindGroup};
 
 use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
@@ -167,6 +167,12 @@ pub struct GraphStorage {
     pub resources: Vec<ResourceRecord>,
     /// Compiled execution queue (topologically sorted pass indices).
     pub execution_queue: Vec<usize>,
+    /// Whether topology compilation has started for the current graph attempt.
+    ///
+    /// Compilation derives mutable state in-place (reference counts, physical
+    /// dependencies, execution order, and draw-plan liveness), so it is a
+    /// deliberately one-shot phase rather than an idempotent query.
+    topology_compiled: bool,
 
     /// Per-frame logical import deduplication for persistent textures.
     persistent_texture_lookup: FxHashMap<PersistentTextureId, PersistentTextureImport>,
@@ -236,6 +242,7 @@ impl GraphStorage {
             passes: Vec::new(),
             resources: Vec::new(),
             execution_queue: Vec::new(),
+            topology_compiled: false,
             persistent_texture_lookup: FxHashMap::default(),
             asset_texture_imports: AssetTextureImportStore::new(),
             history_commit_requests: Vec::new(),
@@ -266,6 +273,7 @@ impl GraphStorage {
         self.passes.clear();
         self.resources.clear();
         self.execution_queue.clear();
+        self.topology_compiled = false;
         self.persistent_texture_lookup.clear();
         self.history_commit_requests.clear();
         self.cache_commit_requests.clear();
@@ -589,7 +597,6 @@ impl<T> AssertNoDrop for T {
 pub struct RenderGraph<'a> {
     pub(crate) storage: &'a mut GraphStorage,
     arena: &'a FrameArena,
-    topology_compiled: bool,
 }
 
 impl Drop for RenderGraph<'_> {
@@ -615,11 +622,7 @@ impl<'a> RenderGraph<'a> {
     /// for pass-level access via [`PassBuilder::frame_config`].
     pub fn new(storage: &'a mut GraphStorage, arena: &'a FrameArena) -> Self {
         storage.clear();
-        Self {
-            storage,
-            arena,
-            topology_compiled: false,
-        }
+        Self { storage, arena }
     }
 
     /// Explicitly ends this graph attempt and releases its arena-backed nodes
@@ -631,13 +634,15 @@ impl<'a> RenderGraph<'a> {
     pub fn finish(self) {}
 
     #[inline]
-    fn assert_topology_mutable(&mut self) {
+    fn assert_topology_mutable(&self) {
         assert!(
             self.storage.persistent_cache_finalization.is_none(),
             "render graph topology is frozen after persistent cache finalization"
         );
-        // Any edit after compilation invalidates the DPE/lifetime results.
-        self.topology_compiled = false;
+        assert!(
+            !self.storage.topology_compiled,
+            "render graph topology is frozen after compilation"
+        );
     }
 
     /// Allocates a copy of `src` on the per-frame arena.
@@ -665,6 +670,16 @@ impl<'a> RenderGraph<'a> {
     #[inline]
     pub(crate) fn alloc_shared_state<T>(&self, value: T) -> &'a T {
         self.arena.alloc(value)
+    }
+
+    /// Reserve a stable frame-local draw-plan ID during graph construction.
+    ///
+    /// The reservation owns no physical resources. Multiple passes reserving
+    /// the same canonical key receive the same ID and may independently
+    /// declare it through [`PassBuilder::demand_draw_plan`].
+    pub(crate) fn reserve_draw_plan(&mut self, key: DrawPlanKey) -> DrawPlanId {
+        self.assert_topology_mutable();
+        self.storage.draw_plans.reserve_plan(key)
     }
 
     /// Moves Drop-bearing WGPU request owners into persistent GraphStorage and
@@ -932,7 +947,7 @@ impl<'a> RenderGraph<'a> {
         registry: &mut HistoryRegistry,
     ) -> bool {
         assert!(
-            self.topology_compiled,
+            self.storage.topology_compiled,
             "persistent texture materialization requires a compiled graph"
         );
         if let Some(any_cache_member_touched) = self.storage.persistent_cache_finalization {
@@ -990,13 +1005,13 @@ impl<'a> RenderGraph<'a> {
     /// replacement physical texture.
     ///
     /// Call this after [`Self::compile`] (or [`Self::compile_topology`]) and
-    /// before prepare/execute/submission. The first call freezes graph topology;
-    /// repeated calls in the same attempt are idempotent.
+    /// before prepare/execute/submission. Compilation already freezes graph
+    /// topology; repeated calls in the same attempt are idempotent.
     ///
     /// # Panics
     ///
     /// Panics before modifying graph or registry state when topology has not
-    /// been compiled, or has changed since its last compilation.
+    /// been compiled.
     pub fn materialize_live_persistent_textures(
         &mut self,
         registry: &mut HistoryRegistry,
@@ -1208,14 +1223,15 @@ impl<'a> RenderGraph<'a> {
 
     pub fn compile_topology(&mut self) {
         self.assert_topology_mutable();
+        self.storage.topology_compiled = true;
         self.fold_simple_passes();
         self.build_physical_dependencies();
         self.cull_dead_passes();
         self.validate_live_asset_texture_dependencies();
         self.topological_sort();
+        self.collect_live_draw_plan_demands();
 
         self.compute_resource_lifetimes();
-        self.topology_compiled = true;
     }
 
     pub fn compile(&mut self, pool: &mut TransientPool, device: &Device) {
@@ -1568,6 +1584,30 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
+    /// Project DPE liveness onto frame-local draw-plan reservations.
+    ///
+    /// Plan demands never participate in pass rooting or dependency
+    /// construction. Only records already selected into the compiled execution
+    /// queue can make a plan live, and repeated demands are idempotent.
+    fn collect_live_draw_plan_demands(&mut self) {
+        self.storage.draw_plans.reset_live_demands();
+
+        for queue_index in 0..self.storage.execution_queue.len() {
+            let pass_index = self.storage.execution_queue[queue_index];
+            let demand_count = self.storage.passes[pass_index].draw_plan_demands.len();
+            for demand_index in 0..demand_count {
+                let id = self.storage.passes[pass_index].draw_plan_demands[demand_index];
+                assert!(
+                    self.storage.draw_plans.validate_reserved(id),
+                    "live pass '{}' retained a draw plan from another graph attempt",
+                    self.storage.passes[pass_index].name
+                );
+                self.storage.draw_plans.mark_live(id);
+                debug_assert!(self.storage.draw_plans.is_live(id));
+            }
+        }
+    }
+
     fn topological_sort(&mut self) {
         let pass_count = self.storage.passes.len();
 
@@ -1841,7 +1881,9 @@ mod tests {
         assert_eq!(storage.draw_plans.buffer_owner_count(), 1);
         assert_eq!(storage.draw_plans.bind_group_owner_count(), 1);
 
-        let start = storage.draw_plans.begin_plan();
+        let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        storage.draw_plans.mark_live(plan);
+        let start = storage.draw_plans.begin_finalize(plan);
         storage.draw_plans.push_command(crate::graph::DrawCommand {
             sort_key: 0,
             pipeline_id: crate::pipeline::RenderPipelineId(0),
@@ -1853,8 +1895,7 @@ mod tests {
             vertex_range: 0..3,
             instance_range: 0..1,
         });
-        let plan = storage.draw_plans.finish_plan(start);
-        storage.draw_plans.set_opaque_plan(plan);
+        storage.draw_plans.finish_finalize(plan, start);
         storage.prepared_global_bind_group.stage(&bind_group);
         assert_eq!(storage.draw_plans.resolve_plan(plan).unwrap().len(), 1);
 
@@ -1957,6 +1998,72 @@ mod tests {
     struct MockExec;
     impl PassNode<'_> for MockExec {
         fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    #[test]
+    fn draw_plan_demands_follow_dpe_and_deduplicate_shared_consumers() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let dead = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let shared = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let second = graph.reserve_draw_plan(DrawPlanKey::Prepass {
+            needs_normal: true,
+            needs_feature_id: false,
+            needs_velocity: true,
+        });
+
+        graph.add_pass("Dead_Draw_Consumer", |builder| {
+            builder.demand_draw_plan(dead);
+            (MockExec, ())
+        });
+        graph.add_pass("Live_Shared_Consumer", |builder| {
+            builder.demand_draw_plan(shared);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.add_pass("Live_Two_Plan_Consumer", |builder| {
+            builder.demand_draw_plan(shared);
+            builder.demand_draw_plan(second);
+            builder.demand_draw_plan(second);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        assert_eq!(graph.storage.passes[2].draw_plan_demands.len(), 2);
+        graph.compile_topology();
+
+        assert_eq!(graph.storage.passes[0].reference_count, 0);
+        assert!(!graph.storage.draw_plans.is_live(dead));
+        assert!(graph.storage.draw_plans.is_live(shared));
+        assert!(graph.storage.draw_plans.is_live(second));
+        assert!(graph.storage.draw_plans.resolve_plan(shared).is_none());
+        assert!(graph.storage.draw_plans.resolve_plan(second).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "demanded a draw plan from another graph attempt")]
+    fn pass_builder_rejects_a_foreign_draw_plan_id() {
+        let mut foreign = DrawPlanStore::new();
+        let foreign_id = foreign.reserve_plan(DrawPlanKey::Opaque);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        graph.add_pass("Foreign_Draw_Consumer", |builder| {
+            builder.demand_draw_plan(foreign_id);
+            (MockExec, ())
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "render graph topology is frozen after compilation")]
+    fn topology_compilation_is_a_one_shot_phase() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        graph.compile_topology();
+        graph.compile_topology();
     }
 
     #[test]
@@ -2975,11 +3082,6 @@ mod tests {
                 let texture =
                     graph.import_persistent_texture("Replacement", replacement.textures[0]);
                 let output = graph.register_texture("Output", dummy_desc(), true);
-                if register_publication {
-                    // Compiling an incomplete graph must not authorize later
-                    // materialization after a new reader changes its topology.
-                    graph.compile_topology();
-                }
                 graph.add_pass("ReadInvalidReplacement", |builder| {
                     builder.read_texture(texture);
                     builder.write_texture(output);

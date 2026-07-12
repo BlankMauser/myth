@@ -51,7 +51,7 @@ use crate::graph::core::{
     TextureNodeId,
 };
 use crate::graph::extracted::ExtractedScene;
-use crate::graph::frame::{RenderLists, ShadowLightInstance};
+use crate::graph::frame::{DrawPlanId, DrawPlanKey, RenderLists, ShadowLightInstance};
 use crate::graph::passes::draw::submit_draw_commands;
 
 /// Output returned by [`ShadowFeature::add_to_graph`].
@@ -207,6 +207,22 @@ impl ShadowFeature {
 
         let d2_lights = snapshot.d2_lights;
         let cube_lights = snapshot.cube_lights;
+        let mut d2_draw_plans = SmallVec::<[DrawPlanId; 16]>::new();
+        for light in d2_lights {
+            d2_draw_plans.push(ctx.graph.reserve_draw_plan(DrawPlanKey::Shadow {
+                light_id: light.light_id,
+                layer_index: light.view_layer_index,
+            }));
+        }
+        let d2_draw_plans = ctx.graph.alloc_slice(&d2_draw_plans);
+        let mut cube_draw_plans = SmallVec::<[DrawPlanId; 16]>::new();
+        for light in cube_lights {
+            cube_draw_plans.push(ctx.graph.reserve_draw_plan(DrawPlanKey::Shadow {
+                light_id: light.light_id,
+                layer_index: light.view_layer_index,
+            }));
+        }
+        let cube_draw_plans = ctx.graph.alloc_slice(&cube_draw_plans);
         let prepared = ctx.graph.alloc_shared_state(ShadowPreparedState {
             bind_group: OnceLock::new(),
         });
@@ -247,11 +263,15 @@ impl ShadowFeature {
             );
 
             let shadow_2d_id = ctx.graph.add_pass("Shadow_2D_Pass", |builder| {
+                for &draw_plan in d2_draw_plans {
+                    builder.demand_draw_plan(draw_plan);
+                }
                 builder.read_buffer(vp_buffer);
                 let tex_id = builder.create_texture("Shadow_2D_Array", desc);
 
                 let node = Shadow2DPassNode {
                     lights: d2_lights,
+                    draw_plans: d2_draw_plans,
                     uniform_stride,
                     prepared,
                     texture_id: tex_id,
@@ -279,11 +299,15 @@ impl ShadowFeature {
             );
 
             let shadow_cube_id = ctx.graph.add_pass("Shadow_Cube_Pass", |builder| {
+                for &draw_plan in cube_draw_plans {
+                    builder.demand_draw_plan(draw_plan);
+                }
                 builder.read_buffer(vp_buffer);
                 let tex_id = builder.create_texture("Shadow_Cube_Array", desc);
 
                 let node = ShadowCubePassNode {
                     lights: cube_lights,
+                    draw_plans: cube_draw_plans,
                     uniform_base: d2_lights.len() as u32,
                     uniform_stride,
                     prepared,
@@ -348,6 +372,7 @@ impl<'a> PassNode<'a> for ShadowVpUploadNode<'a> {
 /// array texture.
 struct Shadow2DPassNode<'a> {
     lights: &'a [ShadowLightInstance],
+    draw_plans: &'a [DrawPlanId],
     uniform_stride: u32,
     prepared: &'a ShadowPreparedState,
     texture_id: TextureNodeId,
@@ -358,6 +383,7 @@ impl<'a> PassNode<'a> for Shadow2DPassNode<'a> {
         if self.lights.is_empty() {
             return;
         }
+        debug_assert_eq!(self.lights.len(), self.draw_plans.len());
 
         let texture = ctx.get_texture(self.texture_id);
         let bind_group_id = self
@@ -368,7 +394,9 @@ impl<'a> PassNode<'a> for Shadow2DPassNode<'a> {
             .expect("Shadow VP bind group missing after prepare");
         let bind_group = ctx.resolve_prepared_bind_group(bind_group_id);
 
-        for (uniform_idx, shadow_light) in self.lights.iter().enumerate() {
+        for (uniform_idx, (shadow_light, &draw_plan)) in
+            self.lights.iter().zip(self.draw_plans).enumerate()
+        {
             let layer_view = texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("Shadow_2D_Layer"),
                 format: Some(wgpu::TextureFormat::Depth32Float),
@@ -397,12 +425,7 @@ impl<'a> PassNode<'a> for Shadow2DPassNode<'a> {
             let dynamic_offset = uniform_idx as u32 * self.uniform_stride;
             pass.set_bind_group(0, bind_group, &[dynamic_offset]);
 
-            if let Some(plan) = ctx
-                .draw_plans
-                .shadow_plan((shadow_light.light_id, shadow_light.view_layer_index))
-            {
-                submit_draw_commands(&mut pass, ctx.draw_plans, plan, ctx.pipeline_cache);
-            }
+            submit_draw_commands(&mut pass, ctx.draw_plans, draw_plan, ctx.pipeline_cache);
         }
     }
 }
@@ -417,6 +440,7 @@ impl<'a> PassNode<'a> for Shadow2DPassNode<'a> {
 /// hardware-filtered PCF sampling.
 struct ShadowCubePassNode<'a> {
     lights: &'a [ShadowLightInstance],
+    draw_plans: &'a [DrawPlanId],
     uniform_base: u32,
     uniform_stride: u32,
     prepared: &'a ShadowPreparedState,
@@ -428,6 +452,7 @@ impl<'a> PassNode<'a> for ShadowCubePassNode<'a> {
         if self.lights.is_empty() {
             return;
         }
+        debug_assert_eq!(self.lights.len(), self.draw_plans.len());
 
         let texture = ctx.get_texture(self.texture_id);
         let bind_group_id = self
@@ -438,7 +463,9 @@ impl<'a> PassNode<'a> for ShadowCubePassNode<'a> {
             .expect("Shadow VP bind group missing after prepare");
         let bind_group = ctx.resolve_prepared_bind_group(bind_group_id);
 
-        for (uniform_index, shadow_light) in self.lights.iter().enumerate() {
+        for (uniform_index, (shadow_light, &draw_plan)) in
+            self.lights.iter().zip(self.draw_plans).enumerate()
+        {
             // Each face is a single 2D layer within the cube array texture.
             let layer_view = texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("Shadow_Cube_Face"),
@@ -469,12 +496,7 @@ impl<'a> PassNode<'a> for ShadowCubePassNode<'a> {
             let dynamic_offset = uniform_index * self.uniform_stride;
             pass.set_bind_group(0, bind_group, &[dynamic_offset]);
 
-            if let Some(plan) = ctx
-                .draw_plans
-                .shadow_plan((shadow_light.light_id, shadow_light.view_layer_index))
-            {
-                submit_draw_commands(&mut pass, ctx.draw_plans, plan, ctx.pipeline_cache);
-            }
+            submit_draw_commands(&mut pass, ctx.draw_plans, draw_plan, ctx.pipeline_cache);
         }
     }
 }

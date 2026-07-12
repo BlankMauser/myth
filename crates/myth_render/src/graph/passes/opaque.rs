@@ -34,6 +34,7 @@ use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
     TextureDesc, TextureNodeId, build_screen_bind_group,
 };
+use crate::graph::frame::{DrawPlanId, DrawPlanKey};
 use crate::graph::passes::draw::submit_draw_commands;
 
 /// Outputs produced by the Opaque pass, returned to the Composer for
@@ -92,8 +93,10 @@ impl OpaqueFeature {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
+        let draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Opaque);
 
         ctx.graph.add_pass("Opaque_Pass", |builder| {
+            builder.demand_draw_plan(draw_plan);
             // ── Create color / depth / resolve targets ─────────────────
             let (color_target, depth_target) = if is_msaa {
                 let msaa_color_desc = TextureDesc::new(
@@ -245,6 +248,7 @@ impl OpaqueFeature {
                 material_tex,
                 material_resolved,
                 scene_lighting,
+                draw_plan,
             );
 
             let specular_mrt = if needs_specular_data {
@@ -298,6 +302,7 @@ pub struct OpaquePassNode {
     pub shadow_input: Option<TextureNodeId>,
     pub shadow_cube_input: Option<TextureNodeId>,
     pub scene_lighting: ClusteredScreenBindings,
+    draw_plan: DrawPlanId,
 
     // ─── Internal Cache ────────────────────────────────────────────
     screen_bind_group: Option<PreparedBindGroupId>,
@@ -319,6 +324,7 @@ impl OpaquePassNode {
         material_tex: TextureNodeId,
         material_resolve_target: Option<TextureNodeId>,
         scene_lighting: ClusteredScreenBindings,
+        draw_plan: DrawPlanId,
     ) -> Self {
         Self {
             color_target,
@@ -334,6 +340,7 @@ impl OpaquePassNode {
             shadow_input,
             shadow_cube_input,
             scene_lighting,
+            draw_plan,
             screen_bind_group: None,
         }
     }
@@ -412,7 +419,7 @@ impl<'a> PassNode<'a> for OpaquePassNode {
         submit_draw_commands(
             &mut pass,
             ctx.draw_plans,
-            ctx.draw_plans.opaque_plan(),
+            self.draw_plan,
             ctx.pipeline_cache,
         );
     }

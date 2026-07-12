@@ -47,6 +47,13 @@ use super::shadow_utils;
 /// - `dynamic_offset` supports dynamic uniform buffering
 /// - `sort_key` enables efficient sorting (front-to-back / back-to-front)
 pub struct RenderCommand {
+    /// Exact index of the originating item in
+    /// [`ExtractedScene::render_items`](super::extracted::ExtractedScene).
+    ///
+    /// Geometry and material handles are not sufficient source identity:
+    /// multiple instances may share both while differing in per-item shader
+    /// variants such as skinning or negative-scale front-face selection.
+    pub source_item_index: u32,
     /// Per-object bind group (model matrix, skeleton, etc.)
     pub object_bind_group: BindGroupContext,
     /// Geometry handle
@@ -104,10 +111,45 @@ pub struct DrawPlanId {
     index: u32,
 }
 
+/// Canonical frame-local recipe for one draw-plan command list.
+///
+/// Recipes contain only graph-build-time POD data. Repeated reservation of the
+/// same key returns the same [`DrawPlanId`], allowing multiple passes to share
+/// one finalized command range without borrowing physical WGPU resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DrawPlanKey {
+    Opaque,
+    Transparent,
+    Prepass {
+        needs_normal: bool,
+        needs_feature_id: bool,
+        needs_velocity: bool,
+    },
+    Shadow {
+        light_id: u64,
+        layer_index: u32,
+    },
+}
+
+struct DrawPlanRecord {
+    key: DrawPlanKey,
+    commands: Option<std::ops::Range<u32>>,
+    live: bool,
+}
+
+/// Copy metadata used by the post-compile draw-plan finalizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawPlanMeta {
+    pub(crate) id: DrawPlanId,
+    pub(crate) key: DrawPlanKey,
+    pub(crate) is_live: bool,
+    pub(crate) is_finalized: bool,
+}
+
 /// A single pre-baked draw command with all GPU resources resolved to
 /// frame-local physical-resource slots.
 ///
-/// Produced by [`bake::bake_render_lists`] after culling, consumed by the
+/// Produced by [`bake::finalize_live_draw_plans`] after DPE, consumed by the
 /// unified [`submit_draw_commands`] helper during the execute phase.  Contains
 /// **zero** asset handles. Each unique WGPU buffer or bind group is cloned
 /// exactly once into the graph-attempt-owned [`DrawPlanStore`]; commands carry
@@ -119,10 +161,10 @@ pub struct DrawPlanId {
 ///
 /// All semantic decisions (pipeline variant selection, alpha-test detection,
 /// material/geometry resolution) are completed during the earlier **cull /
-/// bake** phase.  The execute phase sees only hardware-level GPU state and
+/// finalize** phase. The execute phase sees only hardware-level GPU state and
 /// can be trivially parallelised in the future.
 ///
-/// [`bake::bake_render_lists`]: super::bake::bake_render_lists
+/// [`bake::finalize_live_draw_plans`]: super::bake::finalize_live_draw_plans
 /// [`submit_draw_commands`]: super::rdg::draw::submit_draw_commands
 pub struct DrawCommand {
     /// Composite sort key for minimising GPU state switches.
@@ -170,11 +212,9 @@ pub struct DrawCommand {
 /// on both successful completion and abandoned graph attempts.
 pub struct DrawPlanStore {
     commands: Vec<DrawCommand>,
-    plans: Vec<std::ops::Range<u32>>,
-    opaque_plan: Option<DrawPlanId>,
-    transparent_plan: Option<DrawPlanId>,
-    prepass_plan: Option<DrawPlanId>,
-    shadow_plans: FxHashMap<(u64, u32), DrawPlanId>,
+    plans: Vec<DrawPlanRecord>,
+    plan_lookup: FxHashMap<DrawPlanKey, DrawPlanId>,
+    open_plan: Option<(DrawPlanId, u32)>,
     buffers: Vec<Tracked<wgpu::Buffer>>,
     buffer_lookup: FxHashMap<u64, DrawBufferSlot>,
     bind_groups: Vec<Tracked<wgpu::BindGroup>>,
@@ -194,10 +234,8 @@ impl DrawPlanStore {
         Self {
             commands: Vec::with_capacity(1024),
             plans: Vec::with_capacity(16),
-            opaque_plan: None,
-            transparent_plan: None,
-            prepass_plan: None,
-            shadow_plans: FxHashMap::default(),
+            plan_lookup: FxHashMap::default(),
+            open_plan: None,
             buffers: Vec::with_capacity(256),
             buffer_lookup: FxHashMap::default(),
             bind_groups: Vec::with_capacity(256),
@@ -210,10 +248,8 @@ impl DrawPlanStore {
     pub(crate) fn clear(&mut self) {
         self.commands.clear();
         self.plans.clear();
-        self.opaque_plan = None;
-        self.transparent_plan = None;
-        self.prepass_plan = None;
-        self.shadow_plans.clear();
+        self.plan_lookup.clear();
+        self.open_plan = None;
         self.buffer_lookup.clear();
         self.buffers.clear();
         self.bind_group_lookup.clear();
@@ -225,50 +261,163 @@ impl DrawPlanStore {
         self.commands.reserve(additional);
     }
 
-    pub(crate) fn begin_plan(&self) -> u32 {
-        u32::try_from(self.commands.len())
-            .expect("one graph attempt cannot bake more than u32::MAX draw commands")
+    /// Reserve a stable plan ID during graph construction.
+    ///
+    /// Reservation is idempotent for one canonical key within the graph
+    /// attempt. It performs no physical-resource lookup or WGPU cloning.
+    pub(crate) fn reserve_plan(&mut self, key: DrawPlanKey) -> DrawPlanId {
+        if let Some(&id) = self.plan_lookup.get(&key) {
+            debug_assert!(self.validate_reserved(id));
+            return id;
+        }
+
+        let index = u32::try_from(self.plans.len())
+            .expect("one graph attempt cannot reserve more than u32::MAX draw plans");
+        let id = DrawPlanId {
+            attempt_token: self.attempt_token,
+            index,
+        };
+        self.plans.push(DrawPlanRecord {
+            key,
+            commands: None,
+            live: false,
+        });
+        let previous = self.plan_lookup.insert(key, id);
+        debug_assert!(previous.is_none());
+        id
+    }
+
+    /// Return whether an ID addresses a reserved plan in this graph attempt.
+    #[must_use]
+    pub(crate) fn validate_reserved(&self, id: DrawPlanId) -> bool {
+        id.attempt_token == self.attempt_token && (id.index as usize) < self.plans.len()
+    }
+
+    /// Reset compile-time demand marks before collecting the current DPE
+    /// result. Reservations and already-owned resources are left intact.
+    pub(crate) fn reset_live_demands(&mut self) {
+        for plan in &mut self.plans {
+            plan.live = false;
+        }
+    }
+
+    /// Mark a reserved plan as demanded by at least one live pass.
+    pub(crate) fn mark_live(&mut self, id: DrawPlanId) {
+        let plan = self
+            .plan_mut(id)
+            .expect("draw plan demand does not belong to this graph attempt");
+        plan.live = true;
+    }
+
+    #[must_use]
+    pub(crate) fn is_live(&self, id: DrawPlanId) -> bool {
+        self.plan(id)
+            .expect("draw plan ID does not belong to this graph attempt")
+            .live
+    }
+
+    /// Return Copy metadata for a reservation-table slot.
+    ///
+    /// Iterating by index and copying this value lets the finalizer mutate the
+    /// store without retaining an immutable borrow of the plan table.
+    #[must_use]
+    pub(crate) fn plan_meta(&self, index: usize) -> Option<DrawPlanMeta> {
+        let plan = self.plans.get(index)?;
+        Some(DrawPlanMeta {
+            id: DrawPlanId {
+                attempt_token: self.attempt_token,
+                index: u32::try_from(index).ok()?,
+            },
+            key: plan.key,
+            is_live: plan.live,
+            is_finalized: plan.commands.is_some(),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn plan_count(&self) -> usize {
+        self.plans.len()
+    }
+
+    /// Verify the prepare/finalize barrier before command execution.
+    ///
+    /// This catches a newly added draw-plan key whose live-node handler forgot
+    /// to materialize its range; an empty range is fully valid.
+    pub(crate) fn assert_all_live_finalized(&self) {
+        assert!(
+            self.open_plan.is_none(),
+            "draw-plan finalization remained open at the execute barrier"
+        );
+        for plan in &self.plans {
+            assert!(
+                !plan.live || plan.commands.is_some(),
+                "live draw plan {:?} was not finalized before execute",
+                plan.key
+            );
+        }
+    }
+
+    /// Begin materializing one live reserved plan into the shared command
+    /// array. Only one plan may be open because command ranges are contiguous.
+    pub(crate) fn begin_finalize(&mut self, id: DrawPlanId) -> u32 {
+        let plan = self
+            .plan(id)
+            .expect("draw plan ID does not belong to this graph attempt");
+        assert!(
+            plan.live,
+            "cannot finalize a draw plan with no live consumer"
+        );
+        assert!(
+            plan.commands.is_none(),
+            "draw plan was finalized more than once"
+        );
+        assert!(
+            self.open_plan.is_none(),
+            "draw plan finalization cannot be interleaved"
+        );
+
+        let start = u32::try_from(self.commands.len())
+            .expect("one graph attempt cannot bake more than u32::MAX draw commands");
+        self.open_plan = Some((id, start));
+        start
     }
 
     pub(crate) fn push_command(&mut self, command: DrawCommand) {
+        assert!(
+            self.open_plan.is_some(),
+            "draw commands must be appended inside plan finalization"
+        );
         self.commands.push(command);
     }
 
     pub(crate) fn sort_commands_from(&mut self, start: u32) {
+        assert!(
+            self.open_plan
+                .is_some_and(|(_, open_start)| open_start == start),
+            "only the currently open draw plan may be sorted"
+        );
         self.commands[start as usize..].sort_unstable_by_key(|command| command.sort_key);
     }
 
-    pub(crate) fn finish_plan(&mut self, start: u32) -> DrawPlanId {
+    /// Finish one reserved plan. `start == end` is a valid demanded empty
+    /// plan and stays distinguishable from an unfinalized dead plan.
+    pub(crate) fn finish_finalize(&mut self, id: DrawPlanId, start: u32) {
         let end = u32::try_from(self.commands.len())
             .expect("one graph attempt cannot bake more than u32::MAX draw commands");
-        let index = u32::try_from(self.plans.len())
-            .expect("one graph attempt cannot bake more than u32::MAX draw plans");
-        self.plans.push(start..end);
-        DrawPlanId {
-            attempt_token: self.attempt_token,
-            index,
-        }
-    }
-
-    pub(crate) fn set_opaque_plan(&mut self, plan: DrawPlanId) {
-        debug_assert!(self.resolve_plan(plan).is_some());
-        self.opaque_plan = Some(plan);
-    }
-
-    pub(crate) fn set_transparent_plan(&mut self, plan: DrawPlanId) {
-        debug_assert!(self.resolve_plan(plan).is_some());
-        self.transparent_plan = Some(plan);
-    }
-
-    pub(crate) fn set_prepass_plan(&mut self, plan: DrawPlanId) {
-        debug_assert!(self.resolve_plan(plan).is_some());
-        self.prepass_plan = Some(plan);
-    }
-
-    pub(crate) fn insert_shadow_plan(&mut self, key: (u64, u32), plan: DrawPlanId) {
-        debug_assert!(self.resolve_plan(plan).is_some());
-        let previous = self.shadow_plans.insert(key, plan);
-        debug_assert!(previous.is_none(), "shadow draw plan staged twice");
+        assert_eq!(
+            self.open_plan.take(),
+            Some((id, start)),
+            "draw plan finish does not match the currently open plan"
+        );
+        let plan = self
+            .plan_mut(id)
+            .expect("draw plan ID does not belong to this graph attempt");
+        assert!(plan.live, "cannot finish a draw plan with no live consumer");
+        assert!(
+            plan.commands.is_none(),
+            "draw plan was finalized more than once"
+        );
+        plan.commands = Some(start..end);
     }
 
     #[inline]
@@ -309,11 +458,22 @@ impl DrawPlanStore {
     }
 
     pub(crate) fn resolve_plan(&self, id: DrawPlanId) -> Option<&[DrawCommand]> {
+        let range = self.plan(id)?.commands.as_ref()?;
+        Some(&self.commands[range.start as usize..range.end as usize])
+    }
+
+    fn plan(&self, id: DrawPlanId) -> Option<&DrawPlanRecord> {
         if id.attempt_token != self.attempt_token {
             return None;
         }
-        let range = self.plans.get(id.index as usize)?;
-        Some(&self.commands[range.start as usize..range.end as usize])
+        self.plans.get(id.index as usize)
+    }
+
+    fn plan_mut(&mut self, id: DrawPlanId) -> Option<&mut DrawPlanRecord> {
+        if id.attempt_token != self.attempt_token {
+            return None;
+        }
+        self.plans.get_mut(id.index as usize)
     }
 
     fn resolve_buffer(&self, slot: DrawBufferSlot) -> Option<&Tracked<wgpu::Buffer>> {
@@ -334,10 +494,8 @@ impl DrawPlanStore {
     pub(crate) fn is_empty(&self) -> bool {
         self.commands.is_empty()
             && self.plans.is_empty()
-            && self.opaque_plan.is_none()
-            && self.transparent_plan.is_none()
-            && self.prepass_plan.is_none()
-            && self.shadow_plans.is_empty()
+            && self.plan_lookup.is_empty()
+            && self.open_plan.is_none()
             && self.buffers.is_empty()
             && self.buffer_lookup.is_empty()
             && self.bind_groups.is_empty()
@@ -364,32 +522,6 @@ pub struct DrawPlanResolver<'a> {
 }
 
 impl<'a> DrawPlanResolver<'a> {
-    #[must_use]
-    pub(crate) fn opaque_plan(self) -> DrawPlanId {
-        self.store
-            .opaque_plan
-            .expect("opaque draw plan was not baked")
-    }
-
-    #[must_use]
-    pub(crate) fn transparent_plan(self) -> DrawPlanId {
-        self.store
-            .transparent_plan
-            .expect("transparent draw plan was not baked")
-    }
-
-    #[must_use]
-    pub(crate) fn prepass_plan(self) -> DrawPlanId {
-        self.store
-            .prepass_plan
-            .expect("prepass draw plan was not baked")
-    }
-
-    #[must_use]
-    pub(crate) fn shadow_plan(self, key: (u64, u32)) -> Option<DrawPlanId> {
-        self.store.shadow_plans.get(&key).copied()
-    }
-
     #[must_use]
     #[inline]
     pub(crate) fn commands(self, id: DrawPlanId) -> &'a [DrawCommand] {
@@ -1145,6 +1277,20 @@ mod draw_plan_tests {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     fn assert_copy<T: Copy>() {}
 
+    fn test_command(sort_key: u64) -> DrawCommand {
+        DrawCommand {
+            sort_key,
+            pipeline_id: RenderPipelineId(0),
+            vertex_buffers: SmallVec::new(),
+            index_buffer: None,
+            bind_group_1: None,
+            bind_group_2: (DrawBindGroupSlot(0), 0),
+            stencil_reference: None,
+            vertex_range: 0..3,
+            instance_range: 0..1,
+        }
+    }
+
     #[test]
     fn draw_plan_types_do_not_borrow_frame_resources() {
         assert_send_sync_static::<DrawCommand>();
@@ -1157,12 +1303,87 @@ mod draw_plan_tests {
     #[test]
     fn clearing_store_invalidates_attempt_scoped_plan_ids() {
         let mut store = DrawPlanStore::new();
-        let start = store.begin_plan();
-        let plan = store.finish_plan(start);
+        let plan = store.reserve_plan(DrawPlanKey::Opaque);
+        store.mark_live(plan);
+        let start = store.begin_finalize(plan);
+        store.finish_finalize(plan, start);
 
         assert!(store.resolve_plan(plan).is_some());
         store.clear();
         assert!(store.resolve_plan(plan).is_none());
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn reservations_are_keyed_and_demanded_empty_plans_finalize() {
+        let mut store = DrawPlanStore::new();
+        let opaque = store.reserve_plan(DrawPlanKey::Opaque);
+        let repeated = store.reserve_plan(DrawPlanKey::Opaque);
+        let transparent = store.reserve_plan(DrawPlanKey::Transparent);
+
+        assert_eq!(opaque, repeated);
+        assert_ne!(opaque, transparent);
+        assert!(!store.is_live(opaque));
+        assert!(store.resolve_plan(opaque).is_none());
+
+        store.mark_live(opaque);
+        let start = store.begin_finalize(opaque);
+        store.finish_finalize(opaque, start);
+
+        assert!(store.is_live(opaque));
+        assert!(
+            store
+                .resolve_plan(opaque)
+                .is_some_and(<[DrawCommand]>::is_empty)
+        );
+        assert!(store.resolve_plan(transparent).is_none());
+        assert_eq!(
+            store.plan_meta(0),
+            Some(DrawPlanMeta {
+                id: opaque,
+                key: DrawPlanKey::Opaque,
+                is_live: true,
+                is_finalized: true,
+            })
+        );
+    }
+
+    #[test]
+    fn non_empty_plans_finalize_and_sort_out_of_reservation_order() {
+        let mut store = DrawPlanStore::new();
+        let first = store.reserve_plan(DrawPlanKey::Opaque);
+        let second = store.reserve_plan(DrawPlanKey::Transparent);
+        store.mark_live(first);
+        store.mark_live(second);
+
+        let second_start = store.begin_finalize(second);
+        store.push_command(test_command(30));
+        store.push_command(test_command(10));
+        store.sort_commands_from(second_start);
+        store.finish_finalize(second, second_start);
+        let first_start = store.begin_finalize(first);
+        store.push_command(test_command(20));
+        store.sort_commands_from(first_start);
+        store.finish_finalize(first, first_start);
+
+        assert_eq!(
+            store
+                .resolve_plan(first)
+                .unwrap()
+                .iter()
+                .map(|command| command.sort_key)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert_eq!(
+            store
+                .resolve_plan(second)
+                .unwrap()
+                .iter()
+                .map(|command| command.sort_key)
+                .collect::<Vec<_>>(),
+            vec![10, 30]
+        );
+        assert_eq!(store.plan_count(), 2);
     }
 }

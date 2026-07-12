@@ -7,7 +7,7 @@ use crate::core::gpu::{
     BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
     MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
-use crate::graph::frame::{DrawPlanResolver, RenderLists};
+use crate::graph::frame::{DrawPlanResolver, DrawPlanStore, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
 use crate::pipeline::ComputePipelineId;
 use crate::pipeline::RenderPipelineId;
@@ -60,6 +60,19 @@ pub struct ExtractContext<'a> {
 
 // ─── Prepare Context (Post-Compile Deferred Preparation) ─────────────────────
 
+/// Narrow scene-draw capability available only after DPE.
+///
+/// The source lists and extracted items are immutable products of the central
+/// cull path. The mutable store owns only graph-attempt draw commands and their
+/// exact physical-resource clones. Keeping this partition separate avoids
+/// exposing the monolithic ResourceManager to a live Feature node.
+pub(crate) struct SceneDrawPrepareContext<'a> {
+    pub(crate) render_lists: &'a RenderLists,
+    pub(crate) extracted_scene: &'a ExtractedScene,
+    pub(crate) depth_format: wgpu::TextureFormat,
+    pub(crate) draw_plans: &'a mut DrawPlanStore,
+}
+
 /// Context available during the RDG **prepare** phase.
 ///
 /// After the render graph has been compiled and transient resources allocated,
@@ -91,6 +104,9 @@ pub struct PrepareContext<'a> {
     /// Narrow persistent upload/source-resolution capability. This does not
     /// expose the monolithic ResourceManager to pass preparation.
     pub uploads: BufferUploadContext<'a>,
+    /// Immutable culled scene inputs plus the graph-attempt draw-plan owner.
+    /// Only live draw Features use this capability.
+    pub(crate) scene_draws: SceneDrawPrepareContext<'a>,
     /// Shared mipmap encoder state. Live producers pre-warm their required
     /// format pipeline here so execute remains command-recording only.
     pub mipmap_generator: &'a mut MipmapGenerator,

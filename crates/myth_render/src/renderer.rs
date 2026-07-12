@@ -463,30 +463,13 @@ impl Renderer {
             .scene_variants
             .contains(SceneFeatures::USE_CLUSTERED_SHADING);
 
-        // ── Phase 2.5: Remaining eager feature preparation ─────────────
+        // ── Phase 2.5: Cross-frame feature maintenance ─────────────────
         //
-        // Features not yet migrated to deferred RDG preparation still resolve
-        // their persistent resources here. Migrated features capture snapshots
-        // in FrameComposer and materialize resources only in live PassNodes.
+        // No Feature performs physical preparation here. Composer snapshots
+        // drive live-node prepare after DPE; this block only advances cache
+        // maintenance and synchronizes lightweight debug state.
         {
-            use crate::graph::core::context::ExtractContext;
-
-            let is_hf = state.wgpu_ctx.render_path.supports_post_processing();
-
-            let ssao_enabled = scene.ssao.enabled && is_hf;
-            let ssgi_enabled = state
-                .render_frame
-                .extracted_scene
-                .scene_variants
-                .contains(SceneFeatures::USE_SSGI);
-            let ssr_enabled = state
-                .render_frame
-                .extracted_scene
-                .scene_variants
-                .contains(SceneFeatures::USE_SSR);
-            let needs_feature_id = is_hf && (scene.ssss.enabled || ssr_enabled);
-
-            // Sync camera debug settings → RenderState before borrowing it.
+            // Sync camera debug settings before Composer snapshots RenderState.
             #[cfg(feature = "debug_view")]
             {
                 let dv = camera.debug_view;
@@ -494,25 +477,6 @@ impl Renderer {
                 state.render_frame.render_state.debug_view_scale = dv.custom_scale;
             }
 
-            #[cfg(feature = "debug_view")]
-            let (dbg_needs_normal, dbg_needs_velocity) = {
-                use crate::graph::render_state::DebugViewTarget;
-                let target =
-                    DebugViewTarget::from_mode(state.render_frame.render_state.debug_view_mode);
-                (
-                    target == DebugViewTarget::SceneNormal,
-                    target == DebugViewTarget::Velocity,
-                )
-            };
-
-            #[cfg(not(feature = "debug_view"))]
-            let (dbg_needs_normal, dbg_needs_velocity) = (false, false);
-
-            let needs_normal = ssao_enabled || ssgi_enabled || needs_feature_id || dbg_needs_normal;
-            let needs_velocity =
-                camera.aa_mode.is_taa() || ssgi_enabled || ssr_enabled || dbg_needs_velocity;
-
-            // let needs_normal = ssao_enabled || needs_feature_id;
             let environment_cache_frame = state.resource_manager.frame_index();
             let retired_environment_scenes = state
                 .environment_cache
@@ -525,28 +489,6 @@ impl Renderer {
             state
                 .atmosphere_pass
                 .maintain(&mut state.history_registry, environment_cache_frame);
-
-            if is_hf {
-                let mut extract_ctx = ExtractContext {
-                    device: &state.wgpu_ctx.device,
-                    queue: &state.wgpu_ctx.queue,
-                    pipeline_cache: &mut state.pipeline_cache,
-                    shader_manager: &mut state.shader_manager,
-                    resource_manager: &mut state.resource_manager,
-                    wgpu_ctx: &state.wgpu_ctx,
-                    render_lists: &mut state.render_lists,
-                    extracted_scene: &state.render_frame.extracted_scene,
-                    render_state: &state.render_frame.render_state,
-                    render_camera: &camera,
-                    assets,
-                };
-                state.prepass.extract_and_prepare(
-                    &mut extract_ctx,
-                    needs_normal,
-                    needs_feature_id,
-                    needs_velocity,
-                );
-            }
         }
 
         // ── Phase 3: Build ComposerContext ──────────────────────────────
@@ -2482,6 +2424,52 @@ mod tests {
             state.graph_storage.asset_texture_imports.is_empty(),
             "submitted asset imports must release their view/request owners immediately"
         );
+    }
+
+    #[test]
+    fn prepass_pipelines_are_created_only_by_live_prepare_and_reused() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            PhysicalMaterial::new(Vec4::new(0.7, 0.7, 0.7, 1.0)),
+            &assets,
+        );
+        let camera = make_camera();
+
+        let composer = renderer
+            .begin_frame(
+                &mut scene,
+                camera,
+                &assets,
+                FrameTime {
+                    time: 0.0,
+                    delta_time: 1.0 / 60.0,
+                    frame_count: 0,
+                },
+            )
+            .expect("frame composer must exist");
+        drop(composer);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(
+            state.prepass.cached_pipeline_count(),
+            0,
+            "begin_frame must not compile Prepass pipelines"
+        );
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(graph_contains_pass(state, "Pre_Pass"));
+        let live_pipeline_count = state.prepass.cached_pipeline_count();
+        assert!(live_pipeline_count > 0);
+
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.prepass.cached_pipeline_count(), live_pipeline_count);
     }
 
     #[test]

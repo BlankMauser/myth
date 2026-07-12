@@ -36,6 +36,7 @@ use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
     TextureNodeId, build_screen_bind_group,
 };
+use crate::graph::frame::{DrawPlanId, DrawPlanKey};
 use crate::graph::passes::draw::submit_draw_commands;
 
 // ─── Feature ───────────────────────────────────────────────────────────
@@ -77,8 +78,10 @@ impl TransparentFeature {
         scene_lighting: ClusteredScreenBindings,
     ) -> TextureNodeId {
         let fc = ctx.frame_config;
+        let draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Transparent);
 
         ctx.graph.add_pass("Transparent_Pass", |builder| {
+            builder.demand_draw_plan(draw_plan);
             let color_output = builder.mutate_texture(color_target, "Scene_Color_Transparent");
 
             let resolve_target = if fc.msaa_samples > 1 {
@@ -138,6 +141,7 @@ impl TransparentFeature {
                 shadow_tex,
                 shadow_cube_tex,
                 scene_lighting,
+                draw_plan,
             );
 
             (node, result)
@@ -156,6 +160,7 @@ pub struct TransparentPassNode {
     shadow_input: Option<TextureNodeId>,
     shadow_cube_input: Option<TextureNodeId>,
     scene_lighting: ClusteredScreenBindings,
+    draw_plan: DrawPlanId,
     screen_bind_group: Option<PreparedBindGroupId>,
 }
 
@@ -171,6 +176,7 @@ impl TransparentPassNode {
         shadow_input: Option<TextureNodeId>,
         shadow_cube_input: Option<TextureNodeId>,
         scene_lighting: ClusteredScreenBindings,
+        draw_plan: DrawPlanId,
     ) -> Self {
         Self {
             out_color,
@@ -181,6 +187,7 @@ impl TransparentPassNode {
             shadow_input,
             shadow_cube_input,
             scene_lighting,
+            draw_plan,
             screen_bind_group: None,
         }
     }
@@ -220,7 +227,7 @@ impl<'a> PassNode<'a> for TransparentPassNode {
 
         pass.set_bind_group(0, gpu_global_bind_group, &[]);
 
-        let plan = ctx.draw_plans.transparent_plan();
+        let plan = self.draw_plan;
         if !ctx.draw_plans.is_empty(plan) {
             let screen_bg = ctx.resolve_prepared_bind_group(self.screen_bind_group.unwrap());
             pass.set_bind_group(3, screen_bg, &[]);

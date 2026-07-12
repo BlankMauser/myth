@@ -62,7 +62,8 @@ use crate::graph::core::gaussian::GaussianFrameResolver;
 use crate::graph::core::graph::FrameConfig;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GraphBlackboard, HistoryRegistry,
-    HookStage, PrepareContext, RenderGraph, TextureDesc, TransientPool, ViewResolver,
+    HookStage, PrepareContext, RenderGraph, SceneDrawPrepareContext, TextureDesc, TransientPool,
+    ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
 use crate::graph::frame::RenderLists;
@@ -562,6 +563,14 @@ impl<'a> FrameComposer<'a> {
         let taa_enabled = self.ctx.camera.aa_mode.is_taa();
         let needs_normal = ssao_enabled || ssgi_enabled || needs_feature_id || dbg_needs_normal;
         let needs_velocity = taa_enabled || ssgi_enabled || ssr_enabled || dbg_needs_velocity;
+        let prepass_snapshot = is_high_fidelity.then(|| {
+            self.ctx.prepass.extract(
+                GlobalStateKey::new(self.ctx.render_state.id, self.ctx.extracted_scene.scene_id),
+                needs_normal,
+                needs_feature_id,
+                needs_velocity,
+            )
+        });
 
         #[cfg(feature = "3dgs")]
         let gaussian_snapshot = if is_high_fidelity {
@@ -1157,9 +1166,8 @@ impl<'a> FrameComposer<'a> {
                         // 1. Prepass
                         let prepass_out = self.ctx.prepass.add_to_graph(
                             c,
-                            needs_normal,
-                            needs_feature_id,
-                            needs_velocity,
+                            prepass_snapshot
+                                .expect("HighFidelity path must capture a Prepass snapshot"),
                         );
 
                         let scene_depth = prepass_out.scene_depth;
@@ -1747,6 +1755,12 @@ impl<'a> FrameComposer<'a> {
                         &mut self.ctx.resource_manager.resources,
                         &self.ctx.resource_manager.internal_textures,
                     ),
+                    scene_draws: SceneDrawPrepareContext {
+                        render_lists: self.ctx.render_lists,
+                        extracted_scene: self.ctx.extracted_scene,
+                        depth_format: self.ctx.wgpu_ctx.depth_format,
+                        draw_plans: &mut graph.storage.draw_plans,
+                    },
                     mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     #[cfg(feature = "3dgs")]
@@ -1774,29 +1788,23 @@ impl<'a> FrameComposer<'a> {
                 graph.release_gaussian_frame_batch(snapshot.batch_id());
             }
 
-            // ─── 3c. Bake render commands ──────────────────────────────────
+            // ─── 3c. Finalize live draw plans ──────────────────────────────
             //
-            // Resolve every asset handle into graph-attempt-owned physical
-            // resource tables and compact draw-plan ranges. After this point
-            // execute is "blind" to the asset/resource stores.
-            let prepass_config = if is_high_fidelity {
-                Some(crate::graph::bake::PrepassBakeConfig {
-                    local_cache: self.ctx.prepass.local_cache(),
-                    needs_normal: self.ctx.prepass.needs_normal(),
-                    needs_feature_id: self.ctx.prepass.needs_feature_id(),
-                    needs_velocity: self.ctx.prepass.needs_velocity(),
-                })
-            } else {
-                None
-            };
-
-            crate::graph::bake::bake_render_lists(
+            // DPE-selected PassRecords have already marked their reserved
+            // plan IDs live. Resolve only those plans into graph-attempt-owned
+            // physical resource tables and compact command ranges.
+            crate::graph::bake::finalize_live_draw_plans(
                 &mut graph.storage.draw_plans,
-                &mut graph.storage.prepared_global_bind_group,
                 self.ctx.render_lists,
                 self.ctx.resource_manager,
                 self.ctx.pipeline_cache,
-                prepass_config.as_ref(),
+            );
+            graph.storage.prepared_global_bind_group.stage(
+                self.ctx
+                    .render_lists
+                    .gpu_global_bind_group
+                    .as_ref()
+                    .expect("global bind group was not built before graph execution"),
             );
 
             // ─── 3d. Execute ───────────────────────────────────────────────

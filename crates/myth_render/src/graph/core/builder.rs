@@ -1,4 +1,5 @@
 use crate::core::gpu::Tracked;
+use crate::graph::frame::DrawPlanId;
 
 use super::graph::RenderGraph;
 use super::types::{
@@ -187,6 +188,24 @@ impl PassBuilder<'_, '_> {
 
     pub fn mark_side_effect(&mut self) {
         self.graph.storage.passes[self.pass_index].has_side_effect = true;
+    }
+
+    /// Declare that this pass consumes a frame-local draw plan.
+    ///
+    /// A draw-plan demand is deliberately not a graph edge and never roots an
+    /// otherwise dead pass. Compilation collects demands only from passes that
+    /// survive DPE, then the post-prepare finalizer materializes those plans.
+    pub(crate) fn demand_draw_plan(&mut self, id: DrawPlanId) {
+        assert!(
+            self.graph.storage.draw_plans.validate_reserved(id),
+            "pass '{}' demanded a draw plan from another graph attempt",
+            self.graph.storage.passes[self.pass_index].name
+        );
+
+        let demands = &mut self.graph.storage.passes[self.pass_index].draw_plan_demands;
+        if !demands.contains(&id) {
+            demands.push(id);
+        }
     }
 
     /// Flags this pass as a pure forwarding (blit/present) node.

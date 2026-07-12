@@ -10,7 +10,7 @@
 //!
 //! # Call Site
 //!
-//! [`bake_render_lists`] is invoked once per frame inside
+//! [`finalize_live_draw_plans`] is invoked once per frame inside
 //! [`FrameComposer::render()`](super::composer::FrameComposer::render) after
 //! the RDG prepare phase and before the execute loop.
 
@@ -18,92 +18,75 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::core::ResourceManager;
+use crate::core::gpu::BufferUploadContext;
 use crate::pipeline::{PipelineCache, RenderPipelineId};
 
 use super::frame::{
-    DrawCommand, DrawPlanId, DrawPlanStore, PreparedGlobalBindGroup, RenderCommand, RenderLists,
+    DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanStore, RenderCommand, RenderLists,
     ShadowRenderCommand,
 };
 
-// ============================================================================
-// Public API
-// ============================================================================
-
-/// Configuration for baking prepass draw commands.
+/// Finalize only draw plans demanded by passes that survived DPE.
 ///
-/// Passed as `Some(...)` in the HighFidelity render path and `None` when
-/// the prepass is disabled (BasicForward).
-pub struct PrepassBakeConfig<'a> {
-    /// Pipeline remapping table: `(main_pipeline, needs_normal, needs_feature_id, needs_velocity) → prepass_pipeline`.
-    pub local_cache: &'a FxHashMap<(RenderPipelineId, bool, bool, bool), RenderPipelineId>,
-    /// Whether the prepass outputs view-space normals.
-    pub needs_normal: bool,
-    /// Whether the prepass outputs a feature-ID stencil mask.
-    pub needs_feature_id: bool,
-    /// Whether the prepass outputs velocity vectors for TAA.
-    pub needs_velocity: bool,
-}
-
-/// Bake all render lists into the graph-attempt-owned [`DrawPlanStore`].
-///
-/// Every handle lookup (`get_geometry`, `get_material`,
-/// `get_render_pipeline`) is performed exactly once here. Buffer and bind-group
-/// clones pin the selected physical resources until the graph attempt ends;
-/// pipelines remain addressed by stable [`RenderPipelineId`] values.
-pub(crate) fn bake_render_lists(
+/// Reservations are created while the graph is built and marked live after
+/// topology compilation. A demanded plan is finalized even when its source
+/// list is empty or every command is skipped, keeping "empty" distinct from
+/// "not prepared". Dead plans perform no asset lookup, pipeline validation, or
+/// WGPU handle cloning.
+pub(crate) fn finalize_live_draw_plans(
     draw_plans: &mut DrawPlanStore,
-    global_bind_group: &mut PreparedGlobalBindGroup,
     render_lists: &RenderLists,
     resource_manager: &ResourceManager,
     pipeline_cache: &PipelineCache,
-    prepass_config: Option<&PrepassBakeConfig<'_>>,
 ) {
-    draw_plans.clear();
-    global_bind_group.clear();
+    for plan_index in 0..draw_plans.plan_count() {
+        let meta = draw_plans
+            .plan_meta(plan_index)
+            .expect("draw-plan reservation table changed during finalization");
+        if !meta.is_live || meta.is_finalized {
+            continue;
+        }
 
-    let opaque_plan = bake_main_commands(
-        &render_lists.opaque,
-        draw_plans,
-        resource_manager,
-        pipeline_cache,
-    );
-    draw_plans.set_opaque_plan(opaque_plan);
+        match meta.key {
+            DrawPlanKey::Opaque => bake_main_commands(
+                meta.id,
+                &render_lists.opaque,
+                draw_plans,
+                resource_manager,
+                pipeline_cache,
+            ),
+            DrawPlanKey::Transparent => bake_main_commands(
+                meta.id,
+                &render_lists.transparent,
+                draw_plans,
+                resource_manager,
+                pipeline_cache,
+            ),
+            DrawPlanKey::Prepass {
+                needs_normal: _,
+                needs_feature_id: _,
+                needs_velocity: _,
+            } => panic!("live prepass draw plan was not finalized by PrepassPassNode::prepare"),
+            DrawPlanKey::Shadow {
+                light_id,
+                layer_index,
+            } => {
+                let commands = render_lists
+                    .shadow_queues
+                    .get(&(light_id, layer_index))
+                    .map_or(&[][..], Vec::as_slice);
+                bake_shadow_commands(
+                    meta.id,
+                    commands,
+                    draw_plans,
+                    resource_manager,
+                    pipeline_cache,
+                );
+            }
+        }
+    }
 
-    let transparent_plan = bake_main_commands(
-        &render_lists.transparent,
-        draw_plans,
-        resource_manager,
-        pipeline_cache,
-    );
-    draw_plans.set_transparent_plan(transparent_plan);
-
-    let prepass_plan = if let Some(cfg) = prepass_config {
-        bake_prepass_commands(
-            &render_lists.opaque,
-            draw_plans,
-            resource_manager,
-            pipeline_cache,
-            cfg,
-        )
-    } else {
-        let start = draw_plans.begin_plan();
-        draw_plans.finish_plan(start)
-    };
-    draw_plans.set_prepass_plan(prepass_plan);
-
-    bake_shadow_queues(
-        &render_lists.shadow_queues,
-        draw_plans,
-        resource_manager,
-        pipeline_cache,
-    );
-
-    global_bind_group.stage(
-        render_lists
-            .gpu_global_bind_group
-            .as_ref()
-            .expect("Global bind group not built!"),
-    );
+    draw_plans.assert_all_live_finalized();
 }
 
 // ============================================================================
@@ -115,13 +98,14 @@ pub(crate) fn bake_render_lists(
 /// The output preserves the input order (already sorted by
 /// [`RenderLists::sort`]).
 fn bake_main_commands(
+    plan: DrawPlanId,
     commands: &[RenderCommand],
     draw_plans: &mut DrawPlanStore,
     rm: &ResourceManager,
     pc: &PipelineCache,
-) -> DrawPlanId {
+) {
     draw_plans.reserve_commands(commands.len());
-    let start = draw_plans.begin_plan();
+    let start = draw_plans.begin_finalize(plan);
 
     for cmd in commands {
         // Preserve the old bake-time validation boundary even though execute
@@ -175,41 +159,45 @@ fn bake_main_commands(
         });
     }
 
-    draw_plans.finish_plan(start)
+    draw_plans.finish_finalize(plan, start);
 }
 
 /// Bake prepass draw commands from the opaque list with pipeline remapping.
 ///
 /// For each opaque command that has a corresponding prepass pipeline in
-/// `cfg.local_cache`, a [`DrawCommand`] is emitted using the prepass
+/// `local_cache`, a [`DrawCommand`] is emitted using the prepass
 /// pipeline. Feature-ID output selection is encoded in that pipeline variant;
 /// this central draw path does not override the render-pass stencil reference.
-fn bake_prepass_commands(
+pub(crate) fn finalize_prepass_draw_plan(
+    plan: DrawPlanId,
     opaque_commands: &[RenderCommand],
     draw_plans: &mut DrawPlanStore,
-    rm: &ResourceManager,
+    uploads: &BufferUploadContext<'_>,
     pc: &PipelineCache,
-    cfg: &PrepassBakeConfig<'_>,
-) -> DrawPlanId {
+    local_cache: &FxHashMap<(RenderPipelineId, bool, bool, bool), RenderPipelineId>,
+    needs_normal: bool,
+    needs_feature_id: bool,
+    needs_velocity: bool,
+) {
     draw_plans.reserve_commands(opaque_commands.len());
-    let start = draw_plans.begin_plan();
+    let start = draw_plans.begin_finalize(plan);
 
     for cmd in opaque_commands {
-        let Some(&prepass_pipeline_id) = cfg.local_cache.get(&(
+        let Some(&prepass_pipeline_id) = local_cache.get(&(
             cmd.pipeline_id,
-            cfg.needs_normal,
-            cfg.needs_feature_id,
-            cfg.needs_velocity,
+            needs_normal,
+            needs_feature_id,
+            needs_velocity,
         )) else {
             continue;
         };
 
         let _ = pc.get_render_pipeline(prepass_pipeline_id);
 
-        let Some(gpu_mat) = rm.get_material(cmd.material_handle) else {
+        let Some(gpu_mat) = uploads.get_material(cmd.material_handle) else {
             continue;
         };
-        let Some(gpu_geom) = rm.get_geometry(cmd.geometry_handle) else {
+        let Some(gpu_geom) = uploads.get_geometry(cmd.geometry_handle) else {
             continue;
         };
 
@@ -253,78 +241,75 @@ fn bake_prepass_commands(
         });
     }
 
-    draw_plans.finish_plan(start)
+    draw_plans.finish_finalize(plan, start);
 }
 
-/// Bake all per-view shadow command queues and sort them by pipeline ID.
-fn bake_shadow_queues(
-    shadow_queues: &FxHashMap<(u64, u32), Vec<ShadowRenderCommand>>,
+/// Bake one demanded shadow-view command queue and sort it by pipeline ID.
+fn bake_shadow_commands(
+    plan: DrawPlanId,
+    commands: &[ShadowRenderCommand],
     draw_plans: &mut DrawPlanStore,
     rm: &ResourceManager,
     pc: &PipelineCache,
 ) {
-    for (&key, commands) in shadow_queues {
-        draw_plans.reserve_commands(commands.len());
-        let start = draw_plans.begin_plan();
+    draw_plans.reserve_commands(commands.len());
+    let start = draw_plans.begin_finalize(plan);
 
-        for cmd in commands {
-            let _ = pc.get_render_pipeline(cmd.pipeline_id);
+    for cmd in commands {
+        let _ = pc.get_render_pipeline(cmd.pipeline_id);
 
-            let Some(gpu_mat) = rm.get_material(cmd.material_handle) else {
-                continue;
-            };
-            let Some(gpu_geom) = rm.get_geometry(cmd.geometry_handle) else {
-                continue;
-            };
+        let Some(gpu_mat) = rm.get_material(cmd.material_handle) else {
+            continue;
+        };
+        let Some(gpu_geom) = rm.get_geometry(cmd.geometry_handle) else {
+            continue;
+        };
 
-            assert_eq!(
-                gpu_geom.vertex_buffers.len(),
-                gpu_geom.vertex_buffer_ids.len(),
-                "geometry buffer handles and physical IDs must stay aligned"
-            );
-            let mut vertex_buffers = SmallVec::with_capacity(gpu_geom.vertex_buffers.len());
-            for (buffer, &id) in gpu_geom
-                .vertex_buffers
-                .iter()
-                .zip(&gpu_geom.vertex_buffer_ids)
-            {
-                vertex_buffers.push(draw_plans.intern_buffer(buffer, id));
-            }
-
-            let index_buffer = gpu_geom
-                .index_buffer
-                .as_ref()
-                .map(|(buffer, format, count, id)| {
-                    (draw_plans.intern_buffer(buffer, *id), *format, *count)
-                });
-            let material_bind_group =
-                draw_plans.intern_bind_group(&gpu_mat.bind_group, gpu_mat.bind_group_id);
-            let object_bind_group = draw_plans.intern_bind_group(
-                &cmd.object_bind_group.bind_group,
-                cmd.object_bind_group.bind_group_id,
-            );
-
-            // Shadow sort key: pipeline ID in high bits, material bind group
-            // in low bits — minimises both pipeline and bind-group switches.
-            let sort_key =
-                u64::from(cmd.pipeline_id.0) << 32 | (gpu_mat.bind_group_id & 0xFFFF_FFFF);
-
-            draw_plans.push_command(DrawCommand {
-                sort_key,
-                pipeline_id: cmd.pipeline_id,
-                vertex_buffers,
-                index_buffer,
-                bind_group_1: Some(material_bind_group),
-                bind_group_2: (object_bind_group, cmd.dynamic_offset),
-                stencil_reference: None,
-                vertex_range: gpu_geom.draw_range.clone(),
-                instance_range: gpu_geom.instance_range.clone(),
-            });
+        assert_eq!(
+            gpu_geom.vertex_buffers.len(),
+            gpu_geom.vertex_buffer_ids.len(),
+            "geometry buffer handles and physical IDs must stay aligned"
+        );
+        let mut vertex_buffers = SmallVec::with_capacity(gpu_geom.vertex_buffers.len());
+        for (buffer, &id) in gpu_geom
+            .vertex_buffers
+            .iter()
+            .zip(&gpu_geom.vertex_buffer_ids)
+        {
+            vertex_buffers.push(draw_plans.intern_buffer(buffer, id));
         }
 
-        // Sort shadow commands to minimise state switches.
-        draw_plans.sort_commands_from(start);
-        let plan = draw_plans.finish_plan(start);
-        draw_plans.insert_shadow_plan(key, plan);
+        let index_buffer = gpu_geom
+            .index_buffer
+            .as_ref()
+            .map(|(buffer, format, count, id)| {
+                (draw_plans.intern_buffer(buffer, *id), *format, *count)
+            });
+        let material_bind_group =
+            draw_plans.intern_bind_group(&gpu_mat.bind_group, gpu_mat.bind_group_id);
+        let object_bind_group = draw_plans.intern_bind_group(
+            &cmd.object_bind_group.bind_group,
+            cmd.object_bind_group.bind_group_id,
+        );
+
+        // Shadow sort key: pipeline ID in high bits, material bind group
+        // in low bits — minimises both pipeline and bind-group switches.
+        let sort_key = u64::from(cmd.pipeline_id.0) << 32 | (gpu_mat.bind_group_id & 0xFFFF_FFFF);
+
+        draw_plans.push_command(DrawCommand {
+            sort_key,
+            pipeline_id: cmd.pipeline_id,
+            vertex_buffers,
+            index_buffer,
+            bind_group_1: Some(material_bind_group),
+            bind_group_2: (object_bind_group, cmd.dynamic_offset),
+            stencil_reference: None,
+            vertex_range: gpu_geom.draw_range.clone(),
+            instance_range: gpu_geom.instance_range.clone(),
+        });
     }
+
+    // Sort shadow commands to minimise state switches.
+    draw_plans.sort_commands_from(start);
+    draw_plans.finish_finalize(plan, start);
 }

@@ -1,4 +1,5 @@
 use crate::graph::core::context::{ExecuteContext, PrepareContext};
+use crate::graph::frame::DrawPlanId;
 
 use super::types::ErasedResourceNodeId;
 use smallvec::SmallVec;
@@ -126,6 +127,12 @@ pub struct PassRecord {
     pub reads: SmallVec<[ErasedResourceNodeId; 8]>,
     pub writes: SmallVec<[ErasedResourceNodeId; 4]>,
     pub creates: SmallVec<[ErasedResourceNodeId; 4]>,
+    /// Frame-local draw plans consumed by this pass.
+    ///
+    /// These demands are metadata only: they never make a pass live and do
+    /// not create physical graph dependencies. After DPE, demands from the
+    /// compiled execution queue are used to select plans for finalization.
+    pub(crate) draw_plan_demands: SmallVec<[DrawPlanId; 4]>,
 
     // Compile-time state
     pub physical_dependencies: SmallVec<[usize; 8]>,
@@ -160,6 +167,7 @@ impl PassRecord {
             reads: SmallVec::new(),
             writes: SmallVec::new(),
             creates: SmallVec::new(),
+            draw_plan_demands: SmallVec::new(),
             physical_dependencies: SmallVec::new(),
             has_side_effect: false,
             reference_count: 0,
