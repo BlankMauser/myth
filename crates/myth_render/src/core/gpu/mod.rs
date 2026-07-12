@@ -116,13 +116,38 @@ impl ResourceManager {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, anisotropy_clamp: u16) -> Self {
-        let model_allocator = ModelBufferAllocator::new();
+        Self::with_model_allocator(device, queue, anisotropy_clamp, ModelBufferAllocator::new())
+    }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_model_capacity(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        anisotropy_clamp: u16,
+        initial_capacity: usize,
+    ) -> Self {
+        Self::with_model_allocator(
+            device,
+            queue,
+            anisotropy_clamp,
+            ModelBufferAllocator::new_for_test(initial_capacity),
+        )
+    }
+
+    fn with_model_allocator(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        anisotropy_clamp: u16,
+        mut model_allocator: ModelBufferAllocator,
+    ) -> Self {
         let mut gpu_buffers = slotmap::SlotMap::with_key();
         let mut buffer_index = rustc_hash::FxHashMap::default();
 
         // Force initial allocation of the model buffer so that it has a stable GPU handle and ID from the start.
         model_allocator.flush_to_buffer(&device, &queue, &mut gpu_buffers, &mut buffer_index, 0);
+        // Construction is not itself a frame-finalization boundary. Keep the
+        // public allocator usable until the caller explicitly flushes it.
+        model_allocator.reset();
 
         let system_textures = SystemTextures::new(&device, &queue);
 
@@ -174,6 +199,8 @@ impl ResourceManager {
         self.resources.take_mipmap_requests()
     }
 
+    /// Upload and freeze the model-uniform buffer for the current frame.
+    /// Further allocations are rejected until [`Self::next_frame`].
     pub fn flush_model_buffers(&mut self) {
         let (gpu_buffers, buffer_index) = self.resources.buffer_storage_mut();
         let resized = self.model_allocator.flush_to_buffer(
@@ -190,7 +217,7 @@ impl ResourceManager {
         }
     }
 
-    /// Allocate a Model Uniform slot, returning the byte offset
+    /// Allocate a model-uniform slot before [`Self::flush_model_buffers`].
     #[inline]
     pub fn allocate_model_uniform(
         &mut self,
@@ -199,7 +226,8 @@ impl ResourceManager {
         self.model_allocator.allocate(data)
     }
 
-    /// Get the current Model Buffer ID for cache validation
+    /// Get the stable logical model-buffer ID used to resolve its current
+    /// physical allocation.
     #[inline]
     pub fn model_buffer_id(&self) -> u64 {
         self.model_allocator.buffer_handle().id()

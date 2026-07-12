@@ -444,26 +444,13 @@ impl Renderer {
             published_pmrem_max_mip,
         );
 
-        // ── Phase 2: Cull + sort + command generation ───────────────────
-        crate::graph::culling::cull_and_sort(
-            &state.render_frame.extracted_scene,
-            &state.render_frame.render_state,
-            &state.wgpu_ctx,
-            &mut state.resource_manager,
-            &mut state.pipeline_cache,
-            &mut state.shader_manager,
-            &mut state.render_lists,
-            &camera,
-            assets,
-        );
-
         let clustered_lighting_enabled = state
             .render_frame
             .extracted_scene
             .scene_variants
             .contains(SceneFeatures::USE_CLUSTERED_SHADING);
 
-        // ── Phase 2.5: Cross-frame feature maintenance ─────────────────
+        // ── Phase 2: Cross-frame feature maintenance ───────────────────
         //
         // No Feature performs physical preparation here. Composer snapshots
         // drive live-node prepare after DPE; this block only advances cache
@@ -498,7 +485,7 @@ impl Renderer {
             pipeline_cache: &mut state.pipeline_cache,
             shader_manager: &mut state.shader_manager,
 
-            extracted_scene: &state.render_frame.extracted_scene,
+            extracted_scene: &mut state.render_frame.extracted_scene,
             render_state: &state.render_frame.render_state,
             renderer_settings: &self.settings,
             clustered_lighting_enabled,
@@ -1120,21 +1107,35 @@ mod tests {
 
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::{AssetServer, SceneExt};
+    use myth_core::SkeletonKey;
     #[cfg(feature = "3dgs")]
     use myth_resources::gaussian_splat::{GaussianCloud, GaussianSHCoefficients, GaussianSplat};
     use myth_resources::image::{ColorSpace, Image, ImageDimension, PixelFormat};
     use myth_resources::material::PhysicalMaterial;
     use myth_resources::texture::{Texture, TextureSource};
-    use myth_scene::Scene;
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
     use myth_scene::light::Light;
+    use myth_scene::{BindMode, Scene};
 
     fn init_headless_renderer() -> Renderer {
         let mut renderer =
             Renderer::new(RendererInitConfig::default(), RendererSettings::default());
         pollster::block_on(renderer.init_headless(128, 128, None))
             .expect("headless renderer init failed");
+        renderer
+    }
+
+    fn init_headless_renderer_with_model_capacity(initial_capacity: usize) -> Renderer {
+        let mut renderer = init_headless_renderer();
+        let anisotropy_clamp = renderer.settings.anisotropy_clamp;
+        let state = renderer.context.as_mut().expect("renderer state missing");
+        state.resource_manager = ResourceManager::new_with_model_capacity(
+            state.wgpu_ctx.device.clone(),
+            state.wgpu_ctx.queue.clone(),
+            anisotropy_clamp,
+            initial_capacity,
+        );
         renderer
     }
 
@@ -2431,14 +2432,27 @@ mod tests {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
-        scene.spawn_box(
+        let mesh_node = scene.spawn_box(
             1.0,
             1.0,
             1.0,
             PhysicalMaterial::new(Vec4::new(0.7, 0.7, 0.7, 1.0)),
             &assets,
         );
+        let (geometry_handle, material_handle) = {
+            let mesh = scene
+                .meshes
+                .get(mesh_node)
+                .expect("spawned test mesh missing");
+            (mesh.geometry, mesh.material)
+        };
         let camera = make_camera();
+        let initial_pipeline_count = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .pipeline_cache
+            .render_pipeline_count();
 
         let composer = renderer
             .begin_frame(
@@ -2460,16 +2474,346 @@ mod tests {
             0,
             "begin_frame must not compile Prepass pipelines"
         );
+        assert_eq!(
+            state.pipeline_cache.render_pipeline_count(),
+            initial_pipeline_count,
+            "an abandoned Composer must not derive scene render pipelines"
+        );
+        assert!(state.render_lists.opaque.is_empty());
+        assert!(state.render_lists.transparent.is_empty());
+        assert!(state.render_lists.shadow_queues.is_empty());
+        assert!(
+            state
+                .resource_manager
+                .get_geometry(geometry_handle)
+                .is_none()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .is_none()
+        );
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert!(graph_contains_pass(state, "Pre_Pass"));
         let live_pipeline_count = state.prepass.cached_pipeline_count();
         assert!(live_pipeline_count > 0);
+        assert!(state.pipeline_cache.render_pipeline_count() > initial_pipeline_count);
+        assert!(
+            state
+                .resource_manager
+                .get_geometry(geometry_handle)
+                .is_some()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .is_some()
+        );
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 2);
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert_eq!(state.prepass.cached_pipeline_count(), live_pipeline_count);
+    }
+
+    #[test]
+    fn offscreen_draw_sources_do_not_materialize_gpu_assets() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            PhysicalMaterial::new(Vec4::new(0.6, 0.6, 0.6, 1.0)),
+            &assets,
+        );
+        scene.node(&mesh_node).set_position(1_000_000.0, 0.0, 0.0);
+        scene.update_matrix_world();
+        let (geometry_handle, material_handle) = {
+            let mesh = scene.meshes.get(mesh_node).expect("test mesh missing");
+            (mesh.geometry, mesh.material)
+        };
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.render_lists.opaque.is_empty());
+        assert!(state.render_lists.transparent.is_empty());
+        assert!(
+            state
+                .resource_manager
+                .get_geometry(geometry_handle)
+                .is_none()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn material_readiness_is_frozen_by_the_cpu_scene_snapshot() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let pending_material = assets.materials.reserve();
+        scene
+            .meshes
+            .get_mut(mesh_node)
+            .expect("test mesh missing")
+            .material = pending_material;
+
+        let composer = renderer
+            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
+            .expect("frame composer must exist");
+        assets.materials.insert_ready(
+            pending_material,
+            myth_resources::Material::from(PhysicalMaterial::new(Vec4::new(0.3, 0.4, 0.5, 1.0))),
+        );
+        composer.render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.render_frame.extracted_scene.render_items.is_empty());
+        assert!(state.render_lists.opaque.is_empty());
+        assert!(
+            state
+                .resource_manager
+                .get_material(pending_material)
+                .is_none()
+        );
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.render_frame.extracted_scene.render_items.len(), 1);
+        assert_eq!(state.render_lists.opaque.len(), 1);
+        assert!(
+            state
+                .resource_manager
+                .get_material(pending_material)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn blend_material_snapshot_is_not_shadow_eligible() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            PhysicalMaterial::new(Vec4::ONE)
+                .with_alpha_mode(myth_resources::material::AlphaMode::Blend),
+            &assets,
+        );
+
+        let composer = renderer
+            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
+            .expect("frame composer must exist");
+        drop(composer);
+
+        let item = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .render_frame
+            .extracted_scene
+            .render_items
+            .first()
+            .expect("render item missing");
+        assert!(!item.cast_shadows);
+    }
+
+    #[test]
+    fn abandoned_composer_does_not_commit_morph_history() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        {
+            let mesh = scene.meshes.get_mut(mesh_node).expect("test mesh missing");
+            mesh.init_morph_targets(1, 1);
+            mesh.set_morph_target_influence(0, 1.0);
+        }
+
+        let composer = renderer
+            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
+            .expect("frame composer must exist");
+        drop(composer);
+
+        let unsubmitted = scene
+            .meshes
+            .get(mesh_node)
+            .expect("test mesh missing")
+            .morph_uniforms();
+        assert!(unsubmitted.weights[0].x.abs() <= f32::EPSILON);
+        drop(unsubmitted);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+
+        let submitted = scene
+            .meshes
+            .get(mesh_node)
+            .expect("test mesh missing")
+            .morph_uniforms();
+        assert!((submitted.weights[0].x - 1.0).abs() <= f32::EPSILON);
+        assert!(submitted.prev_weights[0].x.abs() <= f32::EPSILON);
+        drop(submitted);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
+        let followup = scene
+            .meshes
+            .get(mesh_node)
+            .expect("test mesh missing")
+            .morph_uniforms();
+        assert!((followup.prev_weights[0].x - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn stale_skeleton_binding_does_not_select_a_skinned_draw_variant() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            PhysicalMaterial::new(Vec4::new(0.4, 0.4, 0.4, 1.0)),
+            &assets,
+        );
+        let stale_skeleton = SkeletonKey::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001));
+        scene.bind_skeleton(mesh_node, stale_skeleton, BindMode::Attached);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let item = state
+            .render_frame
+            .extracted_scene
+            .render_items
+            .first()
+            .expect("render item missing");
+        assert!(item.skeleton.is_none());
+        assert_eq!(item.item_variant_flags & (1 << 1), 0);
+        assert!(!item.item_shader_defines.contains("HAS_SKINNING"));
+        assert_eq!(state.render_lists.opaque.len(), 1);
+    }
+
+    #[test]
+    fn model_buffer_resize_rebinds_objects_before_commands_capture_them() {
+        let mut renderer = init_headless_renderer_with_model_capacity(4);
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            PhysicalMaterial::new(Vec4::new(0.5, 0.5, 0.5, 1.0)),
+            &assets,
+        );
+        let template = scene
+            .meshes
+            .get(mesh_node)
+            .expect("test mesh missing")
+            .clone();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.render_lists.opaque.len(), 1);
+        let old_object_bind_group_id = state.render_lists.opaque[0].object_bind_group.bind_group_id;
+        let model_buffer = state
+            .resource_manager
+            .get_gpu_buffer_by_cpu_id(state.resource_manager.model_buffer_id())
+            .expect("model buffer missing");
+        let old_model_physical_id = model_buffer.id;
+        let old_model_size = model_buffer.size;
+
+        for _ in 0..4 {
+            scene.add_mesh(template.clone());
+        }
+        scene.update_matrix_world();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.render_lists.opaque.len(), 5);
+        let model_buffer = state
+            .resource_manager
+            .get_gpu_buffer_by_cpu_id(state.resource_manager.model_buffer_id())
+            .expect("resized model buffer missing");
+        assert!(model_buffer.size > old_model_size);
+        assert_ne!(model_buffer.id, old_model_physical_id);
+        assert!(
+            state
+                .resource_manager
+                .get_cached_bind_group(old_object_bind_group_id)
+                .is_none(),
+            "resizing must evict every object BindGroup that owns the old buffer"
+        );
+
+        let stride = crate::core::gpu::ModelBufferAllocator::uniform_stride().get();
+        for command in &state.render_lists.opaque {
+            assert_ne!(
+                command.object_bind_group.bind_group_id, old_object_bind_group_id,
+                "this frame must capture a BindGroup built after the resize"
+            );
+            assert!(
+                u64::from(command.dynamic_offset) + stride <= model_buffer.size,
+                "every dynamic model range must fit the final physical buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn pruned_model_buffer_is_recreated_before_the_next_draw_prepare() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_mut().expect("renderer state missing");
+        let old_object_bind_group_id = state.render_lists.opaque[0].object_bind_group.bind_group_id;
+        let logical_id = state.resource_manager.model_buffer_id();
+        let initial_physical_id = state
+            .resource_manager
+            .get_gpu_buffer_by_cpu_id(logical_id)
+            .expect("initial model buffer missing")
+            .id;
+
+        state.resource_manager.next_frame();
+        state.resource_manager.prune(0);
+        assert!(
+            state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(logical_id)
+                .is_none(),
+            "the test must exercise the stale allocator-handle path"
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_cached_bind_group(old_object_bind_group_id)
+                .is_none(),
+            "object cache TTL must release contexts owning stale physical buffers"
+        );
+
+        state.resource_manager.flush_model_buffers();
+        let recreated = state
+            .resource_manager
+            .get_gpu_buffer_by_cpu_id(logical_id)
+            .expect("model buffer was not recreated");
+        assert_ne!(recreated.id, initial_physical_id);
     }
 
     #[test]

@@ -107,7 +107,7 @@ pub struct ComposerContext<'a> {
     pub pipeline_cache: &'a mut PipelineCache,
     pub shader_manager: &'a mut ShaderManager,
 
-    pub extracted_scene: &'a ExtractedScene,
+    pub extracted_scene: &'a mut ExtractedScene,
     pub render_state: &'a RenderState,
     pub renderer_settings: &'a RendererSettings,
     pub clustered_lighting_enabled: bool,
@@ -496,7 +496,31 @@ impl<'a> FrameComposer<'a> {
             return;
         }
 
-        // ━━━ 2. Build Unified RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // ━━━ 2a. Derive central scene draw sources ━━━━━━━━━━━━━━━━━━━━━━
+        //
+        // Keep main/shadow pipeline derivation, model-uniform allocation, and
+        // model-buffer upload behind both Composer ownership and successful
+        // render-target acquisition. A Composer dropped by the caller, or a
+        // failed surface acquire, therefore performs none of this GPU work.
+        self.ctx.extracted_scene.prepare_draw_resources(
+            self.ctx.scene,
+            self.ctx.assets,
+            self.ctx.resource_manager,
+            &self.ctx.render_lists.active_views,
+        );
+        crate::graph::culling::cull_and_sort(
+            self.ctx.extracted_scene,
+            self.ctx.render_state,
+            self.ctx.wgpu_ctx,
+            self.ctx.resource_manager,
+            self.ctx.pipeline_cache,
+            self.ctx.shader_manager,
+            self.ctx.render_lists,
+            &self.ctx.camera,
+            self.ctx.assets,
+        );
+
+        // ━━━ 2b. Build Unified RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
         let surface_desc = TextureDesc::new_2d(
             width,
@@ -520,7 +544,7 @@ impl<'a> FrameComposer<'a> {
             self.ctx.extracted_scene.local_light_count() as u32,
         );
 
-        // ── 2a. Register Resources ──────────────────────────────────────
+        // ── 2c. Register Resources ──────────────────────────────────────
         // Only the swapchain surface is truly external.
         // Scene colour and depth are transient — owned and aliased by the RDG.
 
@@ -528,7 +552,7 @@ impl<'a> FrameComposer<'a> {
         let msaa_samples = self.ctx.wgpu_ctx.msaa_samples;
         let is_msaa = msaa_samples > 1;
 
-        // ── 2b. Scene Configuration ────────────────────────────────────
+        // ── 2d. Scene Configuration ────────────────────────────────────
         let ssao_enabled = self.ctx.scene.ssao.enabled && is_high_fidelity;
         let ssgi_enabled = is_high_fidelity
             && self
@@ -1853,6 +1877,13 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
+            // Morph history is a submission result, not a begin-frame side
+            // effect. Once the queue accepts these commands, advance the
+            // previous-weight baseline even if later publication bookkeeping
+            // reports an internal error.
+            self.ctx
+                .extracted_scene
+                .commit_prepared_draw_history(self.ctx.scene);
             graph.commit_submitted_asset_texture_mipmaps();
             if let Some(batch) = mipmap_batch {
                 let committed = graph.commit_submitted_mipmap_batch(batch);

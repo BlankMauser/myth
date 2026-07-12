@@ -751,6 +751,12 @@ impl Scene {
         }
     }
 
+    /// Copies scene-level morph weights into their target meshes.
+    ///
+    /// Packing the GPU-facing morph uniform is deferred until a renderer owns
+    /// a viable frame target, and history is committed only after submission.
+    /// A scene may run multiple simulation updates before one render without
+    /// consuming the two-frame velocity update window twice.
     pub fn sync_morph_weights(&mut self) {
         for (handle, weights) in &self.morph_weights {
             if weights.is_empty() {
@@ -761,7 +767,6 @@ impl Scene {
 
             if let Some(mesh) = self.meshes.get_mut(handle) {
                 mesh.set_morph_target_influences(weights_slice);
-                mesh.update_morph_uniforms();
             } else if let Some(node) = self.nodes.get(handle) {
                 for &child_handle in &node.children {
                     // Broadcast to child nodes that have SplitPrimitiveTag
@@ -769,7 +774,6 @@ impl Scene {
                         && let Some(child_mesh) = self.meshes.get_mut(child_handle)
                     {
                         child_mesh.set_morph_target_influences(weights_slice);
-                        child_mesh.update_morph_uniforms();
                     }
                 }
             }
@@ -1044,6 +1048,39 @@ impl AnimationTarget for Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myth_resources::{GeometryHandle, MaterialHandle};
+    use slotmap::KeyData;
+
+    #[test]
+    fn simulation_sync_does_not_consume_render_morph_window() {
+        let mut scene = Scene::new();
+        let geometry = GeometryHandle::from(KeyData::from_ffi(0x0000_0001_0000_0001));
+        let material = MaterialHandle::from(KeyData::from_ffi(0x0000_0001_0000_0002));
+        let mut mesh = Mesh::new(geometry, material);
+        mesh.init_morph_targets(1, 1);
+        let node = scene.add_mesh(mesh);
+        scene.set_morph_weights(node, vec![1.0]);
+
+        // Multiple simulation ticks before one render only synchronize the
+        // target value; they must not latch the render-frame history.
+        scene.sync_morph_weights();
+        scene.sync_morph_weights();
+
+        let mesh = scene.meshes.get_mut(node).expect("test mesh missing");
+        mesh.update_morph_uniforms();
+        let (first_current, first_previous) = {
+            let uniforms = mesh.morph_uniforms();
+            (uniforms.weights[0].x, uniforms.prev_weights[0].x)
+        };
+        assert!((first_current - 1.0).abs() <= f32::EPSILON);
+        assert!(first_previous.abs() <= f32::EPSILON);
+
+        scene.sync_morph_weights();
+        let mesh = scene.meshes.get_mut(node).expect("test mesh missing");
+        mesh.update_morph_uniforms();
+        let second_previous = mesh.morph_uniforms().prev_weights[0].x;
+        assert!((second_previous - 1.0).abs() <= f32::EPSILON);
+    }
 
     #[cfg(feature = "3dgs")]
     #[test]

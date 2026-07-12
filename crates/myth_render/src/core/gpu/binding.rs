@@ -8,7 +8,6 @@ use wgpu::ShaderStages;
 
 use myth_assets::{AssetServer, TextureHandle};
 use myth_resources::Mesh;
-use myth_resources::geometry::Geometry;
 use myth_resources::texture::TextureSource;
 use myth_resources::uniforms::DynamicModelUniforms;
 use myth_resources::uniforms::WgslStruct;
@@ -158,54 +157,33 @@ impl ResourceManager {
 
     /// Prepare basic resources for a Mesh
     ///
-    /// Uses an "Ensure -> Collect IDs -> Check Fingerprint -> Rebind" pattern
+    /// Uses an "Ensure -> Collect IDs -> Check Fingerprint -> Rebind" pattern.
+    /// The caller must allocate every model slot and call
+    /// [`ResourceManager::flush_model_buffers`] first; this guarantees the
+    /// physical model buffer cannot change after the returned BindGroup is
+    /// captured by a draw command.
     pub fn prepare_mesh(
         &mut self,
         assets: &AssetServer,
-        mesh: &mut Mesh,
+        mesh: &Mesh,
         skeleton: Option<&Skeleton>,
     ) -> Option<BindGroupContext> {
+        // Object bindings are valid only after every source item has reserved
+        // its dynamic slot and the model buffer can no longer grow this frame.
+        self.model_allocator.assert_frozen();
+
         // === Ensure phase: ensure all resources are uploaded ===
-        // If the Allocator expanded this frame, IDs will change and must be registered here
-        mesh.update_morph_uniforms();
-        let (_, morph_result) = self.ensure_buffer(&mesh.morph_uniforms);
+        self.ensure_buffer(&mesh.morph_uniforms);
         self.prepare_geometry(assets, mesh.geometry);
         self.prepare_material(assets, mesh.material);
 
         let geometry = assets.geometries.get(mesh.geometry)?;
 
-        // === Collect phase: gather all resource IDs ===
-        let mut current_ids = super::ResourceIdSet::with_capacity(6);
-        current_ids.push(self.model_allocator.buffer_handle().id());
-        current_ids.push(morph_result.resource_id);
-        current_ids.push_optional(skeleton.map(|s| s.joint_matrices.handle().id));
-        current_ids.push_optional(skeleton.map(|s| s.prev_joint_matrices.handle().id));
-
-        let cache_key = current_ids.hash_value();
-
-        // Check global cache
-        if let Some(binding_data) = self.bind_groups.cached_object_bind_group(cache_key) {
-            return Some(binding_data.clone());
-        }
-
-        // Create new GpuObject
-        let binding_data =
-            self.create_object_bind_group_internal(assets, &geometry, mesh, skeleton, cache_key);
-        Some(binding_data)
-    }
-
-    fn create_object_bind_group_internal(
-        &mut self,
-        assets: &AssetServer,
-        geometry: &Geometry,
-        mesh: &Mesh,
-        skeleton: Option<&Skeleton>,
-        cache_key: ObjectBindGroupKey,
-    ) -> BindGroupContext {
+        // Build the exact binding recipe once. Resource preparation and cache
+        // fingerprinting must use this same recipe so a future binding cannot
+        // be created while silently missing from the cache key.
         let min_binding_size = ModelBufferAllocator::uniform_stride();
-
         let model_buffer_ref = self.model_allocator.buffer_handle();
-
         let mut builder = ResourceBuilder::new();
         builder.add_dynamic_uniform::<DynamicModelUniforms>(
             "model",
@@ -217,7 +195,7 @@ impl ResourceManager {
         mesh.define_bindings(&mut builder);
         geometry.define_bindings(&mut builder);
 
-        if let Some(skeleton) = &skeleton {
+        if let Some(skeleton) = skeleton {
             builder.add_storage_buffer(
                 "skins",
                 &skeleton.joint_matrices.handle(),
@@ -236,11 +214,34 @@ impl ResourceManager {
             );
         }
 
-        let binding_wgsl = builder.generate_wgsl(2);
+        assert_object_bindings_are_buffer_only(&builder.bindings);
         let layout_entries = builder.generate_layout_entries();
-
-        let (layout, layout_id) = self.get_or_create_layout(&layout_entries);
         self.prepare_binding_resources(assets, &builder.bindings);
+        let (layout_id, newly_created_layout) =
+            if let Some(layout_id) = self.bind_groups.cached_layout_id(&layout_entries) {
+                (layout_id, None)
+            } else {
+                let (layout, layout_id) = self.get_or_create_layout(&layout_entries);
+                (layout_id, Some(layout))
+            };
+        let cache_key = self.object_bind_group_fingerprint(&builder, layout_id);
+
+        // Check global cache
+        if let Some(binding_data) = self
+            .bind_groups
+            .cached_object_bind_group(&cache_key, self.frame_index)
+        {
+            return Some(binding_data);
+        }
+
+        // Cache miss: reuse the exact builder that was prepared and
+        // fingerprinted above to create the physical BindGroup.
+        let binding_wgsl = builder.generate_wgsl(2);
+        let layout = newly_created_layout.unwrap_or_else(|| {
+            let (layout, resolved_layout_id) = self.get_or_create_layout(&layout_entries);
+            debug_assert_eq!(layout_id, resolved_layout_id);
+            layout
+        });
         let (bind_group, bind_group_id) = self.create_bind_group(&layout, &builder);
 
         let data = BindGroupContext {
@@ -251,9 +252,53 @@ impl ResourceManager {
             binding_wgsl: binding_wgsl.into(),
         };
 
-        self.bind_groups
-            .cache_object_bind_group(cache_key, bind_group_id, data.clone());
-        data
+        self.bind_groups.cache_object_bind_group(
+            cache_key,
+            bind_group_id,
+            data.clone(),
+            self.frame_index,
+        );
+        Some(data)
+    }
+
+    fn object_bind_group_fingerprint(
+        &self,
+        builder: &ResourceBuilder<'_>,
+        layout_id: u64,
+    ) -> ObjectBindGroupKey {
+        let mut key = ObjectBindGroupKey::with_capacity(builder.bindings.len(), layout_id);
+        for binding in &builder.bindings {
+            match &binding.resource {
+                BindingResource::Buffer {
+                    buffer,
+                    offset,
+                    size,
+                    ..
+                } => {
+                    let gpu_buffer = self
+                        .get_gpu_buffer_by_cpu_id(buffer.id())
+                        .expect("object BindGroup buffer must be prepared before fingerprinting");
+                    key.push_buffer(
+                        gpu_buffer.id,
+                        *offset,
+                        *size,
+                        binding.name,
+                        binding.struct_name.as_ref(),
+                    );
+                }
+                BindingResource::Texture(_) => {
+                    panic!(
+                        "object BindGroup texture binding '{}' requires physical view/sampler fingerprint support",
+                        binding.name
+                    );
+                }
+                BindingResource::_Phantom(_) => {
+                    unreachable!("_Phantom should never be used for an object BindGroup")
+                }
+            }
+        }
+
+        key
     }
 
     // ========================================================================
@@ -638,14 +683,52 @@ fn global_resource_ids(
     ids
 }
 
+/// Enforce the current Group 2 contract before resource preparation.
+///
+/// Texture bindings expand to a view plus sampler and therefore require both
+/// physical identities in the cache fingerprint. Object bindings do not yet
+/// implement that path, so accepting one without extending the fingerprint
+/// would make cache reuse unsound.
+fn assert_object_bindings_are_buffer_only(bindings: &[Binding<'_>]) {
+    for binding in bindings {
+        match binding.resource {
+            BindingResource::Buffer { .. } => {}
+            BindingResource::Texture(_) => panic!(
+                "object BindGroup texture binding '{}' requires physical view/sampler fingerprint support",
+                binding.name
+            ),
+            BindingResource::_Phantom(_) => {
+                unreachable!("_Phantom should never be used for an object BindGroup")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::global_resource_ids;
+    use super::{assert_object_bindings_are_buffer_only, global_resource_ids};
+    use myth_resources::ResourceBuilder;
+    use myth_resources::texture::TextureSource;
 
     #[test]
     fn global_fingerprint_contains_only_bound_resource_identities() {
         let ids = global_resource_ids(11, 22, 33, 44);
 
         assert_eq!(ids.as_slice(), &[11, 22, 33, 44]);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires physical view/sampler fingerprint support")]
+    fn object_binding_contract_rejects_unfingerprinted_textures() {
+        let mut builder = ResourceBuilder::new();
+        builder.add_texture(
+            "unsupported",
+            None::<TextureSource>,
+            wgpu::TextureSampleType::Float { filterable: true },
+            wgpu::TextureViewDimension::D2,
+            wgpu::ShaderStages::VERTEX,
+        );
+
+        assert_object_bindings_are_buffer_only(&builder.bindings);
     }
 }

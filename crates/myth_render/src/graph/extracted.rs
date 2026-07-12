@@ -1,7 +1,8 @@
 //! Render Extract Phase
 //!
-//! Before rendering begins, extract minimal data needed for the current frame from the Scene.
-//! After extraction is complete, the Scene can be released and subsequent render preparation doesn't depend on Scene's borrow.
+//! Before rendering begins, extract the minimal CPU data needed for the current
+//! frame. Physical draw preparation is a later explicit step while Composer
+//! still owns the Scene borrow.
 //!
 //! # Design Principles
 //! - Only copy "minimal data" needed for rendering, don't copy actual Mesh/Material resources
@@ -16,12 +17,16 @@ use glam::{Mat4, Vec3};
 
 use bitflags::{Flags, bitflags};
 
+use crate::core::view::{RenderView, ViewTarget};
 use crate::core::{BindGroupContext, ResourceManager};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::BoundingBox;
 use myth_resources::buffer::CpuBuffer;
+use myth_resources::material::AlphaMode;
 use myth_resources::shader_defines::ShaderDefines;
-use myth_resources::uniforms::{EnvironmentUniforms, GpuLightStorage, LightBufferMetadata};
+use myth_resources::uniforms::{
+    DynamicModelUniforms, EnvironmentUniforms, GpuLightStorage, LightBufferMetadata, Mat3Uniform,
+};
 use myth_scene::background::BackgroundMode;
 use myth_scene::camera::RenderCamera;
 use myth_scene::environment::Environment;
@@ -31,9 +36,9 @@ use myth_scene::{NodeHandle, Scene, SkeletonKey};
 const SPOT_TIGHT_SPHERE_COS_THRESHOLD: f32 = std::f32::consts::FRAC_1_SQRT_2; // ~ 0.70710678, corresponds to a 90-degree outer cone angle
 const LIGHT_SCORE_DISTANCE_FLOOR: f32 = 1.0;
 
-/// Minimal render item, containing only data needed by GPU
+/// Minimal CPU-only render item.
 ///
-/// Uses Clone instead of Copy because `SkinBinding` contains non-Copy types.
+/// Uses Clone instead of Copy because `ShaderDefines` owns its entries.
 /// Contains all per-object attributes needed for view-independent filtering and culling.
 #[derive(Clone)]
 pub struct ExtractedRenderItem {
@@ -45,11 +50,13 @@ pub struct ExtractedRenderItem {
     /// Previous frame's world transform matrix (64 bytes)
     pub prev_world_matrix: Mat4,
 
-    pub object_bind_group: BindGroupContext,
     /// Geometry handle (8 bytes)
     pub geometry: GeometryHandle,
     /// Material handle (8 bytes)
     pub material: MaterialHandle,
+
+    /// Exact skeleton selected while the Scene is still borrowed.
+    pub(crate) skeleton: Option<SkeletonKey>,
 
     pub item_variant_flags: u32,
 
@@ -60,6 +67,18 @@ pub struct ExtractedRenderItem {
 
     /// World-space axis-aligned bounding box.
     pub world_aabb: BoundingBox,
+}
+
+/// Physical per-item state prepared after CPU extraction.
+///
+/// This store stays parallel to [`ExtractedScene::render_items`]. Keeping the
+/// WGPU bind group out of [`ExtractedRenderItem`] preserves a CPU-only scene
+/// snapshot while allowing every view of one source item to share one model
+/// uniform slot.
+#[derive(Clone)]
+pub(crate) struct PreparedRenderItem {
+    pub(crate) object_bind_group: BindGroupContext,
+    pub(crate) dynamic_offset: u32,
 }
 
 #[derive(Clone)]
@@ -116,8 +135,9 @@ bitflags! {
 
 /// Extracted scene data
 ///
-/// This is a lightweight structure containing only the minimal dataset needed for current frame rendering.
-/// Populated during Extract phase, after which the Scene borrow can be safely released.
+/// This is a lightweight structure containing only the minimal dataset needed
+/// for current frame rendering. Physical draw state is kept in a separate,
+/// parallel store and populated only when Composer proceeds with rendering.
 ///
 /// # "Single Source of Truth" Design
 ///
@@ -129,6 +149,9 @@ pub struct ExtractedScene {
     /// All active render items (NOT frustum-culled).
     /// Each `RenderView` in the Cull phase filters and culls from this list.
     pub render_items: Vec<ExtractedRenderItem>,
+    /// Physical state indexed exactly like `render_items`.
+    prepared_render_items: Vec<Option<PreparedRenderItem>>,
+    draw_resources_prepared: bool,
     /// Scene's shader macro definitions
     pub scene_id: u32,
     pub scene_variants: SceneFeatures,
@@ -149,7 +172,6 @@ pub struct ExtractedScene {
     pub environment_uniforms_buffer: CpuBuffer<EnvironmentUniforms>,
 
     collected_meshes: Vec<CollectedMesh>,
-    collected_skeleton_keys: HashSet<SkeletonKey>,
     local_light_upload_cache: Vec<GpuLightStorage>,
     directional_light_upload_cache: Vec<GpuLightStorage>,
 }
@@ -172,6 +194,8 @@ impl ExtractedScene {
     pub fn new() -> Self {
         Self {
             render_items: Vec::new(),
+            prepared_render_items: Vec::new(),
+            draw_resources_prepared: false,
             scene_id: 0,
             scene_variants: SceneFeatures::empty(),
             scene_defines: ShaderDefines::new(),
@@ -202,7 +226,6 @@ impl ExtractedScene {
             ),
 
             collected_meshes: Vec::new(),
-            collected_skeleton_keys: HashSet::default(),
             local_light_upload_cache: Vec::with_capacity(16),
             directional_light_upload_cache: Vec::with_capacity(4),
         }
@@ -213,6 +236,8 @@ impl ExtractedScene {
     pub fn with_capacity(item_capacity: usize) -> Self {
         Self {
             render_items: Vec::with_capacity(item_capacity),
+            prepared_render_items: Vec::with_capacity(item_capacity),
+            draw_resources_prepared: false,
             scene_id: 0,
             scene_variants: SceneFeatures::empty(),
             scene_defines: ShaderDefines::new(),
@@ -243,7 +268,6 @@ impl ExtractedScene {
             ),
 
             collected_meshes: Vec::with_capacity(item_capacity),
-            collected_skeleton_keys: HashSet::default(),
             local_light_upload_cache: Vec::with_capacity(16),
             directional_light_upload_cache: Vec::with_capacity(4),
         }
@@ -252,13 +276,14 @@ impl ExtractedScene {
     /// Clear data for reuse
     pub fn clear(&mut self) {
         self.render_items.clear();
+        self.prepared_render_items.clear();
+        self.draw_resources_prepared = false;
         self.scene_defines.clear();
         self.scene_id = 0;
         self.lights.clear();
         self.local_light_count = 0;
 
         self.collected_meshes.clear();
-        self.collected_skeleton_keys.clear();
     }
 
     #[must_use]
@@ -291,12 +316,11 @@ impl ExtractedScene {
         scene: &mut Scene,
         camera: &RenderCamera,
         assets: &AssetServer,
-        resource_manager: &mut ResourceManager,
         max_light_count: usize,
     ) {
         self.clear();
         self.extract_lights(scene, camera, max_light_count);
-        self.extract_render_items(scene, camera, assets, resource_manager);
+        self.extract_render_items(scene, camera, assets);
         self.extract_environment(scene);
 
         self.scene_variants.clear();
@@ -484,7 +508,7 @@ impl ExtractedScene {
     ///
     /// Only performs lightweight validity checks:
     /// - `mesh.visible` and `node.visible` flags
-    /// - Geometry asset exists
+    /// - Geometry and material assets exist
     ///
     /// World-space bounding spheres are pre-computed here so the Cull phase
     /// can test each item against multiple `RenderView` frustums without
@@ -492,16 +516,16 @@ impl ExtractedScene {
     #[allow(clippy::too_many_lines)]
     fn extract_render_items(
         &mut self,
-        scene: &mut Scene,
+        scene: &Scene,
         _camera: &RenderCamera,
         assets: &AssetServer,
-        resource_manager: &mut ResourceManager,
     ) {
         // =========================================================
         // Phase 1: Collect active meshes (holding read lock)
         // =========================================================
         {
             let geo_guard = assets.geometries.read_lock();
+            let mat_guard = assets.materials.read_lock();
 
             for (node_handle, mesh) in &scene.meshes {
                 if !mesh.visible {
@@ -519,13 +543,18 @@ impl ExtractedScene {
                 let Some(geometry) = geo_guard.get_loaded(mesh.geometry) else {
                     continue;
                 };
+                let Some(material) = mat_guard.get_loaded(mesh.material) else {
+                    continue;
+                };
 
                 // 2. prepare basic data
                 let node_world = node.transform.world_matrix;
                 let world_matrix = Mat4::from(node_world);
                 let prev_world_matrix = Mat4::from(node.transform.previous_world_matrix);
                 let skin_binding = scene.skins.get(node_handle);
-                let skeleton_key = skin_binding.map(|s| s.skeleton);
+                let skeleton_key = skin_binding
+                    .map(|binding| binding.skeleton)
+                    .filter(|key| scene.skeleton_pool.get(*key).is_some());
 
                 // 3. calculate Flags (pure math calculation)
                 let has_negative_scale = world_matrix.determinant() < 0.0;
@@ -553,46 +582,23 @@ impl ExtractedScene {
                     prev_world_matrix,
                     world_aabb,
                     item_variant_flags,
-                    cast_shadows: mesh.cast_shadows,
+                    cast_shadows: mesh.cast_shadows && material.alpha_mode() != AlphaMode::Blend,
                     receive_shadows: mesh.receive_shadows,
                 });
-
-                if let Some(key) = skeleton_key {
-                    self.collected_skeleton_keys.insert(key);
-                }
             }
         } // release geometry read lock here
 
         // =========================================================
-        // Phase 2: Prepare resources & build render items (no lock)
+        // Phase 2: Build CPU-only render items (no asset lock)
         // =========================================================
-
-        // Prepare skeleton data
-        for skeleton_key in &self.collected_skeleton_keys {
-            if let Some(skeleton) = scene.skeleton_pool.get(*skeleton_key) {
-                resource_manager.prepare_skeleton(skeleton);
-            }
-        }
-
-        // Ensure model buffer capacity
-        // resource_manager.ensure_model_buffer_capacity(self.collected_meshes.len());
-
         for item in &self.collected_meshes {
-            let Some(mesh) = scene.meshes.get_mut(item.node_handle) else {
-                continue;
-            };
-            let skeleton = item.skeleton.and_then(|k| scene.skeleton_pool.get(k));
-
-            mesh.update_morph_uniforms();
-
-            let Some(object_bind_group) = resource_manager.prepare_mesh(assets, mesh, skeleton)
-            else {
+            let Some(mesh) = scene.meshes.get(item.node_handle) else {
                 continue;
             };
 
             let mut item_shader_defines = ShaderDefines::with_capacity(1);
 
-            if skeleton.is_some() {
+            if item.skeleton.is_some() {
                 item_shader_defines.set("HAS_SKINNING", "1");
             }
             if mesh.receive_shadows {
@@ -603,9 +609,9 @@ impl ExtractedScene {
                 node_handle: item.node_handle,
                 world_matrix: item.world_matrix,
                 prev_world_matrix: item.prev_world_matrix,
-                object_bind_group,
                 geometry: mesh.geometry,
                 material: mesh.material,
+                skeleton: item.skeleton,
                 item_variant_flags: item.item_variant_flags,
                 item_shader_defines,
                 cast_shadows: item.cast_shadows,
@@ -613,6 +619,140 @@ impl ExtractedScene {
                 world_aabb: item.world_aabb,
             });
         }
+    }
+
+    /// Prepare the physical resources consumed by central draw-list building.
+    ///
+    /// Model slots are allocated once per source item that reaches at least
+    /// one main or shadow view, then flushed before any object bind group is
+    /// selected. If the model buffer grows,
+    /// `flush_model_buffers` therefore invalidates the old object cache before
+    /// this frame obtains its bind groups, never after commands have captured
+    /// them. Main, prepass, and every shadow view share the resulting offset.
+    pub(crate) fn prepare_draw_resources(
+        &mut self,
+        scene: &mut Scene,
+        assets: &AssetServer,
+        resource_manager: &mut ResourceManager,
+        active_views: &[RenderView],
+    ) {
+        assert!(
+            !self.draw_resources_prepared,
+            "draw resources may be prepared only once per extracted frame"
+        );
+        self.draw_resources_prepared = true;
+
+        assert_eq!(
+            active_views
+                .iter()
+                .filter(|view| matches!(view.target, ViewTarget::MainCamera))
+                .count(),
+            1,
+            "central draw preparation requires exactly one main-camera view"
+        );
+
+        let mut dynamic_offsets = Vec::with_capacity(self.render_items.len());
+        let mut required_skeletons = HashSet::<SkeletonKey>::default();
+        for item in &self.render_items {
+            if !Self::item_reaches_any_draw_view(item, active_views) {
+                dynamic_offsets.push(None);
+                continue;
+            }
+
+            let world_matrix_inverse = item.world_matrix.inverse();
+            let normal_matrix = Mat3Uniform::from_mat4(world_matrix_inverse.transpose());
+            dynamic_offsets.push(Some(resource_manager.allocate_model_uniform(
+                DynamicModelUniforms {
+                    world_matrix: item.world_matrix,
+                    world_matrix_inverse,
+                    normal_matrix,
+                    previous_world_matrix: item.prev_world_matrix,
+                    ..Default::default()
+                },
+            )));
+            if let Some(skeleton) = item.skeleton {
+                required_skeletons.insert(skeleton);
+            }
+        }
+
+        // This is the only model-buffer flush for central scene draws. It must
+        // precede object bind-group lookup because a capacity growth replaces
+        // the physical WGPU buffer and clears the persistent object cache.
+        resource_manager.flush_model_buffers();
+
+        for skeleton_key in &required_skeletons {
+            if let Some(skeleton) = scene.skeleton_pool.get(*skeleton_key) {
+                resource_manager.prepare_skeleton(skeleton);
+            }
+        }
+
+        self.prepared_render_items
+            .resize_with(self.render_items.len(), || None);
+
+        let skeleton_pool = &scene.skeleton_pool;
+        let meshes = &mut scene.meshes;
+        for (source_item_index, item) in self.render_items.iter().enumerate() {
+            let Some(dynamic_offset) = dynamic_offsets[source_item_index] else {
+                continue;
+            };
+            let skeleton = item.skeleton.and_then(|key| skeleton_pool.get(key));
+            let Some(mesh) = meshes.get_mut(item.node_handle) else {
+                continue;
+            };
+
+            // Pack current/previous morph weights only after target acquire.
+            // Temporal history remains unchanged until successful submit.
+            mesh.prepare_morph_uniforms();
+            let Some(object_bind_group) = resource_manager.prepare_mesh(assets, mesh, skeleton)
+            else {
+                continue;
+            };
+
+            self.prepared_render_items[source_item_index] = Some(PreparedRenderItem {
+                object_bind_group,
+                dynamic_offset,
+            });
+        }
+    }
+
+    /// Advance CPU morph history for draw resources consumed by a submitted
+    /// frame. Abandoned composers and failed target acquisition never call
+    /// this commit boundary.
+    pub(crate) fn commit_prepared_draw_history(&self, scene: &mut Scene) {
+        for (source_item_index, prepared) in self.prepared_render_items.iter().enumerate() {
+            if prepared.is_none() {
+                continue;
+            }
+            let Some(item) = self.render_items.get(source_item_index) else {
+                continue;
+            };
+            if let Some(mesh) = scene.meshes.get_mut(item.node_handle) {
+                mesh.commit_morph_history();
+            }
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn prepared_render_item(
+        &self,
+        source_item_index: usize,
+    ) -> Option<&PreparedRenderItem> {
+        self.prepared_render_items
+            .get(source_item_index)
+            .and_then(Option::as_ref)
+    }
+
+    #[inline]
+    fn item_reaches_any_draw_view(item: &ExtractedRenderItem, active_views: &[RenderView]) -> bool {
+        active_views.iter().any(|view| {
+            let participates = match view.target {
+                ViewTarget::MainCamera => true,
+                ViewTarget::ShadowLight { .. } => item.cast_shadows,
+            };
+            participates
+                && (!item.world_aabb.is_finite() || view.frustum.intersects_aabb(&item.world_aabb))
+        })
     }
 
     /// Extract environment data

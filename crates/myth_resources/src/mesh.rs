@@ -103,8 +103,11 @@ impl Mesh {
 
     /// set influence for a single morph target
     pub fn set_morph_target_influence(&mut self, index: usize, weight: f32) {
-        if index < self.morph_target_influences.len() {
+        if index < self.morph_target_influences.len()
+            && self.morph_target_influences[index].to_bits() != weight.to_bits()
+        {
             self.morph_target_influences[index] = weight;
+            self.morph_update_frames = 2;
         }
     }
 
@@ -121,9 +124,12 @@ impl Mesh {
         }
     }
 
-    /// update Morph Uniforms (sort, cull, and fill GPU buffer)
-    /// should be called before each frame rendering
-    pub fn update_morph_uniforms(&mut self) {
+    /// Packs current and previous morph weights into the GPU-facing uniform.
+    ///
+    /// This does not advance temporal history. A renderer may prepare an
+    /// attempt that is later abandoned; call [`Self::commit_morph_history`]
+    /// only after the commands using this uniform have been submitted.
+    pub fn prepare_morph_uniforms(&mut self) {
         if self.morph_target_influences.is_empty() || self.morph_update_frames == 0 {
             return;
         }
@@ -174,10 +180,26 @@ impl Mesh {
                 uniforms.prev_weights[vec_idx][component] = prev_weight;
             }
             // self.morph_dirty = false;
-
-            self.morph_update_frames -= 1;
         }
+    }
 
+    /// Commits one successfully submitted morph-history step.
+    pub fn commit_morph_history(&mut self) {
+        if self.morph_target_influences.is_empty() || self.morph_update_frames == 0 {
+            return;
+        }
+        self.morph_update_frames -= 1;
         self.latch_previous_morph_weights();
+    }
+
+    /// Packs and immediately commits morph history.
+    ///
+    /// This compatibility helper is appropriate only when the caller knows
+    /// the prepared data will be consumed. Render backends should use the
+    /// split prepare/commit methods so an abandoned frame does not advance
+    /// temporal state.
+    pub fn update_morph_uniforms(&mut self) {
+        self.prepare_morph_uniforms();
+        self.commit_morph_history();
     }
 }

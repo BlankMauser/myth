@@ -1,8 +1,12 @@
 //! Persistent bind-group, layout, and shader-interface caches.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use myth_core::utils::interner::{self, Symbol};
+use myth_resources::WgslStructName;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::pipeline::vertex::VertexLayoutSignature;
 
@@ -51,8 +55,69 @@ pub struct GpuGlobalState {
     pub last_used_frame: u64,
 }
 
-// Object BindGroup cache key (using the hash value of ResourceIdSet)
-pub(crate) type ObjectBindGroupKey = u64;
+/// Exact physical recipe for one object BindGroup.
+///
+/// The layout ID comes from the layout cache's exact entry-vector lookup, and
+/// each buffer dependency retains binding order, physical identity, offset,
+/// size, binding name, and WGSL struct identity. Hash collisions therefore
+/// fall through to structural equality instead of aliasing either a different
+/// WGPU binding or different generated shader interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ObjectWgslStructKey {
+    Generator(usize),
+    Name(Symbol),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ObjectBufferBindingKey {
+    physical_id: u64,
+    offset: u64,
+    size: Option<NonZeroU64>,
+    name: Symbol,
+    struct_name: Option<ObjectWgslStructKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ObjectBindGroupKey {
+    // Model + morph uniforms are the common two-binding case and therefore
+    // remain allocation-free on object-cache hits.
+    buffers: SmallVec<[ObjectBufferBindingKey; 2]>,
+    layout_id: u64,
+}
+
+impl ObjectBindGroupKey {
+    pub(crate) fn with_capacity(binding_count: usize, layout_id: u64) -> Self {
+        Self {
+            buffers: SmallVec::with_capacity(binding_count),
+            layout_id,
+        }
+    }
+
+    pub(crate) fn push_buffer(
+        &mut self,
+        physical_id: u64,
+        offset: u64,
+        size: Option<u64>,
+        name: &str,
+        struct_name: Option<&WgslStructName>,
+    ) {
+        let struct_name = struct_name.map(|struct_name| match struct_name {
+            WgslStructName::Generator(generator) => {
+                ObjectWgslStructKey::Generator(*generator as usize)
+            }
+            WgslStructName::Name(name) => ObjectWgslStructKey::Name(interner::intern(name)),
+        });
+        self.buffers.push(ObjectBufferBindingKey {
+            physical_id,
+            offset,
+            size: size.map(|size| {
+                NonZeroU64::new(size).expect("object buffer binding size must be non-zero")
+            }),
+            name: interner::intern(name),
+            struct_name,
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct BindGroupContext {
@@ -61,6 +126,11 @@ pub struct BindGroupContext {
     pub bind_group: wgpu::BindGroup,
     pub bind_group_id: u64,
     pub binding_wgsl: Arc<str>,
+}
+
+struct CachedObjectBindGroup {
+    context: BindGroupContext,
+    last_used_frame: u64,
 }
 
 /// Narrow, immutable post-compile capability for resolving global binding
@@ -88,7 +158,7 @@ pub(crate) struct BindGroupStore {
     global_states: FxHashMap<GlobalStateKey, GpuGlobalState>,
     layout_cache: FxHashMap<Vec<wgpu::BindGroupLayoutEntry>, (wgpu::BindGroupLayout, u64)>,
     vertex_layout_cache: FxHashMap<VertexLayoutSignature, u64>,
-    object_bind_group_cache: FxHashMap<ObjectBindGroupKey, BindGroupContext>,
+    object_bind_group_cache: FxHashMap<ObjectBindGroupKey, CachedObjectBindGroup>,
     bind_group_id_lookup: FxHashMap<u64, BindGroupContext>,
 }
 
@@ -96,6 +166,17 @@ impl BindGroupStore {
     pub(super) fn prune(&mut self, cutoff: u64) {
         self.global_states
             .retain(|_, v| v.last_used_frame >= cutoff);
+        let mut stale_object_ids = Vec::new();
+        self.object_bind_group_cache.retain(|_, entry| {
+            let retain = entry.last_used_frame >= cutoff;
+            if !retain {
+                stale_object_ids.push(entry.context.bind_group_id);
+            }
+            retain
+        });
+        for bind_group_id in stale_object_ids {
+            self.bind_group_id_lookup.remove(&bind_group_id);
+        }
     }
 
     pub(super) fn remove_scene_global_states(&mut self, scene_id: u32) -> usize {
@@ -114,10 +195,13 @@ impl BindGroupStore {
     #[inline]
     #[must_use]
     pub(super) fn cached_object_bind_group(
-        &self,
-        key: ObjectBindGroupKey,
-    ) -> Option<&BindGroupContext> {
-        self.object_bind_group_cache.get(&key)
+        &mut self,
+        key: &ObjectBindGroupKey,
+        frame_index: u64,
+    ) -> Option<BindGroupContext> {
+        let entry = self.object_bind_group_cache.get_mut(key)?;
+        entry.last_used_frame = frame_index;
+        Some(entry.context.clone())
     }
 
     #[inline]
@@ -126,8 +210,15 @@ impl BindGroupStore {
         key: ObjectBindGroupKey,
         bind_group_id: u64,
         context: BindGroupContext,
+        frame_index: u64,
     ) {
-        self.object_bind_group_cache.insert(key, context.clone());
+        self.object_bind_group_cache.insert(
+            key,
+            CachedObjectBindGroup {
+                context: context.clone(),
+                last_used_frame: frame_index,
+            },
+        );
         self.bind_group_id_lookup.insert(bind_group_id, context);
     }
 
@@ -155,6 +246,12 @@ impl BindGroupStore {
         self.layout_cache
             .insert(entries.to_vec(), (layout.clone(), id));
         (layout, id)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(super) fn cached_layout_id(&self, entries: &[wgpu::BindGroupLayoutEntry]) -> Option<u64> {
+        self.layout_cache.get(entries).map(|(_, id)| *id)
     }
 
     pub(super) fn get_or_create_vertex_layout_id(
@@ -196,7 +293,21 @@ impl BindGroupStore {
 
 #[cfg(test)]
 mod tests {
-    use super::GlobalStateKey;
+    use super::{GlobalStateKey, ObjectBindGroupKey};
+    use myth_resources::WgslStructName;
+
+    fn object_key(bindings: &[(u64, u64, Option<u64>)], layout_id: u64) -> ObjectBindGroupKey {
+        let mut key = ObjectBindGroupKey::with_capacity(bindings.len(), layout_id);
+        for (index, &(physical_id, offset, size)) in bindings.iter().enumerate() {
+            let name = match index {
+                0 => "model",
+                1 => "morph_targets",
+                _ => "extra",
+            };
+            key.push_buffer(physical_id, offset, size, name, None);
+        }
+        key
+    }
 
     #[test]
     fn global_state_key_round_trips_both_ids() {
@@ -206,4 +317,57 @@ mod tests {
         assert_eq!(key.scene_id(), 0x0123_4567);
     }
 
+    #[test]
+    fn object_bind_group_key_tracks_layout_and_binding_order() {
+        let baseline = object_key(&[(11, 0, None), (22, 0, Some(64)), (33, 16, None)], 101);
+
+        assert_eq!(
+            baseline,
+            object_key(&[(11, 0, None), (22, 0, Some(64)), (33, 16, None)], 101)
+        );
+        assert_ne!(
+            baseline,
+            object_key(&[(11, 0, None), (22, 0, Some(64)), (33, 16, None)], 202),
+            "a different object layout must not reuse the cached BindGroup"
+        );
+        assert_ne!(
+            baseline,
+            object_key(&[(22, 0, Some(64)), (11, 0, None), (33, 16, None)], 101),
+            "physical resource IDs are positional BindGroup dependencies"
+        );
+        assert_ne!(
+            baseline,
+            object_key(&[(11, 0, None), (22, 0, Some(64)), (44, 16, None)], 101),
+            "recreating one bound buffer must invalidate the object BindGroup"
+        );
+        assert_ne!(
+            baseline,
+            object_key(&[(11, 0, None), (22, 32, Some(64)), (33, 16, None)], 101),
+            "binding offsets are part of the physical recipe"
+        );
+        assert_ne!(
+            baseline,
+            object_key(&[(11, 0, None), (22, 0, Some(128)), (33, 16, None)], 101),
+            "binding sizes are part of the physical recipe"
+        );
+
+        let mut different_interface = ObjectBindGroupKey::with_capacity(3, baseline.layout_id);
+        different_interface.push_buffer(11, 0, None, "model", None);
+        different_interface.push_buffer(22, 0, Some(64), "morph_targets", None);
+        different_interface.push_buffer(33, 16, None, "different_semantic", None);
+        assert_ne!(
+            baseline, different_interface,
+            "WGSL binding names are part of the cached context contract"
+        );
+
+        let mut different_struct = ObjectBindGroupKey::with_capacity(3, baseline.layout_id);
+        different_struct.push_buffer(11, 0, None, "model", None);
+        different_struct.push_buffer(22, 0, Some(64), "morph_targets", None);
+        let named_struct = WgslStructName::Name("DifferentStruct".to_owned());
+        different_struct.push_buffer(33, 16, None, "extra", Some(&named_struct));
+        assert_ne!(
+            baseline, different_struct,
+            "WGSL struct identity is part of the cached context contract"
+        );
+    }
 }

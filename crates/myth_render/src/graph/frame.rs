@@ -72,6 +72,8 @@ pub struct RenderCommand {
 }
 
 pub struct ShadowRenderCommand {
+    /// Exact originating item in `ExtractedScene::render_items`.
+    pub source_item_index: u32,
     pub object_bind_group: BindGroupContext,
     pub geometry_handle: GeometryHandle,
     pub material_handle: MaterialHandle,
@@ -875,13 +877,8 @@ impl RenderFrame {
         resource_manager.next_frame();
 
         // ── 1. Extract ─────────────────────────────────────────────────
-        self.extracted_scene.extract_into(
-            scene,
-            camera,
-            assets,
-            resource_manager,
-            max_extracted_lights,
-        );
+        self.extracted_scene
+            .extract_into(scene, camera, assets, max_extracted_lights);
 
         // ── 2. Resolve frame-dependent shader variants ────────────────
         self.resolve_scene_feature_variants(scene, feature_config);

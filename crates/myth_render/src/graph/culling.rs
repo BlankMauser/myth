@@ -2,8 +2,8 @@
 //!
 //! Standalone functions that perform unified view-based culling, render command
 //! generation, and sorting. Extracted from the old `SceneCullPass` as part of
-//! the RDG migration — culling is a CPU-only operation that belongs in the
-//! **extract & prepare** phase rather than in a graph node.
+//! the RDG migration. Composer runs this derivation only after successfully
+//! acquiring a render target; it is not part of `Renderer::begin_frame`.
 //!
 //! # Architecture
 //!
@@ -15,11 +15,14 @@
 //!     ├── update_shadow_metadata()    ← light storage buffer update
 //!     └── prepare_global()            ← global bind group creation
 //!
-//! culling::cull_and_sort()            ← THIS MODULE
+//! FrameComposer::render()
+//!     │
+//!     ├── acquire target
+//!     ├── prepare reachable draw resources
+//!     └── culling::cull_and_sort()    ← THIS MODULE
 //!     │
 //!     ├── prepare_main_camera_commands()  → opaque + transparent lists
-//!     ├── prepare_shadow_commands()       → per-view shadow command queues
-//!     └── upload_dynamic_uniforms()       → GPU model matrix upload
+//!     └── prepare_shadow_commands()       → per-view shadow command queues
 //! ```
 
 use glam::Vec3A;
@@ -44,7 +47,6 @@ use myth_assets::AssetServer;
 use myth_resources::AntiAliasingMode;
 use myth_resources::RenderableMaterialTrait;
 use myth_resources::material::{AlphaMode, Side};
-use myth_resources::uniforms::{DynamicModelUniforms, Mat3Uniform};
 use myth_scene::camera::RenderCamera;
 
 /// Shadow-only WGSL binding declaration, injected into shadow depth shaders.
@@ -58,8 +60,9 @@ struct Struct_shadow_light {
 
 /// Top-level entry point: performs culling, command generation, and sorting.
 ///
-/// Call after `extract_and_prepare` has populated the `ExtractedScene`, built
-/// shadow views in `RenderLists::active_views`, and called `prepare_global`.
+/// Call after `extract_and_prepare` has populated the CPU scene snapshot and
+/// active views, and after `prepare_draw_resources` has frozen the shared
+/// model buffer and materialized each reachable source item.
 ///
 /// # Phases
 ///
@@ -68,8 +71,9 @@ struct Struct_shadow_light {
 ///    command lists.
 /// 2. **Shadow commands** — per-shadow-view frustum cull + shadow pipeline
 ///    lookup → per-view `ShadowRenderCommand` queues.
-/// 3. **Dynamic uniform upload** — compute inverse/normal matrices, allocate
-///    model-uniform slots, flush the model buffer to GPU.
+///
+/// Model uniforms and object bind groups have already been prepared once per
+/// source item by `ExtractedScene`; every generated view command reuses them.
 #[allow(clippy::too_many_arguments)]
 pub fn cull_and_sort(
     extracted_scene: &ExtractedScene,
@@ -103,9 +107,6 @@ pub fn cull_and_sort(
         render_lists,
         assets,
     );
-
-    // resource_manager.upload_model_buffer();
-    resource_manager.flush_model_buffers();
 }
 
 // ============================================================================
@@ -176,6 +177,10 @@ fn prepare_main_camera_commands(
                 continue;
             }
 
+            let Some(prepared_item) = extracted_scene.prepared_render_item(item_idx) else {
+                continue;
+            };
+
             let Some(gpu_world) = resource_manager.get_global_state(render_state_id, scene_id)
             else {
                 error!("CRITICAL: GpuWorld missing during iteration");
@@ -191,7 +196,7 @@ fn prepare_main_camera_commands(
                 continue;
             };
 
-            let object_bind_group = &item.object_bind_group;
+            let object_bind_group = &prepared_item.object_bind_group;
 
             let Some(gpu_geometry) = resource_manager.get_geometry(item.geometry) else {
                 error!("CRITICAL: GpuGeometry missing for {:?}", item.geometry);
@@ -419,17 +424,6 @@ fn prepare_main_camera_commands(
             let distance_sq = camera_pos.distance_squared(item_pos);
             let sort_key = RenderKey::new(pipeline_id, mat_id, distance_sq, is_transparent);
 
-            let world_matrix_inverse = item.world_matrix.inverse();
-            let normal_matrix = Mat3Uniform::from_mat4(world_matrix_inverse.transpose());
-
-            let dynamic_offset = resource_manager.allocate_model_uniform(DynamicModelUniforms {
-                world_matrix: item.world_matrix,
-                world_matrix_inverse,
-                normal_matrix,
-                previous_world_matrix: item.prev_world_matrix,
-                ..Default::default()
-            });
-
             let cmd = RenderCommand {
                 source_item_index: checked_source_item_index(item_idx),
                 object_bind_group: object_bind_group.clone(),
@@ -437,7 +431,7 @@ fn prepare_main_camera_commands(
                 material_handle: item.material,
                 pipeline_id,
                 sort_key,
-                dynamic_offset,
+                dynamic_offset: prepared_item.dynamic_offset,
             };
 
             if is_transparent {
@@ -464,7 +458,7 @@ fn checked_source_item_index(item_idx: usize) -> u32 {
 /// Per-shadow-view frustum culling and shadow render command generation.
 ///
 /// Iterates shadow views already stored in `render_lists.active_views` (built
-/// by `extract_and_prepare`), culls `extracted_scene.render_items` per view,
+/// during frame extraction), culls `extracted_scene.render_items` per view,
 /// and produces per-view `ShadowRenderCommand` queues in `render_lists.shadow_queues`.
 #[allow(clippy::too_many_arguments)]
 fn prepare_shadow_commands(
@@ -523,7 +517,7 @@ fn prepare_shadow_commands(
             .entry((light_id, layer_index))
             .or_default();
 
-        for item in &extracted_scene.render_items {
+        for (item_idx, item) in extracted_scene.render_items.iter().enumerate() {
             if !item.cast_shadows {
                 continue;
             }
@@ -532,6 +526,10 @@ fn prepare_shadow_commands(
             if aabb.is_finite() && !view_frustum.intersects_aabb(&aabb) {
                 continue;
             }
+
+            let Some(prepared_item) = extracted_scene.prepared_render_item(item_idx) else {
+                continue;
+            };
 
             let Some(geometry) = geo_guard.get_loaded(item.geometry) else {
                 continue;
@@ -578,7 +576,7 @@ fn prepare_shadow_commands(
                     "{}\n{}\n{}",
                     SHADOW_BINDING_WGSL,
                     gpu_material.binding_wgsl,
-                    item.object_bind_group.binding_wgsl
+                    prepared_item.object_bind_group.binding_wgsl
                 );
 
                 options.inject_code(
@@ -605,7 +603,7 @@ fn prepare_shadow_commands(
                             bind_group_layouts: &[
                                 Some(&shadow_global_layout),
                                 Some(&gpu_material.layout),
-                                Some(&item.object_bind_group.layout),
+                                Some(&prepared_item.object_bind_group.layout),
                             ],
                             immediate_size: 0,
                         });
@@ -658,21 +656,13 @@ fn prepare_shadow_commands(
                 id
             };
 
-            let world_matrix_inverse = item.world_matrix.inverse();
-            let normal_matrix = Mat3Uniform::from_mat4(world_matrix_inverse.transpose());
-            let dynamic_offset = resource_manager.allocate_model_uniform(DynamicModelUniforms {
-                world_matrix: item.world_matrix,
-                world_matrix_inverse,
-                normal_matrix,
-                ..Default::default()
-            });
-
             queue.push(ShadowRenderCommand {
-                object_bind_group: item.object_bind_group.clone(),
+                source_item_index: checked_source_item_index(item_idx),
+                object_bind_group: prepared_item.object_bind_group.clone(),
                 geometry_handle: item.geometry,
                 material_handle: item.material,
                 pipeline_id,
-                dynamic_offset,
+                dynamic_offset: prepared_item.dynamic_offset,
             });
         }
     }
