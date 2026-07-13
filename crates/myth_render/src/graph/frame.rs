@@ -96,7 +96,7 @@ pub(crate) struct DrawBindGroupSlot(u32);
 /// The attempt token prevents an ID retained by a future pass-node API from
 /// aliasing a plan at the same vector index in a later graph attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DrawPlanId {
+pub(crate) struct DrawPlanId {
     attempt_token: u64,
     index: u32,
 }
@@ -141,7 +141,7 @@ pub(crate) struct DrawPlanMeta {
 /// frame-local physical-resource slots.
 ///
 /// Produced by [`bake::finalize_live_draw_plans`] after DPE, consumed by the
-/// unified [`submit_draw_commands`] helper during the execute phase.  Contains
+/// unified [`submit_scene_submission`] helper during the execute phase. Contains
 /// **zero** asset handles. Each unique WGPU buffer or bind group is cloned
 /// exactly once into the graph-attempt-owned [`DrawPlanStore`]; commands carry
 /// compact slots plus a stable [`RenderPipelineId`]. The execute phase never
@@ -156,8 +156,8 @@ pub(crate) struct DrawPlanMeta {
 /// can be trivially parallelised in the future.
 ///
 /// [`bake::finalize_live_draw_plans`]: super::bake::finalize_live_draw_plans
-/// [`submit_draw_commands`]: super::passes::draw::submit_draw_commands
-pub struct DrawCommand {
+/// [`submit_scene_submission`]: super::passes::draw::submit_scene_submission
+pub(crate) struct DrawCommand {
     /// Exact extracted source used only by the post-submit history commit.
     /// Execute remains blind to this logical identity.
     pub(crate) source_item_index: u32,
@@ -341,7 +341,7 @@ impl Default for PreparedDrawStore {
 /// All GPU handle lookups have been resolved to owned physical WGPU clones.
 /// [`GraphStorage`](super::core::GraphStorage) owns this store and clears it
 /// on both successful completion and abandoned graph attempts.
-pub struct DrawPlanStore {
+pub(crate) struct DrawPlanStore {
     commands: Vec<DrawCommand>,
     plans: Vec<DrawPlanRecord>,
     plan_lookup: FxHashMap<DrawPlanKey, DrawPlanId>,
@@ -434,7 +434,7 @@ impl DrawPlanStore {
             self.plans.iter().all(|plan| {
                 !plan.topology_demanded || draw_texture_dependency_key(plan.key) != key
             }),
-            "draw-plan texture dependencies must be registered before the first consumer"
+            "scene-submission texture dependencies must be registered before reservation"
         );
     }
 
@@ -480,11 +480,6 @@ impl DrawPlanStore {
     }
 
     /// Return the dense attempt-local slot addressed by a valid plan ID.
-    #[must_use]
-    pub(crate) fn reserved_index(&self, id: DrawPlanId) -> Option<usize> {
-        self.validate_reserved(id).then_some(id.index as usize)
-    }
-
     /// Reset compile-time demand marks before collecting the current DPE
     /// result. Reservations and already-owned resources are left intact.
     pub(crate) fn reset_live_demands(&mut self) {
@@ -591,6 +586,22 @@ impl DrawPlanStore {
             "draw commands must be appended inside plan finalization"
         );
         self.commands.push(command);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_test_command(&mut self, sort_key: u64) {
+        self.push_command(DrawCommand {
+            source_item_index: 0,
+            sort_key,
+            pipeline_id: RenderPipelineId(0),
+            vertex_buffers: SmallVec::new(),
+            index_buffer: None,
+            bind_group_1: None,
+            bind_group_2: (DrawBindGroupSlot(0), 0),
+            stencil_reference: None,
+            vertex_range: 0..3,
+            instance_range: 0..1,
+        });
     }
 
     pub(crate) fn sort_commands_from(&mut self, start: u32) {
@@ -737,7 +748,7 @@ fn draw_texture_dependency_key(key: DrawPlanKey) -> DrawPlanKey {
 
 /// Narrow immutable execute-time view over one graph attempt's draw plans.
 #[derive(Clone, Copy)]
-pub struct DrawPlanResolver<'a> {
+pub(crate) struct DrawPlanResolver<'a> {
     store: &'a DrawPlanStore,
 }
 
@@ -748,11 +759,6 @@ impl<'a> DrawPlanResolver<'a> {
         self.store
             .resolve_plan(id)
             .expect("draw plan ID does not belong to this graph attempt")
-    }
-
-    #[must_use]
-    pub(crate) fn is_empty(self, id: DrawPlanId) -> bool {
-        self.commands(id).is_empty()
     }
 
     #[must_use]

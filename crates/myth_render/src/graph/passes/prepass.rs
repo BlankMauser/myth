@@ -3,7 +3,7 @@
 //! - **`PrepassFeature`** (long-lived): owns its cross-frame pipeline L1.
 //! - **`PrepassSnapshot`**: carries only scene identity and output flags.
 //! - **`PrepassPassNode`** (ephemeral per-frame): derives missing pipelines
-//!   and finalizes its draw plan only after surviving DPE.
+//!   and finalizes its scene submission only after surviving DPE.
 //!
 //! # RDG Slots (explicit wiring)
 //!
@@ -16,11 +16,12 @@ use rustc_hash::FxHashMap;
 
 use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
+use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
 use crate::graph::core::{
     ExecuteContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
 };
-use crate::graph::frame::{DrawPlanId, DrawPlanKey, RenderKey};
-use crate::graph::passes::draw::submit_draw_commands;
+use crate::graph::frame::RenderKey;
+use crate::graph::passes::draw::submit_scene_submission;
 use crate::pipeline::{
     ColorTargetKey, DepthStencilKey, RenderPipelineId, ShaderCompilationOptions, ShaderSource,
     SimpleGeometryPipelineKey,
@@ -145,43 +146,45 @@ impl PrepassFeature {
         }
     }
 
-    /// Derive missing Prepass variants and bake the live plan directly from
+    /// Derive missing Prepass variants and bake the live submission from
     /// CPU intents plus graph-attempt source records.
     #[allow(clippy::too_many_lines)]
-    fn prepare_draw_plan(
+    fn prepare_submission(
         &mut self,
         ctx: &mut PrepareContext<'_>,
         snapshot: PrepassSnapshot,
-        plan: DrawPlanId,
+        submission: SceneSubmissionPlanId,
     ) {
-        if ctx.scene_draws.draw_plans.resolve_plan(plan).is_some() {
+        // Capture every immutable source before the writer exclusively borrows
+        // the CpuDirect owner store. The Feature never sees that backend or
+        // its command ranges through the writer facade.
+        let render_lists = ctx.scene_draws.render_lists;
+        let extracted_scene = ctx.scene_draws.extracted_scene;
+        let prepared_draws = ctx.scene_draws.prepared_draws;
+        let depth_format = ctx.scene_draws.depth_format;
+        let pipeline_settings_version = ctx.scene_draws.pipeline_settings_version;
+        let Some(mut writer) = ctx
+            .scene_draws
+            .begin_submission_writer(submission, render_lists.opaque.len())
+        else {
             return;
-        }
+        };
 
-        let start = ctx.scene_draws.draw_plans.begin_finalize(plan);
         let Some(gpu_world) = ctx.global_states.get(snapshot.global_state_key) else {
-            ctx.scene_draws.draw_plans.finish_finalize(plan, start);
+            writer.finish_sorted();
             return;
         };
         let global_layout_id = gpu_world.layout_id;
         let global_binding_wgsl_hash = gpu_world.binding_wgsl_hash;
-        let depth_format = ctx.scene_draws.depth_format;
-        let scene_defines_hash = ctx.scene_draws.extracted_scene.scene_defines.compute_hash();
-        let pipeline_settings_version = ctx.scene_draws.pipeline_settings_version;
+        let scene_defines_hash = extracted_scene.scene_defines.compute_hash();
         let shader_source = ShaderSource::File("entry/utility/depth_prepass");
         let shader_source_identity = ctx.shader_manager.source_identity_hash(shader_source);
 
-        for intent in &ctx.scene_draws.render_lists.opaque {
-            let Some(source) = ctx
-                .scene_draws
-                .prepared_draws
-                .source(intent.source_item_index)
-            else {
+        for intent in &render_lists.opaque {
+            let Some(source) = prepared_draws.source(intent.source_item_index) else {
                 continue;
             };
-            let Some(extracted_item) = ctx
-                .scene_draws
-                .extracted_scene
+            let Some(extracted_item) = extracted_scene
                 .render_items
                 .get(intent.source_item_index as usize)
             else {
@@ -254,7 +257,7 @@ impl PrepassFeature {
                     let mut options = ShaderCompilationOptions::from_merged(
                         &mat_defines,
                         geo_defines,
-                        &ctx.scene_draws.extracted_scene.scene_defines,
+                        &extracted_scene.scene_defines,
                         &extracted_item.item_shader_defines,
                     );
                     options.add_define("IS_PREPASS", "1");
@@ -371,8 +374,7 @@ impl PrepassFeature {
                 intent.distance_sq,
                 false,
             );
-            crate::graph::bake::push_prepared_source_command(
-                ctx.scene_draws.draw_plans,
+            writer.push_prepared_source(
                 intent.source_item_index,
                 source,
                 pipeline_id,
@@ -381,8 +383,7 @@ impl PrepassFeature {
             );
         }
 
-        ctx.scene_draws.draw_plans.sort_commands_from(start);
-        ctx.scene_draws.draw_plans.finish_finalize(plan, start);
+        writer.finish_sorted();
     }
 
     /// Build the ephemeral pass node, register resources, and insert it
@@ -449,11 +450,13 @@ impl PrepassFeature {
         } else {
             None
         };
-        let draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Prepass {
-            needs_normal: snapshot.needs_normal,
-            needs_feature_id: snapshot.needs_feature_id,
-            needs_velocity: snapshot.needs_velocity,
-        });
+        let scene_submission = ctx
+            .graph
+            .reserve_scene_submission(SceneSubmissionKey::Prepass {
+                needs_normal: snapshot.needs_normal,
+                needs_feature_id: snapshot.needs_feature_id,
+                needs_velocity: snapshot.needs_velocity,
+            });
 
         let node = PrepassPassNode {
             feature: self,
@@ -462,11 +465,11 @@ impl PrepassFeature {
             scene_normals: scene_normals.unwrap_or(TextureNodeId::from_index(0)),
             feature_id: feature_id.unwrap_or(TextureNodeId::from_index(0)),
             velocity_buffer: velocity_buffer.unwrap_or(TextureNodeId::from_index(0)),
-            draw_plan,
+            scene_submission,
         };
         ctx.graph.add_pass("Pre_Pass", |builder| {
             builder.demand_global_state(snapshot.global_state_key);
-            builder.demand_draw_plan(draw_plan);
+            builder.demand_scene_submission(scene_submission);
             builder.write_texture(scene_depth);
             if let Some(n) = scene_normals {
                 builder.write_texture(n);
@@ -496,7 +499,7 @@ impl PrepassFeature {
 /// Ephemeral per-frame prepass node.
 ///
 /// Carries a lightweight snapshot and RDG IDs. A live node lazily derives any
-/// missing pipeline variants and finalizes its own graph-attempt draw plan.
+/// missing pipeline variants and finalizes its graph-attempt scene submission.
 pub struct PrepassPassNode<'a> {
     feature: &'a mut PrepassFeature,
     snapshot: PrepassSnapshot,
@@ -507,13 +510,13 @@ pub struct PrepassPassNode<'a> {
     feature_id: TextureNodeId,
     velocity_buffer: TextureNodeId,
 
-    draw_plan: DrawPlanId,
+    scene_submission: SceneSubmissionPlanId,
 }
 
 impl<'a> PassNode<'a> for PrepassPassNode<'a> {
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {
         self.feature
-            .prepare_draw_plan(ctx, self.snapshot, self.draw_plan);
+            .prepare_submission(ctx, self.snapshot, self.scene_submission);
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
@@ -572,10 +575,10 @@ impl<'a> PassNode<'a> for PrepassPassNode<'a> {
 
         pass.set_bind_group(0, gpu_global_bind_group, &[]);
 
-        submit_draw_commands(
+        submit_scene_submission(
             &mut pass,
-            ctx.draw_plans,
-            self.draw_plan,
+            ctx.scene_submissions,
+            self.scene_submission,
             ctx.pipeline_cache,
         );
     }

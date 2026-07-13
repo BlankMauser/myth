@@ -28,9 +28,7 @@ pub use core::{
     RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
 };
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton};
-pub use frame::{
-    DrawCommand, DrawPlanId, RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,
-};
+pub use frame::{RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent};
 #[cfg(feature = "debug_view")]
 pub use render_state::DebugViewTarget;
 pub use render_state::RenderState;

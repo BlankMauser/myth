@@ -7,7 +7,7 @@ use crate::core::gpu::{
     BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
     MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
-use crate::graph::frame::{DrawPlanResolver, DrawPlanStore, PreparedDrawStore, RenderLists};
+use crate::graph::frame::{DrawPlanStore, PreparedDrawStore, RenderLists};
 use crate::graph::{ExtractedScene, RenderState};
 use crate::pipeline::ComputePipelineId;
 use crate::pipeline::RenderPipelineId;
@@ -21,6 +21,9 @@ use super::allocator::{SubViewKey, TransientPool};
 use super::gaussian::GaussianFrameResolver;
 use super::graph::MipmapEncodeCoordinator;
 use super::persistent::HistoryRegistry;
+use super::scene_submission::{
+    SceneSubmissionPlanId, SceneSubmissionResolver, SceneSubmissionStore, SceneSubmissionWriter,
+};
 use super::types::{
     BufferNodeId, GraphResourceType, RenderTargetOps, ResourceKind, ResourceNodeId, ResourceRecord,
     TextureNodeId,
@@ -72,7 +75,46 @@ pub(crate) struct SceneDrawPrepareContext<'a> {
     pub(crate) prepared_draws: &'a PreparedDrawStore,
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) pipeline_settings_version: u64,
-    pub(crate) draw_plans: &'a mut DrawPlanStore,
+    scene_submissions: &'a SceneSubmissionStore,
+    draw_plans: &'a mut DrawPlanStore,
+}
+
+impl<'a> SceneDrawPrepareContext<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        render_lists: &'a RenderLists,
+        extracted_scene: &'a ExtractedScene,
+        prepared_draws: &'a PreparedDrawStore,
+        depth_format: wgpu::TextureFormat,
+        pipeline_settings_version: u64,
+        scene_submissions: &'a SceneSubmissionStore,
+        draw_plans: &'a mut DrawPlanStore,
+    ) -> Self {
+        Self {
+            render_lists,
+            extracted_scene,
+            prepared_draws,
+            depth_format,
+            pipeline_settings_version,
+            scene_submissions,
+            draw_plans,
+        }
+    }
+
+    /// Open the backend-selected writer without exposing its physical store or
+    /// command-range identity to the Feature.
+    pub(crate) fn begin_submission_writer(
+        &mut self,
+        submission: SceneSubmissionPlanId,
+        expected_commands: usize,
+    ) -> Option<SceneSubmissionWriter<'_>> {
+        SceneSubmissionWriter::begin(
+            self.scene_submissions,
+            self.draw_plans,
+            submission,
+            expected_commands,
+        )
+    }
 }
 
 /// Context available during the RDG **prepare** phase.
@@ -106,7 +148,7 @@ pub struct PrepareContext<'a> {
     /// Narrow persistent upload/source-resolution capability. This does not
     /// expose the monolithic ResourceManager to pass preparation.
     pub uploads: BufferUploadContext<'a>,
-    /// Immutable culled scene inputs plus the graph-attempt draw-plan owner.
+    /// Immutable culled scene inputs plus the backend-neutral submission writer.
     /// Only live draw Features use this capability.
     pub(crate) scene_draws: SceneDrawPrepareContext<'a>,
     /// Shared mipmap encoder state. Live producers pre-warm their required
@@ -1270,7 +1312,7 @@ pub fn build_screen_bind_group(
 /// Immutable context available during the RDG **execute** phase.
 ///
 /// Provides read-only access to the compiled render graph, physical resource
-/// pool, pipeline cache, draw plans, and any external views injected before
+/// pool, pipeline cache, scene submissions, and any external views injected before
 /// execution.
 pub struct ExecuteContext<'a> {
     pub resources: &'a [ResourceRecord],
@@ -1292,13 +1334,13 @@ pub struct ExecuteContext<'a> {
     /// compatibility mipmap nodes.
     pub(crate) mipmap_encode_coordinator: &'a MipmapEncodeCoordinator,
 
-    /// Attempt-scoped pre-baked draw plans with all physical resources
-    /// interned in graph-owned stores.
+    /// Backend-neutral, attempt-scoped scene submissions.
     ///
     /// Scene-drawing passes (opaque, transparent, shadow, prepass,
-    /// simple-forward) consume these instead of performing per-command
-    /// handle lookups via `resource_manager`.
-    pub draw_plans: DrawPlanResolver<'a>,
+    /// simple-forward) resolve an opaque plan to a draw stream here. The
+    /// current direct backend borrows its original command slice without an
+    /// intermediate allocation or copy.
+    pub(crate) scene_submissions: SceneSubmissionResolver<'a>,
 
     /// Graph-attempt-owned scene-global bind group, present only when at least
     /// one DPE-live pass explicitly demanded the frame's GlobalState plan.

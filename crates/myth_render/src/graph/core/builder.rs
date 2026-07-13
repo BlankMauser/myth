@@ -1,6 +1,5 @@
 use crate::core::gpu::GlobalStateKey;
 use crate::core::gpu::Tracked;
-use crate::graph::frame::DrawPlanId;
 
 use super::graph::RenderGraph;
 use super::scene_submission::SceneSubmissionPlanId;
@@ -198,21 +197,6 @@ impl PassBuilder<'_, '_> {
 
     pub fn mark_side_effect(&mut self) {
         self.graph.storage.passes[self.pass_index].has_side_effect = true;
-    }
-
-    /// Declare that this pass consumes a frame-local draw plan.
-    ///
-    /// This hot-path call records only the raw POD ID. After the setup closure
-    /// returns, [`RenderGraph::add_pass`] deduplicates all plan IDs and unions
-    /// their logical texture dependencies in one linear finalization step.
-    /// Demand metadata never roots an otherwise dead pass.
-    pub(crate) fn demand_draw_plan(&mut self, id: DrawPlanId) {
-        assert!(
-            self.graph.storage.draw_plans.validate_reserved(id),
-            "pass '{}' demanded a draw plan from another graph attempt",
-            self.graph.storage.passes[self.pass_index].name
-        );
-        self.graph.storage.draw_plan_raw_demands.push(id);
     }
 
     /// Declare that this pass consumes one backend-neutral scene submission.

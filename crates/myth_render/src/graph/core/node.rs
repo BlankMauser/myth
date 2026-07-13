@@ -126,20 +126,11 @@ pub struct PassRecord {
     pub(crate) node: Option<NodeSlot>,
 
     /// Range into GraphStorage's capacity-retaining flat logical-read table.
-    /// Direct setup reads and deferred DrawPlan texture dependencies remain
+    /// Direct setup reads and deferred submission dependencies remain
     /// contiguous because pass setup is deliberately non-reentrant.
     pub(crate) logical_read_range: Range<usize>,
     pub writes: SmallVec<[ErasedResourceNodeId; 4]>,
     pub creates: SmallVec<[ErasedResourceNodeId; 4]>,
-    /// Frame-local draw plans consumed by this pass.
-    ///
-    /// The setup closure appends raw IDs to GraphStorage-owned staging.
-    /// `RenderGraph::add_pass` canonicalizes them once after setup into a
-    /// retained flat vector; this range addresses that first-demand-ordered
-    /// slice. Demand metadata never makes a pass live. After DPE, demands from
-    /// the compiled execution queue select plans for physical finalization.
-    pub(crate) draw_plan_demand_range: Range<usize>,
-
     /// Canonical backend-neutral scene-submission plans consumed by this
     /// pass, addressed through GraphStorage's retained flat demand table.
     /// Demand metadata never roots an otherwise dead pass.
@@ -185,7 +176,6 @@ impl PassRecord {
             logical_read_range: logical_read_start..logical_read_start,
             writes: SmallVec::new(),
             creates: SmallVec::new(),
-            draw_plan_demand_range: 0..0,
             scene_submission_demand_range: 0..0,
             global_state_demand: None,
             physical_dependency_range: 0..0,

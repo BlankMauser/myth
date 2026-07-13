@@ -62,6 +62,7 @@ use crate::graph::core::GraphStorage;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::GaussianFrameResolver;
 use crate::graph::core::graph::FrameConfig;
+use crate::graph::core::scene_submission::SceneSubmissionResolver;
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GlobalStateMaterializationFailure,
     GlobalStateSources, GraphBlackboard, HistoryRegistry, HookStage, PrepareContext,
@@ -1035,7 +1036,7 @@ impl<'a> FrameComposer<'a> {
 
             // Register every lazy material import before its draw consumers.
             // The import store coordinates repeated exact snapshots into one
-            // optional Mipmap SSA chain; each canonical DrawPlan receives only
+            // optional Mipmap SSA chain; each canonical submission receives only
             // the roots or aliases sampled by its own source list.
             for plan in &draw_texture_dependencies {
                 let mut dependencies = Vec::with_capacity(plan.textures.len());
@@ -1064,7 +1065,7 @@ impl<'a> FrameComposer<'a> {
                 }
                 graph_ctx
                     .graph
-                    .set_draw_plan_texture_dependencies(plan.key, dependencies);
+                    .set_scene_submission_texture_dependencies(plan.key.into(), dependencies);
             }
 
             if let Some((_, source)) = texture_skybox_plan {
@@ -1985,14 +1986,15 @@ impl<'a> FrameComposer<'a> {
                         &mut self.ctx.resource_manager.resources,
                         &self.ctx.resource_manager.internal_textures,
                     ),
-                    scene_draws: SceneDrawPrepareContext {
-                        render_lists: self.ctx.render_lists,
-                        extracted_scene: self.ctx.extracted_scene,
-                        prepared_draws: &graph.storage.prepared_draws,
-                        depth_format: self.ctx.wgpu_ctx.depth_format,
-                        pipeline_settings_version: self.ctx.wgpu_ctx.pipeline_settings_version,
-                        draw_plans: &mut graph.storage.draw_plans,
-                    },
+                    scene_draws: SceneDrawPrepareContext::new(
+                        self.ctx.render_lists,
+                        self.ctx.extracted_scene,
+                        &graph.storage.prepared_draws,
+                        self.ctx.wgpu_ctx.depth_format,
+                        self.ctx.wgpu_ctx.pipeline_settings_version,
+                        &graph.storage.scene_submissions,
+                        &mut graph.storage.draw_plans,
+                    ),
                     mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     #[cfg(feature = "3dgs")]
@@ -2075,7 +2077,10 @@ impl<'a> FrameComposer<'a> {
                     mipmap_generator: &*mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
                     mipmap_encode_coordinator: &graph.storage.mipmap_encode_coordinator,
-                    draw_plans: graph.storage.draw_plans.resolver(),
+                    scene_submissions: SceneSubmissionResolver::new(
+                        &graph.storage.scene_submissions,
+                        &graph.storage.draw_plans,
+                    ),
                     global_bind_group: finalized_global_bind_group.as_ref(),
                     wgpu_ctx: &*self.ctx.wgpu_ctx,
                     current_timeline_index: 0,

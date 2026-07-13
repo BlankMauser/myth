@@ -1,7 +1,7 @@
 //! Unified Draw Command Submission
 //!
-//! Provides [`submit_draw_commands`], the single function responsible for
-//! translating a pre-baked draw plan into GPU render-pass calls. All
+//! Provides [`submit_scene_submission`], the single function responsible for
+//! translating a backend-neutral scene submission into GPU render-pass calls. All
 //! scene-drawing passes invoke this function, ensuring consistent state
 //! management and eliminating duplicated draw-loop boilerplate.
 //!
@@ -9,9 +9,8 @@
 //! table. Stable physical IDs carried by that table provide identity without
 //! depending on WGPU wrapper addresses.
 
-use crate::graph::frame::{
-    DrawBindGroupSlot, DrawBufferSlot, DrawCommand, DrawPlanId, DrawPlanResolver,
-};
+use crate::graph::core::scene_submission::{SceneSubmissionPlanId, SceneSubmissionResolver};
+use crate::graph::frame::{DrawBindGroupSlot, DrawBufferSlot, DrawCommand};
 use crate::pipeline::{PipelineCache, RenderPipelineId};
 
 /// Submit a pre-baked draw plan through a raw render pass.
@@ -30,13 +29,14 @@ use crate::pipeline::{PipelineCache, RenderPipelineId};
 ///   dynamic offset.
 /// * **Group 3** (screen / transient + clustered lighting) — set by the
 ///   caller at pass level.
-pub fn submit_draw_commands<'pass>(
+pub(crate) fn submit_scene_submission<'pass>(
     pass: &mut wgpu::RenderPass<'pass>,
-    draw_plans: DrawPlanResolver<'pass>,
-    plan: DrawPlanId,
+    submissions: SceneSubmissionResolver<'pass>,
+    plan: SceneSubmissionPlanId,
     pipeline_cache: &'pass PipelineCache,
 ) {
-    let commands: &'pass [DrawCommand] = draw_plans.commands(plan);
+    let stream = submissions.stream(plan);
+    let commands: &'pass [DrawCommand] = submissions.commands(stream);
     if commands.is_empty() {
         return;
     }
@@ -56,14 +56,14 @@ pub fn submit_draw_commands<'pass>(
         if let Some(slot) = cmd.bind_group_1
             && Some(slot) != cur_bg1
         {
-            let bind_group = draw_plans.bind_group(slot);
+            let bind_group = submissions.bind_group(slot);
             pass.set_bind_group(1, &**bind_group, &[]);
             cur_bg1 = Some(slot);
         }
 
         {
             let (slot, offset) = cmd.bind_group_2;
-            let bind_group = draw_plans.bind_group(slot);
+            let bind_group = submissions.bind_group(slot);
             // Object bind groups are often shared across instances with
             // different dynamic offsets, so this remains unconditional.
             pass.set_bind_group(2, &**bind_group, &[offset]);
@@ -78,7 +78,7 @@ pub fn submit_draw_commands<'pass>(
 
         for (binding, &slot) in cmd.vertex_buffers.iter().enumerate() {
             if cur_vertex_b[binding] != Some(slot) {
-                let buffer = draw_plans.buffer(slot);
+                let buffer = submissions.buffer(slot);
                 pass.set_vertex_buffer(binding as u32, buffer.slice(..));
                 cur_vertex_b[binding] = Some(slot);
             }
@@ -86,7 +86,7 @@ pub fn submit_draw_commands<'pass>(
 
         if let Some((slot, format, count)) = cmd.index_buffer {
             if Some((slot, format)) != cur_index_b {
-                let buffer = draw_plans.buffer(slot);
+                let buffer = submissions.buffer(slot);
                 pass.set_index_buffer(buffer.slice(..), format);
                 cur_index_b = Some((slot, format));
             }

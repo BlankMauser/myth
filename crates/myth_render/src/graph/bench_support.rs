@@ -2,14 +2,14 @@
 //!
 //! This module is present in library tests and explicit benchmark-support
 //! builds, but absent from default shipping builds. Its narrow semantic API
-//! avoids exposing DrawPlan internals or timing an approximate public topology.
+//! avoids exposing backend command-plan internals or timing an approximate public topology.
 
+use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
 use crate::graph::core::types::ErasedResourceNodeId;
 use crate::graph::core::{
     BufferDesc, ExecuteContext, FrameArena, GraphStorage, PassBuilder, PassNode,
     RdgDiagnosticsRecorder, RdgFramePhase, RenderGraph, TextureDesc, TextureNodeId,
 };
-use crate::graph::frame::{DrawPlanId, DrawPlanKey, DrawPlanStore};
 
 const CUBE_LIGHT_ID_BASE: u64 = 1 << 32;
 
@@ -185,7 +185,7 @@ pub enum DrawDemandRoot {
     Both,
 }
 
-/// Exact workload passed through the production DrawPlan demand path.
+/// Exact workload passed through the production SceneSubmission demand path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrawDemandBenchSpec {
     /// Total distinct Shadow plans. One quarter is D2 and three quarters Cube.
@@ -204,7 +204,7 @@ pub struct DrawDemandBenchSpec {
     pub root: DrawDemandRoot,
 }
 
-/// Stable benchmark projection of one internal Shadow DrawPlan key.
+/// Stable benchmark projection of one semantic Shadow submission key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DrawDemandPlanKey {
     /// Stable light identity.
@@ -279,7 +279,7 @@ pub struct DrawDemandBenchObservation {
     pub texture_producer_dependency_edge_count: usize,
 }
 
-/// Reusable owner for exact DrawPlan demand benchmark iterations.
+/// Reusable owner for exact scene-submission demand benchmark iterations.
 ///
 /// GraphStorage's flat topology collections, FrameArena, and harness scratch
 /// retain their high-water-mark capacity. The allocation probe verifies that
@@ -287,7 +287,7 @@ pub struct DrawDemandBenchObservation {
 pub struct DrawDemandBenchHarness {
     storage: GraphStorage,
     arena: FrameArena,
-    plan_ids: Vec<DrawPlanId>,
+    plan_ids: Vec<SceneSubmissionPlanId>,
     dependency_scratch: Vec<TextureNodeId>,
     diagnostics_mode: RdgBenchDiagnosticsMode,
 }
@@ -314,13 +314,19 @@ impl DrawDemandBenchHarness {
     /// Run one production-path iteration with only an O(1) timed result.
     #[must_use]
     pub fn run_iteration(&mut self, spec: DrawDemandBenchSpec) -> DrawDemandRunToken {
-        self.run_iteration_with(spec, |graph, indices| DrawDemandRunToken {
+        self.run_iteration_with(spec, |graph, indices, _| DrawDemandRunToken {
             registered_pass_count: graph.storage.passes.len(),
             registered_resource_count: graph.storage.resources.len(),
             d2_read_count: graph.storage.pass_reads(indices.d2).len(),
             cube_read_count: graph.storage.pass_reads(indices.cube).len(),
-            d2_demand_count: graph.storage.pass_draw_plan_demands(indices.d2).len(),
-            cube_demand_count: graph.storage.pass_draw_plan_demands(indices.cube).len(),
+            d2_demand_count: graph
+                .storage
+                .pass_scene_submission_demands(indices.d2)
+                .len(),
+            cube_demand_count: graph
+                .storage
+                .pass_scene_submission_demands(indices.cube)
+                .len(),
             d2_physical_dependency_count: graph
                 .storage
                 .pass_physical_dependencies(indices.d2)
@@ -349,20 +355,22 @@ impl DrawDemandBenchHarness {
         &mut self,
         spec: DrawDemandBenchSpec,
     ) -> DrawDemandBenchObservation {
-        self.run_iteration_with(spec, |graph, indices| {
-            let draw_plans = &graph.storage.draw_plans;
+        self.run_iteration_with(spec, |graph, indices, plan_ids| {
+            let d2_plan_count = spec.plan_count / 4;
             DrawDemandBenchObservation {
                 d2: observe_pass(
                     graph.storage.pass_reads(indices.d2),
                     graph.storage.pass_physical_dependencies(indices.d2),
-                    graph.storage.pass_draw_plan_demands(indices.d2),
-                    draw_plans,
+                    graph.storage.pass_scene_submission_demands(indices.d2),
+                    plan_ids,
+                    d2_plan_count,
                 ),
                 cube: observe_pass(
                     graph.storage.pass_reads(indices.cube),
                     graph.storage.pass_physical_dependencies(indices.cube),
-                    graph.storage.pass_draw_plan_demands(indices.cube),
-                    draw_plans,
+                    graph.storage.pass_scene_submission_demands(indices.cube),
+                    plan_ids,
+                    d2_plan_count,
                 ),
                 registered_pass_count: graph.storage.passes.len(),
                 registered_resource_count: graph.storage.resources.len(),
@@ -373,7 +381,16 @@ impl DrawDemandBenchHarness {
                     .map(crate::graph::core::ResourceRecord::consumer_edge_count)
                     .sum(),
                 live_plans: if spec.compile_topology {
-                    draw_plans.live_keys().map(project_plan_key).collect()
+                    plan_ids
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, &id)| {
+                            graph
+                                .storage
+                                .scene_submission_is_live(id)
+                                .then(|| project_plan_key(shadow_plan_key(index, d2_plan_count)))
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 },
@@ -396,7 +413,7 @@ impl DrawDemandBenchHarness {
     fn run_iteration_with<R>(
         &mut self,
         spec: DrawDemandBenchSpec,
-        observe: impl FnOnce(&RenderGraph<'_>, DrawDemandRunIndices) -> R,
+        observe: impl FnOnce(&RenderGraph<'_>, DrawDemandRunIndices, &[SceneSubmissionPlanId]) -> R,
     ) -> R {
         validate_spec(spec);
 
@@ -430,11 +447,10 @@ impl DrawDemandBenchHarness {
         plan_ids.reserve(spec.plan_count);
         for plan_index in 0..spec.plan_count {
             let key = shadow_plan_key(plan_index, d2_plan_count);
-            let plan = graph.reserve_draw_plan(key);
 
             match spec.dependency_pattern {
                 DrawDemandDependencyPattern::Shared => {
-                    graph.set_draw_plan_texture_dependencies(
+                    graph.set_scene_submission_texture_dependencies(
                         key,
                         dependency_scratch.iter().copied(),
                     );
@@ -449,12 +465,13 @@ impl DrawDemandBenchHarness {
                             spec.texture_topology,
                         ));
                     }
-                    graph.set_draw_plan_texture_dependencies(
+                    graph.set_scene_submission_texture_dependencies(
                         key,
                         dependency_scratch.iter().copied(),
                     );
                 }
             }
+            let plan = graph.reserve_scene_submission(key);
             plan_ids.push(plan);
         }
 
@@ -501,6 +518,7 @@ impl DrawDemandBenchHarness {
                 root: root_pass,
                 texture_producer_end,
             },
+            plan_ids,
         )
     }
 }
@@ -555,25 +573,29 @@ fn register_texture_input(
     }
 }
 
-fn shadow_plan_key(plan_index: usize, d2_plan_count: usize) -> DrawPlanKey {
+fn shadow_plan_key(plan_index: usize, d2_plan_count: usize) -> SceneSubmissionKey {
     if plan_index < d2_plan_count {
-        DrawPlanKey::Shadow {
+        SceneSubmissionKey::Shadow {
             light_id: plan_index as u64,
             layer_index: 0,
         }
     } else {
         let cube_face_index = plan_index - d2_plan_count;
-        DrawPlanKey::Shadow {
+        SceneSubmissionKey::Shadow {
             light_id: CUBE_LIGHT_ID_BASE + (cube_face_index / 6) as u64,
             layer_index: (cube_face_index % 6) as u32,
         }
     }
 }
 
-fn demand_plans(builder: &mut PassBuilder<'_, '_>, plans: &[DrawPlanId], repetitions: usize) {
+fn demand_plans(
+    builder: &mut PassBuilder<'_, '_>,
+    plans: &[SceneSubmissionPlanId],
+    repetitions: usize,
+) {
     for &plan in plans {
         for _ in 0..repetitions {
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(plan);
         }
     }
 }
@@ -606,32 +628,34 @@ fn add_output_root(
 fn observe_pass(
     reads: &[ErasedResourceNodeId],
     physical_dependencies: &[usize],
-    demands: &[DrawPlanId],
-    draw_plans: &DrawPlanStore,
+    demands: &[SceneSubmissionPlanId],
+    plan_ids: &[SceneSubmissionPlanId],
+    d2_plan_count: usize,
 ) -> DrawDemandPassObservation {
     DrawDemandPassObservation {
         logical_reads: reads.iter().map(|id| (id.index(), id.version())).collect(),
         demanded_plans: demands
             .iter()
-            .map(|&id| resolve_plan_key(draw_plans, id))
+            .map(|&id| resolve_plan_key(plan_ids, d2_plan_count, id))
             .collect(),
         physical_dependencies: physical_dependencies.to_vec(),
     }
 }
 
-fn resolve_plan_key(draw_plans: &DrawPlanStore, id: DrawPlanId) -> DrawDemandPlanKey {
-    (0..draw_plans.plan_count())
-        .find_map(|index| {
-            let meta = draw_plans
-                .plan_meta(index)
-                .expect("benchmark DrawPlan table changed while observing");
-            (meta.id == id).then(|| project_plan_key(meta.key))
-        })
-        .expect("benchmark pass retained an unknown DrawPlan ID")
+fn resolve_plan_key(
+    plan_ids: &[SceneSubmissionPlanId],
+    d2_plan_count: usize,
+    id: SceneSubmissionPlanId,
+) -> DrawDemandPlanKey {
+    plan_ids
+        .iter()
+        .position(|&candidate| candidate == id)
+        .map(|index| project_plan_key(shadow_plan_key(index, d2_plan_count)))
+        .expect("benchmark pass retained an unknown scene-submission ID")
 }
 
-fn project_plan_key(key: DrawPlanKey) -> DrawDemandPlanKey {
-    let DrawPlanKey::Shadow {
+fn project_plan_key(key: SceneSubmissionKey) -> DrawDemandPlanKey {
+    let SceneSubmissionKey::Shadow {
         light_id,
         layer_index,
     } = key

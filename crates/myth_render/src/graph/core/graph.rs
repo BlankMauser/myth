@@ -15,7 +15,9 @@ use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
-use crate::graph::frame::{DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedDrawStore};
+#[cfg(test)]
+use crate::graph::frame::DrawPlanKey;
+use crate::graph::frame::{DrawPlanStore, PreparedDrawStore};
 use crate::graph::material_plan::MaterialPlanStore;
 
 use super::asset_texture::{AssetTextureImportId, AssetTextureImportStore, snapshot_texture_desc};
@@ -36,9 +38,9 @@ use super::scene_buffer::{
     SceneBufferImportStore, SceneBufferMaterializationFailure, SceneBufferRecipe,
     SceneBufferSources,
 };
-use super::scene_submission::{
-    SceneSubmissionDependencies, SceneSubmissionPlanId, SceneSubmissionStore,
-};
+#[cfg(test)]
+use super::scene_submission::SceneSubmissionDependencies;
+use super::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId, SceneSubmissionStore};
 use super::types::{
     BufferDesc, BufferNodeId, ErasedResourceNodeId, GraphResourceType, ResourceClass, ResourceKind,
     ResourceNodeId, ResourceRecord, TextureDesc, TextureNodeId,
@@ -303,11 +305,8 @@ pub struct GraphStorage {
     /// Destructor-aware physical resources and compact commands for scene
     /// draws selected during post-prepare baking.
     pub(crate) draw_plans: DrawPlanStore,
-    /// Canonical per-pass plan demands in one capacity-retaining flat table.
-    /// Pass records address this table by range.
-    pub(crate) draw_plan_demands: Vec<DrawPlanId>,
     /// Backend-neutral scene-submission plans reserved for this attempt.
-    pub(super) scene_submissions: SceneSubmissionStore,
+    pub(crate) scene_submissions: SceneSubmissionStore,
     /// Canonical per-pass scene-submission demands in first-occurrence order.
     scene_submission_demands: Vec<SceneSubmissionPlanId>,
     /// Graph-attempt source records materialized only for the source-item
@@ -339,16 +338,11 @@ pub struct GraphStorage {
 
     compile_max_ext_indices: Vec<usize>,
 
-    /// One-shot draw-demand union scratch, retained at the plan/resource
-    /// high-water marks and generation-cleared between operations.
-    draw_plan_demand_scratch: DenseGenerationScratch,
-    draw_plan_resource_scratch: DenseGenerationScratch,
+    /// One-shot dependency scratch retained at the resource high-water mark.
+    draw_texture_dependency_scratch: DenseGenerationScratch,
     scene_submission_demand_scratch: DenseGenerationScratch,
     scene_submission_resource_scratch: DenseGenerationScratch,
     physical_dependency_scratch: DenseGenerationScratch,
-    /// Raw demand IDs for the pass whose setup closure is currently running.
-    /// Cleared without releasing capacity before each `add_pass` call.
-    pub(crate) draw_plan_raw_demands: Vec<DrawPlanId>,
     /// Raw opaque submission IDs for the pass whose setup is in progress.
     pub(crate) scene_submission_raw_demands: Vec<SceneSubmissionPlanId>,
     /// Setup is deliberately non-reentrant. External callers cannot reach the
@@ -391,7 +385,6 @@ impl GraphStorage {
             mipmap_encode_coordinator: MipmapEncodeCoordinator::default(),
             prepared_bind_groups: PreparedBindGroupStore::new(),
             draw_plans: DrawPlanStore::new(),
-            draw_plan_demands: Vec::with_capacity(64),
             scene_submissions: SceneSubmissionStore::new(),
             scene_submission_demands: Vec::with_capacity(64),
             prepared_draws: PreparedDrawStore::new(),
@@ -407,12 +400,10 @@ impl GraphStorage {
             compile_reverse_edges: Vec::new(),
             compile_reverse_cursors: Vec::new(),
             compile_max_ext_indices: Vec::new(),
-            draw_plan_demand_scratch: DenseGenerationScratch::default(),
-            draw_plan_resource_scratch: DenseGenerationScratch::default(),
+            draw_texture_dependency_scratch: DenseGenerationScratch::default(),
             scene_submission_demand_scratch: DenseGenerationScratch::default(),
             scene_submission_resource_scratch: DenseGenerationScratch::default(),
             physical_dependency_scratch: DenseGenerationScratch::default(),
-            draw_plan_raw_demands: Vec::with_capacity(64),
             scene_submission_raw_demands: Vec::with_capacity(64),
             pass_setup_active: false,
             #[cfg(feature = "rdg_inspector")]
@@ -432,8 +423,6 @@ impl GraphStorage {
         self.compile_reverse_offsets.clear();
         self.compile_reverse_edges.clear();
         self.compile_reverse_cursors.clear();
-        self.draw_plan_demands.clear();
-        self.draw_plan_raw_demands.clear();
         self.scene_submission_demands.clear();
         self.scene_submission_raw_demands.clear();
         self.pass_setup_active = false;
@@ -564,78 +553,12 @@ impl GraphStorage {
         self.passes[pass_index].logical_read_range = cleared_start..cleared_start;
     }
 
-    /// Canonicalize raw draw-plan demands and attach their logical texture
-    /// reads after one pass setup closure has completed.
-    ///
-    /// Both dense sets are generation-stamped and storage-owned, so this does
-    /// no temporary hashing or dependency cloning. First-demand and
-    /// first-resource order are preserved.
-    fn finalize_pass_draw_plan_demands(&mut self, pass_index: usize) {
-        let canonical_start = self.draw_plan_demands.len();
-        if self.draw_plan_raw_demands.is_empty() {
-            self.passes[pass_index].draw_plan_demand_range = canonical_start..canonical_start;
-            return;
-        }
-
-        self.draw_plan_demand_scratch
-            .begin(self.draw_plans.plan_count());
-        let raw_demand_count = self.draw_plan_raw_demands.len();
-        let mut unique_demand_count = 0;
-        for read_index in 0..raw_demand_count {
-            let id = self.draw_plan_raw_demands[read_index];
-            let dense_index = self
-                .draw_plans
-                .reserved_index(id)
-                .expect("draw plan demand does not belong to this graph attempt");
-            if self.draw_plan_demand_scratch.insert(dense_index) {
-                self.draw_plan_raw_demands[unique_demand_count] = id;
-                unique_demand_count += 1;
-            }
-        }
-        self.draw_plan_raw_demands.truncate(unique_demand_count);
-        self.draw_plan_demands
-            .extend_from_slice(&self.draw_plan_raw_demands);
-        let canonical_end = self.draw_plan_demands.len();
-        self.passes[pass_index].draw_plan_demand_range = canonical_start..canonical_end;
-
-        self.draw_plan_resource_scratch.begin(self.resources.len());
-        let existing_read_count = self.pass_reads(pass_index).len();
-        for read_index in 0..existing_read_count {
-            let read = self.pass_reads(pass_index)[read_index];
-            self.draw_plan_resource_scratch
-                .insert(read.index() as usize);
-        }
-
-        for demand_index in canonical_start..canonical_end {
-            let id = self.draw_plan_demands[demand_index];
-            let dependency_key = self.draw_plans.mark_topology_demanded(id);
-            let dependencies = self.draw_plans.texture_dependencies(dependency_key);
-            let logical_reads = &mut self.logical_reads;
-            let pass = &mut self.passes[pass_index];
-            let resources = &mut self.resources;
-            let resource_scratch = &mut self.draw_plan_resource_scratch;
-            for &dependency in dependencies {
-                let resource_index = dependency.index() as usize;
-                assert!(
-                    resource_index < resources.len(),
-                    "pass '{}' demanded a draw-plan texture from another graph",
-                    pass.name
-                );
-                if !resource_scratch.insert(resource_index) {
-                    continue;
-                }
-
-                append_logical_read(logical_reads, pass, resources, dependency.erase());
-            }
-        }
-    }
-
     /// Canonicalize backend-neutral submission demands and attach their mixed
     /// texture/buffer dependencies once after pass setup.
     ///
     /// Both dense sets retain capacity across attempts. Plan order follows
     /// first demand; resource order follows the first occurrence across direct
-    /// reads, legacy DrawPlan dependencies, and submission dependencies.
+    /// reads and submission dependencies.
     fn finalize_pass_scene_submission_demands(&mut self, pass_index: usize) {
         let canonical_start = self.scene_submission_demands.len();
         if self.scene_submission_raw_demands.is_empty() {
@@ -706,12 +629,6 @@ impl GraphStorage {
 
     #[inline]
     #[cfg(any(test, feature = "rdg_bench_support"))]
-    pub(crate) fn pass_draw_plan_demands(&self, pass_index: usize) -> &[DrawPlanId] {
-        &self.draw_plan_demands[self.passes[pass_index].draw_plan_demand_range.clone()]
-    }
-
-    #[inline]
-    #[cfg(test)]
     pub(crate) fn pass_scene_submission_demands(
         &self,
         pass_index: usize,
@@ -719,6 +636,12 @@ impl GraphStorage {
         &self.scene_submission_demands[self.passes[pass_index]
             .scene_submission_demand_range
             .clone()]
+    }
+
+    #[inline]
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    pub(crate) fn scene_submission_is_live(&self, id: SceneSubmissionPlanId) -> bool {
+        self.scene_submissions.is_live(id)
     }
 
     /// Immediately releases Drop-bearing owners captured by one graph attempt.
@@ -1195,7 +1118,6 @@ impl Drop for RenderGraph<'_> {
         // running. In particular, do not let a setup panic leave stale IDs for
         // retained-topology inspection or a later attempt.
         self.storage.rollback_active_pass_reads();
-        self.storage.draw_plan_raw_demands.clear();
         self.storage.scene_submission_raw_demands.clear();
         self.storage.pass_setup_active = false;
         // NodeSlot erases the arena lifetime behind a raw trait-object pointer.
@@ -1414,54 +1336,20 @@ impl<'a> RenderGraph<'a> {
         self.arena.alloc(value)
     }
 
-    /// Reserve a stable frame-local draw-plan ID during graph construction.
-    ///
-    /// The reservation owns no physical resources. Multiple passes reserving
-    /// the same canonical key receive the same ID and may independently
-    /// declare it through [`PassBuilder::demand_draw_plan`].
-    pub(crate) fn reserve_draw_plan(&mut self, key: DrawPlanKey) -> DrawPlanId {
-        self.assert_topology_mutable();
-        self.storage.draw_plans.reserve_plan(key)
-    }
-
-    /// Wrap a valid legacy CPU-direct DrawPlan behind the backend-neutral
-    /// scene-submission contract.
-    ///
-    /// This is the M3 transition bridge: Features can migrate to opaque
-    /// submission IDs while the existing CPU command backend remains the
-    /// private adapter selected by the core coordinator.
-    #[allow(dead_code)] // Activated incrementally as Features migrate in M3.
-    pub(crate) fn reserve_cpu_direct_scene_submission(
+    /// Reserve the backend-neutral scene-submission plan for one canonical
+    /// draw recipe. The current CpuDirect backend and its texture dependencies
+    /// remain private to GraphStorage.
+    pub(crate) fn reserve_scene_submission(
         &mut self,
-        draw_plan: DrawPlanId,
-        dependencies: &SceneSubmissionDependencies,
+        key: SceneSubmissionKey,
     ) -> SceneSubmissionPlanId {
         self.assert_topology_mutable();
-        for &dependency in dependencies.as_slice() {
-            assert!(
-                (dependency.index() as usize) < self.storage.resources.len(),
-                "scene-submission dependency belongs to another graph"
-            );
-        }
-        let draw_dependency_key = self.storage.draw_plans.mark_topology_demanded(draw_plan);
-        for &texture in self
-            .storage
-            .draw_plans
-            .texture_dependencies(draw_dependency_key)
-        {
-            assert!(
-                dependencies
-                    .as_slice()
-                    .iter()
-                    .any(|&dependency| dependency == texture.erase()),
-                "CpuDirect scene submission omitted a registered DrawPlan texture dependency"
-            );
-        }
-        self.storage.scene_submissions.reserve_cpu_direct(
-            &self.storage.draw_plans,
-            draw_plan,
-            dependencies,
-        )
+        let draw_plans = &mut self.storage.draw_plans;
+        let submissions = &mut self.storage.scene_submissions;
+        let draw_plan = draw_plans.reserve_plan(key.cpu_direct_key());
+        let dependency_key = draw_plans.mark_topology_demanded(draw_plan);
+        let dependencies = draw_plans.texture_dependencies(dependency_key);
+        submissions.reserve_cpu_direct_textures(draw_plans, draw_plan, dependencies)
     }
 
     /// Test-only topology backend proving that indirect instance/argument/
@@ -1499,30 +1387,31 @@ impl<'a> RenderGraph<'a> {
             .set_plan(GlobalStatePlan::capture(key, sources));
     }
 
-    /// Bind exact logical Asset Texture aliases to a canonical draw recipe.
-    /// Passes that later demand the plan inherit these as normal RDG reads.
-    pub(crate) fn set_draw_plan_texture_dependencies(
+    /// Bind exact logical Asset Texture aliases to a canonical scene recipe.
+    /// Passes that later demand the submission inherit ordinary RDG reads.
+    pub(crate) fn set_scene_submission_texture_dependencies(
         &mut self,
-        key: DrawPlanKey,
+        key: SceneSubmissionKey,
         dependencies: impl IntoIterator<Item = TextureNodeId>,
     ) {
         self.assert_topology_mutable();
+        let direct_key = key.cpu_direct_key();
         self.storage
             .draw_plans
-            .assert_texture_dependencies_registerable(key);
+            .assert_texture_dependencies_registerable(direct_key);
         self.storage
-            .draw_plan_resource_scratch
+            .draw_texture_dependency_scratch
             .begin(self.storage.resources.len());
         let mut unique = SmallVec::<[TextureNodeId; 8]>::new();
         for dependency in dependencies {
             let resource_index = dependency.index() as usize;
             assert!(
                 resource_index < self.storage.resources.len(),
-                "draw-plan texture dependency belongs to another graph"
+                "scene-submission texture dependency belongs to another graph"
             );
             if self
                 .storage
-                .draw_plan_resource_scratch
+                .draw_texture_dependency_scratch
                 .insert(resource_index)
             {
                 unique.push(dependency);
@@ -1530,7 +1419,7 @@ impl<'a> RenderGraph<'a> {
         }
         self.storage
             .draw_plans
-            .set_texture_dependencies(key, unique);
+            .set_texture_dependencies(direct_key, unique);
     }
 
     /// Moves Drop-bearing WGPU request owners into persistent GraphStorage and
@@ -2235,7 +2124,6 @@ impl<'a> RenderGraph<'a> {
         self.storage.pass_setup_active = true;
         let pass_index = self.storage.passes.len();
         let logical_read_start = self.storage.logical_reads.len();
-        self.storage.draw_plan_raw_demands.clear();
         self.storage.scene_submission_raw_demands.clear();
 
         // Phase 1: placeholder record (node = None) so the PassBuilder can
@@ -2264,13 +2152,10 @@ impl<'a> RenderGraph<'a> {
         );
         self.storage.pass_setup_active = false;
 
-        // Phase 3: one-shot plan-demand canonicalization. The setup hot path
-        // records raw IDs only; mixed logical reads and consumer edges are
-        // attached once, in deterministic first-occurrence order, after the
-        // closure no longer borrows the graph. The legacy DrawPlan bridge runs
-        // first so already-migrated submission dependencies deduplicate against
-        // every compatibility edge too.
-        self.storage.finalize_pass_draw_plan_demands(pass_index);
+        // Phase 3: one-shot submission-demand canonicalization. The setup hot
+        // path records raw opaque IDs only; mixed logical reads and consumer
+        // edges are attached once, in deterministic first-occurrence order,
+        // after the closure no longer borrows the graph.
         self.storage
             .finalize_pass_scene_submission_demands(pass_index);
 
@@ -2293,7 +2178,6 @@ impl<'a> RenderGraph<'a> {
         self.validate_live_asset_texture_dependencies();
         self.topological_sort();
         self.collect_live_global_state_demand();
-        self.collect_live_draw_plan_demands();
         self.collect_live_scene_submission_demands();
 
         self.compute_resource_lifetimes();
@@ -2703,36 +2587,10 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
-    /// Project DPE liveness onto frame-local draw-plan reservations.
-    ///
-    /// Plan demands never participate in pass rooting or dependency
-    /// construction. Only records already selected into the compiled execution
-    /// queue can make a plan live, and repeated demands are idempotent.
-    fn collect_live_draw_plan_demands(&mut self) {
-        self.storage.draw_plans.reset_live_demands();
-
-        for queue_index in 0..self.storage.execution_queue.len() {
-            let pass_index = self.storage.execution_queue[queue_index];
-            let demand_range = self.storage.passes[pass_index]
-                .draw_plan_demand_range
-                .clone();
-            for demand_index in demand_range {
-                let id = self.storage.draw_plan_demands[demand_index];
-                assert!(
-                    self.storage.draw_plans.validate_reserved(id),
-                    "live pass '{}' retained a draw plan from another graph attempt",
-                    self.storage.passes[pass_index].name
-                );
-                self.storage.draw_plans.mark_live(id);
-                debug_assert!(self.storage.draw_plans.is_live(id));
-            }
-        }
-    }
-
     /// Project backend-neutral submission liveness from the compiled queue,
-    /// then synchronize the transitional CPU-direct adapter with its private
-    /// legacy DrawPlan records.
+    /// then synchronize the selected CPU-direct backend's private records.
     fn collect_live_scene_submission_demands(&mut self) {
+        self.storage.draw_plans.reset_live_demands();
         if self.storage.scene_submissions.plan_count() == 0 {
             return;
         }
@@ -3165,18 +3023,20 @@ mod tests {
         let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
         storage.draw_plans.mark_live(plan);
         let start = storage.draw_plans.begin_finalize(plan);
-        storage.draw_plans.push_command(crate::graph::DrawCommand {
-            source_item_index: 0,
-            sort_key: 0,
-            pipeline_id: crate::pipeline::RenderPipelineId(0),
-            vertex_buffers: smallvec::smallvec![buffer_slot],
-            index_buffer: None,
-            bind_group_1: Some(bind_group_slot),
-            bind_group_2: (bind_group_slot, 0),
-            stencil_reference: None,
-            vertex_range: 0..3,
-            instance_range: 0..1,
-        });
+        storage
+            .draw_plans
+            .push_command(crate::graph::frame::DrawCommand {
+                source_item_index: 0,
+                sort_key: 0,
+                pipeline_id: crate::pipeline::RenderPipelineId(0),
+                vertex_buffers: smallvec::smallvec![buffer_slot],
+                index_buffer: None,
+                bind_group_1: Some(bind_group_slot),
+                bind_group_2: (bind_group_slot, 0),
+                stencil_reference: None,
+                vertex_range: 0..3,
+                instance_range: 0..1,
+            });
         storage.draw_plans.finish_finalize(plan, start);
         assert_eq!(storage.draw_plans.resolve_plan(plan).unwrap().len(), 1);
 
@@ -3276,24 +3136,24 @@ mod tests {
     }
 
     #[test]
-    fn next_attempt_clears_raw_draw_staging_after_setup_panic() {
+    fn next_attempt_clears_raw_submission_staging_after_setup_panic() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut graph = begin_test_frame(&mut storage, &arena);
             let texture = graph.register_texture("Abandoned", dummy_desc(), false);
-            graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
-            let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+            graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
+            let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
             graph.add_pass("Panicking_Draw_Setup", |builder| -> (MockExec, ()) {
                 builder.read_texture(texture);
                 builder.read_texture(texture);
-                builder.demand_draw_plan(plan);
+                builder.demand_scene_submission(submission);
                 panic!("intentional draw setup failure")
             });
         }));
         assert!(result.is_err());
-        assert!(storage.draw_plan_raw_demands.is_empty());
+        assert!(storage.scene_submission_raw_demands.is_empty());
         assert!(storage.logical_reads.is_empty());
         assert!(storage.pass_reads(0).is_empty());
         assert_eq!(
@@ -3305,18 +3165,21 @@ mod tests {
         let mut graph = begin_test_frame(&mut storage, &arena);
         assert!(graph.storage.passes.is_empty());
         assert!(graph.storage.logical_reads.is_empty());
-        assert!(graph.storage.draw_plan_raw_demands.is_empty());
-        assert!(graph.storage.draw_plan_demands.is_empty());
+        assert!(graph.storage.scene_submission_raw_demands.is_empty());
+        assert!(graph.storage.scene_submission_demands.is_empty());
 
         let texture = graph.register_texture("Recovered", dummy_desc(), false);
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [texture]);
-        let plan = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Transparent, [texture]);
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
         let pass_index = graph.storage.passes.len();
         graph.add_pass("Recovered_Draw_Setup", |builder| {
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(submission);
             (MockExec, ())
         });
-        assert_eq!(graph.storage.pass_draw_plan_demands(pass_index), &[plan]);
+        assert_eq!(
+            graph.storage.pass_scene_submission_demands(pass_index),
+            &[submission]
+        );
         assert_eq!(graph.storage.pass_reads(pass_index), &[texture.erase()]);
     }
 
@@ -3470,7 +3333,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_plan_demands_follow_dpe_and_deduplicate_shared_consumers() {
+    fn scene_submission_demands_follow_dpe_and_deduplicate_shared_consumers() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -3484,38 +3347,41 @@ mod tests {
             builder.write_texture(shared_texture);
             (MockExec, ())
         });
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [dead_texture]);
-        graph.set_draw_plan_texture_dependencies(
-            DrawPlanKey::Opaque,
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Transparent,
+            [dead_texture],
+        );
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Opaque,
             [shared_texture, shared_texture],
         );
 
-        let dead = graph.reserve_draw_plan(DrawPlanKey::Transparent);
-        let shared = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let second = graph.reserve_draw_plan(DrawPlanKey::Prepass {
+        let dead = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
+        let shared = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
+        let second = graph.reserve_scene_submission(SceneSubmissionKey::Prepass {
             needs_normal: true,
             needs_feature_id: false,
             needs_velocity: true,
         });
 
         graph.add_pass("Dead_Draw_Consumer", |builder| {
-            builder.demand_draw_plan(dead);
+            builder.demand_scene_submission(dead);
             (MockExec, ())
         });
         graph.add_pass("Live_Shared_Consumer", |builder| {
-            builder.demand_draw_plan(shared);
+            builder.demand_scene_submission(shared);
             builder.mark_side_effect();
             (MockExec, ())
         });
         graph.add_pass("Live_Two_Plan_Consumer", |builder| {
-            builder.demand_draw_plan(shared);
-            builder.demand_draw_plan(second);
-            builder.demand_draw_plan(second);
+            builder.demand_scene_submission(shared);
+            builder.demand_scene_submission(second);
+            builder.demand_scene_submission(second);
             builder.mark_side_effect();
             (MockExec, ())
         });
 
-        assert_eq!(graph.storage.pass_draw_plan_demands(4).len(), 2);
+        assert_eq!(graph.storage.pass_scene_submission_demands(4).len(), 2);
         assert_eq!(
             graph.storage.pass_reads(4),
             &[shared_texture.erase()],
@@ -3524,11 +3390,17 @@ mod tests {
         graph.compile_topology();
 
         assert_eq!(graph.storage.passes[0].reference_count, 0);
-        assert!(!graph.storage.draw_plans.is_live(dead));
-        assert!(graph.storage.draw_plans.is_live(shared));
-        assert!(graph.storage.draw_plans.is_live(second));
-        assert!(graph.storage.draw_plans.resolve_plan(shared).is_none());
-        assert!(graph.storage.draw_plans.resolve_plan(second).is_none());
+        assert!(!graph.storage.scene_submission_is_live(dead));
+        assert!(graph.storage.scene_submission_is_live(shared));
+        assert!(graph.storage.scene_submission_is_live(second));
+        assert_eq!(
+            graph
+                .storage
+                .scene_submissions
+                .live_backend_counts()
+                .cpu_direct,
+            2
+        );
         let live: Vec<_> = graph
             .storage
             .execution_queue
@@ -3546,21 +3418,24 @@ mod tests {
     }
 
     #[test]
-    fn draw_plan_demands_are_raw_during_setup_and_canonical_afterward() {
+    fn scene_submission_demands_are_raw_during_setup_and_canonical_afterward() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
         let texture = graph.register_texture("Draw_Texture", dummy_desc(), false);
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture, texture]);
-        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Opaque,
+            [texture, texture],
+        );
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
         let pass_index = graph.storage.passes.len();
 
         graph.add_pass("Repeated_Draw_Consumer", |builder| {
-            builder.demand_draw_plan(plan);
-            builder.demand_draw_plan(plan);
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(submission);
+            builder.demand_scene_submission(submission);
+            builder.demand_scene_submission(submission);
             assert_eq!(
-                builder.graph.storage.draw_plan_raw_demands.len(),
+                builder.graph.storage.scene_submission_raw_demands.len(),
                 3,
                 "setup must append raw IDs without accumulated-demand scans"
             );
@@ -3570,12 +3445,15 @@ mod tests {
                     .storage
                     .pass_reads(builder.pass_index)
                     .is_empty(),
-                "draw-plan dependency union must wait until setup returns"
+                "scene-submission dependency union must wait until setup returns"
             );
             (MockExec, ())
         });
 
-        assert_eq!(graph.storage.pass_draw_plan_demands(pass_index), &[plan]);
+        assert_eq!(
+            graph.storage.pass_scene_submission_demands(pass_index),
+            &[submission]
+        );
         assert_eq!(graph.storage.pass_reads(pass_index), &[texture.erase()]);
         assert_eq!(
             graph
@@ -3595,11 +3473,8 @@ mod tests {
             let texture = builder.create_texture("Submission_Texture", dummy_desc());
             (MockExec, texture)
         });
-        let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let submission = graph.reserve_cpu_direct_scene_submission(
-            draw_plan,
-            &SceneSubmissionDependencies::new().with_texture(dependency),
-        );
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [dependency]);
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
         let pass_index = graph.storage.passes.len();
 
         graph.add_pass("Repeated_Submission_Consumer", |builder| {
@@ -3634,59 +3509,15 @@ mod tests {
 
         graph.compile_topology();
         assert!(graph.storage.scene_submissions.is_live(submission));
-        assert!(
-            graph.storage.draw_plans.is_live(draw_plan),
+        assert_eq!(
+            graph
+                .storage
+                .scene_submissions
+                .live_backend_counts()
+                .cpu_direct,
+            1,
             "the CpuDirect adapter must synchronize live submission state"
         );
-    }
-
-    #[test]
-    fn cpu_direct_scene_submission_matches_legacy_draw_projection() {
-        fn observe(
-            use_submission: bool,
-        ) -> (
-            Vec<ErasedResourceNodeId>,
-            Vec<&'static str>,
-            Vec<DrawPlanKey>,
-        ) {
-            let mut storage = GraphStorage::new();
-            let arena = FrameArena::new();
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let dependency = graph.add_pass("Direct_Projection_Texture", |builder| {
-                let texture = builder.create_texture("Direct_Projection_Input", dummy_desc());
-                (MockExec, texture)
-            });
-            graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [dependency]);
-            let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-            let submission = use_submission.then(|| {
-                graph.reserve_cpu_direct_scene_submission(
-                    draw_plan,
-                    &SceneSubmissionDependencies::new().with_texture(dependency),
-                )
-            });
-            let consumer_index = graph.storage.passes.len();
-            graph.add_pass("Direct_Projection_Consumer", |builder| {
-                if let Some(submission) = submission {
-                    builder.demand_scene_submission(submission);
-                } else {
-                    builder.demand_draw_plan(draw_plan);
-                }
-                builder.mark_side_effect();
-                (MockExec, ())
-            });
-            let reads = graph.storage.pass_reads(consumer_index).to_vec();
-            graph.compile_topology();
-            let execution = graph
-                .storage
-                .execution_queue
-                .iter()
-                .map(|&index| graph.storage.passes[index].name)
-                .collect();
-            let live_keys = graph.storage.draw_plans.live_keys().collect();
-            (reads, execution, live_keys)
-        }
-
-        assert_eq!(observe(true), observe(false));
     }
 
     #[test]
@@ -3702,20 +3533,18 @@ mod tests {
         );
         let texture_b = graph.register_texture("Submission_Texture_B", dummy_desc(), false);
 
-        let first_draw = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let first_submission = graph.reserve_cpu_direct_scene_submission(
-            first_draw,
+        let first_submission = graph.reserve_indirect_scene_submission_for_test(
+            11,
             &SceneSubmissionDependencies::new()
                 .with_texture(texture_a)
                 .with_buffer(buffer),
         );
-        let second_draw = graph.reserve_draw_plan(DrawPlanKey::Transparent);
         let mut second_dependencies = SceneSubmissionDependencies::new()
             .with_texture(texture_b)
             .with_buffer(buffer);
         second_dependencies.read_texture(texture_b);
         let second_submission =
-            graph.reserve_cpu_direct_scene_submission(second_draw, &second_dependencies);
+            graph.reserve_indirect_scene_submission_for_test(12, &second_dependencies);
         let pass_index = graph.storage.passes.len();
 
         graph.add_pass("Mixed_Submission_Consumer", |builder| {
@@ -3745,11 +3574,8 @@ mod tests {
             let texture = builder.create_texture("Dead_Submission_Texture", dummy_desc());
             (MockExec, texture)
         });
-        let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let submission = graph.reserve_cpu_direct_scene_submission(
-            draw_plan,
-            &SceneSubmissionDependencies::new().with_texture(dependency),
-        );
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [dependency]);
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
         let indirect_dependency = graph.add_pass("Dead_Indirect_Args_Producer", |builder| {
             let buffer = builder.create_buffer(
                 "Dead_Indirect_Args",
@@ -3779,7 +3605,7 @@ mod tests {
             graph.storage.scene_submissions.live_backend_counts(),
             super::super::scene_submission::LiveSceneSubmissionCounts::default()
         );
-        assert!(!graph.storage.draw_plans.is_live(draw_plan));
+        assert_eq!(graph.storage.draw_plans.live_keys().count(), 0);
     }
 
     #[test]
@@ -3867,9 +3693,7 @@ mod tests {
         let mut first_storage = GraphStorage::new();
         let first_arena = FrameArena::new();
         let mut first_graph = begin_test_frame(&mut first_storage, &first_arena);
-        let draw_plan = first_graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let foreign = first_graph
-            .reserve_cpu_direct_scene_submission(draw_plan, &SceneSubmissionDependencies::new());
+        let foreign = first_graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
 
         let mut second_storage = GraphStorage::new();
         let second_arena = FrameArena::new();
@@ -3887,9 +3711,7 @@ mod tests {
         let arena = FrameArena::new();
         let stale = {
             let mut graph = begin_test_frame(&mut storage, &arena);
-            let draw_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-            graph
-                .reserve_cpu_direct_scene_submission(draw_plan, &SceneSubmissionDependencies::new())
+            graph.reserve_scene_submission(SceneSubmissionKey::Opaque)
         };
 
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -3917,22 +3739,25 @@ mod tests {
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
         let texture = graph.register_texture("Outer_Texture", dummy_desc(), false);
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
-        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
         let outer_index = graph.storage.passes.len();
 
         graph.add_pass("Outer", |builder| {
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(submission);
             let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 builder.graph.add_pass("Nested", |_nested| (MockExec, ()));
             }));
             assert!(nested.is_err());
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(submission);
             (MockExec, ())
         });
 
         assert_eq!(graph.storage.passes.len(), 1);
-        assert_eq!(graph.storage.pass_draw_plan_demands(outer_index), &[plan]);
+        assert_eq!(
+            graph.storage.pass_scene_submission_demands(outer_index),
+            &[submission]
+        );
         assert_eq!(graph.storage.pass_reads(outer_index), &[texture.erase()]);
         assert_eq!(
             graph
@@ -3944,7 +3769,7 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_draw_plans_union_dependencies_in_first_occurrence_order() {
+    fn disjoint_scene_submissions_union_dependencies_in_first_occurrence_order() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -3953,28 +3778,30 @@ mod tests {
         let opaque_only = graph.register_texture("Opaque", dummy_desc(), false);
         let transparent_only = graph.register_texture("Transparent", dummy_desc(), false);
 
-        graph
-            .set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [shared, opaque_only, shared]);
-        graph.set_draw_plan_texture_dependencies(
-            DrawPlanKey::Transparent,
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Opaque,
+            [shared, opaque_only, shared],
+        );
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Transparent,
             [transparent_only, shared, transparent_only],
         );
-        let opaque = graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let transparent = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let opaque = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
+        let transparent = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
         let pass_index = graph.storage.passes.len();
 
         graph.add_pass("Disjoint_Draw_Consumer", |builder| {
             builder.read_texture(direct);
             builder.read_texture(shared);
-            builder.demand_draw_plan(transparent);
-            builder.demand_draw_plan(opaque);
-            builder.demand_draw_plan(transparent);
+            builder.demand_scene_submission(transparent);
+            builder.demand_scene_submission(opaque);
+            builder.demand_scene_submission(transparent);
             builder.mark_side_effect();
             (MockExec, ())
         });
 
         assert_eq!(
-            graph.storage.pass_draw_plan_demands(pass_index),
+            graph.storage.pass_scene_submission_demands(pass_index),
             &[transparent, opaque]
         );
         assert_eq!(
@@ -3998,12 +3825,12 @@ mod tests {
         }
 
         graph.compile_topology();
-        assert!(graph.storage.draw_plans.is_live(opaque));
-        assert!(graph.storage.draw_plans.is_live(transparent));
+        assert!(graph.storage.scene_submission_is_live(opaque));
+        assert!(graph.storage.scene_submission_is_live(transparent));
     }
 
     #[test]
-    fn draw_plan_resource_scratch_recovers_after_iterator_panic() {
+    fn scene_submission_dependency_scratch_recovers_after_iterator_panic() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -4011,19 +3838,22 @@ mod tests {
         let retained = graph.register_texture("Retained", dummy_desc(), false);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            graph.set_draw_plan_texture_dependencies(
-                DrawPlanKey::Opaque,
+            graph.set_scene_submission_texture_dependencies(
+                SceneSubmissionKey::Opaque,
                 std::iter::once(abandoned)
                     .chain(std::iter::once_with(|| panic!("dependency iterator panic"))),
             );
         }));
         assert!(result.is_err());
 
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [retained, retained]);
-        let plan = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Transparent,
+            [retained, retained],
+        );
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
         let pass_index = graph.storage.passes.len();
         graph.add_pass("Post_Panic_Consumer", |builder| {
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(submission);
             (MockExec, ())
         });
 
@@ -4060,41 +3890,41 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "draw-plan texture dependencies must be registered before the first consumer"
+        expected = "scene-submission texture dependencies must be registered before reservation"
     )]
-    fn draw_plan_texture_dependencies_reject_late_registration() {
+    fn scene_submission_texture_dependencies_reject_late_registration() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
-        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
         graph.add_pass("Consumer", |builder| {
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(submission);
             (MockExec, ())
         });
         let texture = graph.register_texture("Late_Texture", dummy_desc(), false);
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
     }
 
     #[test]
     #[should_panic(
-        expected = "draw-plan texture dependencies must be registered before the first consumer"
+        expected = "scene-submission texture dependencies must be registered before reservation"
     )]
     fn prepass_demand_rejects_late_opaque_dependency_registration() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
-        let prepass = graph.reserve_draw_plan(DrawPlanKey::Prepass {
+        let prepass = graph.reserve_scene_submission(SceneSubmissionKey::Prepass {
             needs_normal: true,
             needs_feature_id: false,
             needs_velocity: true,
         });
         graph.add_pass("Prepass_Consumer", |builder| {
-            builder.demand_draw_plan(prepass);
+            builder.demand_scene_submission(prepass);
             (MockExec, ())
         });
 
         let texture = graph.register_texture("Late_Opaque_Texture", dummy_desc(), false);
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [texture]);
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
     }
 
     #[test]
@@ -4107,15 +3937,18 @@ mod tests {
         {
             let mut graph = begin_test_frame(&mut storage, &arena);
             first_texture = graph.register_texture("First_Texture", dummy_desc(), false);
-            graph.set_draw_plan_texture_dependencies(DrawPlanKey::Opaque, [first_texture]);
-            first_plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+            graph.set_scene_submission_texture_dependencies(
+                SceneSubmissionKey::Opaque,
+                [first_texture],
+            );
+            first_plan = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
             graph.add_pass("First_Consumer", |builder| {
-                builder.demand_draw_plan(first_plan);
+                builder.demand_scene_submission(first_plan);
                 (MockExec, ())
             });
         }
-        assert_eq!(storage.pass_draw_plan_demands(0), &[first_plan]);
-        assert_eq!(storage.passes[0].draw_plan_demand_range, 0..1);
+        assert_eq!(storage.pass_scene_submission_demands(0), &[first_plan]);
+        assert_eq!(storage.passes[0].scene_submission_demand_range, 0..1);
         assert_eq!(storage.pass_reads(0), &[first_texture.erase()]);
         assert_eq!(storage.passes[0].logical_read_range, 0..1);
         let retained_read_capacity = storage.logical_reads.capacity();
@@ -4126,14 +3959,20 @@ mod tests {
             retained_read_capacity
         );
         let second_texture = graph.register_texture("Second_Texture", dummy_desc(), false);
-        graph.set_draw_plan_texture_dependencies(DrawPlanKey::Transparent, [second_texture]);
-        let second_plan = graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Transparent,
+            [second_texture],
+        );
+        let second_plan = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
         graph.add_pass("Second_Consumer", |builder| {
-            builder.demand_draw_plan(second_plan);
+            builder.demand_scene_submission(second_plan);
             (MockExec, ())
         });
-        assert_eq!(graph.storage.pass_draw_plan_demands(0), &[second_plan]);
-        assert_eq!(graph.storage.passes[0].draw_plan_demand_range, 0..1);
+        assert_eq!(
+            graph.storage.pass_scene_submission_demands(0),
+            &[second_plan]
+        );
+        assert_eq!(graph.storage.passes[0].scene_submission_demand_range, 0..1);
         assert_eq!(graph.storage.pass_reads(0), &[second_texture.erase()]);
         assert_eq!(graph.storage.passes[0].logical_read_range, 0..1);
     }
@@ -4266,7 +4105,7 @@ mod tests {
     }
 
     #[test]
-    fn large_draw_plan_texture_sets_use_deduplicated_physical_edges() {
+    fn large_scene_submission_texture_sets_use_deduplicated_physical_edges() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -4279,15 +4118,15 @@ mod tests {
             });
             textures.push(texture);
         }
-        graph.set_draw_plan_texture_dependencies(
-            DrawPlanKey::Opaque,
+        graph.set_scene_submission_texture_dependencies(
+            SceneSubmissionKey::Opaque,
             textures.iter().chain(&textures).copied(),
         );
-        let plan = graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
         let consumer = graph.storage.passes.len();
         graph.add_pass("Large_Draw_Consumer", |builder| {
-            builder.demand_draw_plan(plan);
-            builder.demand_draw_plan(plan);
+            builder.demand_scene_submission(submission);
+            builder.demand_scene_submission(submission);
             builder.mark_side_effect();
             (MockExec, ())
         });
@@ -4460,21 +4299,6 @@ mod tests {
         assert!(graph.storage.compiled_reverse_consumers(0).is_empty());
         assert_eq!(graph.storage.compiled_reverse_consumers(2), &[3]);
         assert_eq!(graph.storage.execution_queue, [2, 3]);
-    }
-
-    #[test]
-    #[should_panic(expected = "demanded a draw plan from another graph attempt")]
-    fn pass_builder_rejects_a_foreign_draw_plan_id() {
-        let mut foreign = DrawPlanStore::new();
-        let foreign_id = foreign.reserve_plan(DrawPlanKey::Opaque);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        graph.add_pass("Foreign_Draw_Consumer", |builder| {
-            builder.demand_draw_plan(foreign_id);
-            (MockExec, ())
-        });
     }
 
     #[test]

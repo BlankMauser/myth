@@ -1,4 +1,4 @@
-//! Exact DrawPlan-demand scaling benchmarks.
+//! Exact SceneSubmission-demand scaling benchmarks.
 //!
 //! Run with:
 //! `cargo bench --bench rdg_draw_demand_bench --features rdg_bench_support`

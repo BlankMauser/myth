@@ -1,6 +1,6 @@
 //! Same-binary A/B benchmark for RDG diagnostics bookkeeping.
 //!
-//! Both arms execute the exact crate-private DrawPlan demand topology. The
+//! Both arms execute the exact crate-private SceneSubmission topology. The
 //! control arm skips only diagnostics attempt creation, counter updates, and
 //! terminal publication.
 //!

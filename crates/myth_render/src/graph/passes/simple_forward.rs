@@ -25,12 +25,12 @@
 use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
+use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
     TextureDesc, TextureNodeId, build_screen_bind_group,
 };
-use crate::graph::frame::{DrawPlanId, DrawPlanKey};
-use crate::graph::passes::draw::submit_draw_commands;
+use crate::graph::passes::draw::submit_scene_submission;
 use crate::graph::passes::skybox::{SkyboxDrawRequest, SkyboxDrawState};
 
 // ─── Feature ───────────────────────────────────────────────────────────
@@ -78,13 +78,17 @@ impl SimpleForwardFeature {
 
         let out_desc = fc.create_surface_desc(wgpu::TextureUsages::TEXTURE_BINDING);
         let depth_desc = fc.create_depth_desc(wgpu::TextureUsages::TEXTURE_BINDING);
-        let opaque_draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Opaque);
-        let transparent_draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Transparent);
+        let opaque_submission = ctx
+            .graph
+            .reserve_scene_submission(SceneSubmissionKey::Opaque);
+        let transparent_submission = ctx
+            .graph
+            .reserve_scene_submission(SceneSubmissionKey::Transparent);
 
         ctx.graph.add_pass("SimpleForward_Pass", |builder| {
             builder.demand_global_state(global_state_key);
-            builder.demand_draw_plan(opaque_draw_plan);
-            builder.demand_draw_plan(transparent_draw_plan);
+            builder.demand_scene_submission(opaque_submission);
+            builder.demand_scene_submission(transparent_submission);
             let out = builder.create_texture("Scene_Color", out_desc);
             let scene_depth = builder.create_texture("Scene_Depth", depth_desc);
 
@@ -146,8 +150,8 @@ impl SimpleForwardFeature {
                 shadow_input: shadow_tex,
                 shadow_cube_input: shadow_cube_tex,
                 scene_lighting,
-                opaque_draw_plan,
-                transparent_draw_plan,
+                opaque_submission,
+                transparent_submission,
                 screen_bind_group: None,
             };
             (node, out)
@@ -173,8 +177,8 @@ pub struct SimpleForwardPassNode<'a> {
     pub shadow_input: Option<TextureNodeId>,
     pub shadow_cube_input: Option<TextureNodeId>,
     pub scene_lighting: ClusteredScreenBindings,
-    opaque_draw_plan: DrawPlanId,
-    transparent_draw_plan: DrawPlanId,
+    opaque_submission: SceneSubmissionPlanId,
+    transparent_submission: SceneSubmissionPlanId,
     screen_bind_group: Option<PreparedBindGroupId>,
 }
 
@@ -230,10 +234,10 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
         pass.set_bind_group(3, screen_bg, &[]);
 
         // 1. Opaque (front-to-back)
-        submit_draw_commands(
+        submit_scene_submission(
             &mut pass,
-            ctx.draw_plans,
-            self.opaque_draw_plan,
+            ctx.scene_submissions,
+            self.opaque_submission,
             ctx.pipeline_cache,
         );
 
@@ -246,10 +250,10 @@ impl<'a> PassNode<'a> for SimpleForwardPassNode<'a> {
         }
 
         // 3. Transparent (back-to-front)
-        submit_draw_commands(
+        submit_scene_submission(
             &mut pass,
-            ctx.draw_plans,
-            self.transparent_draw_plan,
+            ctx.scene_submissions,
+            self.transparent_submission,
             ctx.pipeline_cache,
         );
     }

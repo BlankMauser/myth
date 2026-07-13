@@ -1,4 +1,4 @@
-//! Thread-scoped allocation baseline for exact RDG DrawPlan demand workloads.
+//! Thread-scoped allocation baseline for exact RDG SceneSubmission workloads.
 //!
 //! This is deliberately separate from Criterion so its allocator wrapper
 //! cannot perturb wall-time measurements. Run with:
@@ -277,7 +277,7 @@ fn run_scenario(
     assert_eq!(
         enabled_stats,
         AllocationStats::default(),
-        "resident DrawPlan workload regressed from its zero-allocation plateau"
+        "resident SceneSubmission workload regressed from its zero-allocation plateau"
     );
     let expected_passes = if root == DrawDemandRoot::None { 3 } else { 4 };
     let expected_live = match root {
@@ -342,7 +342,7 @@ fn run_producer_fan_in_scenario(
     assert_eq!(
         produced_stats,
         AllocationStats::default(),
-        "producer-heavy DrawPlan workload regressed from its zero-allocation plateau"
+        "producer-heavy SceneSubmission workload regressed from its zero-allocation plateau"
     );
     assert_eq!(
         produced_token.registered_resource_count, resident_token.registered_resource_count,
@@ -445,7 +445,7 @@ fn measure_plateau(
     }
 
     (
-        token.expect("DrawPlan workload was not sampled"),
+        token.expect("SceneSubmission workload was not sampled"),
         baseline.expect("allocation baseline was not sampled"),
     )
 }

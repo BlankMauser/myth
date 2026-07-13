@@ -31,12 +31,12 @@ use crate::HDR_TEXTURE_FORMAT;
 use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
+use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
     TextureDesc, TextureNodeId, build_screen_bind_group,
 };
-use crate::graph::frame::{DrawPlanId, DrawPlanKey};
-use crate::graph::passes::draw::submit_draw_commands;
+use crate::graph::passes::draw::submit_scene_submission;
 
 /// Outputs produced by the Opaque pass, returned to the Composer for
 /// explicit downstream wiring.
@@ -95,11 +95,13 @@ impl OpaqueFeature {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
-        let draw_plan = ctx.graph.reserve_draw_plan(DrawPlanKey::Opaque);
+        let scene_submission = ctx
+            .graph
+            .reserve_scene_submission(SceneSubmissionKey::Opaque);
 
         ctx.graph.add_pass("Opaque_Pass", |builder| {
             builder.demand_global_state(global_state_key);
-            builder.demand_draw_plan(draw_plan);
+            builder.demand_scene_submission(scene_submission);
             // ── Create color / depth / resolve targets ─────────────────
             let (color_target, depth_target) = if is_msaa {
                 let msaa_color_desc = TextureDesc::new(
@@ -251,7 +253,7 @@ impl OpaqueFeature {
                 material_tex,
                 material_resolved,
                 scene_lighting,
-                draw_plan,
+                scene_submission,
             );
 
             let specular_mrt = if needs_specular_data {
@@ -305,7 +307,7 @@ pub struct OpaquePassNode {
     pub shadow_input: Option<TextureNodeId>,
     pub shadow_cube_input: Option<TextureNodeId>,
     pub scene_lighting: ClusteredScreenBindings,
-    draw_plan: DrawPlanId,
+    scene_submission: SceneSubmissionPlanId,
 
     // ─── Internal Cache ────────────────────────────────────────────
     screen_bind_group: Option<PreparedBindGroupId>,
@@ -313,7 +315,7 @@ pub struct OpaquePassNode {
 
 impl OpaquePassNode {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         color_target: TextureNodeId,
         depth_target: TextureNodeId,
         clear_color: wgpu::Color,
@@ -327,7 +329,7 @@ impl OpaquePassNode {
         material_tex: TextureNodeId,
         material_resolve_target: Option<TextureNodeId>,
         scene_lighting: ClusteredScreenBindings,
-        draw_plan: DrawPlanId,
+        scene_submission: SceneSubmissionPlanId,
     ) -> Self {
         Self {
             color_target,
@@ -343,7 +345,7 @@ impl OpaquePassNode {
             shadow_input,
             shadow_cube_input,
             scene_lighting,
-            draw_plan,
+            scene_submission,
             screen_bind_group: None,
         }
     }
@@ -421,10 +423,10 @@ impl<'a> PassNode<'a> for OpaquePassNode {
         let screen_bg = ctx.resolve_prepared_bind_group(self.screen_bind_group.unwrap());
         pass.set_bind_group(3, screen_bg, &[]);
 
-        submit_draw_commands(
+        submit_scene_submission(
             &mut pass,
-            ctx.draw_plans,
-            self.draw_plan,
+            ctx.scene_submissions,
+            self.scene_submission,
             ctx.pipeline_cache,
         );
     }
