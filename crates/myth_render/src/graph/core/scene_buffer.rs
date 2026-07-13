@@ -15,6 +15,10 @@ use myth_resources::uniforms::{GpuLightStorage, LightBufferMetadata};
 use rustc_hash::FxHashMap;
 
 use crate::core::gpu::{BufferUploadContext, Tracked};
+use crate::graph::capacity::{
+    CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
+    shrink_vec_by_family_ratio, vec_footprint,
+};
 
 use super::types::{BufferDesc, BufferNodeId, ResourceRecord};
 
@@ -194,6 +198,16 @@ impl SceneBufferImportStore {
             entries: Vec::new(),
             lookup: FxHashMap::default(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.entries, 16) + estimated_hash_map_footprint(&self.lookup, 16)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(&mut self.entries, 16, target_bytes, retained_bytes);
+        shrink_hash_map_by_family_ratio(&mut self.lookup, 16, target_bytes, retained_bytes);
     }
 
     pub(crate) fn clear(&mut self) {

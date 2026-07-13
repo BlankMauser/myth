@@ -11,6 +11,10 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::graph::RenderState;
+use crate::graph::capacity::{
+    CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
+    shrink_vec_by_family_ratio, vec_footprint,
+};
 use myth_resources::Mesh;
 use myth_resources::ResourceBuilder;
 use myth_resources::geometry::Geometry;
@@ -298,6 +302,16 @@ impl PreparedBindGroupStore {
             lookup: FxHashMap::default(),
             attempt_token: next_prepared_bind_group_attempt(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.bind_groups, 64) + estimated_hash_map_footprint(&self.lookup, 64)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(&mut self.bind_groups, 64, target_bytes, retained_bytes);
+        shrink_hash_map_by_family_ratio(&mut self.lookup, 64, target_bytes, retained_bytes);
     }
 
     /// Returns the frame-local ID for `key`, cloning a cache-owned WGPU handle

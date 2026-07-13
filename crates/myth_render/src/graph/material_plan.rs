@@ -20,6 +20,11 @@ use crate::core::gpu::{
 };
 use crate::core::{BindingInterfaceId, ResourceManager};
 
+use super::capacity::{
+    CapacityUsage, estimated_hash_map_footprint, estimated_hash_set_footprint,
+    shrink_hash_map_by_family_ratio, shrink_hash_set_by_family_ratio, shrink_vec_by_family_ratio,
+    vec_footprint,
+};
 use super::extracted::{ExtractedRenderItem, ExtractedScene};
 use super::frame::{DrawPlanKey, FrameSourceId, RenderLists};
 
@@ -189,15 +194,19 @@ pub(crate) struct MaterialPlanStore {
     initialized: bool,
 }
 
+const MATERIAL_PLAN_BASELINE: usize = 128;
+const MATERIAL_SOURCE_BASELINE: usize = 512;
+const MATERIAL_RECIPE_BASELINE: usize = 16;
+
 impl MaterialPlanStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            plans: Vec::with_capacity(128),
+            plans: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
             lookup: FxHashMap::default(),
             failed: FxHashSet::default(),
-            source_plans: Vec::with_capacity(512),
-            recipes: Vec::with_capacity(16),
+            source_plans: Vec::with_capacity(MATERIAL_SOURCE_BASELINE),
+            recipes: Vec::with_capacity(MATERIAL_RECIPE_BASELINE),
             initialized: false,
         }
     }
@@ -429,6 +438,47 @@ impl MaterialPlanStore {
         self.failed.clear();
         self.plans.clear();
         self.initialized = false;
+    }
+
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.plans, MATERIAL_PLAN_BASELINE)
+            + estimated_hash_map_footprint(&self.lookup, MATERIAL_PLAN_BASELINE)
+            + estimated_hash_set_footprint(&self.failed, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.source_plans, MATERIAL_SOURCE_BASELINE)
+            + vec_footprint(&self.recipes, MATERIAL_RECIPE_BASELINE)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(
+            &mut self.plans,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.lookup,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_set_by_family_ratio(
+            &mut self.failed,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.source_plans,
+            MATERIAL_SOURCE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.recipes,
+            MATERIAL_RECIPE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
     }
 
     #[cfg(test)]

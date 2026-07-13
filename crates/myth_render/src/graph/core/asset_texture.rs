@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rustc_hash::FxHashMap;
 
 use crate::core::gpu::{AssetTextureMaterialization, AssetTextureSnapshot, MipmapRequest, Tracked};
+use crate::graph::capacity::{
+    CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
+    shrink_vec_by_family_ratio, vec_footprint,
+};
 
 use super::types::{TextureDesc, TextureNodeId};
 
@@ -102,6 +106,16 @@ impl AssetTextureImportStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.entries, 32) + estimated_hash_map_footprint(&self.lookup, 32)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(&mut self.entries, 32, target_bytes, retained_bytes);
+        shrink_hash_map_by_family_ratio(&mut self.lookup, 32, target_bytes, retained_bytes);
     }
 
     pub(crate) fn clear(&mut self) {

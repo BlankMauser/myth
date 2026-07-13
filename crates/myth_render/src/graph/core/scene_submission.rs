@@ -13,6 +13,10 @@ use smallvec::SmallVec;
 
 use crate::core::gpu::Tracked;
 use crate::graph::asset_frame::GeometryFramePhysical;
+use crate::graph::capacity::{
+    CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
+    shrink_vec_by_family_ratio, vec_footprint,
+};
 use crate::graph::frame::{
     DrawBindGroupSlot, DrawBufferSlot, DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanResolver,
     DrawPlanStore, FrameSourceId, PreparedDrawSource,
@@ -231,6 +235,19 @@ impl SceneSubmissionStore {
             lookup: FxHashMap::default(),
             dependencies: Vec::with_capacity(64),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.plans, 16)
+            + estimated_hash_map_footprint(&self.lookup, 16)
+            + vec_footprint(&self.dependencies, 64)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(&mut self.plans, 16, target_bytes, retained_bytes);
+        shrink_hash_map_by_family_ratio(&mut self.lookup, 16, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(&mut self.dependencies, 64, target_bytes, retained_bytes);
     }
 
     /// Release attempt records while retaining every backing allocation.

@@ -12,6 +12,12 @@ use crate::core::gpu::{
     MipmapRequestBatch, PhysicalImageGenerationKey, Tracked,
 };
 use crate::graph::asset_frame::{GeometryFrameStore, ObjectInterfaceStore};
+use crate::graph::capacity::{
+    CapacityGovernor, CapacityUsage, PendingCapacityTrim, binary_heap_footprint,
+    estimated_hash_map_footprint, estimated_hash_set_footprint, shrink_binary_heap_by_family_ratio,
+    shrink_hash_map_by_family_ratio, shrink_hash_set_by_family_ratio, shrink_vec_by_family_ratio,
+    vec_footprint,
+};
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
@@ -48,6 +54,100 @@ use super::types::{
 };
 use smallvec::SmallVec;
 use wgpu::Device;
+
+const GRAPH_CAPACITY_FAMILY_COUNT: usize = 12;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphCapacityFamily {
+    Topology = 0,
+    CompileScratch = 1,
+    Mipmap = 2,
+    AssetTextures = 3,
+    SceneBuffers = 4,
+    PreparedBindGroups = 5,
+    DrawPlans = 6,
+    SceneSubmissions = 7,
+    PreparedDraws = 8,
+    Geometry = 9,
+    ObjectInterfaces = 10,
+    Materials = 11,
+}
+
+impl GraphCapacityFamily {
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Estimated CPU backing capacity retained by the Render Graph between
+/// attempts. Hash-table values are stable policy estimates, not allocator-
+/// exact byte counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RdgRetainedCapacityStats {
+    estimated_retained_bytes: usize,
+    estimated_topology_bytes: usize,
+    estimated_compile_scratch_bytes: usize,
+    estimated_attempt_store_bytes: usize,
+    last_attempt_active_bytes: usize,
+    observed_attempts: u64,
+    cooldown_attempts_remaining: u32,
+    trim_pending: bool,
+    trim_count: u64,
+    last_trimmed_bytes: usize,
+}
+
+impl RdgRetainedCapacityStats {
+    #[must_use]
+    pub const fn estimated_retained_bytes(self) -> usize {
+        self.estimated_retained_bytes
+    }
+
+    #[must_use]
+    pub const fn estimated_topology_bytes(self) -> usize {
+        self.estimated_topology_bytes
+    }
+
+    #[must_use]
+    pub const fn estimated_compile_scratch_bytes(self) -> usize {
+        self.estimated_compile_scratch_bytes
+    }
+
+    #[must_use]
+    pub const fn estimated_attempt_store_bytes(self) -> usize {
+        self.estimated_attempt_store_bytes
+    }
+
+    #[must_use]
+    pub const fn last_attempt_active_bytes(self) -> usize {
+        self.last_attempt_active_bytes
+    }
+
+    #[must_use]
+    pub const fn observed_attempts(self) -> u64 {
+        self.observed_attempts
+    }
+
+    #[must_use]
+    pub const fn cooldown_attempts_remaining(self) -> u32 {
+        self.cooldown_attempts_remaining
+    }
+
+    #[must_use]
+    pub const fn trim_pending(self) -> bool {
+        self.trim_pending
+    }
+
+    #[must_use]
+    pub const fn trim_count(self) -> u64 {
+        self.trim_count
+    }
+
+    #[must_use]
+    pub const fn last_trimmed_bytes(self) -> usize {
+        self.last_trimmed_bytes
+    }
+}
 
 /// Per-frame rendering configuration stored in the [`RenderGraph`].
 /// during graph construction through [`PassBuilder`] accessors.  This
@@ -177,6 +277,14 @@ impl MipmapEncodeCoordinator {
     pub(crate) fn clear(&mut self) {
         self.claimed.get_mut().clear();
     }
+
+    fn capacity_usage(&self) -> CapacityUsage {
+        estimated_hash_set_footprint(&*self.claimed.lock(), 64)
+    }
+
+    fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_hash_set_by_family_ratio(self.claimed.get_mut(), 64, target_bytes, retained_bytes);
+    }
 }
 
 /// Reusable dense set for attempt-local IDs.
@@ -189,10 +297,12 @@ impl MipmapEncodeCoordinator {
 struct DenseGenerationScratch {
     stamps: Vec<u32>,
     generation: u32,
+    active_len: usize,
 }
 
 impl DenseGenerationScratch {
     fn begin(&mut self, domain_len: usize) {
+        self.active_len = domain_len;
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
             self.stamps.fill(0);
@@ -214,6 +324,39 @@ impl DenseGenerationScratch {
         }
         *stamp = self.generation;
         true
+    }
+
+    fn reset_active_len(&mut self) {
+        self.active_len = 0;
+    }
+
+    fn capacity_usage(&self, baseline_capacity: usize) -> CapacityUsage {
+        let bytes_per_stamp = std::mem::size_of::<u32>();
+        CapacityUsage::new(
+            self.active_len.saturating_mul(bytes_per_stamp),
+            self.stamps.capacity().saturating_mul(bytes_per_stamp),
+            baseline_capacity.saturating_mul(bytes_per_stamp),
+        )
+    }
+
+    fn trim_capacity(
+        &mut self,
+        baseline_capacity: usize,
+        target_bytes: usize,
+        retained_bytes: usize,
+    ) {
+        if retained_bytes == 0 || target_bytes >= retained_bytes {
+            return;
+        }
+        let target_capacity = ((self.stamps.capacity() as u128) * (target_bytes as u128))
+            .div_ceil(retained_bytes as u128)
+            .min(usize::MAX as u128) as usize;
+        let target_capacity = target_capacity
+            .max(self.active_len)
+            .max(baseline_capacity)
+            .min(self.stamps.capacity());
+        self.stamps.truncate(target_capacity);
+        self.stamps.shrink_to(target_capacity);
     }
 }
 
@@ -257,6 +400,12 @@ pub struct GraphStorage {
     /// Attempt lifecycle and zero-allocation health counters. This is not
     /// cleared with topology or frame-owned physical resources.
     pub(crate) diagnostics: RdgStandaloneDiagnosticsStore,
+    /// Allocation-free retained-capacity policy state. Attempt sampling is
+    /// finalized before Drop-bearing owners are released; any selected trim
+    /// is applied only by the next `clear` maintenance boundary.
+    capacity_governor: CapacityGovernor<GRAPH_CAPACITY_FAMILY_COUNT>,
+    capacity_sample: [CapacityUsage; GRAPH_CAPACITY_FAMILY_COUNT],
+    capacity_sampled: bool,
     /// All pass records for the current frame.
     pub passes: Vec<PassRecord>,
     /// All resource records for the current frame.
@@ -374,6 +523,9 @@ impl GraphStorage {
     pub fn new() -> Self {
         Self {
             diagnostics: RdgStandaloneDiagnosticsStore::default(),
+            capacity_governor: CapacityGovernor::default(),
+            capacity_sample: [CapacityUsage::default(); GRAPH_CAPACITY_FAMILY_COUNT],
+            capacity_sampled: false,
             passes: Vec::new(),
             resources: Vec::new(),
             execution_queue: Vec::new(),
@@ -420,8 +572,303 @@ impl GraphStorage {
         }
     }
 
-    /// Clears all per-frame data while retaining heap capacity.
+    fn capacity_snapshot(&self) -> [CapacityUsage; GRAPH_CAPACITY_FAMILY_COUNT] {
+        let topology = vec_footprint(&self.passes, 64)
+            + vec_footprint(&self.resources, 128)
+            + vec_footprint(&self.execution_queue, 64)
+            + vec_footprint(&self.logical_reads, 256)
+            + vec_footprint(&self.physical_dependencies, 256)
+            + estimated_hash_map_footprint(&self.persistent_texture_lookup, 32)
+            + vec_footprint(&self.history_commit_requests, 16)
+            + vec_footprint(&self.cache_commit_requests, 16)
+            + vec_footprint(&self.scene_submission_demands, 64)
+            + vec_footprint(&self.scene_submission_raw_demands, 64);
+        #[cfg(feature = "rdg_inspector")]
+        let topology = topology + vec_footprint(&self.current_group_stack, 16);
+        #[cfg(debug_assertions)]
+        let topology = topology + vec_footprint(&self.prev_execution_names, 64);
+
+        let compile = vec_footprint(&self.compile_stack, 128)
+            + vec_footprint(&self.compile_in_degrees, 128)
+            + binary_heap_footprint(&self.compile_ready_heap, 128)
+            + vec_footprint(&self.compile_reverse_offsets, 129)
+            + vec_footprint(&self.compile_reverse_edges, 256)
+            + vec_footprint(&self.compile_reverse_cursors, 128)
+            + vec_footprint(&self.compile_max_ext_indices, 128)
+            + self.draw_texture_dependency_scratch.capacity_usage(256)
+            + self.scene_submission_demand_scratch.capacity_usage(64)
+            + self.scene_submission_resource_scratch.capacity_usage(256)
+            + self.physical_dependency_scratch.capacity_usage(256);
+
+        let mipmap = vec_footprint(&self.mipmap_batches, 16)
+            + self.mipmap_encode_coordinator.capacity_usage();
+        #[cfg(feature = "3dgs")]
+        let mipmap = mipmap + vec_footprint(&self.gaussian_frame_batches, 16);
+
+        let mut snapshot = [CapacityUsage::default(); GRAPH_CAPACITY_FAMILY_COUNT];
+        snapshot[GraphCapacityFamily::Topology.index()] = topology;
+        snapshot[GraphCapacityFamily::CompileScratch.index()] = compile;
+        snapshot[GraphCapacityFamily::Mipmap.index()] = mipmap;
+        snapshot[GraphCapacityFamily::AssetTextures.index()] =
+            self.asset_texture_imports.capacity_usage();
+        snapshot[GraphCapacityFamily::SceneBuffers.index()] =
+            self.scene_buffer_imports.capacity_usage();
+        snapshot[GraphCapacityFamily::PreparedBindGroups.index()] =
+            self.prepared_bind_groups.capacity_usage();
+        snapshot[GraphCapacityFamily::DrawPlans.index()] = self.draw_plans.capacity_usage();
+        snapshot[GraphCapacityFamily::SceneSubmissions.index()] =
+            self.scene_submissions.capacity_usage();
+        snapshot[GraphCapacityFamily::PreparedDraws.index()] = self.prepared_draws.capacity_usage();
+        snapshot[GraphCapacityFamily::Geometry.index()] = self.geometry_frames.capacity_usage();
+        snapshot[GraphCapacityFamily::ObjectInterfaces.index()] =
+            self.object_interfaces.capacity_usage();
+        snapshot[GraphCapacityFamily::Materials.index()] = self.material_plans.capacity_usage();
+        snapshot
+    }
+
+    /// Merge the current point-in-time usage into this attempt's peak sample.
+    /// This is called before early owner release and again from RenderGraph
+    /// Drop, so clear stores cannot make a busy attempt look idle.
+    pub(crate) fn sample_retained_capacity(&mut self) {
+        let snapshot = self.capacity_snapshot();
+        for (peak, current) in self.capacity_sample.iter_mut().zip(snapshot) {
+            peak.active_bytes = peak.active_bytes.max(current.active_bytes);
+            peak.retained_bytes = peak.retained_bytes.max(current.retained_bytes);
+            peak.baseline_bytes = peak.baseline_bytes.max(current.baseline_bytes);
+        }
+        self.capacity_sampled = true;
+    }
+
+    fn finish_retained_capacity_sample(&mut self) {
+        self.sample_retained_capacity();
+        if self.capacity_sampled {
+            self.capacity_governor.observe(self.capacity_sample);
+        }
+        self.capacity_sample = [CapacityUsage::default(); GRAPH_CAPACITY_FAMILY_COUNT];
+        self.capacity_sampled = false;
+    }
+
+    /// Queue one pressure-driven family trim. Selection uses the most recent
+    /// attempt sample and is applied at the earliest safe `clear` boundary
+    /// after any active global trim cooldown has elapsed.
+    pub fn request_retained_capacity_trim(&mut self) {
+        self.capacity_governor.request_trim();
+    }
+
+    /// Return the current estimated backing capacity and the maintenance
+    /// governor's last-attempt state.
+    #[must_use]
+    pub fn retained_capacity_stats(&self) -> RdgRetainedCapacityStats {
+        let snapshot = self.capacity_snapshot();
+        let topology = snapshot[GraphCapacityFamily::Topology.index()].retained_bytes;
+        let compile = snapshot[GraphCapacityFamily::CompileScratch.index()].retained_bytes;
+        let total = snapshot.iter().fold(0usize, |bytes, usage| {
+            bytes.saturating_add(usage.retained_bytes)
+        });
+        let governor = self.capacity_governor.stats();
+        RdgRetainedCapacityStats {
+            estimated_retained_bytes: total,
+            estimated_topology_bytes: topology,
+            estimated_compile_scratch_bytes: compile,
+            estimated_attempt_store_bytes: total.saturating_sub(topology).saturating_sub(compile),
+            last_attempt_active_bytes: governor.usage.active_bytes,
+            observed_attempts: governor.attempts,
+            cooldown_attempts_remaining: governor.cooldown_remaining,
+            trim_pending: governor.pending.is_some() || governor.explicit_request_queued,
+            trim_count: governor.trim_count,
+            last_trimmed_bytes: governor.last_trimmed_bytes,
+        }
+    }
+
+    fn trim_topology_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(&mut self.passes, 64, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(&mut self.resources, 128, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(&mut self.execution_queue, 64, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(&mut self.logical_reads, 256, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(
+            &mut self.physical_dependencies,
+            256,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.persistent_texture_lookup,
+            32,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.history_commit_requests,
+            16,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.cache_commit_requests,
+            16,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.scene_submission_demands,
+            64,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.scene_submission_raw_demands,
+            64,
+            target_bytes,
+            retained_bytes,
+        );
+        #[cfg(feature = "rdg_inspector")]
+        shrink_vec_by_family_ratio(
+            &mut self.current_group_stack,
+            16,
+            target_bytes,
+            retained_bytes,
+        );
+        #[cfg(debug_assertions)]
+        shrink_vec_by_family_ratio(
+            &mut self.prev_execution_names,
+            64,
+            target_bytes,
+            retained_bytes,
+        );
+    }
+
+    fn trim_compile_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(&mut self.compile_stack, 128, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(
+            &mut self.compile_in_degrees,
+            128,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_binary_heap_by_family_ratio(
+            &mut self.compile_ready_heap,
+            128,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.compile_reverse_offsets,
+            129,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.compile_reverse_edges,
+            256,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.compile_reverse_cursors,
+            128,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.compile_max_ext_indices,
+            128,
+            target_bytes,
+            retained_bytes,
+        );
+        self.draw_texture_dependency_scratch
+            .trim_capacity(256, target_bytes, retained_bytes);
+        self.scene_submission_demand_scratch
+            .trim_capacity(64, target_bytes, retained_bytes);
+        self.scene_submission_resource_scratch
+            .trim_capacity(256, target_bytes, retained_bytes);
+        self.physical_dependency_scratch
+            .trim_capacity(256, target_bytes, retained_bytes);
+    }
+
+    fn trim_mipmap_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(&mut self.mipmap_batches, 16, target_bytes, retained_bytes);
+        self.mipmap_encode_coordinator
+            .trim_capacity(target_bytes, retained_bytes);
+        #[cfg(feature = "3dgs")]
+        shrink_vec_by_family_ratio(
+            &mut self.gaussian_frame_batches,
+            16,
+            target_bytes,
+            retained_bytes,
+        );
+    }
+
+    fn apply_pending_capacity_trim(&mut self) {
+        let Some(PendingCapacityTrim {
+            family,
+            target_bytes,
+            ..
+        }) = self.capacity_governor.take_pending_target()
+        else {
+            return;
+        };
+        let before_snapshot = self.capacity_snapshot();
+        let retained_before = before_snapshot[family].retained_bytes;
+        let target_bytes = target_bytes.min(retained_before);
+        match family {
+            family if family == GraphCapacityFamily::Topology.index() => {
+                self.trim_topology_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::CompileScratch.index() => {
+                self.trim_compile_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::Mipmap.index() => {
+                self.trim_mipmap_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::AssetTextures.index() => {
+                self.asset_texture_imports
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::SceneBuffers.index() => {
+                self.scene_buffer_imports
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::PreparedBindGroups.index() => {
+                self.prepared_bind_groups
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::DrawPlans.index() => {
+                self.draw_plans.trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::SceneSubmissions.index() => {
+                self.scene_submissions
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::PreparedDraws.index() => {
+                self.prepared_draws
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::Geometry.index() => {
+                self.geometry_frames
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::ObjectInterfaces.index() => {
+                self.object_interfaces
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            family if family == GraphCapacityFamily::Materials.index() => {
+                self.material_plans
+                    .trim_capacity(target_bytes, retained_before);
+            }
+            _ => unreachable!("capacity governor selected an unknown family"),
+        }
+        let retained_after = self.capacity_snapshot()[family].retained_bytes;
+        self.capacity_governor
+            .complete_trim(retained_before, retained_after);
+    }
+
+    /// Clears all per-frame data. Heap capacity is normally retained; a single
+    /// governor-selected cold family may be trimmed here after sustained low
+    /// utilization or an explicit pressure request.
     pub fn clear(&mut self) {
+        let visible_capacity = self.capacity_snapshot();
+        self.capacity_governor
+            .resolve_requested_trim(visible_capacity);
         self.passes.clear();
         self.resources.clear();
         self.execution_queue.clear();
@@ -430,6 +877,14 @@ impl GraphStorage {
         self.compile_reverse_offsets.clear();
         self.compile_reverse_edges.clear();
         self.compile_reverse_cursors.clear();
+        self.compile_stack.clear();
+        self.compile_in_degrees.clear();
+        self.compile_ready_heap.clear();
+        self.compile_max_ext_indices.clear();
+        self.draw_texture_dependency_scratch.reset_active_len();
+        self.scene_submission_demand_scratch.reset_active_len();
+        self.scene_submission_resource_scratch.reset_active_len();
+        self.physical_dependency_scratch.reset_active_len();
         self.scene_submission_demands.clear();
         self.scene_submission_raw_demands.clear();
         self.pass_setup_active = false;
@@ -442,6 +897,9 @@ impl GraphStorage {
         // self.resource_registry.clear();
         #[cfg(feature = "rdg_inspector")]
         self.current_group_stack.clear();
+        self.apply_pending_capacity_trim();
+        self.capacity_sample = [CapacityUsage::default(); GRAPH_CAPACITY_FAMILY_COUNT];
+        self.capacity_sampled = false;
     }
 
     /// Latest terminal standalone attempt, retained independently from graph
@@ -1133,6 +1591,10 @@ impl Drop for RenderGraph<'_> {
         // Remove every slot at the graph boundary so resetting FrameArena can
         // never leave a callable dangling node in retained topology metadata.
         self.storage.invalidate_pass_nodes();
+        // Finalize the attempt's allocation-free capacity sample before any
+        // remaining Drop-bearing store is cleared. Actual trimming is deferred
+        // to the next GraphStorage::clear maintenance boundary.
+        self.storage.finish_retained_capacity_sample();
         // Successful submission paths have already consumed/published their
         // producer attempts; prepared bind-group clones intentionally remain
         // owned through execute and are released here. On panic or early abort
@@ -2950,6 +3412,101 @@ mod tests {
     }
 
     #[test]
+    fn pressure_trim_is_deferred_to_clear_and_reclaims_one_capacity_family() {
+        let mut storage = GraphStorage::new();
+        storage.compile_reverse_edges.reserve(256 * 1024);
+        let capacity_before = storage.compile_reverse_edges.capacity();
+        let bytes_before = storage.retained_capacity_stats().estimated_retained_bytes();
+
+        storage.request_retained_capacity_trim();
+        assert_eq!(storage.compile_reverse_edges.capacity(), capacity_before);
+        assert!(storage.retained_capacity_stats().trim_pending());
+
+        storage.clear();
+
+        assert!(storage.compile_reverse_edges.capacity() < capacity_before);
+        let stats = storage.retained_capacity_stats();
+        assert_eq!(stats.trim_count(), 1);
+        assert!(stats.last_trimmed_bytes() > 0);
+        assert!(stats.estimated_retained_bytes() < bytes_before);
+        assert!(!stats.trim_pending());
+    }
+
+    #[test]
+    fn retained_capacity_categories_partition_the_total_and_keep_mipmaps_out_of_topology() {
+        let mut storage = GraphStorage::new();
+        let before = storage.retained_capacity_stats();
+        storage.mipmap_batches.reserve(16 * 1024);
+        let after = storage.retained_capacity_stats();
+
+        assert_eq!(
+            after.estimated_retained_bytes(),
+            after
+                .estimated_topology_bytes()
+                .saturating_add(after.estimated_compile_scratch_bytes())
+                .saturating_add(after.estimated_attempt_store_bytes())
+        );
+        assert_eq!(
+            after.estimated_topology_bytes(),
+            before.estimated_topology_bytes(),
+            "attempt-owned mipmap slots must not be reported as topology"
+        );
+        assert!(
+            after.estimated_attempt_store_bytes() > before.estimated_attempt_store_bytes(),
+            "attempt-owned mipmap capacity must be visible in the attempt-store ledger"
+        );
+    }
+
+    #[test]
+    fn cold_capacity_hysteresis_schedules_but_does_not_trim_inside_an_attempt() {
+        let mut storage = GraphStorage::new();
+        storage.capacity_governor = CapacityGovernor::new(crate::graph::capacity::CapacityPolicy {
+            minimum_family_bytes: 100,
+            cold_numerator: 1,
+            cold_denominator: 4,
+            cold_attempts: 3,
+            minimum_recoverable_bytes: 40,
+            cooldown_attempts: 2,
+        });
+        storage.compile_reverse_edges.reserve(16 * 1024);
+        let capacity_before = storage.compile_reverse_edges.capacity();
+
+        for _ in 0..3 {
+            storage.finish_retained_capacity_sample();
+        }
+
+        assert!(storage.retained_capacity_stats().trim_pending());
+        assert_eq!(storage.compile_reverse_edges.capacity(), capacity_before);
+
+        storage.clear();
+
+        assert!(storage.compile_reverse_edges.capacity() < capacity_before);
+        assert_eq!(storage.retained_capacity_stats().trim_count(), 1);
+    }
+
+    #[test]
+    fn early_owner_release_cannot_erase_the_attempt_capacity_sample() {
+        let mut storage = GraphStorage::new();
+        let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        storage.draw_plans.mark_live(plan);
+        let start = storage.draw_plans.begin_finalize(plan);
+        for sort_key in 0..64 {
+            storage.draw_plans.push_test_command(sort_key);
+        }
+        storage.draw_plans.finish_finalize(plan, start);
+        let draw_active = storage.draw_plans.capacity_usage().active_bytes;
+        assert!(draw_active > 0);
+
+        storage.sample_retained_capacity();
+        storage.draw_plans.clear();
+        storage.finish_retained_capacity_sample();
+
+        let stats = storage.retained_capacity_stats();
+        assert_eq!(stats.observed_attempts(), 1);
+        assert!(stats.last_attempt_active_bytes() >= draw_active);
+    }
+
+    #[test]
     fn release_frame_owners_clears_interned_draw_plan_resources() {
         let wgpu = pollster::block_on(WgpuContext::new_headless(
             &RendererInitConfig::default(),
@@ -3126,6 +3683,7 @@ mod tests {
         assert_eq!(abandoned.declared_passes(), 0);
         assert_eq!(abandoned.live_passes(), None);
         assert!(abandoned.panicked());
+        assert_eq!(storage.retained_capacity_stats().observed_attempts(), 1);
     }
 
     #[test]

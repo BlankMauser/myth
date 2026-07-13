@@ -36,7 +36,7 @@ pub(crate) use diagnostics::{
     RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgRendererAttemptGuard,
 };
 pub(crate) use global_state::{GlobalStateMaterializationFailure, GlobalStateSources};
-pub use graph::{GraphStorage, MermaidDumpMode, RenderGraph};
+pub use graph::{GraphStorage, MermaidDumpMode, RdgRetainedCapacityStats, RenderGraph};
 pub use node::PassNode;
 pub use persistent::{
     CacheCommitToken, CacheId, CacheKey, CachePlan, CachePublicationReceipt, HistoryCommitToken,

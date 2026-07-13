@@ -34,6 +34,10 @@ use myth_scene::Scene;
 use myth_scene::camera::RenderCamera;
 
 use super::asset_frame::{GeometryFrameId, ObjectInterfaceId};
+use super::capacity::{
+    CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
+    shrink_vec_by_family_ratio, vec_footprint,
+};
 use super::core::TextureNodeId;
 use super::extracted::{ExtractedScene, SceneFeatures};
 use super::material_plan::MaterialFrameId;
@@ -279,11 +283,13 @@ pub(crate) struct PreparedDrawStore {
     sources_initialized: bool,
 }
 
+const PREPARED_DRAW_SOURCE_BASELINE: usize = 512;
+
 impl PreparedDrawStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            sources: Vec::with_capacity(512),
+            sources: Vec::with_capacity(PREPARED_DRAW_SOURCE_BASELINE),
             source_lookup: FxHashMap::default(),
             sources_initialized: false,
         }
@@ -295,6 +301,26 @@ impl PreparedDrawStore {
         self.sources.clear();
         self.source_lookup.clear();
         self.sources_initialized = false;
+    }
+
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.sources, PREPARED_DRAW_SOURCE_BASELINE)
+            + estimated_hash_map_footprint(&self.source_lookup, PREPARED_DRAW_SOURCE_BASELINE)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(
+            &mut self.sources,
+            PREPARED_DRAW_SOURCE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.source_lookup,
+            PREPARED_DRAW_SOURCE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
     }
 
     /// Reserve the expected DPE-live source count once for this graph attempt.
@@ -372,6 +398,10 @@ pub(crate) struct DrawPlanStore {
     attempt_token: u64,
 }
 
+const DRAW_COMMAND_BASELINE: usize = 1024;
+const DRAW_PLAN_BASELINE: usize = 16;
+const DRAW_PHYSICAL_OWNER_BASELINE: usize = 256;
+
 impl Default for DrawPlanStore {
     fn default() -> Self {
         Self::new()
@@ -382,14 +412,14 @@ impl DrawPlanStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            commands: Vec::with_capacity(1024),
-            plans: Vec::with_capacity(16),
+            commands: Vec::with_capacity(DRAW_COMMAND_BASELINE),
+            plans: Vec::with_capacity(DRAW_PLAN_BASELINE),
             plan_lookup: FxHashMap::default(),
             texture_dependencies: FxHashMap::default(),
             open_plan: None,
-            buffers: Vec::with_capacity(256),
+            buffers: Vec::with_capacity(DRAW_PHYSICAL_OWNER_BASELINE),
             buffer_lookup: FxHashMap::default(),
-            bind_groups: Vec::with_capacity(256),
+            bind_groups: Vec::with_capacity(DRAW_PHYSICAL_OWNER_BASELINE),
             bind_group_lookup: FxHashMap::default(),
             attempt_token: next_draw_plan_attempt(),
         }
@@ -407,6 +437,68 @@ impl DrawPlanStore {
         self.bind_group_lookup.clear();
         self.bind_groups.clear();
         self.attempt_token = next_draw_plan_attempt();
+    }
+
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.commands, DRAW_COMMAND_BASELINE)
+            + vec_footprint(&self.plans, DRAW_PLAN_BASELINE)
+            + estimated_hash_map_footprint(&self.plan_lookup, DRAW_PLAN_BASELINE)
+            + estimated_hash_map_footprint(&self.texture_dependencies, DRAW_PLAN_BASELINE)
+            + vec_footprint(&self.buffers, DRAW_PHYSICAL_OWNER_BASELINE)
+            + estimated_hash_map_footprint(&self.buffer_lookup, DRAW_PHYSICAL_OWNER_BASELINE)
+            + vec_footprint(&self.bind_groups, DRAW_PHYSICAL_OWNER_BASELINE)
+            + estimated_hash_map_footprint(&self.bind_group_lookup, DRAW_PHYSICAL_OWNER_BASELINE)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(
+            &mut self.commands,
+            DRAW_COMMAND_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.plans,
+            DRAW_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.plan_lookup,
+            DRAW_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.texture_dependencies,
+            DRAW_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.buffers,
+            DRAW_PHYSICAL_OWNER_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.buffer_lookup,
+            DRAW_PHYSICAL_OWNER_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.bind_groups,
+            DRAW_PHYSICAL_OWNER_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.bind_group_lookup,
+            DRAW_PHYSICAL_OWNER_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
     }
 
     pub(crate) fn reserve_commands(&mut self, additional: usize) {

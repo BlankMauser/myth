@@ -14,6 +14,11 @@ use smallvec::SmallVec;
 
 use crate::core::{BindingInterfaceId, ResourceManager};
 
+use super::capacity::{
+    CapacityUsage, estimated_hash_map_footprint, estimated_hash_set_footprint,
+    shrink_hash_map_by_family_ratio, shrink_hash_set_by_family_ratio, shrink_vec_by_family_ratio,
+    vec_footprint,
+};
 #[cfg(test)]
 use super::extracted::MaterialClassification;
 use super::extracted::{ExtractedRenderItem, ExtractedScene};
@@ -92,15 +97,19 @@ pub(crate) struct GeometryFrameStore {
     initialized: bool,
 }
 
+const GEOMETRY_FRAME_RECORD_BASELINE: usize = 256;
+const GEOMETRY_FRAME_SOURCE_BASELINE: usize = 512;
+const GEOMETRY_FRAME_FAILED_BASELINE: usize = 64;
+
 impl GeometryFrameStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            records: Vec::with_capacity(256),
+            records: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
             lookup: FxHashMap::default(),
             stamp_lookup: FxHashMap::default(),
             failed_stamps: FxHashSet::default(),
-            source_geometries: Vec::with_capacity(512),
+            source_geometries: Vec::with_capacity(GEOMETRY_FRAME_SOURCE_BASELINE),
             initialized: false,
         }
     }
@@ -310,6 +319,47 @@ impl GeometryFrameStore {
         self.initialized = false;
     }
 
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.records, GEOMETRY_FRAME_RECORD_BASELINE)
+            + estimated_hash_map_footprint(&self.lookup, GEOMETRY_FRAME_RECORD_BASELINE)
+            + estimated_hash_map_footprint(&self.stamp_lookup, GEOMETRY_FRAME_RECORD_BASELINE)
+            + estimated_hash_set_footprint(&self.failed_stamps, GEOMETRY_FRAME_FAILED_BASELINE)
+            + vec_footprint(&self.source_geometries, GEOMETRY_FRAME_SOURCE_BASELINE)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(
+            &mut self.records,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.lookup,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.stamp_lookup,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_set_by_family_ratio(
+            &mut self.failed_stamps,
+            GEOMETRY_FRAME_FAILED_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.source_geometries,
+            GEOMETRY_FRAME_SOURCE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn geometry_count(&self) -> usize {
@@ -413,11 +463,13 @@ pub(crate) struct ObjectInterfaceStore {
     lookup: FxHashMap<BindingInterfaceId, ObjectInterfaceId>,
 }
 
+const OBJECT_INTERFACE_BASELINE: usize = 64;
+
 impl ObjectInterfaceStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            records: Vec::with_capacity(64),
+            records: Vec::with_capacity(OBJECT_INTERFACE_BASELINE),
             lookup: FxHashMap::default(),
         }
     }
@@ -460,6 +512,26 @@ impl ObjectInterfaceStore {
     pub(crate) fn clear(&mut self) {
         self.lookup.clear();
         self.records.clear();
+    }
+
+    pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        vec_footprint(&self.records, OBJECT_INTERFACE_BASELINE)
+            + estimated_hash_map_footprint(&self.lookup, OBJECT_INTERFACE_BASELINE)
+    }
+
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(
+            &mut self.records,
+            OBJECT_INTERFACE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.lookup,
+            OBJECT_INTERFACE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
     }
 }
 

@@ -10,7 +10,7 @@ use crate::core::gpu::Tracked;
 use crate::graph::composer::ComposerContext;
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
-use crate::graph::core::graph::GraphStorage;
+use crate::graph::core::graph::{GraphStorage, RdgRetainedCapacityStats};
 use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
 use crate::graph::core::{
     HistoryRegistry, RdgDiagnosticsRecorder, RdgFrameDiagnostics, RdgFramePhase,
@@ -784,6 +784,26 @@ impl Renderer {
         self.context
             .as_ref()
             .and_then(|state| state.rdg_diagnostics.latest())
+    }
+
+    /// Returns the accounted CPU backing capacity retained by the RDG between
+    /// attempts, including topology, compile scratch, and attempt stores.
+    /// Hash-table bytes are stable estimates rather than allocator-exact data.
+    #[must_use]
+    pub fn rdg_retained_capacity_stats(&self) -> Option<RdgRetainedCapacityStats> {
+        self.context
+            .as_ref()
+            .map(|state| state.graph_storage.retained_capacity_stats())
+    }
+
+    /// Requests one pressure-driven retained-capacity trim. The largest
+    /// eligible family is selected, but deallocation is deferred until the
+    /// earliest safe `GraphStorage::clear` boundary after any active global
+    /// trim cooldown has elapsed.
+    pub fn request_rdg_retained_capacity_trim(&mut self) {
+        if let Some(state) = &mut self.context {
+            state.graph_storage.request_retained_capacity_trim();
+        }
     }
 
     /// Dumps a compact, human-oriented Mermaid view of the latest Render Graph.

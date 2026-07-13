@@ -2068,6 +2068,7 @@ impl<'a> FrameComposer<'a> {
             // Execute consumes only finalized DrawCommands. Release exact CPU
             // asset/interface owners as soon as every live plan is baked;
             // DrawPlanStore continues to own the physical WGPU handles.
+            graph.storage.sample_retained_capacity();
             graph.storage.prepared_draws.clear();
             graph.storage.object_interfaces.clear();
             graph.storage.geometry_frames.clear();

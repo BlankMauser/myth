@@ -13,6 +13,7 @@ pub mod bake;
 #[cfg(any(test, feature = "rdg_bench_support"))]
 #[doc(hidden)]
 pub mod bench_support;
+pub(crate) mod capacity;
 pub mod composer;
 pub mod core;
 pub mod culling;
@@ -26,7 +27,7 @@ pub mod shadow_utils;
 pub use composer::FrameComposer;
 pub use core::{
     MermaidDumpMode, RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
-    RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
+    RdgResourceMaterializationFailure, RdgRetainedCapacityStats, RdgSurfaceAcquireFailure,
 };
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton};
 pub use frame::{RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent};
