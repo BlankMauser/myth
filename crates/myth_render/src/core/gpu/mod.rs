@@ -51,12 +51,16 @@ pub(crate) use crate::core::gpu::environment::{
     CubeSourceType, GpuEnvironment, ProceduralEnvironmentSnapshot,
 };
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
-pub(crate) use crate::core::gpu::material::{GpuMaterial, PlannedMaterialTexture};
+pub(crate) use crate::core::gpu::material::{
+    GpuMaterial, PlannedMaterialCandidateBatch, PlannedMaterialCandidateId, PlannedMaterialTexture,
+};
 #[cfg(test)]
 pub(crate) use crate::core::gpu::texture::snapshot_asset_texture;
+#[cfg(test)]
+pub(crate) use crate::core::gpu::texture::snapshot_asset_texture_state;
 pub(crate) use crate::core::gpu::texture::{
     AssetTextureMaterialization, AssetTextureSnapshot, AssetTextureStateSnapshot, GpuImage,
-    GpuImageSpec, PhysicalImageId, TextureBinding, TextureImageLease, snapshot_asset_texture_state,
+    GpuImageSpec, PhysicalImageId, TextureBinding, TextureImageLease,
 };
 pub use bind_group_store::{
     BindGroupContext, BindingInterfaceId, GlobalStateKey, GlobalStateResolver, GpuGlobalState,

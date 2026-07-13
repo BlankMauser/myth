@@ -520,6 +520,54 @@ impl<H: Key, T> AssetStorage<H, T> {
         }
     }
 
+    /// Revalidates selected snapshots and opens a bounded publication gate
+    /// while each storage read guard is still held.
+    ///
+    /// `indices` are processed in chunks no wider than
+    /// [`ASSET_READ_BATCH_WIDTH`]. For each chunk, `publish_chunk` receives its
+    /// starting position in the complete selected input, the original indices,
+    /// and an equally sized, position-aligned current mask. Order and duplicates
+    /// are preserved; an out-of-range index fails closed as `false`. The same
+    /// masks are appended to `out`, whose allocation is retained and reused
+    /// across calls. Revalidation only compares stamps and `Arc` allocation
+    /// identity; it never clones an asset owner.
+    ///
+    /// The callback runs **before** that chunk's storage read guard is released.
+    /// It may therefore publish derived state to an external cache for mask
+    /// entries that are `true`, knowing the corresponding exact snapshots
+    /// cannot be replaced concurrently. The guarantee is deliberately local
+    /// to one bounded chunk; writers may run between successive callbacks.
+    ///
+    /// # Reentrancy
+    ///
+    /// `publish_chunk` must not call any method on this same `AssetStorage`.
+    /// In particular, attempting to acquire its write lock would deadlock, and
+    /// recursively acquiring a read lock can deadlock when a writer is queued
+    /// because `parking_lot::RwLock` uses eventual fairness. Keep the callback
+    /// bounded and restrict it to external cache publication.
+    pub fn revalidate_selected_batched_at_publish(
+        &self,
+        snapshots: &[AssetSnapshot<H, T>],
+        indices: &[usize],
+        out: &mut Vec<bool>,
+        mut publish_chunk: impl FnMut(usize, &[usize], &[bool]),
+    ) {
+        // Clear/grow outside the lock so dropping old contents or allocator
+        // work can never lengthen the read-side critical section.
+        out.clear();
+        out.reserve(indices.len());
+
+        for chunk in indices.chunks(ASSET_READ_BATCH_WIDTH) {
+            let output_start = out.len();
+            let guard = self.inner.read();
+            Self::append_selected_revalidation_chunk_locked(&guard, snapshots, chunk, out);
+            publish_chunk(output_start, chunk, &out[output_start..]);
+            // Keep this explicit: publication must finish before the exact
+            // snapshot is allowed to change.
+            drop(guard);
+        }
+    }
+
     #[inline]
     fn append_snapshot_chunk(&self, handles: &[H], out: &mut Vec<AssetSnapshot<H, T>>) {
         debug_assert!(handles.len() <= ASSET_READ_BATCH_WIDTH);
@@ -558,11 +606,24 @@ impl<H: Key, T> AssetStorage<H, T> {
         debug_assert!(out.capacity() - out.len() >= indices.len());
 
         let guard = self.inner.read();
+        Self::append_selected_revalidation_chunk_locked(&guard, snapshots, indices, out);
+    }
+
+    #[inline]
+    fn append_selected_revalidation_chunk_locked(
+        guard: &StorageInner<H, T>,
+        snapshots: &[AssetSnapshot<H, T>],
+        indices: &[usize],
+        out: &mut Vec<bool>,
+    ) {
+        debug_assert!(indices.len() <= ASSET_READ_BATCH_WIDTH);
+        debug_assert!(out.capacity() - out.len() >= indices.len());
+
         for &index in indices {
             out.push(
                 snapshots
                     .get(index)
-                    .is_some_and(|snapshot| Self::snapshot_is_current(&guard, snapshot)),
+                    .is_some_and(|snapshot| Self::snapshot_is_current(guard, snapshot)),
             );
         }
     }
@@ -899,6 +960,98 @@ mod tests {
         assert_eq!(current, [true]);
         assert_eq!(Arc::strong_count(retained), owners_before);
         storage.revalidate_selected_batched(&snapshots, &[0, 0], &mut current);
+        assert_eq!(current, [true, true]);
+        assert_eq!(Arc::strong_count(retained), owners_before);
+    }
+
+    #[test]
+    fn selected_publish_gate_preserves_chunk_and_output_alignment() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let handles: Vec<_> = (0..=ASSET_READ_BATCH_WIDTH)
+            .map(|value| storage.add(value as u32))
+            .collect();
+        let mut snapshots = Vec::new();
+        storage.snapshot_batched(&handles, &mut snapshots);
+        assert_eq!(storage.update(handles[1], 999_u32), Some(2));
+
+        let mut indices: Vec<_> = (0..handles.len()).collect();
+        indices.extend([usize::MAX, 1]);
+        let mut current = Vec::new();
+        let mut observed_indices = Vec::new();
+        let mut observed_current = Vec::new();
+        let mut chunk_lengths = Vec::new();
+        let mut chunk_starts = Vec::new();
+
+        storage.revalidate_selected_batched_at_publish(
+            &snapshots,
+            &indices,
+            &mut current,
+            |start, chunk, chunk_current| {
+                assert_eq!(start, observed_indices.len());
+                assert_eq!(chunk.len(), chunk_current.len());
+                assert!(chunk.len() <= ASSET_READ_BATCH_WIDTH);
+                assert!(
+                    storage.inner.try_write().is_none(),
+                    "publication must run while the storage read guard is held"
+                );
+                chunk_starts.push(start);
+                chunk_lengths.push(chunk.len());
+                observed_indices.extend_from_slice(chunk);
+                observed_current.extend_from_slice(chunk_current);
+            },
+        );
+
+        assert_eq!(chunk_starts, [0, ASSET_READ_BATCH_WIDTH]);
+        assert_eq!(chunk_lengths, [ASSET_READ_BATCH_WIDTH, 3]);
+        assert_eq!(observed_indices, indices);
+        assert_eq!(observed_current, current);
+        assert_eq!(current.len(), indices.len());
+        for (position, &index) in indices.iter().enumerate() {
+            let expected = index != usize::MAX && index != 1;
+            assert_eq!(current[position], expected, "position {position}");
+        }
+        assert!(
+            storage.inner.try_write().is_some(),
+            "the final batch read guard must be released after publication"
+        );
+    }
+
+    #[test]
+    fn selected_publish_gate_reuses_capacity_without_cloning_owners() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let handles: Vec<_> = (0..=ASSET_READ_BATCH_WIDTH)
+            .map(|value| storage.add(value as u32))
+            .collect();
+        let mut snapshots = Vec::new();
+        storage.snapshot_batched(&handles, &mut snapshots);
+        let retained = snapshots[0].loaded().unwrap().asset();
+        let owners_before = Arc::strong_count(retained);
+        let all_indices: Vec<_> = (0..handles.len()).collect();
+        let mut current = Vec::new();
+
+        storage.revalidate_selected_batched_at_publish(
+            &snapshots,
+            &all_indices,
+            &mut current,
+            |_, _, _| {},
+        );
+        let allocation = current.as_ptr();
+        let capacity = current.capacity();
+        assert!(capacity >= all_indices.len());
+        assert_eq!(Arc::strong_count(retained), owners_before);
+
+        storage.revalidate_selected_batched_at_publish(
+            &snapshots,
+            &[0, 0],
+            &mut current,
+            |start, indices, mask| {
+                assert_eq!(start, 0);
+                assert_eq!(indices, [0, 0]);
+                assert_eq!(mask, [true, true]);
+            },
+        );
+        assert_eq!(current.as_ptr(), allocation);
+        assert_eq!(current.capacity(), capacity);
         assert_eq!(current, [true, true]);
         assert_eq!(Arc::strong_count(retained), owners_before);
     }

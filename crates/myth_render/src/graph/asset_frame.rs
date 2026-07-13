@@ -158,15 +158,6 @@ pub(crate) struct GeometryFrameStore {
 const GEOMETRY_FRAME_RECORD_BASELINE: usize = 256;
 const GEOMETRY_FRAME_SOURCE_BASELINE: usize = 512;
 
-#[inline]
-fn bit_vec_footprint(value: &Vec<bool>, baseline_capacity: usize) -> CapacityUsage {
-    CapacityUsage::new(
-        value.len().div_ceil(8),
-        value.capacity().div_ceil(8),
-        baseline_capacity.div_ceil(8),
-    )
-}
-
 impl GeometryFrameStore {
     #[must_use]
     pub(crate) fn new() -> Self {
@@ -593,17 +584,17 @@ impl GeometryFrameStore {
                 GEOMETRY_FRAME_RECORD_BASELINE,
             )
             + vec_footprint(&self.asset_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
-            + bit_vec_footprint(&self.asset_current, GEOMETRY_FRAME_RECORD_BASELINE)
+            + vec_footprint(&self.asset_current, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.live_snapshot_indices, GEOMETRY_FRAME_RECORD_BASELINE)
             + estimated_hash_map_footprint(
                 &self.live_snapshot_lookup,
                 GEOMETRY_FRAME_RECORD_BASELINE,
             )
-            + bit_vec_footprint(&self.live_current, GEOMETRY_FRAME_RECORD_BASELINE)
+            + vec_footprint(&self.live_current, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.records, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.record_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.snapshot_records, GEOMETRY_FRAME_RECORD_BASELINE)
-            + bit_vec_footprint(&self.failed_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
+            + vec_footprint(&self.failed_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.source_geometries, GEOMETRY_FRAME_SOURCE_BASELINE)
     }
 
@@ -1208,13 +1199,13 @@ mod tests {
     }
 
     #[test]
-    fn packed_geometry_revalidation_bits_are_accounted_as_bits() {
+    fn geometry_revalidation_flags_are_accounted_as_bytes() {
         let mut current = Vec::with_capacity(65);
         current.resize(65, true);
-        let usage = bit_vec_footprint(&current, 64);
+        let usage = vec_footprint(&current, 64);
 
-        assert_eq!(usage.active_bytes, 65_usize.div_ceil(8));
-        assert_eq!(usage.retained_bytes, current.capacity().div_ceil(8));
-        assert_eq!(usage.baseline_bytes, 64_usize.div_ceil(8));
+        assert_eq!(usage.active_bytes, 65);
+        assert_eq!(usage.retained_bytes, current.capacity());
+        assert_eq!(usage.baseline_bytes, 64);
     }
 }

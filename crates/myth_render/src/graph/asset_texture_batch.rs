@@ -46,9 +46,9 @@ impl AssetTextureBatchId {
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct AssetImageBatchId(NonZeroU32);
+struct AssetImageSnapshotId(NonZeroU32);
 
-impl AssetImageBatchId {
+impl AssetImageSnapshotId {
     #[inline]
     fn from_index(index: usize) -> Self {
         let raw = u32::try_from(index)
@@ -65,65 +65,46 @@ impl AssetImageBatchId {
     }
 }
 
-/// Generation-stamped dense Image-ID to selected-slot join.
+/// Retained sparse Image-snapshot-ID to selected-slot join.
 ///
-/// A new postflight advances one generation instead of clearing the historical
-/// high-water domain. Only the practically unreachable generation wrap scans
-/// old stamps before generation one is reused.
+/// The table is cleared without releasing capacity between postflights and is
+/// never iterated for externally visible ordering. Its allocation therefore
+/// follows the unique selected Image count, not the complete captured domain.
 #[derive(Default)]
-struct SelectedImageDenseLookup {
-    stamps: Vec<u32>,
-    slots: Vec<u32>,
-    generation: u32,
-    active_len: usize,
+struct SelectedImageSparseLookup {
+    slots: FxHashMap<AssetImageSnapshotId, usize>,
 }
 
-impl SelectedImageDenseLookup {
-    fn begin(&mut self, domain_len: usize) {
-        self.active_len = 0;
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.stamps.fill(0);
-            self.generation = 1;
-        }
-        if self.stamps.len() < domain_len {
-            self.stamps.resize(domain_len, 0);
-            self.slots.resize(domain_len, 0);
-        }
-        debug_assert_eq!(self.stamps.len(), self.slots.len());
+impl SelectedImageSparseLookup {
+    #[inline]
+    fn begin(&mut self) {
+        self.slots.clear();
     }
 
     #[inline]
-    fn get_or_insert(&mut self, index: usize, vacant_slot: usize) -> (usize, bool) {
-        let stamp = self
-            .stamps
-            .get_mut(index)
-            .expect("selected Image ID is outside the captured dense domain");
-        if *stamp == self.generation {
-            return (self.slots[index] as usize, false);
+    fn get_or_insert(&mut self, image: AssetImageSnapshotId, vacant_slot: usize) -> (usize, bool) {
+        match self.slots.entry(image) {
+            std::collections::hash_map::Entry::Occupied(entry) => (*entry.get(), false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(vacant_slot);
+                (vacant_slot, true)
+            }
         }
-
-        let slot = u32::try_from(vacant_slot).expect("selected Image slot exceeds u32::MAX");
-        *stamp = self.generation;
-        self.slots[index] = slot;
-        self.active_len += 1;
-        (vacant_slot, true)
     }
 
     #[inline]
-    fn reset_active_len(&mut self) {
-        self.active_len = 0;
+    fn clear(&mut self) {
+        self.slots.clear();
     }
 
     #[inline]
     #[cfg(test)]
     fn is_active_empty(&self) -> bool {
-        self.active_len == 0
+        self.slots.is_empty()
     }
 
     fn capacity_usage(&self, baseline_capacity: usize) -> CapacityUsage {
-        dense_u32_vec_footprint(&self.stamps, self.active_len, baseline_capacity)
-            + dense_u32_vec_footprint(&self.slots, self.active_len, baseline_capacity)
+        estimated_hash_map_footprint(&self.slots, baseline_capacity)
     }
 
     fn trim_capacity(
@@ -132,28 +113,25 @@ impl SelectedImageDenseLookup {
         target_bytes: usize,
         retained_bytes: usize,
     ) {
-        if retained_bytes == 0 || target_bytes >= retained_bytes {
-            return;
-        }
-        let target_capacity = ((self.stamps.capacity() as u128) * (target_bytes as u128))
-            .div_ceil(retained_bytes as u128)
-            .min(usize::MAX as u128) as usize;
-        let target_capacity = target_capacity
-            .max(self.active_len)
-            .max(baseline_capacity)
-            .min(self.stamps.capacity());
-        self.stamps.truncate(target_capacity);
-        self.stamps.shrink_to(target_capacity);
-        self.slots.truncate(target_capacity);
-        self.slots.shrink_to(target_capacity);
-        debug_assert_eq!(self.stamps.len(), self.slots.len());
+        shrink_hash_map_by_family_ratio(
+            &mut self.slots,
+            baseline_capacity,
+            target_bytes,
+            retained_bytes,
+        );
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct AssetTextureBatchRecord {
-    image: Option<AssetImageBatchId>,
+    image: Option<AssetImageSnapshotId>,
     state: AssetTextureStateSnapshot,
+}
+
+#[derive(Clone, Copy)]
+enum SelectedPostflightState {
+    ReadyOnly,
+    Complete,
 }
 
 /// One graph-attempt table of exact Texture and Image owners.
@@ -173,7 +151,7 @@ pub(crate) struct AssetTextureBatch {
     texture_current: Vec<bool>,
 
     image_handles: Vec<ImageHandle>,
-    image_lookup: FxHashMap<ImageHandle, AssetImageBatchId>,
+    image_lookup: FxHashMap<ImageHandle, AssetImageSnapshotId>,
     image_snapshots: Vec<AssetSnapshot<ImageHandle, Image>>,
     image_current: Vec<bool>,
 
@@ -184,7 +162,7 @@ pub(crate) struct AssetTextureBatch {
     /// first selected Texture occurrence order.
     selected_texture_indices: Vec<usize>,
     selected_image_indices: Vec<usize>,
-    selected_image_lookup: SelectedImageDenseLookup,
+    selected_image_lookup: SelectedImageSparseLookup,
     selected_texture_image_slots: Vec<Option<usize>>,
     selected_texture_current_before_images: Vec<bool>,
     selected_image_current: Vec<bool>,
@@ -208,7 +186,7 @@ impl AssetTextureBatch {
             records: Vec::with_capacity(ASSET_TEXTURE_BATCH_BASELINE),
             selected_texture_indices: Vec::with_capacity(ASSET_TEXTURE_BATCH_BASELINE),
             selected_image_indices: Vec::with_capacity(ASSET_TEXTURE_BATCH_BASELINE),
-            selected_image_lookup: SelectedImageDenseLookup::default(),
+            selected_image_lookup: SelectedImageSparseLookup::default(),
             selected_texture_image_slots: Vec::with_capacity(ASSET_TEXTURE_BATCH_BASELINE),
             selected_texture_current_before_images: Vec::with_capacity(
                 ASSET_TEXTURE_BATCH_BASELINE,
@@ -313,7 +291,7 @@ impl AssetTextureBatch {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 self.image_lookup.entry(image_handle)
             {
-                let index = AssetImageBatchId::from_index(self.image_handles.len());
+                let index = AssetImageSnapshotId::from_index(self.image_handles.len());
                 self.image_handles.push(image_handle);
                 entry.insert(index);
             }
@@ -491,7 +469,29 @@ impl AssetTextureBatch {
         assets: &AssetServer,
         ids: &[AssetTextureBatchId],
     ) -> &[bool] {
-        self.postflight_selected_impl(assets, ids, || {}, || {})
+        self.postflight_selected_impl(
+            assets,
+            ids,
+            SelectedPostflightState::ReadyOnly,
+            || {},
+            || {},
+        )
+    }
+
+    /// Revalidate complete captured states for a canonical selected subset.
+    ///
+    /// Unlike [`Self::postflight_selected`], this accepts every stable state:
+    /// ready Texture/Image pairs, unavailable Textures, and loaded Textures
+    /// whose Image remains unavailable. Results stay input-aligned and any
+    /// Texture or Image transition still fails closed. Image owners are
+    /// stable-deduplicated and checked once through the same bounded
+    /// T-before -> unique-I -> T-after scratch path.
+    pub(crate) fn postflight_states_selected(
+        &mut self,
+        assets: &AssetServer,
+        ids: &[AssetTextureBatchId],
+    ) -> &[bool] {
+        self.postflight_selected_impl(assets, ids, SelectedPostflightState::Complete, || {}, || {})
     }
 
     #[cfg(test)]
@@ -502,13 +502,37 @@ impl AssetTextureBatch {
         after_texture_before: impl FnOnce(),
         after_images: impl FnOnce(),
     ) -> &[bool] {
-        self.postflight_selected_impl(assets, ids, after_texture_before, after_images)
+        self.postflight_selected_impl(
+            assets,
+            ids,
+            SelectedPostflightState::ReadyOnly,
+            after_texture_before,
+            after_images,
+        )
+    }
+
+    #[cfg(test)]
+    fn postflight_states_selected_with_hooks(
+        &mut self,
+        assets: &AssetServer,
+        ids: &[AssetTextureBatchId],
+        after_texture_before: impl FnOnce(),
+        after_images: impl FnOnce(),
+    ) -> &[bool] {
+        self.postflight_selected_impl(
+            assets,
+            ids,
+            SelectedPostflightState::Complete,
+            after_texture_before,
+            after_images,
+        )
     }
 
     fn postflight_selected_impl(
         &mut self,
         assets: &AssetServer,
         ids: &[AssetTextureBatchId],
+        state: SelectedPostflightState,
         after_texture_before: impl FnOnce(),
         after_images: impl FnOnce(),
     ) -> &[bool] {
@@ -516,7 +540,7 @@ impl AssetTextureBatch {
 
         self.selected_texture_indices.clear();
         self.selected_image_indices.clear();
-        self.selected_image_lookup.begin(self.image_snapshots.len());
+        self.selected_image_lookup.begin();
         self.selected_texture_image_slots.clear();
         self.selected_texture_current_before_images.clear();
         self.selected_image_current.clear();
@@ -531,12 +555,18 @@ impl AssetTextureBatch {
             let image_slot = self
                 .records
                 .get(index)
-                .filter(|record| self.record_is_accepted(index) && record.state.ready.is_some())
+                .filter(|record| {
+                    self.record_is_accepted(index)
+                        && match state {
+                            SelectedPostflightState::ReadyOnly => record.state.ready.is_some(),
+                            SelectedPostflightState::Complete => true,
+                        }
+                })
                 .and_then(|record| record.image)
                 .map(|image| {
                     let (slot, inserted) = self
                         .selected_image_lookup
-                        .get_or_insert(image.index(), self.selected_image_indices.len());
+                        .get_or_insert(image, self.selected_image_indices.len());
                     if inserted {
                         self.selected_image_indices.push(image.index());
                     }
@@ -565,10 +595,23 @@ impl AssetTextureBatch {
 
         debug_assert_eq!(ids.len(), self.selected_current.len());
         for (selected_index, &id) in ids.iter().enumerate() {
-            let image_is_current = self.selected_texture_image_slots[selected_index]
-                .and_then(|slot| self.selected_image_current.get(slot))
-                .copied()
-                == Some(true);
+            let record = self
+                .records
+                .get(id.index())
+                .filter(|_| self.record_is_accepted(id.index()));
+            let state_is_eligible = record.is_some_and(|record| match state {
+                SelectedPostflightState::ReadyOnly => record.state.ready.is_some(),
+                SelectedPostflightState::Complete => true,
+            });
+            let image_is_current = record.is_some_and(|record| match record.image {
+                Some(_) => {
+                    self.selected_texture_image_slots[selected_index]
+                        .and_then(|slot| self.selected_image_current.get(slot))
+                        .copied()
+                        == Some(true)
+                }
+                None => matches!(state, SelectedPostflightState::Complete),
+            });
             self.selected_current[selected_index] = self
                 .selected_texture_current_before_images
                 .get(selected_index)
@@ -576,9 +619,7 @@ impl AssetTextureBatch {
                 == Some(true)
                 && self.selected_current[selected_index]
                 && image_is_current
-                && self.records.get(id.index()).is_some_and(|record| {
-                    self.record_is_accepted(id.index()) && record.state.ready.is_some()
-                });
+                && state_is_eligible;
         }
 
         &self.selected_current
@@ -700,7 +741,7 @@ impl AssetTextureBatch {
         self.selected_image_current.clear();
         self.selected_texture_current_before_images.clear();
         self.selected_texture_image_slots.clear();
-        self.selected_image_lookup.reset_active_len();
+        self.selected_image_lookup.clear();
         self.selected_image_indices.clear();
         self.selected_texture_indices.clear();
         self.records.clear();
@@ -721,15 +762,15 @@ impl AssetTextureBatch {
         vec_footprint(&self.texture_handles, ASSET_TEXTURE_BATCH_BASELINE)
             + estimated_hash_map_footprint(&self.texture_lookup, ASSET_TEXTURE_BATCH_BASELINE)
             + vec_footprint(&self.texture_snapshots, ASSET_TEXTURE_BATCH_BASELINE)
-            + bit_vec_footprint(
+            + vec_footprint(
                 &self.texture_current_before_images,
                 ASSET_TEXTURE_BATCH_BASELINE,
             )
-            + bit_vec_footprint(&self.texture_current, ASSET_TEXTURE_BATCH_BASELINE)
+            + vec_footprint(&self.texture_current, ASSET_TEXTURE_BATCH_BASELINE)
             + vec_footprint(&self.image_handles, ASSET_TEXTURE_BATCH_BASELINE)
             + estimated_hash_map_footprint(&self.image_lookup, ASSET_TEXTURE_BATCH_BASELINE)
             + vec_footprint(&self.image_snapshots, ASSET_TEXTURE_BATCH_BASELINE)
-            + bit_vec_footprint(&self.image_current, ASSET_TEXTURE_BATCH_BASELINE)
+            + vec_footprint(&self.image_current, ASSET_TEXTURE_BATCH_BASELINE)
             + vec_footprint(&self.records, ASSET_TEXTURE_BATCH_BASELINE)
             + vec_footprint(&self.selected_texture_indices, ASSET_TEXTURE_BATCH_BASELINE)
             + vec_footprint(&self.selected_image_indices, ASSET_TEXTURE_BATCH_BASELINE)
@@ -740,12 +781,12 @@ impl AssetTextureBatch {
                 &self.selected_texture_image_slots,
                 ASSET_TEXTURE_BATCH_BASELINE,
             )
-            + bit_vec_footprint(
+            + vec_footprint(
                 &self.selected_texture_current_before_images,
                 ASSET_TEXTURE_BATCH_BASELINE,
             )
-            + bit_vec_footprint(&self.selected_image_current, ASSET_TEXTURE_BATCH_BASELINE)
-            + bit_vec_footprint(&self.selected_current, ASSET_TEXTURE_BATCH_BASELINE)
+            + vec_footprint(&self.selected_image_current, ASSET_TEXTURE_BATCH_BASELINE)
+            + vec_footprint(&self.selected_current, ASSET_TEXTURE_BATCH_BASELINE)
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
@@ -892,29 +933,6 @@ impl Default for AssetTextureBatch {
     }
 }
 
-#[inline]
-fn bit_vec_footprint(value: &Vec<bool>, baseline_capacity: usize) -> CapacityUsage {
-    CapacityUsage::new(
-        value.len().div_ceil(8),
-        value.capacity().div_ceil(8),
-        baseline_capacity.div_ceil(8),
-    )
-}
-
-#[inline]
-fn dense_u32_vec_footprint(
-    value: &Vec<u32>,
-    active_len: usize,
-    baseline_capacity: usize,
-) -> CapacityUsage {
-    let bytes_per_entry = std::mem::size_of::<u32>();
-    CapacityUsage::new(
-        active_len.saturating_mul(bytes_per_entry),
-        value.capacity().saturating_mul(bytes_per_entry),
-        baseline_capacity.saturating_mul(bytes_per_entry),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -941,7 +959,7 @@ mod tests {
     fn asset_texture_batch_id_uses_the_nonzero_option_niche() {
         assert_eq!(std::mem::size_of::<AssetTextureBatchId>(), 4);
         assert_eq!(std::mem::size_of::<Option<AssetTextureBatchId>>(), 4);
-        assert_eq!(std::mem::size_of::<Option<AssetImageBatchId>>(), 4);
+        assert_eq!(std::mem::size_of::<Option<AssetImageSnapshotId>>(), 4);
         assert_eq!(AssetTextureBatchId::from_index(0).index(), 0);
     }
 
@@ -1150,11 +1168,135 @@ mod tests {
         assert!(!current[SHARED_TEXTURE_COUNT]);
         assert_eq!(batch.selected_texture_indices.len(), 65);
         assert_eq!(batch.selected_image_indices.len(), 2);
-        assert_eq!(batch.selected_image_lookup.active_len, batch.image_count());
+        assert_eq!(batch.selected_image_lookup.slots.len(), batch.image_count());
     }
 
     #[test]
-    fn selected_image_dense_lookup_advances_generation_across_clear_and_reuse() {
+    fn complete_state_postflight_accepts_ready_and_unavailable_states() {
+        let assets = AssetServer::new();
+        let ready_image = assets.images.add(image_8x8(1));
+        let unavailable_image = assets.images.reserve();
+        let ready_texture = assets
+            .textures
+            .add(Texture::new_2d(Some("ready complete state"), ready_image));
+        let unavailable_texture = assets.textures.reserve();
+        let texture_with_unavailable_image = assets.textures.add(Texture::new_2d(
+            Some("unavailable image complete state"),
+            unavailable_image,
+        ));
+
+        let mut batch = AssetTextureBatch::new();
+        let ready_id = batch.request(ready_texture);
+        let unavailable_texture_id = batch.request(unavailable_texture);
+        let unavailable_image_id = batch.request(texture_with_unavailable_image);
+        batch.capture_requested(&assets);
+        let selected = [ready_id, unavailable_texture_id, unavailable_image_id];
+
+        assert_eq!(
+            batch.postflight_states_selected(&assets, &selected),
+            [true, true, true]
+        );
+        assert_eq!(batch.selected_texture_indices.len(), 3);
+        assert_eq!(batch.selected_image_indices.len(), 2);
+        assert_eq!(batch.selected_image_lookup.slots.len(), 2);
+
+        assert_eq!(
+            batch.postflight_selected(&assets, &selected),
+            [true, false, false],
+            "the existing ready-only postflight must retain its narrower contract"
+        );
+    }
+
+    #[test]
+    fn complete_state_postflight_rejects_transitions_and_redirects() {
+        let assets = AssetServer::new();
+        let first_image = assets.images.add(image_8x8(1));
+        let replacement_image = assets.images.add(image_8x8(2));
+        let unavailable_image = assets.images.reserve();
+        let stable_unavailable_texture = assets.textures.reserve();
+        let transitioning_texture = assets.textures.reserve();
+        let texture_with_transitioning_image = assets.textures.add(Texture::new_2d(
+            Some("transitioning unavailable image"),
+            unavailable_image,
+        ));
+        let redirected_texture = assets.textures.add(Texture::new_2d(
+            Some("redirected complete state"),
+            first_image,
+        ));
+
+        let mut batch = AssetTextureBatch::new();
+        let stable_id = batch.request(stable_unavailable_texture);
+        let transitioning_texture_id = batch.request(transitioning_texture);
+        let transitioning_image_id = batch.request(texture_with_transitioning_image);
+        let redirected_id = batch.request(redirected_texture);
+        batch.capture_requested(&assets);
+
+        assets.textures.insert_ready(
+            transitioning_texture,
+            Texture::new_2d(Some("now ready"), first_image),
+        );
+        assets.images.insert_ready(unavailable_image, image_8x8(3));
+
+        let current = batch.postflight_states_selected_with_hooks(
+            &assets,
+            &[
+                stable_id,
+                transitioning_texture_id,
+                transitioning_image_id,
+                redirected_id,
+            ],
+            || {},
+            || {
+                assets.textures.insert_ready(
+                    redirected_texture,
+                    Texture::new_2d(Some("redirected replacement"), replacement_image),
+                );
+            },
+        );
+
+        assert_eq!(current, [true, false, false, false]);
+    }
+
+    #[test]
+    fn complete_state_postflight_crosses_batch_width_with_aligned_unavailable_states() {
+        const READY_TEXTURE_COUNT: usize = 63;
+        let assets = AssetServer::new();
+        let shared_image = assets.images.add(image_8x8(1));
+        let unavailable_image = assets.images.reserve();
+
+        let mut batch = AssetTextureBatch::new();
+        let mut selected = Vec::with_capacity(READY_TEXTURE_COUNT + 2);
+        for _ in 0..READY_TEXTURE_COUNT {
+            let texture = assets.textures.add(Texture::new_2d(
+                Some("shared complete-state boundary"),
+                shared_image,
+            ));
+            selected.push(batch.request(texture));
+        }
+        let unavailable_texture = assets.textures.reserve();
+        selected.push(batch.request(unavailable_texture));
+        let texture_with_unavailable_image = assets.textures.add(Texture::new_2d(
+            Some("unavailable-image boundary"),
+            unavailable_image,
+        ));
+        selected.push(batch.request(texture_with_unavailable_image));
+        batch.capture_requested(&assets);
+
+        let current = batch.postflight_states_selected(&assets, &selected);
+        assert_eq!(current.len(), 65);
+        assert!(current.iter().all(|&value| value));
+        assert_eq!(batch.selected_texture_indices.len(), 65);
+        assert_eq!(batch.selected_image_indices.len(), 2);
+        assert_eq!(batch.selected_image_lookup.slots.len(), 2);
+
+        assets.images.insert_ready(unavailable_image, image_8x8(2));
+        let current = batch.postflight_states_selected(&assets, &selected);
+        assert!(current[..64].iter().all(|&value| value));
+        assert!(!current[64]);
+    }
+
+    #[test]
+    fn selected_image_sparse_lookup_reuses_retained_capacity_across_clear() {
         let assets = AssetServer::new();
         let first_image = assets.images.add(image_8x8(1));
         let first_texture = assets
@@ -1168,7 +1310,7 @@ mod tests {
         assert!(batch.selected_image_lookup.is_active_empty());
         assert_eq!(batch.postflight_selected(&assets, &[first_id]), [true]);
         assert_eq!(batch.selected_image_indices, [0]);
-        let first_generation = batch.selected_image_lookup.generation;
+        let retained_lookup_capacity = batch.selected_image_lookup.slots.capacity();
         let retained_before_clear = batch.capacity_usage().retained_bytes;
 
         batch.clear();
@@ -1183,8 +1325,45 @@ mod tests {
         let second_id = batch.request(second_texture);
         batch.capture_requested(&assets);
         assert_eq!(batch.postflight_selected(&assets, &[second_id]), [true]);
-        assert_ne!(batch.selected_image_lookup.generation, first_generation);
+        assert_eq!(
+            batch.selected_image_lookup.slots.capacity(),
+            retained_lookup_capacity
+        );
         assert_eq!(batch.selected_image_indices, [0]);
+    }
+
+    #[test]
+    fn empty_and_high_index_single_selection_keep_image_lookup_sparse() {
+        const CAPTURED_IMAGE_COUNT: usize = 1024;
+        let assets = AssetServer::new();
+        let mut batch = AssetTextureBatch::new();
+        let mut last_id = None;
+
+        for index in 0..CAPTURED_IMAGE_COUNT {
+            let image = assets.images.add(image_8x8(index as u8));
+            let texture = assets
+                .textures
+                .add(Texture::new_2d(Some("sparse selected Image lookup"), image));
+            last_id = Some(batch.request(texture));
+        }
+        batch.capture_requested(&assets);
+        assert_eq!(batch.image_count(), CAPTURED_IMAGE_COUNT);
+        assert_eq!(batch.selected_image_lookup.slots.capacity(), 0);
+
+        assert!(batch.postflight_selected(&assets, &[]).is_empty());
+        assert_eq!(batch.selected_image_lookup.slots.capacity(), 0);
+        assert!(batch.selected_image_indices.is_empty());
+
+        assert_eq!(
+            batch.postflight_selected(&assets, &[last_id.unwrap()]),
+            [true]
+        );
+        assert_eq!(batch.selected_image_indices, [CAPTURED_IMAGE_COUNT - 1]);
+        assert_eq!(batch.selected_image_lookup.slots.len(), 1);
+        assert!(
+            batch.selected_image_lookup.slots.capacity() < CAPTURED_IMAGE_COUNT / 16,
+            "selected Image lookup retained capacity followed the captured domain"
+        );
     }
 
     #[test]

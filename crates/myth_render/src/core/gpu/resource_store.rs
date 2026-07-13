@@ -2,8 +2,8 @@
 
 use std::{mem::size_of, num::NonZeroU32};
 
-use rustc_hash::{FxHashMap, FxHashSet};
-use slotmap::SecondaryMap;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use slotmap::{SecondaryMap, SparseSecondaryMap};
 use smallvec::SmallVec;
 
 use myth_assets::{GeometryHandle, ImageHandle, MaterialHandle, TextureHandle};
@@ -258,7 +258,10 @@ struct PhysicalImageEntry {
 /// storage independently from bind-group and environment state.
 pub(crate) struct GpuResourceStore {
     gpu_geometries: SecondaryMap<GeometryHandle, GpuGeometry>,
-    gpu_materials: SecondaryMap<MaterialHandle, GpuMaterial>,
+    /// Slotmap-compatible generation ordering with pointer-sized sparse slots.
+    /// `GpuMaterial` owners are boxed during cold candidate construction so a
+    /// high Material handle never allocates an array of large owner values.
+    gpu_materials: SparseSecondaryMap<MaterialHandle, Option<Box<GpuMaterial>>, FxBuildHasher>,
     /// Destructor-bearing exact physical image arena.
     physical_images: slotmap::SlotMap<PhysicalImageId, PhysicalImageEntry>,
     /// Referenced-only physical pool. Zero-member entries are released
@@ -293,7 +296,7 @@ impl GpuResourceStore {
     ) -> Self {
         Self {
             gpu_geometries: SecondaryMap::new(),
-            gpu_materials: SecondaryMap::new(),
+            gpu_materials: SparseSecondaryMap::with_hasher(FxBuildHasher),
             physical_images: slotmap::SlotMap::with_key(),
             physical_image_index: FxHashMap::default(),
             texture_image_leases: SecondaryMap::new(),
@@ -389,17 +392,70 @@ impl GpuResourceStore {
     #[inline]
     #[must_use]
     pub(super) fn material(&self, handle: MaterialHandle) -> Option<&GpuMaterial> {
-        self.gpu_materials.get(handle)
+        self.gpu_materials.get(handle).and_then(Option::as_deref)
     }
 
     #[inline]
     pub(super) fn material_mut(&mut self, handle: MaterialHandle) -> Option<&mut GpuMaterial> {
-        self.gpu_materials.get_mut(handle)
+        self.gpu_materials
+            .get_mut(handle)
+            .and_then(Option::as_deref_mut)
     }
 
     #[inline]
     pub(super) fn insert_material(&mut self, handle: MaterialHandle, material: GpuMaterial) {
-        self.gpu_materials.insert(handle, material);
+        assert!(
+            self.reserve_material_slot(handle),
+            "cannot insert an obsolete or null Material handle"
+        );
+        drop(self.swap_material(handle, Box::new(material)));
+    }
+
+    /// Reserve the exact generational cache slot before entering a bounded
+    /// AssetStorage publication guard.
+    ///
+    /// Reusing a slot index with a newer `MaterialHandle` retires the obsolete
+    /// owner here, where destructor work cannot extend the publication gate.
+    #[inline]
+    pub(super) fn reserve_material_slot(&mut self, handle: MaterialHandle) -> bool {
+        let Some(entry) = self.gpu_materials.entry(handle) else {
+            // Null and older wrapped generations cannot displace a current
+            // cache owner. Their candidates fail closed at publication.
+            return false;
+        };
+        entry.or_insert(None);
+        true
+    }
+
+    #[inline]
+    #[must_use]
+    pub(super) fn material_slot_exists(&self, handle: MaterialHandle) -> bool {
+        self.gpu_materials.contains_key(handle)
+    }
+
+    #[inline]
+    pub(super) fn reserve_material_slots(&mut self, additional: usize) {
+        self.gpu_materials.reserve(additional);
+    }
+
+    /// Replace a pre-reserved Material owner without allocation or destruction.
+    /// The caller retains the returned owner until after its publication guard.
+    #[inline]
+    pub(super) fn swap_material(
+        &mut self,
+        handle: MaterialHandle,
+        material: Box<GpuMaterial>,
+    ) -> Option<Box<GpuMaterial>> {
+        self.gpu_materials
+            .get_mut(handle)
+            .expect("Material cache slot must be reserved before publication")
+            .replace(material)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn material_slot_capacity(&self) -> usize {
+        self.gpu_materials.capacity()
     }
 
     #[inline]
@@ -1154,8 +1210,11 @@ impl GpuResourceStore {
     pub(super) fn prune(&mut self, cutoff: u64) {
         self.gpu_geometries
             .retain(|_, v| v.last_used_frame >= cutoff);
-        self.gpu_materials
-            .retain(|_, v| v.last_used_frame >= cutoff);
+        self.gpu_materials.retain(|_, material| {
+            material
+                .as_deref()
+                .is_some_and(|material| material.last_used_frame >= cutoff)
+        });
         self.gpu_buffers.retain(|_, v| v.last_used_frame >= cutoff);
         self.buffer_index
             .retain(|_, h| self.gpu_buffers.contains_key(*h));

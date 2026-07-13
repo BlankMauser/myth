@@ -2010,11 +2010,15 @@ impl<'a> FrameComposer<'a> {
                 .ctx
                 .render_lists
                 .live_frame_sources(graph.storage.draw_plans.live_keys());
-            graph.storage.material_plans.prepare_live(
-                self.ctx.assets,
-                self.ctx.resource_manager,
-                &live_frame_sources,
-            );
+            {
+                let storage = &mut *graph.storage;
+                storage.material_plans.prepare_live(
+                    self.ctx.assets,
+                    &mut storage.asset_texture_plans,
+                    self.ctx.resource_manager,
+                    &live_frame_sources,
+                );
+            }
             graph.storage.geometry_frames.capture_live(
                 self.ctx.assets,
                 self.ctx.extracted_scene,

@@ -186,6 +186,7 @@ pub(crate) fn snapshot_asset_texture(
 /// GPU resources. Material plans use the complete value for exact post-DPE
 /// revalidation; only `ready` snapshots become logical RDG imports.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn snapshot_asset_texture_state(
     assets: &AssetServer,
     handle: TextureHandle,

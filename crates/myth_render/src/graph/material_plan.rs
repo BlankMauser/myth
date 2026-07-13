@@ -16,10 +16,12 @@ use myth_resources::material::{MaterialSettings, ShaderTemplateMode};
 use myth_resources::shader_defines::ShaderDefines;
 use myth_resources::texture::TextureSource;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 
+#[cfg(test)]
+use crate::core::gpu::snapshot_asset_texture_state;
 use crate::core::gpu::{
-    AssetTextureSnapshot, PlannedMaterialTexture, snapshot_asset_texture_state,
+    AssetTextureSnapshot, PlannedMaterialCandidateBatch, PlannedMaterialCandidateId,
+    PlannedMaterialTexture,
 };
 use crate::core::{BindingInterfaceId, ResourceManager};
 
@@ -165,20 +167,40 @@ pub(crate) struct MaterialFrameInterface {
     pub(crate) binding_interface_id: BindingInterfaceId,
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MaterialFrameInterfaceId(NonZeroU32);
+
+impl MaterialFrameInterfaceId {
+    #[inline]
+    fn from_index(index: usize) -> Self {
+        let raw = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .expect("material frame interface index exceeds u32::MAX - 1");
+        Self(raw)
+    }
+
+    #[inline]
+    const fn index(self) -> usize {
+        self.0.get() as usize - 1
+    }
+}
+
 struct MaterialFrameRecord {
     key: MaterialPlanKey,
     pipeline: MaterialPipelineSnapshot,
-    textures: SmallVec<[PlannedMaterialTexture; 8]>,
-    /// Binding-aligned range in the store's flat canonical Texture -> Image
-    /// plan-ID stream. Attachments carry `None`; Asset bindings retain a slot
-    /// even when their captured state is unavailable.
+    /// Binding-aligned range shared by the flat TextureSource and canonical
+    /// Texture -> Image plan-ID streams. Attachments carry `None`; Asset
+    /// bindings retain a plan slot even when their captured state is
+    /// unavailable.
     texture_plan_range: Range<usize>,
+    attempted: bool,
     /// Success gate for this graph attempt. A persistent `GpuMaterial` with
     /// matching material stamps is insufficient when an Image changed and
     /// this attempt's exact texture materialization failed.
-    prepared: bool,
-    attempted: bool,
-    interface: Option<MaterialFrameInterface>,
+    interface: Option<MaterialFrameInterfaceId>,
 }
 
 /// Owned topology recipe returned to Composer before draw consumers are added.
@@ -207,6 +229,9 @@ pub(crate) struct MaterialPlanStore {
     asset_snapshots: Vec<AssetSnapshot<MaterialHandle, Material>>,
     asset_current: Vec<bool>,
     plans: Vec<MaterialFrameRecord>,
+    /// Flat binding-aligned source stream. This replaces one nested SmallVec
+    /// plus one complete AssetTexture snapshot copy per material binding.
+    texture_sources: Vec<TextureSource>,
     /// Flat binding-aligned plan IDs for every material record. Keeping this
     /// outside each record avoids one nested allocation for materials with
     /// more than the inline texture count.
@@ -226,6 +251,14 @@ pub(crate) struct MaterialPlanStore {
     selected_snapshot_indices: Vec<usize>,
     selected_current: Vec<bool>,
     live_plans: Vec<MaterialFrameId>,
+    selected_texture_lookup: SelectedTexturePlanLookup,
+    selected_texture_plan_ids: Vec<AssetTextureBatchId>,
+    selected_texture_current: Vec<bool>,
+    candidate_textures: Vec<PlannedMaterialTexture>,
+    candidates: PlannedMaterialCandidateBatch,
+    live_candidates: Vec<Option<PlannedMaterialCandidateId>>,
+    candidate_current: Vec<bool>,
+    interfaces: Vec<MaterialFrameInterface>,
     recipes: Vec<DrawMaterialTextureRecipe>,
     captured: bool,
     initialized: bool,
@@ -235,14 +268,59 @@ const MATERIAL_PLAN_BASELINE: usize = 128;
 const MATERIAL_TEXTURE_PLAN_BASELINE: usize = MATERIAL_PLAN_BASELINE * 8;
 const MATERIAL_SOURCE_BASELINE: usize = 512;
 const MATERIAL_RECIPE_BASELINE: usize = 16;
+const MATERIAL_TEXTURE_SCRATCH_BASELINE: usize = 16;
 
-#[inline]
-fn bit_vec_footprint(value: &Vec<bool>, baseline_capacity: usize) -> CapacityUsage {
-    CapacityUsage::new(
-        value.len().div_ceil(8),
-        value.capacity().div_ceil(8),
-        baseline_capacity.div_ceil(8),
-    )
+/// Retained sparse AssetTextureBatchId -> selected slot join.
+///
+/// Capacity follows the DPE-live selected domain rather than the complete
+/// graph-build Texture domain. `clear` retains buckets for warm reuse; the
+/// family-level hysteretic trimmer owns historical high-water reclamation.
+#[derive(Default)]
+struct SelectedTexturePlanLookup {
+    slots: FxHashMap<AssetTextureBatchId, u32>,
+}
+
+impl SelectedTexturePlanLookup {
+    #[inline]
+    fn begin(&mut self) {
+        self.slots.clear();
+    }
+
+    #[inline]
+    fn get_or_insert(&mut self, id: AssetTextureBatchId, vacant_slot: usize) -> (usize, bool) {
+        match self.slots.entry(id) {
+            std::collections::hash_map::Entry::Occupied(entry) => (*entry.get() as usize, false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let slot = u32::try_from(vacant_slot)
+                    .expect("selected Asset Texture slot exceeds u32::MAX");
+                entry.insert(slot);
+                (vacant_slot, true)
+            }
+        }
+    }
+
+    #[inline]
+    fn slot(&self, id: AssetTextureBatchId) -> Option<usize> {
+        self.slots.get(&id).map(|&slot| slot as usize)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    fn capacity_usage(&self) -> CapacityUsage {
+        estimated_hash_map_footprint(&self.slots, MATERIAL_PLAN_BASELINE)
+    }
+
+    fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_hash_map_by_family_ratio(
+            &mut self.slots,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+    }
 }
 
 impl MaterialPlanStore {
@@ -254,6 +332,7 @@ impl MaterialPlanStore {
             asset_snapshots: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
             asset_current: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
             plans: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
+            texture_sources: Vec::with_capacity(MATERIAL_TEXTURE_PLAN_BASELINE),
             texture_plan_ids: Vec::with_capacity(MATERIAL_TEXTURE_PLAN_BASELINE),
             plan_snapshots: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
             snapshot_plans: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
@@ -263,6 +342,14 @@ impl MaterialPlanStore {
             selected_snapshot_indices: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
             selected_current: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
             live_plans: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
+            selected_texture_lookup: SelectedTexturePlanLookup::default(),
+            selected_texture_plan_ids: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
+            selected_texture_current: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
+            candidate_textures: Vec::with_capacity(MATERIAL_TEXTURE_SCRATCH_BASELINE),
+            candidates: PlannedMaterialCandidateBatch::new(),
+            live_candidates: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
+            candidate_current: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
+            interfaces: Vec::with_capacity(MATERIAL_PLAN_BASELINE),
             recipes: Vec::with_capacity(MATERIAL_RECIPE_BASELINE),
             captured: false,
             initialized: false,
@@ -288,6 +375,7 @@ impl MaterialPlanStore {
         debug_assert!(self.asset_snapshots.is_empty());
         debug_assert!(self.asset_current.is_empty());
         debug_assert!(self.plans.is_empty());
+        debug_assert!(self.texture_sources.is_empty());
         debug_assert!(self.texture_plan_ids.is_empty());
         debug_assert!(self.plan_snapshots.is_empty());
         debug_assert!(self.snapshot_plans.is_empty());
@@ -297,6 +385,14 @@ impl MaterialPlanStore {
         debug_assert!(self.selected_snapshot_indices.is_empty());
         debug_assert!(self.selected_current.is_empty());
         debug_assert!(self.live_plans.is_empty());
+        debug_assert!(self.selected_texture_plan_ids.is_empty());
+        debug_assert!(self.selected_texture_current.is_empty());
+        debug_assert!(self.selected_texture_lookup.slots.is_empty());
+        debug_assert!(self.candidate_textures.is_empty());
+        debug_assert!(self.candidates.is_empty());
+        debug_assert!(self.live_candidates.is_empty());
+        debug_assert!(self.candidate_current.is_empty());
+        debug_assert!(self.interfaces.is_empty());
         debug_assert!(self.recipes.is_empty());
 
         self.source_snapshots
@@ -386,14 +482,6 @@ impl MaterialPlanStore {
             "material texture snapshots may be finalized only once"
         );
 
-        for record in &mut self.plans {
-            let texture_plan_ids = &self.texture_plan_ids[record.texture_plan_range.clone()];
-            debug_assert_eq!(record.textures.len(), texture_plan_ids.len());
-            for (planned, &batch_id) in record.textures.iter_mut().zip(texture_plan_ids) {
-                planned.asset = batch_id.and_then(|id| asset_textures.state(id));
-            }
-        }
-
         // Texture topology is checked once per unique plan, followed by one
         // bounded selected AssetStorage batch. The owner validation comes
         // last so a replacement during texture inspection cannot publish a
@@ -403,9 +491,16 @@ impl MaterialPlanStore {
         for index in 0..self.plans.len() {
             let id = MaterialFrameId::from_index(index);
             let record = &self.plans[index];
+            let texture_sources = &self.texture_sources[record.texture_plan_range.clone()];
             let texture_plan_ids = &self.texture_plan_ids[record.texture_plan_range.clone()];
             let current = self.material_owner(id).is_some_and(|material| {
-                material_record_content_matches_batch(material, record, texture_plan_ids)
+                material_record_content_matches_batch(
+                    material,
+                    record,
+                    texture_sources,
+                    texture_plan_ids,
+                    asset_textures,
+                )
             });
             self.selected_current.push(current);
         }
@@ -443,10 +538,12 @@ impl MaterialPlanStore {
         self.push_recipe(
             DrawPlanKey::Opaque,
             render_lists.opaque.iter().map(|intent| intent.source),
+            asset_textures,
         );
         self.push_recipe(
             DrawPlanKey::Transparent,
             render_lists.transparent.iter().map(|intent| intent.source),
+            asset_textures,
         );
         let mut shadow_keys: Vec<_> = render_lists.shadow_queues.keys().copied().collect();
         shadow_keys.sort_unstable();
@@ -459,6 +556,7 @@ impl MaterialPlanStore {
                 render_lists.shadow_queues[&(light_id, layer_index)]
                     .iter()
                     .map(|intent| intent.source),
+                asset_textures,
             );
         }
 
@@ -489,25 +587,23 @@ impl MaterialPlanStore {
         }
 
         let pipeline = MaterialPipelineSnapshot::capture(material);
-        let mut textures = SmallVec::<[PlannedMaterialTexture; 8]>::new();
+        let texture_plan_start = self.texture_sources.len();
         material.data.visit_textures(&mut |source| {
-            textures.push(PlannedMaterialTexture {
-                source: *source,
-                asset: None,
-            });
+            self.texture_sources.push(*source);
         });
         // Every field above belongs to the same serial capture window. A
         // mutation observed during capture rejects this attempt instead of
         // publishing a mixed classification/shader/binding recipe or adding
         // orphan Texture requests to the shared batch.
         if material.data.version() != material_version {
+            self.texture_sources.truncate(texture_plan_start);
             self.failed_snapshots[snapshot_id.index()] = true;
             return;
         }
 
-        let texture_plan_start = self.texture_plan_ids.len();
-        for planned in &textures {
-            let asset_plan = match planned.source {
+        debug_assert_eq!(self.texture_plan_ids.len(), texture_plan_start);
+        for &source in &self.texture_sources[texture_plan_start..] {
+            let asset_plan = match source {
                 TextureSource::Asset(handle) => Some(asset_textures.request(handle)),
                 TextureSource::Attachment(_, _) => None,
             };
@@ -517,9 +613,7 @@ impl MaterialPlanStore {
         let record = MaterialFrameRecord {
             key,
             pipeline,
-            textures,
             texture_plan_range,
-            prepared: false,
             attempted: false,
             interface: None,
         };
@@ -562,7 +656,12 @@ impl MaterialPlanStore {
             .map(myth_assets::LoadedAssetSnapshot::asset)
     }
 
-    fn push_recipe(&mut self, key: DrawPlanKey, sources: impl IntoIterator<Item = FrameSourceId>) {
+    fn push_recipe(
+        &mut self,
+        key: DrawPlanKey,
+        sources: impl IntoIterator<Item = FrameSourceId>,
+        asset_textures: &AssetTextureBatch,
+    ) {
         let mut visited_materials = FxHashSet::default();
         let mut visited_textures = FxHashSet::default();
         let mut textures = Vec::new();
@@ -574,13 +673,18 @@ impl MaterialPlanStore {
                 continue;
             }
             let record = &self.plans[plan.index()];
+            let texture_sources = &self.texture_sources[record.texture_plan_range.clone()];
             let texture_plan_ids = &self.texture_plan_ids[record.texture_plan_range.clone()];
-            debug_assert_eq!(record.textures.len(), texture_plan_ids.len());
-            for (texture, &owner_plan) in record.textures.iter().zip(texture_plan_ids) {
+            debug_assert_eq!(texture_sources.len(), texture_plan_ids.len());
+            for (&source, &owner_plan) in texture_sources.iter().zip(texture_plan_ids) {
                 let Some(owner_plan) = owner_plan else {
                     continue;
                 };
-                let Some(snapshot) = texture.asset.and_then(|state| state.ready) else {
+                debug_assert!(matches!(source, TextureSource::Asset(_)));
+                let Some(snapshot) = asset_textures
+                    .state(owner_plan)
+                    .and_then(|state| state.ready)
+                else {
                     continue;
                 };
                 if visited_textures.insert(owner_plan) {
@@ -608,14 +712,40 @@ impl MaterialPlanStore {
     pub(crate) fn prepare_live(
         &mut self,
         assets: &AssetServer,
+        asset_textures: &mut AssetTextureBatch,
         resource_manager: &mut ResourceManager,
         live_sources: &[FrameSourceId],
+    ) {
+        self.prepare_live_impl(
+            assets,
+            asset_textures,
+            resource_manager,
+            live_sources,
+            |_| {},
+            |_| {},
+        );
+    }
+
+    fn prepare_live_impl(
+        &mut self,
+        assets: &AssetServer,
+        asset_textures: &mut AssetTextureBatch,
+        resource_manager: &mut ResourceManager,
+        live_sources: &[FrameSourceId],
+        after_candidates: impl FnOnce(&ResourceManager),
+        after_reservations: impl FnOnce(&ResourceManager),
     ) {
         assert!(self.initialized, "material plans were not captured");
 
         self.selected_snapshot_indices.clear();
         self.selected_current.clear();
         self.live_plans.clear();
+        self.selected_texture_plan_ids.clear();
+        self.selected_texture_current.clear();
+        self.live_candidates.clear();
+        self.candidate_current.clear();
+        debug_assert!(self.candidates.is_empty());
+        self.selected_texture_lookup.begin();
         for &source in live_sources {
             let Some(id) = self.source_plans.get(source.index()).copied().flatten() else {
                 continue;
@@ -627,14 +757,31 @@ impl MaterialPlanStore {
             self.live_plans.push(id);
             self.selected_snapshot_indices
                 .push(self.plan_snapshots[id.index()].index());
+            self.live_candidates.push(None);
+
+            let record = &self.plans[id.index()];
+            for &texture in &self.texture_plan_ids[record.texture_plan_range.clone()] {
+                let Some(texture) = texture else {
+                    continue;
+                };
+                let (_, inserted) = self
+                    .selected_texture_lookup
+                    .get_or_insert(texture, self.selected_texture_plan_ids.len());
+                if inserted {
+                    self.selected_texture_plan_ids.push(texture);
+                }
+            }
         }
 
-        // Only the stable-deduplicated DPE-live owner subset touches
-        // AssetStorage after graph compilation.
+        // One Material batch plus one complete-state T -> I -> T batch replaces
+        // every per-Material/per-binding AssetStorage point lookup.
         assets.materials.revalidate_selected_batched(
             &self.asset_snapshots,
             &self.selected_snapshot_indices,
             &mut self.selected_current,
+        );
+        self.selected_texture_current.extend_from_slice(
+            asset_textures.postflight_states_selected(assets, &self.selected_texture_plan_ids),
         );
         debug_assert_eq!(self.live_plans.len(), self.selected_current.len());
 
@@ -644,70 +791,245 @@ impl MaterialPlanStore {
             }
             let id = self.live_plans[live_index];
             let Some(material) = self.material_owner(id) else {
+                self.selected_current[live_index] = false;
                 continue;
             };
-            if !material_record_content_is_current(assets, material, &self.plans[id.index()]) {
-                continue;
-            }
-            let prepared = {
-                let record = &self.plans[id.index()];
-                resource_manager.prepare_planned_material(
-                    assets,
-                    record.key.handle,
+            let record = &self.plans[id.index()];
+            let texture_sources = &self.texture_sources[record.texture_plan_range.clone()];
+            let texture_plan_ids = &self.texture_plan_ids[record.texture_plan_range.clone()];
+            let textures_current = texture_plan_ids.iter().flatten().all(|texture| {
+                self.selected_texture_lookup
+                    .slot(*texture)
+                    .and_then(|slot| self.selected_texture_current.get(slot))
+                    .copied()
+                    == Some(true)
+            });
+            if !textures_current
+                || !material_record_content_matches_batch(
                     material,
-                    record.key.asset_version,
-                    record.key.asset_identity,
-                    record.key.material_version,
-                    &record.textures,
+                    record,
+                    texture_sources,
+                    texture_plan_ids,
+                    asset_textures,
                 )
-            };
-            if prepared {
-                let record = &self.plans[id.index()];
-                let Some(gpu_material) = resource_manager.get_material(record.key.handle) else {
-                    continue;
-                };
-                if (gpu_material.asset_version, gpu_material.asset_identity)
-                    != (record.key.asset_version, record.key.asset_identity)
-                    || gpu_material.version != record.key.material_version
-                {
-                    continue;
-                }
-                let interface = MaterialFrameInterface {
-                    layout: gpu_material.layout.clone(),
-                    layout_id: gpu_material.layout_id,
-                    bind_group: gpu_material.bind_group.clone(),
-                    bind_group_id: gpu_material.bind_group_id,
-                    binding_wgsl: gpu_material.binding_wgsl.clone(),
-                    binding_interface_id: gpu_material.binding_interface_id,
-                };
-                let record = &mut self.plans[id.index()];
-                record.interface = Some(interface);
-                record.prepared = true;
+            {
+                self.selected_current[live_index] = false;
+                continue;
             }
+            let key = record.key;
+            let texture_plan_range = record.texture_plan_range.clone();
+
+            self.candidate_textures.clear();
+            for (&source, &texture) in self.texture_sources[texture_plan_range.clone()]
+                .iter()
+                .zip(&self.texture_plan_ids[texture_plan_range])
+            {
+                self.candidate_textures.push(PlannedMaterialTexture {
+                    source,
+                    asset: texture.and_then(|texture| asset_textures.state(texture)),
+                });
+            }
+            let snapshot_id = self.plan_snapshots[id.index()];
+            let material = self.asset_snapshots[snapshot_id.index()]
+                .loaded()
+                .expect("live Material plan lost its retained owner")
+                .asset();
+            let candidate = resource_manager.prepare_planned_material_candidate(
+                &mut self.candidates,
+                key.handle,
+                material,
+                key.asset_version,
+                key.asset_identity,
+                key.material_version,
+                &self.candidate_textures,
+            );
+            debug_assert_eq!(candidate.index(), self.candidate_current.len());
+            self.candidate_current.push(false);
+            self.live_candidates[live_index] = Some(candidate);
         }
 
-        // Physical preparation may overlap an asset or texture mutation.
-        // Revalidate the same dense live subset once and retract every stale
-        // interface before any draw source can observe it.
-        for live_index in 0..self.live_plans.len() {
-            let id = self.live_plans[live_index];
-            self.selected_current[live_index] = self.material_owner(id).is_some_and(|material| {
-                material_record_content_is_current(assets, material, &self.plans[id.index()])
-            });
-        }
-        assets.materials.revalidate_selected_batched(
-            &self.asset_snapshots,
-            &self.selected_snapshot_indices,
-            &mut self.asset_current,
+        after_candidates(resource_manager);
+
+        // GPU buffer/layout/BG work may overlap a Texture state or owner-local
+        // Material mutation. Repeat the complete-state Texture barrier and all
+        // potentially locking Material recipe checks before opening the final
+        // bounded AssetStorage publication gate.
+        self.selected_texture_current.clear();
+        self.selected_texture_current.extend_from_slice(
+            asset_textures.postflight_states_selected(assets, &self.selected_texture_plan_ids),
         );
         for live_index in 0..self.live_plans.len() {
-            let id = self.live_plans[live_index];
-            if !self.selected_current[live_index] || !self.asset_current[live_index] {
-                let record = &mut self.plans[id.index()];
-                record.prepared = false;
-                record.interface = None;
+            if self.live_candidates[live_index].is_none() {
+                self.selected_current[live_index] = false;
+                continue;
             }
+            let id = self.live_plans[live_index];
+            let record = &self.plans[id.index()];
+            let texture_sources = &self.texture_sources[record.texture_plan_range.clone()];
+            let texture_plan_ids = &self.texture_plan_ids[record.texture_plan_range.clone()];
+            let textures_current = texture_plan_ids.iter().flatten().all(|texture| {
+                self.selected_texture_lookup
+                    .slot(*texture)
+                    .and_then(|slot| self.selected_texture_current.get(slot))
+                    .copied()
+                    == Some(true)
+            });
+            let content_current = self.material_owner(id).is_some_and(|material| {
+                material_record_content_matches_batch(
+                    material,
+                    record,
+                    texture_sources,
+                    texture_plan_ids,
+                    asset_textures,
+                )
+            });
+            self.selected_current[live_index] =
+                self.selected_current[live_index] && textures_current && content_current;
         }
+
+        // Interface growth and WGPU owner clones must happen outside the
+        // Material storage guard. The callback below is intentionally bounded
+        // to exact asset checks and cache CAS.
+        if !self.candidates.is_empty() {
+            for (live_index, candidate) in self.live_candidates.iter().copied().enumerate() {
+                if let Some(candidate) = candidate {
+                    self.candidate_current[candidate.index()] = self.selected_current[live_index];
+                }
+            }
+            resource_manager.reserve_planned_material_candidate_slots(
+                &self.candidates,
+                &mut self.candidate_current,
+            );
+            after_reservations(resource_manager);
+
+            let asset_snapshots = &self.asset_snapshots;
+            let selected_snapshot_indices = &self.selected_snapshot_indices;
+            let plan_snapshots = &self.plan_snapshots;
+            let live_plans = &self.live_plans;
+            let live_candidates = &self.live_candidates;
+            let candidate_current = &mut self.candidate_current;
+            let candidates = &mut self.candidates;
+            let plans = &self.plans;
+
+            assets.materials.revalidate_selected_batched_at_publish(
+                asset_snapshots,
+                selected_snapshot_indices,
+                &mut self.asset_current,
+                |start, snapshot_indices, material_current| {
+                    let end = start + material_current.len();
+                    debug_assert_eq!(snapshot_indices, &selected_snapshot_indices[start..end]);
+                    for (chunk_index, &asset_is_current) in material_current.iter().enumerate() {
+                        let live_index = start + chunk_index;
+                        let Some(candidate) = live_candidates[live_index] else {
+                            continue;
+                        };
+                        let id = live_plans[live_index];
+                        let snapshot_id = plan_snapshots[id.index()];
+                        let final_epoch_is_current = asset_snapshots[snapshot_id.index()]
+                            .loaded()
+                            .is_some_and(|loaded| {
+                                loaded.asset().data.version()
+                                    == plans[id.index()].key.material_version
+                            });
+                        let current = candidate_current[candidate.index()]
+                            && asset_is_current
+                            && final_epoch_is_current;
+                        candidate_current[candidate.index()] = resource_manager
+                            .publish_planned_material_candidate(candidates, candidate, current);
+                    }
+                },
+            );
+            debug_assert!(self.candidates.all_published());
+        }
+
+        self.interfaces.reserve(
+            self.candidate_current
+                .iter()
+                .filter(|&&accepted| accepted)
+                .count(),
+        );
+
+        // The persistent cache cannot be mutated by another renderer thread.
+        // Once the bounded gate accepts an exact candidate, frame-local WGPU
+        // owners may therefore be cloned without extending AssetStorage lock
+        // hold time. A later asset replacement does not invalidate this
+        // retained graph-attempt snapshot.
+        for (live_index, candidate) in self.live_candidates.iter().copied().enumerate() {
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if !self.candidate_current[candidate.index()] {
+                continue;
+            }
+            let id = self.live_plans[live_index];
+            let key = self.plans[id.index()].key;
+            let Some(gpu_material) = resource_manager.get_material(key.handle) else {
+                continue;
+            };
+            if (gpu_material.asset_version, gpu_material.asset_identity)
+                != (key.asset_version, key.asset_identity)
+                || gpu_material.version != key.material_version
+            {
+                continue;
+            }
+            let interface = MaterialFrameInterface {
+                layout: gpu_material.layout.clone(),
+                layout_id: gpu_material.layout_id,
+                bind_group: gpu_material.bind_group.clone(),
+                bind_group_id: gpu_material.bind_group_id,
+                binding_wgsl: gpu_material.binding_wgsl.clone(),
+                binding_interface_id: gpu_material.binding_interface_id,
+            };
+            let interface_id = MaterialFrameInterfaceId::from_index(self.interfaces.len());
+            self.interfaces.push(interface);
+            self.plans[id.index()].interface = Some(interface_id);
+        }
+
+        self.candidate_textures.clear();
+        self.candidate_current.clear();
+        self.live_candidates.clear();
+        self.selected_texture_current.clear();
+        self.selected_texture_plan_ids.clear();
+        self.selected_texture_lookup.clear();
+        self.candidates.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_live_with_hook(
+        &mut self,
+        assets: &AssetServer,
+        asset_textures: &mut AssetTextureBatch,
+        resource_manager: &mut ResourceManager,
+        live_sources: &[FrameSourceId],
+        after_candidates: impl FnOnce(&ResourceManager),
+    ) {
+        self.prepare_live_impl(
+            assets,
+            asset_textures,
+            resource_manager,
+            live_sources,
+            after_candidates,
+            |_| {},
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_live_with_publication_hook(
+        &mut self,
+        assets: &AssetServer,
+        asset_textures: &mut AssetTextureBatch,
+        resource_manager: &mut ResourceManager,
+        live_sources: &[FrameSourceId],
+        after_reservations: impl FnOnce(&ResourceManager),
+    ) {
+        self.prepare_live_impl(
+            assets,
+            asset_textures,
+            resource_manager,
+            live_sources,
+            |_| {},
+            after_reservations,
+        );
     }
 
     #[must_use]
@@ -717,6 +1039,14 @@ impl MaterialPlanStore {
 
     pub(crate) fn clear(&mut self) {
         self.recipes.clear();
+        self.interfaces.clear();
+        self.candidates.clear();
+        self.candidate_current.clear();
+        self.live_candidates.clear();
+        self.candidate_textures.clear();
+        self.selected_texture_current.clear();
+        self.selected_texture_plan_ids.clear();
+        self.selected_texture_lookup.clear();
         self.live_plans.clear();
         self.selected_current.clear();
         self.selected_snapshot_indices.clear();
@@ -726,6 +1056,7 @@ impl MaterialPlanStore {
         self.snapshot_plans.clear();
         self.plan_snapshots.clear();
         self.texture_plan_ids.clear();
+        self.texture_sources.clear();
         self.plans.clear();
         self.asset_current.clear();
         self.asset_snapshots.clear();
@@ -739,17 +1070,30 @@ impl MaterialPlanStore {
         vec_footprint(&self.asset_handles, MATERIAL_PLAN_BASELINE)
             + estimated_hash_map_footprint(&self.asset_handle_lookup, MATERIAL_PLAN_BASELINE)
             + vec_footprint(&self.asset_snapshots, MATERIAL_PLAN_BASELINE)
-            + bit_vec_footprint(&self.asset_current, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.asset_current, MATERIAL_PLAN_BASELINE)
             + vec_footprint(&self.plans, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.texture_sources, MATERIAL_TEXTURE_PLAN_BASELINE)
             + vec_footprint(&self.texture_plan_ids, MATERIAL_TEXTURE_PLAN_BASELINE)
             + vec_footprint(&self.plan_snapshots, MATERIAL_PLAN_BASELINE)
             + vec_footprint(&self.snapshot_plans, MATERIAL_PLAN_BASELINE)
-            + bit_vec_footprint(&self.failed_snapshots, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.failed_snapshots, MATERIAL_PLAN_BASELINE)
             + vec_footprint(&self.source_snapshots, MATERIAL_SOURCE_BASELINE)
             + vec_footprint(&self.source_plans, MATERIAL_SOURCE_BASELINE)
             + vec_footprint(&self.selected_snapshot_indices, MATERIAL_PLAN_BASELINE)
-            + bit_vec_footprint(&self.selected_current, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.selected_current, MATERIAL_PLAN_BASELINE)
             + vec_footprint(&self.live_plans, MATERIAL_PLAN_BASELINE)
+            + self.selected_texture_lookup.capacity_usage()
+            + vec_footprint(&self.selected_texture_plan_ids, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.selected_texture_current, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.candidate_textures, MATERIAL_TEXTURE_SCRATCH_BASELINE)
+            + CapacityUsage::new(
+                self.candidates.active_bytes(),
+                self.candidates.retained_bytes(),
+                PlannedMaterialCandidateBatch::baseline_bytes(),
+            )
+            + vec_footprint(&self.live_candidates, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.candidate_current, MATERIAL_PLAN_BASELINE)
+            + vec_footprint(&self.interfaces, MATERIAL_PLAN_BASELINE)
             + vec_footprint(&self.recipes, MATERIAL_RECIPE_BASELINE)
     }
 
@@ -781,6 +1125,12 @@ impl MaterialPlanStore {
         shrink_vec_by_family_ratio(
             &mut self.plans,
             MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.texture_sources,
+            MATERIAL_TEXTURE_PLAN_BASELINE,
             target_bytes,
             retained_bytes,
         );
@@ -838,6 +1188,45 @@ impl MaterialPlanStore {
             target_bytes,
             retained_bytes,
         );
+        self.selected_texture_lookup
+            .trim_capacity(target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(
+            &mut self.selected_texture_plan_ids,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.selected_texture_current,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.candidate_textures,
+            MATERIAL_TEXTURE_SCRATCH_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        self.candidates.trim_capacity(target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(
+            &mut self.live_candidates,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.candidate_current,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.interfaces,
+            MATERIAL_PLAN_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
         shrink_vec_by_family_ratio(
             &mut self.recipes,
             MATERIAL_RECIPE_BASELINE,
@@ -854,6 +1243,7 @@ impl MaterialPlanStore {
             && self.asset_snapshots.is_empty()
             && self.asset_current.is_empty()
             && self.plans.is_empty()
+            && self.texture_sources.is_empty()
             && self.texture_plan_ids.is_empty()
             && self.plan_snapshots.is_empty()
             && self.snapshot_plans.is_empty()
@@ -863,6 +1253,14 @@ impl MaterialPlanStore {
             && self.selected_snapshot_indices.is_empty()
             && self.selected_current.is_empty()
             && self.live_plans.is_empty()
+            && self.selected_texture_plan_ids.is_empty()
+            && self.selected_texture_current.is_empty()
+            && self.selected_texture_lookup.slots.is_empty()
+            && self.candidate_textures.is_empty()
+            && self.candidates.is_empty()
+            && self.live_candidates.is_empty()
+            && self.candidate_current.is_empty()
+            && self.interfaces.is_empty()
             && self.recipes.is_empty()
             && !self.captured
             && !self.initialized
@@ -896,23 +1294,27 @@ impl<'a> MaterialPlanResolver<'a> {
             .flatten()?;
         let plan = self.store.plans.get(id.index())?;
         let material = self.store.material_owner(id)?.as_ref();
-        (plan.prepared && plan.interface.is_some() && plan.key.matches_item(item)).then_some(
-            PreparedMaterialFrame {
+        let interface = self.store.interfaces.get(plan.interface?.index())?;
+        plan.key
+            .matches_item(item)
+            .then_some(PreparedMaterialFrame {
                 id,
                 record: plan,
                 material,
-            },
-        )
+                interface,
+            })
     }
 
     #[must_use]
     pub(crate) fn material(self, id: MaterialFrameId) -> Option<PreparedMaterialFrame<'a>> {
         let record = self.store.plans.get(id.index())?;
         let material = self.store.material_owner(id)?.as_ref();
-        (record.prepared && record.interface.is_some()).then_some(PreparedMaterialFrame {
+        let interface = self.store.interfaces.get(record.interface?.index())?;
+        Some(PreparedMaterialFrame {
             id,
             record,
             material,
+            interface,
         })
     }
 }
@@ -922,6 +1324,7 @@ pub(crate) struct PreparedMaterialFrame<'a> {
     id: MaterialFrameId,
     record: &'a MaterialFrameRecord,
     material: &'a Material,
+    interface: &'a MaterialFrameInterface,
 }
 
 impl<'a> PreparedMaterialFrame<'a> {
@@ -936,11 +1339,8 @@ impl<'a> PreparedMaterialFrame<'a> {
     }
 
     #[inline]
-    pub(crate) fn interface(self) -> &'a MaterialFrameInterface {
-        self.record
-            .interface
-            .as_ref()
-            .expect("prepared material lacks its physical interface")
+    pub(crate) const fn interface(self) -> &'a MaterialFrameInterface {
+        self.interface
     }
 
     #[inline]
@@ -974,6 +1374,7 @@ fn material_plan_is_current(
     assets: &AssetServer,
     expected: &Arc<Material>,
     record: &MaterialFrameRecord,
+    textures: &[PlannedMaterialTexture],
 ) -> bool {
     let Some((material, asset_version, asset_identity)) =
         assets.materials.get_entry_with_identity(record.key.handle)
@@ -987,7 +1388,7 @@ fn material_plan_is_current(
         return false;
     }
 
-    material_record_content_is_current(assets, expected, record)
+    material_record_content_is_current(assets, expected, record, textures)
         && assets
             .materials
             .get_entry_with_identity(record.key.handle)
@@ -1004,10 +1405,12 @@ fn material_plan_is_current(
 fn material_record_content_matches_batch(
     material: &Material,
     record: &MaterialFrameRecord,
+    texture_sources: &[TextureSource],
     texture_plan_ids: &[Option<AssetTextureBatchId>],
+    asset_textures: &AssetTextureBatch,
 ) -> bool {
     if material.data.version() != record.key.material_version
-        || record.textures.len() != texture_plan_ids.len()
+        || texture_sources.len() != texture_plan_ids.len()
     {
         return false;
     }
@@ -1018,7 +1421,7 @@ fn material_record_content_matches_batch(
         if !matches {
             return;
         }
-        let Some(planned) = record.textures.get(texture_index) else {
+        let Some(&planned_source) = texture_sources.get(texture_index) else {
             matches = false;
             return;
         };
@@ -1027,31 +1430,33 @@ fn material_record_content_matches_batch(
             return;
         };
         texture_index += 1;
-        if planned.source != *source {
+        if planned_source != *source {
             matches = false;
             return;
         }
         matches = match (*source, batch_id) {
-            (TextureSource::Asset(handle), Some(_)) => planned
-                .asset
+            (TextureSource::Asset(handle), Some(batch_id)) => asset_textures
+                .state(batch_id)
                 .is_some_and(|state| state.texture_handle == handle),
-            (TextureSource::Attachment(_, _), None) => planned.asset.is_none(),
+            (TextureSource::Attachment(_, _), None) => true,
             _ => false,
         };
     });
 
     matches
-        && texture_index == record.textures.len()
+        && texture_index == texture_sources.len()
         && material.data.version() == record.key.material_version
 }
 
 /// Validate owner-local Material epochs and the complete texture-source
 /// recipe without acquiring the Material AssetStorage lock. Production paths
 /// pair this with one bounded batch revalidation of exact retained owners.
+#[cfg(test)]
 fn material_record_content_is_current(
     assets: &AssetServer,
     material: &Material,
     record: &MaterialFrameRecord,
+    textures: &[PlannedMaterialTexture],
 ) -> bool {
     if material.data.version() != record.key.material_version {
         return false;
@@ -1063,7 +1468,7 @@ fn material_record_content_is_current(
         if !matches {
             return;
         }
-        let Some(planned) = record.textures.get(texture_index) else {
+        let Some(planned) = textures.get(texture_index) else {
             matches = false;
             return;
         };
@@ -1084,7 +1489,7 @@ fn material_record_content_is_current(
     });
 
     matches
-        && texture_index == record.textures.len()
+        && texture_index == textures.len()
         && material.data.version() == record.key.material_version
 }
 
@@ -1171,16 +1576,93 @@ mod tests {
         asset_textures
     }
 
+    fn capture_untextured_live_plan(
+        assets: &AssetServer,
+        geometry: GeometryHandle,
+        material: MaterialHandle,
+        source_count: usize,
+    ) -> (
+        ExtractedScene,
+        RenderLists,
+        MaterialPlanStore,
+        AssetTextureBatch,
+        Vec<FrameSourceId>,
+    ) {
+        let (_, geometry_version, geometry_identity) = assets
+            .geometries
+            .get_entry_with_identity(geometry)
+            .expect("geometry missing");
+        let (material_owner, material_version, material_identity) = assets
+            .materials
+            .get_entry_with_identity(material)
+            .expect("material missing");
+        let material_data_version = material_owner.data.version();
+        drop(material_owner);
+
+        let mut extracted_scene = ExtractedScene::new();
+        let mut render_lists = RenderLists::new();
+        let mut live_sources = Vec::with_capacity(source_count);
+        for index in 0..source_count {
+            extracted_scene.render_items.push(extracted_item(
+                geometry,
+                geometry_version,
+                geometry_identity,
+                material,
+                material_version,
+                material_identity,
+                material_data_version,
+            ));
+            live_sources
+                .push(render_lists.intern_frame_source(
+                    super::super::frame::ExtractedSourceId::from_index(index),
+                ));
+        }
+
+        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+        geometry_frames.capture_visible(assets, &extracted_scene, &render_lists);
+        let mut store = MaterialPlanStore::new();
+        let asset_textures = capture_test_plans(
+            &mut store,
+            assets,
+            &extracted_scene,
+            &render_lists,
+            geometry_frames.eligibility(&extracted_scene, &render_lists),
+        );
+        (
+            extracted_scene,
+            render_lists,
+            store,
+            asset_textures,
+            live_sources,
+        )
+    }
+
+    fn headless_resource_manager() -> ResourceManager {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1)
+    }
+
     fn capture_record(
         assets: &AssetServer,
         handle: MaterialHandle,
-    ) -> (Arc<Material>, MaterialFrameRecord) {
+    ) -> (
+        Arc<Material>,
+        MaterialFrameRecord,
+        Vec<PlannedMaterialTexture>,
+    ) {
         let (material, asset_version, asset_identity) = assets
             .materials
             .get_entry_with_identity(handle)
             .expect("material missing");
         let material_version = material.data.version();
-        let mut textures = SmallVec::new();
+        let mut textures = Vec::new();
         material.data.visit_textures(&mut |source| {
             textures.push(PlannedMaterialTexture {
                 source: *source,
@@ -1202,13 +1684,11 @@ mod tests {
                 material_version,
             },
             pipeline,
-            textures,
             texture_plan_range,
-            prepared: false,
             attempted: false,
             interface: None,
         };
-        (material, record)
+        (material, record, textures)
     }
 
     #[test]
@@ -1217,6 +1697,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<Option<MaterialFrameId>>(), 4);
         assert_eq!(std::mem::size_of::<MaterialAssetSnapshotId>(), 4);
         assert_eq!(std::mem::size_of::<Option<MaterialAssetSnapshotId>>(), 4);
+        assert_eq!(std::mem::size_of::<MaterialFrameInterfaceId>(), 4);
+        assert_eq!(std::mem::size_of::<Option<MaterialFrameInterfaceId>>(), 4);
         assert_eq!(MaterialFrameId::from_index(0).index(), 0);
         assert_eq!(
             MaterialFrameId::from_index(u32::MAX as usize - 1).index(),
@@ -1225,6 +1707,46 @@ mod tests {
         assert!(
             std::panic::catch_unwind(|| MaterialFrameId::from_index(u32::MAX as usize)).is_err()
         );
+        assert_eq!(MaterialFrameInterfaceId::from_index(0).index(), 0);
+        assert_eq!(
+            MaterialFrameInterfaceId::from_index(u32::MAX as usize - 1).index(),
+            u32::MAX as usize - 1
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                MaterialFrameInterfaceId::from_index(u32::MAX as usize);
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn selected_texture_lookup_scales_with_live_selection_not_captured_id() {
+        let mut asset_textures = AssetTextureBatch::new();
+        let mut high_id = None;
+        for index in 0..1_024_u64 {
+            let handle = TextureHandle::from(slotmap::KeyData::from_ffi(
+                (1_u64 << 32) | index.saturating_add(1),
+            ));
+            high_id = Some(asset_textures.request(handle));
+        }
+        let high_id = high_id.expect("high Asset Texture ID missing");
+        assert_eq!(high_id.index(), 1_023);
+
+        let mut lookup = SelectedTexturePlanLookup::default();
+        lookup.begin();
+        assert_eq!(lookup.get_or_insert(high_id, 0), (0, true));
+        assert_eq!(lookup.get_or_insert(high_id, 1), (0, false));
+        assert_eq!(lookup.slots.len(), 1);
+        assert!(
+            lookup.slots.capacity() < 64,
+            "one high-index live Texture must not allocate the 1,024-entry captured domain"
+        );
+
+        let retained = lookup.capacity_usage().retained_bytes;
+        lookup.clear();
+        assert!(lookup.slots.is_empty());
+        assert_eq!(lookup.capacity_usage().retained_bytes, retained);
     }
 
     #[test]
@@ -1285,8 +1807,18 @@ mod tests {
         assert!(store.source_plans.iter().all(Option::is_some));
         assert_eq!(asset_textures.texture_count(), 1);
         assert_eq!(asset_textures.image_count(), 1);
-        assert_eq!(store.plans[0].textures.len(), 1);
-        assert!(store.plans[0].textures[0].asset.unwrap().ready.is_some());
+        let texture_range = store.plans[0].texture_plan_range.clone();
+        assert_eq!(texture_range.len(), 1);
+        assert_eq!(
+            &store.texture_sources[texture_range.clone()],
+            &[TextureSource::Asset(texture)]
+        );
+        assert!(
+            store.texture_plan_ids[texture_range][0]
+                .and_then(|id| asset_textures.state(id))
+                .and_then(|state| state.ready)
+                .is_some()
+        );
         assert_eq!(
             Arc::strong_count(&retained_material),
             3,
@@ -1394,8 +1926,8 @@ mod tests {
         store.finalize_texture_snapshots(&assets, &extracted_scene, &render_lists, &asset_textures);
         assert!(store.source_plans[source.index()].is_some());
         assert!(
-            store.plans[0].textures[0]
-                .asset
+            asset_textures
+                .state(material_texture_plan)
                 .is_some_and(|state| state.ready.is_some())
         );
     }
@@ -1483,14 +2015,14 @@ mod tests {
     }
 
     #[test]
-    fn packed_material_revalidation_bits_are_accounted_as_bits() {
+    fn material_revalidation_flags_are_accounted_as_bytes() {
         let mut current = Vec::with_capacity(129);
         current.resize(129, true);
-        let usage = bit_vec_footprint(&current, 128);
+        let usage = vec_footprint(&current, 128);
 
-        assert_eq!(usage.active_bytes, 129_usize.div_ceil(8));
-        assert_eq!(usage.retained_bytes, current.capacity().div_ceil(8));
-        assert_eq!(usage.baseline_bytes, 128_usize.div_ceil(8));
+        assert_eq!(usage.active_bytes, 129);
+        assert_eq!(usage.retained_bytes, current.capacity());
+        assert_eq!(usage.baseline_bytes, 128);
     }
 
     #[test]
@@ -1753,6 +2285,263 @@ mod tests {
     }
 
     #[test]
+    fn post_candidate_material_aba_publishes_no_cache_or_interface_and_recovers() {
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+        let (extracted_scene, _render_lists, mut store, mut asset_textures, live_sources) =
+            capture_untextured_live_plan(&assets, geometry, material, 1);
+        let mut resource_manager = headless_resource_manager();
+
+        store.prepare_live_with_hook(
+            &assets,
+            &mut asset_textures,
+            &mut resource_manager,
+            &live_sources,
+            |resources| {
+                assert!(
+                    resources.get_material(material).is_none(),
+                    "the candidate must remain private before the final postflight"
+                );
+                assets
+                    .materials
+                    .insert_ready(material, Material::new_unlit(glam::Vec4::splat(0.5)));
+            },
+        );
+
+        assert!(resource_manager.get_material(material).is_none());
+        assert!(store.interfaces.is_empty());
+        assert!(store.plans[0].interface.is_none());
+        assert!(
+            store
+                .resolver()
+                .prepared_material(live_sources[0], &extracted_scene.render_items[0])
+                .is_none(),
+            "a same-handle replacement after candidate creation must close the source join"
+        );
+
+        // A fresh graph attempt captures the replacement generation and is
+        // not poisoned by the rejected private candidate. Repeated live
+        // sources still publish exactly one compact interface.
+        let (
+            replacement_scene,
+            _replacement_lists,
+            mut replacement_store,
+            mut replacement_textures,
+            replacement_sources,
+        ) = capture_untextured_live_plan(&assets, geometry, material, 2);
+        replacement_store.prepare_live(
+            &assets,
+            &mut replacement_textures,
+            &mut resource_manager,
+            &replacement_sources,
+        );
+
+        assert!(resource_manager.get_material(material).is_some());
+        assert_eq!(replacement_store.plans.len(), 1);
+        assert_eq!(replacement_store.interfaces.len(), 1);
+        for (&source, item) in replacement_sources
+            .iter()
+            .zip(&replacement_scene.render_items)
+        {
+            assert!(
+                replacement_store
+                    .resolver()
+                    .prepared_material(source, item)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn post_candidate_material_epoch_drift_publishes_no_cache_or_interface_and_recovers() {
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+        let material_owner = assets.materials.get(material).expect("material missing");
+        let captured_epoch = material_owner.data.version();
+        let (extracted_scene, _render_lists, mut store, mut asset_textures, live_sources) =
+            capture_untextured_live_plan(&assets, geometry, material, 1);
+        let mut resource_manager = headless_resource_manager();
+
+        store.prepare_live_with_hook(
+            &assets,
+            &mut asset_textures,
+            &mut resource_manager,
+            &live_sources,
+            |resources| {
+                assert!(
+                    resources.get_material(material).is_none(),
+                    "the candidate must remain private before the final postflight"
+                );
+                material_owner
+                    .as_unlit()
+                    .expect("expected unlit material")
+                    .set_alpha_mode(AlphaMode::Blend);
+            },
+        );
+
+        assert_ne!(material_owner.data.version(), captured_epoch);
+        assert!(resource_manager.get_material(material).is_none());
+        assert!(store.interfaces.is_empty());
+        assert!(store.plans[0].interface.is_none());
+        assert!(
+            store
+                .resolver()
+                .prepared_material(live_sources[0], &extracted_scene.render_items[0])
+                .is_none(),
+            "an interior epoch drift after candidate creation must close the source join"
+        );
+
+        let (
+            current_scene,
+            _current_lists,
+            mut current_store,
+            mut current_textures,
+            current_sources,
+        ) = capture_untextured_live_plan(&assets, geometry, material, 1);
+        current_store.prepare_live(
+            &assets,
+            &mut current_textures,
+            &mut resource_manager,
+            &current_sources,
+        );
+
+        assert!(resource_manager.get_material(material).is_some());
+        assert_eq!(current_store.interfaces.len(), 1);
+        assert!(
+            current_store
+                .resolver()
+                .prepared_material(current_sources[0], &current_scene.render_items[0])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn post_reservation_material_epoch_drift_fails_the_publication_gate() {
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+        let material_owner = assets.materials.get(material).expect("material missing");
+        let (extracted_scene, _render_lists, mut store, mut asset_textures, live_sources) =
+            capture_untextured_live_plan(&assets, geometry, material, 1);
+        let mut resource_manager = headless_resource_manager();
+
+        store.prepare_live_with_publication_hook(
+            &assets,
+            &mut asset_textures,
+            &mut resource_manager,
+            &live_sources,
+            |_| {
+                material_owner
+                    .as_unlit()
+                    .expect("expected unlit material")
+                    .set_alpha_mode(AlphaMode::Blend);
+            },
+        );
+
+        assert!(resource_manager.get_material(material).is_none());
+        assert!(store.interfaces.is_empty());
+        assert!(store.plans[0].interface.is_none());
+        assert!(
+            store
+                .resolver()
+                .prepared_material(live_sources[0], &extracted_scene.render_items[0])
+                .is_none(),
+            "an epoch drift after slot reservation must fail before cache CAS"
+        );
+    }
+
+    #[test]
+    fn publication_gate_keeps_second_chunk_candidate_and_interface_alignment() {
+        const MATERIAL_COUNT: usize = 65;
+
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let (_, geometry_version, geometry_identity) = assets
+            .geometries
+            .get_entry_with_identity(geometry)
+            .expect("geometry missing");
+        let mut materials = Vec::with_capacity(MATERIAL_COUNT);
+        let mut extracted_scene = ExtractedScene::new();
+        let mut render_lists = RenderLists::new();
+        let mut live_sources = Vec::with_capacity(MATERIAL_COUNT);
+
+        for index in 0..MATERIAL_COUNT {
+            let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+            let (owner, asset_version, asset_identity) = assets
+                .materials
+                .get_entry_with_identity(material)
+                .expect("material missing");
+            let material_version = owner.data.version();
+            drop(owner);
+            materials.push(material);
+            extracted_scene.render_items.push(extracted_item(
+                geometry,
+                geometry_version,
+                geometry_identity,
+                material,
+                asset_version,
+                asset_identity,
+                material_version,
+            ));
+            live_sources
+                .push(render_lists.intern_frame_source(
+                    super::super::frame::ExtractedSourceId::from_index(index),
+                ));
+        }
+
+        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
+        let mut store = MaterialPlanStore::new();
+        let mut asset_textures = capture_test_plans(
+            &mut store,
+            &assets,
+            &extracted_scene,
+            &render_lists,
+            geometry_frames.eligibility(&extracted_scene, &render_lists),
+        );
+        let mut resource_manager = headless_resource_manager();
+        let drifting = materials[MATERIAL_COUNT - 1];
+
+        store.prepare_live_with_hook(
+            &assets,
+            &mut asset_textures,
+            &mut resource_manager,
+            &live_sources,
+            |_| {
+                assets
+                    .materials
+                    .insert_ready(drifting, Material::new_unlit(glam::Vec4::splat(0.5)));
+            },
+        );
+
+        assert_eq!(store.plans.len(), MATERIAL_COUNT);
+        assert_eq!(store.interfaces.len(), MATERIAL_COUNT - 1);
+        for index in 0..(MATERIAL_COUNT - 1) {
+            assert!(resource_manager.get_material(materials[index]).is_some());
+            assert!(
+                store
+                    .resolver()
+                    .prepared_material(live_sources[index], &extracted_scene.render_items[index])
+                    .is_some()
+            );
+        }
+        assert!(resource_manager.get_material(drifting).is_none());
+        assert!(store.plans[MATERIAL_COUNT - 1].interface.is_none());
+        assert!(
+            store
+                .resolver()
+                .prepared_material(
+                    live_sources[MATERIAL_COUNT - 1],
+                    &extracted_scene.render_items[MATERIAL_COUNT - 1],
+                )
+                .is_none(),
+            "the rejected second-chunk candidate must not shift an interface ID"
+        );
+    }
+
+    #[test]
     fn pending_material_plan_rejects_same_handle_texture_aba() {
         let assets = AssetServer::new();
         let first_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x301));
@@ -1761,15 +2550,20 @@ mod tests {
             .textures
             .add(Texture::new_2d(Some("pending A"), first_missing));
         let material = assets.materials.add(unlit_with_texture(texture));
-        let (material_owner, record) = capture_record(&assets, material);
-        assert!(record.textures[0].asset.unwrap().ready.is_none());
-        assert!(material_plan_is_current(&assets, &material_owner, &record));
+        let (material_owner, record, textures) = capture_record(&assets, material);
+        assert!(textures[0].asset.unwrap().ready.is_none());
+        assert!(material_plan_is_current(
+            &assets,
+            &material_owner,
+            &record,
+            &textures
+        ));
 
         assets
             .textures
             .insert_ready(texture, Texture::new_2d(Some("pending B"), second_missing));
         assert!(
-            !material_plan_is_current(&assets, &material_owner, &record),
+            !material_plan_is_current(&assets, &material_owner, &record, &textures),
             "two unavailable states with different exact identities must not compare equal"
         );
     }
@@ -1778,7 +2572,7 @@ mod tests {
     fn pipeline_snapshot_never_mixes_with_a_later_material_generation() {
         let assets = AssetServer::new();
         let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let (material_owner, record) = capture_record(&assets, material);
+        let (material_owner, record, textures) = capture_record(&assets, material);
         assert_eq!(record.pipeline.settings().alpha_mode, AlphaMode::Opaque);
 
         let current = assets.materials.get(material).expect("material missing");
@@ -1793,7 +2587,7 @@ mod tests {
             "the representative is immutable even when the live asset mutates"
         );
         assert!(
-            !material_plan_is_current(&assets, &material_owner, &record),
+            !material_plan_is_current(&assets, &material_owner, &record, &textures),
             "a mixed snapshot must be rejected instead of being published"
         );
     }
@@ -1816,8 +2610,8 @@ mod tests {
         texture_asset.sampler.mag_filter = wgpu::FilterMode::Nearest;
         let texture = assets.textures.add(texture_asset);
         let material = assets.materials.add(unlit_with_texture(texture));
-        let (material_owner, record) = capture_record(&assets, material);
-        let snapshot = record.textures[0]
+        let (material_owner, record, textures) = capture_record(&assets, material);
+        let snapshot = textures[0]
             .asset
             .and_then(|state| state.ready)
             .expect("ready texture snapshot missing");
@@ -1827,15 +2621,18 @@ mod tests {
         assert!(materialization.texture.is_some());
         assert!(materialization.mipmap_request.is_some());
         assert!(resource_manager.take_mipmap_requests().is_empty());
-        assert!(resource_manager.prepare_planned_material(
-            &assets,
+        let mut candidates = PlannedMaterialCandidateBatch::new();
+        let candidate = resource_manager.prepare_planned_material_candidate(
+            &mut candidates,
             record.key.handle,
             &material_owner,
             record.key.asset_version,
             record.key.asset_identity,
             record.key.material_version,
-            &record.textures,
-        ));
+            &textures,
+        );
+        resource_manager.publish_planned_material_candidates(&mut candidates, &[true]);
+        assert!(candidates.result(candidate));
         assert!(resource_manager.get_material(material).is_some());
         assert!(
             resource_manager.take_mipmap_requests().is_empty(),

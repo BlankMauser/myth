@@ -169,11 +169,7 @@ impl AssetTextureImportStore {
             + vec_footprint(&self.live_imports, ASSET_TEXTURE_IMPORT_BASELINE)
             + vec_footprint(&self.live_owner_plans, ASSET_TEXTURE_IMPORT_BASELINE)
             + vec_footprint(&self.live_candidates, ASSET_TEXTURE_IMPORT_BASELINE)
-            + CapacityUsage::new(
-                self.live_current.len().div_ceil(8),
-                self.live_current.capacity().div_ceil(8),
-                ASSET_TEXTURE_IMPORT_BASELINE.div_ceil(8),
-            )
+            + vec_footprint(&self.live_current, ASSET_TEXTURE_IMPORT_BASELINE)
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {

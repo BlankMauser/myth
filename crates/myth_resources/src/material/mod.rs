@@ -311,6 +311,11 @@ pub trait RenderableMaterialTrait: MaterialTrait {
         ShaderTemplateMode::Template
     }
     /// Returns the material version (used for cache invalidation).
+    ///
+    /// This must be a non-blocking epoch read, normally an atomic load. The
+    /// renderer may call it while holding a bounded asset-publication read
+    /// guard, so implementations must not acquire locks, re-enter asset
+    /// storage, or run user callbacks here.
     fn version(&self) -> u64;
     /// Returns shader macro definitions based on current material state.
     fn shader_defines(&self) -> ShaderDefines;
