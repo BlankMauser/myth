@@ -15,20 +15,13 @@ use std::collections::HashSet;
 
 use glam::{Mat4, Vec3};
 
-use crate::core::ResourceManager;
-use crate::graph::asset_frame::{GeometryFrameResolver, ObjectInterfaceStore};
-use crate::graph::frame::{
-    DrawPlanStore, FrameSourceId, PreparedDrawSource, PreparedDrawStore, RenderLists,
-};
-use crate::graph::material_plan::MaterialPlanResolver;
+use crate::graph::frame::{DrawPlanStore, RenderLists};
 use bitflags::{Flags, bitflags};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::material::AlphaMode;
 use myth_resources::shader_defines::ShaderDefines;
-use myth_resources::uniforms::{
-    DynamicModelUniforms, EnvironmentUniforms, GpuLightStorage, LightBufferMetadata, Mat3Uniform,
-};
+use myth_resources::uniforms::{EnvironmentUniforms, GpuLightStorage, LightBufferMetadata};
 use myth_resources::{BoundingBox, RenderableMaterialTrait};
 use myth_scene::background::BackgroundMode;
 use myth_scene::camera::RenderCamera;
@@ -668,185 +661,6 @@ impl ExtractedScene {
                 receive_shadows: item.receive_shadows,
                 world_aabb: item.world_aabb,
             });
-        }
-    }
-
-    /// Materialize the exact source union selected by DPE-live draw plans.
-    ///
-    /// Every source receives one model slot shared by main, prepass, and all
-    /// shadow views. All slots are allocated before the single model-buffer
-    /// flush; object BindGroups therefore capture only the final physical
-    /// buffer. Exact geometry/material/object resources are interned into the
-    /// graph-attempt [`DrawPlanStore`], while [`PreparedDrawStore`] keeps the
-    /// interface metadata needed by live pipeline derivation.
-    pub(crate) fn prepare_draw_resources(
-        &self,
-        scene: &mut Scene,
-        assets: &AssetServer,
-        resource_manager: &mut ResourceManager,
-        live_frame_sources: &[FrameSourceId],
-        render_lists: &RenderLists,
-        geometry_frames: GeometryFrameResolver<'_>,
-        material_plans: MaterialPlanResolver<'_>,
-        object_interfaces: &mut ObjectInterfaceStore,
-        prepared_draws: &mut PreparedDrawStore,
-        draw_plans: &mut DrawPlanStore,
-    ) {
-        prepared_draws.begin_sources(live_frame_sources.len());
-
-        let mut dynamic_offsets = Vec::with_capacity(live_frame_sources.len());
-        let mut required_skeletons = HashSet::<SkeletonKey>::default();
-        let mut previous = None;
-        for &frame_source in live_frame_sources {
-            assert!(
-                previous.is_none_or(|previous| previous < frame_source),
-                "live frame source IDs must be sorted and deduplicated"
-            );
-            previous = Some(frame_source);
-            let extracted_source = render_lists
-                .extracted_source(frame_source)
-                .expect("live frame source does not belong to these render lists");
-            let item = self
-                .render_items
-                .get(extracted_source.index())
-                .expect("live frame source exceeds the extracted item table");
-            let Some(geometry_id) = geometry_frames.geometry_id(frame_source, item) else {
-                continue;
-            };
-            if material_plans
-                .prepared_material(frame_source, item)
-                .is_none()
-                || geometry_frames.physical(geometry_id).is_none()
-                || !geometry_frames.pipeline_state_is_current(geometry_id)
-            {
-                continue;
-            }
-
-            let world_matrix_inverse = item.world_matrix.inverse();
-            let normal_matrix = Mat3Uniform::from_mat4(world_matrix_inverse.transpose());
-            let dynamic_offset = resource_manager.allocate_model_uniform(DynamicModelUniforms {
-                world_matrix: item.world_matrix,
-                world_matrix_inverse,
-                normal_matrix,
-                previous_world_matrix: item.prev_world_matrix,
-                ..Default::default()
-            });
-            dynamic_offsets.push((frame_source, dynamic_offset));
-            if let Some(skeleton) = item.skeleton {
-                required_skeletons.insert(skeleton);
-            }
-        }
-
-        if !dynamic_offsets.is_empty() {
-            // This is the only model-buffer flush for central scene draws. It
-            // precedes every object BindGroup lookup because a capacity growth
-            // replaces the physical WGPU buffer and clears the persistent
-            // object cache.
-            resource_manager.flush_model_buffers();
-        }
-
-        for skeleton_key in &required_skeletons {
-            if let Some(skeleton) = scene.skeleton_pool.get(*skeleton_key) {
-                resource_manager.prepare_skeleton(skeleton);
-            }
-        }
-
-        let skeleton_pool = &scene.skeleton_pool;
-        let meshes = &mut scene.meshes;
-        for (frame_source, dynamic_offset) in dynamic_offsets {
-            let extracted_source = render_lists
-                .extracted_source(frame_source)
-                .expect("prepared frame source does not belong to these render lists");
-            let item = &self.render_items[extracted_source.index()];
-            let Some(planned_material) = material_plans.prepared_material(frame_source, item)
-            else {
-                continue;
-            };
-            let Some(geometry_id) = geometry_frames.geometry_id(frame_source, item) else {
-                continue;
-            };
-            let Some(geometry) = geometry_frames.geometry(geometry_id) else {
-                continue;
-            };
-            if geometry_frames.physical(geometry_id).is_none()
-                || !geometry_frames.pipeline_state_is_current(geometry_id)
-                || !planned_material.pipeline_state_is_current()
-            {
-                continue;
-            }
-            let skeleton = item.skeleton.and_then(|key| skeleton_pool.get(key));
-            let Some(mesh) = meshes.get_mut(item.node_handle) else {
-                continue;
-            };
-            if (mesh.geometry, mesh.material) != (item.geometry, item.material) {
-                // The Scene changed after extraction. Never combine the old
-                // intent classification with a different physical mesh.
-                continue;
-            }
-            if (geometry.key.asset_version, geometry.key.asset_identity)
-                != (item.geometry_asset_version, item.geometry_asset_identity)
-                || (
-                    planned_material.asset_version(),
-                    planned_material.asset_identity(),
-                ) != (item.material_asset_version, item.material_asset_identity)
-            {
-                // A material changed after the pre-graph producer snapshot.
-                // Defer it to the next frame instead of creating an untracked
-                // texture/mipmap request after graph compilation.
-                continue;
-            }
-
-            // Pack current/previous morph weights only after target acquire.
-            // Temporal history remains unchanged until successful submit.
-            mesh.prepare_morph_uniforms();
-            let Some(object_bind_group_id) = resource_manager.prepare_draw_object_exact_geometry(
-                assets,
-                mesh,
-                skeleton,
-                &geometry.asset,
-                geometry.key.asset_version,
-                geometry.key.asset_identity,
-            ) else {
-                continue;
-            };
-            if !geometry_frames.pipeline_state_is_current(geometry_id)
-                || !planned_material.pipeline_state_is_current()
-            {
-                // An asynchronous replacement raced physical preparation.
-                // The persistent cache may warm, but this graph attempt never
-                // publishes a mixed old/new source record.
-                continue;
-            }
-            let object_bind_group = resource_manager
-                .prepared_object_bind_group(object_bind_group_id)
-                .expect("prepared object BindGroup was not retained by its cache");
-
-            let material_interface = planned_material.interface();
-            let material_bind_group_slot = draw_plans.intern_bind_group(
-                &material_interface.bind_group,
-                material_interface.bind_group_id,
-            );
-            let object_bind_group_slot = draw_plans.intern_bind_group(
-                &object_bind_group.bind_group,
-                object_bind_group.bind_group_id,
-            );
-            let object_interface = object_interfaces.intern(
-                object_bind_group.binding_interface_id,
-                object_bind_group.layout_id,
-                &object_bind_group.layout,
-                &object_bind_group.binding_wgsl,
-            );
-
-            prepared_draws.insert_source(
-                frame_source,
-                PreparedDrawSource {
-                    geometry: geometry_id,
-                    material: planned_material.id(),
-                    object_interface,
-                    material_bind_group: material_bind_group_slot,
-                    object_bind_group: (object_bind_group_slot, dynamic_offset),
-                },
-            );
         }
     }
 

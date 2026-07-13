@@ -197,12 +197,6 @@ impl ResourceManager {
         self.prepare_mesh_internal(assets, mesh, skeleton, true)
     }
 
-    /// Prepare geometry and the per-object binding after the graph-attempt
-    /// material plan was prepared post-DPE.
-    ///
-    /// Live DrawPlan materialization uses this entry point after DPE. It must
-    /// not discover a new material texture/mipmap producer after topology has
-    /// already been compiled, so a missing planned material fails closed.
     /// Prepare one graph-planned draw from the exact retained Geometry asset.
     ///
     /// The caller owns the asset keep-alive and the stamps captured by the
@@ -210,7 +204,6 @@ impl ResourceManager {
     /// preparing each live instance.
     pub(crate) fn prepare_draw_object_exact_geometry(
         &mut self,
-        assets: &AssetServer,
         mesh: &Mesh,
         skeleton: Option<&Skeleton>,
         geometry: &Geometry,
@@ -229,9 +222,8 @@ impl ResourceManager {
         }) {
             return None;
         }
-        self.get_material(mesh.material)?;
 
-        Some(self.prepare_object_bindings_id(assets, mesh, skeleton, geometry))
+        Some(self.prepare_object_bindings_id(mesh, skeleton, geometry))
     }
 
     fn prepare_mesh_internal(
@@ -257,13 +249,12 @@ impl ResourceManager {
         }
 
         let geometry = assets.geometries.get(mesh.geometry)?;
-        let bind_group_id = self.prepare_object_bindings_id(assets, mesh, skeleton, &geometry);
+        let bind_group_id = self.prepare_object_bindings_id(mesh, skeleton, &geometry);
         self.bind_groups.cached_bind_group(bind_group_id).cloned()
     }
 
     fn prepare_object_bindings_id(
         &mut self,
-        assets: &AssetServer,
         mesh: &Mesh,
         skeleton: Option<&Skeleton>,
         geometry: &Geometry,
@@ -305,7 +296,11 @@ impl ResourceManager {
 
         assert_object_bindings_are_buffer_only(&builder.bindings);
         let layout_entries = builder.generate_layout_entries();
-        self.prepare_binding_resources(assets, &builder.bindings);
+        // Object Group 2 recipes are buffer-only by contract. Keeping this
+        // path on the narrow buffer materializer avoids an unnecessary Asset
+        // dictionary capability and prevents future texture-producer
+        // discovery after graph compilation.
+        self.prepare_binding_buffers(&builder.bindings);
         let (layout_id, newly_created_layout) =
             if let Some(layout_id) = self.bind_groups.cached_layout_id(&layout_entries) {
                 (layout_id, None)

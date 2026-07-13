@@ -158,6 +158,13 @@ pub(crate) struct DrawPlanId {
     index: u32,
 }
 
+impl DrawPlanId {
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self.index as usize
+    }
+}
+
 /// Canonical frame-local recipe for one draw-plan command list.
 ///
 /// Recipes contain only graph-build-time POD data. Repeated reservation of the
@@ -197,7 +204,8 @@ pub(crate) struct DrawPlanMeta {
 /// A single pre-baked draw command with all GPU resources resolved to
 /// frame-local physical-resource slots.
 ///
-/// Produced by [`bake::finalize_live_draw_plans`] after DPE, consumed by the
+/// Produced by [`scene_pipeline_coordinator::finalize_live_draw_plans`] after
+/// DPE, consumed by the
 /// unified [`submit_scene_submission`] helper during the execute phase. Contains
 /// **zero** asset handles. Each unique WGPU buffer or bind group is cloned
 /// exactly once into the graph-attempt-owned [`DrawPlanStore`]; commands carry
@@ -212,7 +220,7 @@ pub(crate) struct DrawPlanMeta {
 /// finalize** phase. The execute phase sees only hardware-level GPU state and
 /// can be trivially parallelised in the future.
 ///
-/// [`bake::finalize_live_draw_plans`]: super::bake::finalize_live_draw_plans
+/// [`scene_pipeline_coordinator::finalize_live_draw_plans`]: super::scene_pipeline_coordinator::finalize_live_draw_plans
 /// [`submit_scene_submission`]: super::passes::draw::submit_scene_submission
 pub(crate) struct DrawCommand {
     /// Exact frame source used only by the post-submit history commit.
@@ -229,10 +237,11 @@ pub(crate) struct DrawCommand {
     /// Stable handle for the pre-selected render pipeline.
     pub pipeline_id: RenderPipelineId,
 
-    /// Pre-resolved vertex buffer bindings.
+    /// Range into the DrawPlanStore's retained flat vertex-binding table.
     ///
-    /// Typically 1–2 entries, interned by stable physical resource ID.
-    pub(crate) vertex_buffers: SmallVec<[DrawBufferSlot; 2]>,
+    /// Variable-length bindings stay out of the command object, so arbitrary
+    /// supported geometry layouts cannot trigger one heap allocation per draw.
+    pub(crate) vertex_buffer_range: std::ops::Range<u32>,
 
     /// Pre-resolved index buffer, or `None` for non-indexed draws.
     ///
@@ -255,6 +264,49 @@ pub(crate) struct DrawCommand {
 
     /// Instance range.
     pub instance_range: std::ops::Range<u32>,
+}
+
+/// Test-only, backend-semantic observation of one finalized direct draw
+/// stream.
+///
+/// Attempt tokens, command-array ranges, raw pointers, and frame-local
+/// physical-owner slots are deliberately excluded. Buffer and bind-group
+/// slots are resolved to their stable [`Tracked`] IDs so two implementations
+/// can be compared even when their private interning order differs.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrawStreamObservation {
+    /// Reservation-table order of the canonical plan within this attempt.
+    pub(crate) plan_order: u32,
+    pub(crate) plan_key: DrawPlanKey,
+    /// Vector order is the exact execute order for this stream.
+    pub(crate) commands: Vec<DrawCommandObservation>,
+}
+
+/// Fully normalized POD payload of one direct draw command.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrawCommandObservation {
+    pub(crate) frame_source: FrameSourceId,
+    pub(crate) sort_key: u64,
+    pub(crate) pipeline_id: RenderPipelineId,
+    /// Physical buffer IDs in vertex binding order.
+    pub(crate) vertex_buffer_ids: SmallVec<[u64; 2]>,
+    pub(crate) index_buffer: Option<DrawIndexBufferObservation>,
+    pub(crate) material_bind_group_id: Option<u64>,
+    pub(crate) object_bind_group_id: u64,
+    pub(crate) object_dynamic_offset: u32,
+    pub(crate) stencil_reference: Option<u32>,
+    pub(crate) vertex_range: std::ops::Range<u32>,
+    pub(crate) instance_range: std::ops::Range<u32>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawIndexBufferObservation {
+    pub(crate) buffer_id: u64,
+    pub(crate) format: wgpu::IndexFormat,
+    pub(crate) index_count: u32,
 }
 
 /// Exact graph-attempt physical state unique to one prepared draw instance.
@@ -387,6 +439,9 @@ impl Default for PreparedDrawStore {
 /// on both successful completion and abandoned graph attempts.
 pub(crate) struct DrawPlanStore {
     commands: Vec<DrawCommand>,
+    /// Flat variable-length payload addressed by DrawCommand ranges. This is
+    /// retained across attempts and therefore allocation-free at warm shape.
+    command_vertex_buffers: Vec<DrawBufferSlot>,
     plans: Vec<DrawPlanRecord>,
     plan_lookup: FxHashMap<DrawPlanKey, DrawPlanId>,
     texture_dependencies: FxHashMap<DrawPlanKey, SmallVec<[TextureNodeId; 8]>>,
@@ -399,8 +454,10 @@ pub(crate) struct DrawPlanStore {
 }
 
 const DRAW_COMMAND_BASELINE: usize = 1024;
+const DRAW_COMMAND_VERTEX_BUFFER_BASELINE: usize = DRAW_COMMAND_BASELINE * 2;
 const DRAW_PLAN_BASELINE: usize = 16;
 const DRAW_PHYSICAL_OWNER_BASELINE: usize = 256;
+const MAX_DRAW_VERTEX_BUFFERS: usize = 8;
 
 impl Default for DrawPlanStore {
     fn default() -> Self {
@@ -413,6 +470,7 @@ impl DrawPlanStore {
     pub fn new() -> Self {
         Self {
             commands: Vec::with_capacity(DRAW_COMMAND_BASELINE),
+            command_vertex_buffers: Vec::with_capacity(DRAW_COMMAND_VERTEX_BUFFER_BASELINE),
             plans: Vec::with_capacity(DRAW_PLAN_BASELINE),
             plan_lookup: FxHashMap::default(),
             texture_dependencies: FxHashMap::default(),
@@ -428,6 +486,7 @@ impl DrawPlanStore {
     /// Releases all graph-attempt WGPU owners while retaining store capacity.
     pub(crate) fn clear(&mut self) {
         self.commands.clear();
+        self.command_vertex_buffers.clear();
         self.plans.clear();
         self.plan_lookup.clear();
         self.texture_dependencies.clear();
@@ -441,6 +500,10 @@ impl DrawPlanStore {
 
     pub(crate) fn capacity_usage(&self) -> CapacityUsage {
         vec_footprint(&self.commands, DRAW_COMMAND_BASELINE)
+            + vec_footprint(
+                &self.command_vertex_buffers,
+                DRAW_COMMAND_VERTEX_BUFFER_BASELINE,
+            )
             + vec_footprint(&self.plans, DRAW_PLAN_BASELINE)
             + estimated_hash_map_footprint(&self.plan_lookup, DRAW_PLAN_BASELINE)
             + estimated_hash_map_footprint(&self.texture_dependencies, DRAW_PLAN_BASELINE)
@@ -454,6 +517,12 @@ impl DrawPlanStore {
         shrink_vec_by_family_ratio(
             &mut self.commands,
             DRAW_COMMAND_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.command_vertex_buffers,
+            DRAW_COMMAND_VERTEX_BUFFER_BASELINE,
             target_bytes,
             retained_bytes,
         );
@@ -503,6 +572,8 @@ impl DrawPlanStore {
 
     pub(crate) fn reserve_commands(&mut self, additional: usize) {
         self.commands.reserve(additional);
+        self.command_vertex_buffers
+            .reserve(additional.saturating_mul(2));
     }
 
     /// Reserve a stable plan ID during graph construction.
@@ -690,28 +761,50 @@ impl DrawPlanStore {
         start
     }
 
-    pub(crate) fn push_command(&mut self, command: DrawCommand) {
+    pub(crate) fn push_command(
+        &mut self,
+        mut command: DrawCommand,
+        vertex_buffers: &[DrawBufferSlot],
+    ) {
         assert!(
             self.open_plan.is_some(),
             "draw commands must be appended inside plan finalization"
         );
+        assert!(
+            vertex_buffers.len() <= MAX_DRAW_VERTEX_BUFFERS,
+            "draw command exceeds the Direct backend vertex-buffer limit"
+        );
+        let vertex_start = u32::try_from(self.command_vertex_buffers.len())
+            .expect("one graph attempt cannot address more than u32::MAX vertex bindings");
+        let vertex_end = self
+            .command_vertex_buffers
+            .len()
+            .checked_add(vertex_buffers.len())
+            .and_then(|end| u32::try_from(end).ok())
+            .expect("one graph attempt cannot address more than u32::MAX vertex bindings");
+        self.command_vertex_buffers
+            .extend_from_slice(vertex_buffers);
+        command.vertex_buffer_range = vertex_start..vertex_end;
         self.commands.push(command);
     }
 
     #[cfg(test)]
     pub(crate) fn push_test_command(&mut self, sort_key: u64) {
-        self.push_command(DrawCommand {
-            frame_source: FrameSourceId::from_index(0),
-            sort_key,
-            pipeline_id: RenderPipelineId(0),
-            vertex_buffers: SmallVec::new(),
-            index_buffer: None,
-            bind_group_1: None,
-            bind_group_2: (DrawBindGroupSlot(0), 0),
-            stencil_reference: None,
-            vertex_range: 0..3,
-            instance_range: 0..1,
-        });
+        self.push_command(
+            DrawCommand {
+                frame_source: FrameSourceId::from_index(0),
+                sort_key,
+                pipeline_id: RenderPipelineId(0),
+                vertex_buffer_range: 0..0,
+                index_buffer: None,
+                bind_group_1: None,
+                bind_group_2: (DrawBindGroupSlot(0), 0),
+                stencil_reference: None,
+                vertex_range: 0..3,
+                instance_range: 0..1,
+            },
+            &[],
+        );
     }
 
     pub(crate) fn sort_commands_from(&mut self, start: u32) {
@@ -784,6 +877,91 @@ impl DrawPlanStore {
     pub(crate) fn resolve_plan(&self, id: DrawPlanId) -> Option<&[DrawCommand]> {
         let range = self.plan(id)?.commands.as_ref()?;
         Some(&self.commands[range.start as usize..range.end as usize])
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn command_vertex_buffers(&self, command: &DrawCommand) -> &[DrawBufferSlot] {
+        &self.command_vertex_buffers
+            [command.vertex_buffer_range.start as usize..command.vertex_buffer_range.end as usize]
+    }
+
+    /// Capture exact, field-level semantics for every live finalized direct
+    /// stream in canonical plan-reservation order.
+    ///
+    /// This is intentionally test-only: building the owned observation is not
+    /// part of the shipping prepare or execute hot path.
+    #[cfg(test)]
+    pub(crate) fn observe_live_streams(&self) -> Vec<DrawStreamObservation> {
+        self.assert_all_live_finalized();
+        self.plans
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| plan.live)
+            .map(|(plan_order, plan)| {
+                let range = plan
+                    .commands
+                    .as_ref()
+                    .expect("live draw plan passed the finalized-stream barrier");
+                DrawStreamObservation {
+                    plan_order: u32::try_from(plan_order)
+                        .expect("validated draw-plan reservation order exceeds u32"),
+                    plan_key: plan.key,
+                    commands: self.commands[range.start as usize..range.end as usize]
+                        .iter()
+                        .map(|command| self.observe_command(command))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn observe_command(&self, command: &DrawCommand) -> DrawCommandObservation {
+        let vertex_buffer_ids = self
+            .command_vertex_buffers(command)
+            .iter()
+            .map(|&slot| {
+                self.resolve_buffer(slot)
+                    .expect("draw command references a missing vertex-buffer owner")
+                    .id()
+            })
+            .collect();
+        let index_buffer =
+            command
+                .index_buffer
+                .map(|(slot, format, index_count)| DrawIndexBufferObservation {
+                    buffer_id: self
+                        .resolve_buffer(slot)
+                        .expect("draw command references a missing index-buffer owner")
+                        .id(),
+                    format,
+                    index_count,
+                });
+        let material_bind_group_id = command.bind_group_1.map(|slot| {
+            self.resolve_bind_group(slot)
+                .expect("draw command references a missing material bind-group owner")
+                .id()
+        });
+        let (object_bind_group_slot, object_dynamic_offset) = command.bind_group_2;
+        let object_bind_group_id = self
+            .resolve_bind_group(object_bind_group_slot)
+            .expect("draw command references a missing object bind-group owner")
+            .id();
+
+        DrawCommandObservation {
+            frame_source: command.frame_source,
+            sort_key: command.sort_key,
+            pipeline_id: command.pipeline_id,
+            vertex_buffer_ids,
+            index_buffer,
+            material_bind_group_id,
+            object_bind_group_id,
+            object_dynamic_offset,
+            stencil_reference: command.stencil_reference,
+            vertex_range: command.vertex_range.clone(),
+            instance_range: command.instance_range.clone(),
+        }
     }
 
     /// Source identities of commands that were actually emitted into at least
@@ -1601,6 +1779,8 @@ impl RenderFrame {
 #[cfg(test)]
 mod draw_plan_tests {
     use super::*;
+    use crate::core::WgpuContext;
+    use crate::settings::{RendererInitConfig, RendererSettings};
     use slotmap::Key;
 
     fn test_command(sort_key: u64) -> DrawCommand {
@@ -1608,7 +1788,7 @@ mod draw_plan_tests {
             frame_source: FrameSourceId::from_index(0),
             sort_key,
             pipeline_id: RenderPipelineId(0),
-            vertex_buffers: SmallVec::new(),
+            vertex_buffer_range: 0..0,
             index_buffer: None,
             bind_group_1: None,
             bind_group_2: (DrawBindGroupSlot(0), 0),
@@ -1719,12 +1899,12 @@ mod draw_plan_tests {
         store.mark_live(second);
 
         let second_start = store.begin_finalize(second);
-        store.push_command(test_command(30));
-        store.push_command(test_command(10));
+        store.push_command(test_command(30), &[]);
+        store.push_command(test_command(10), &[]);
         store.sort_commands_from(second_start);
         store.finish_finalize(second, second_start);
         let first_start = store.begin_finalize(first);
-        store.push_command(test_command(20));
+        store.push_command(test_command(20), &[]);
         store.sort_commands_from(first_start);
         store.finish_finalize(first, first_start);
 
@@ -1747,6 +1927,155 @@ mod draw_plan_tests {
             vec![10, 30]
         );
         assert_eq!(store.plan_count(), 2);
+    }
+
+    #[test]
+    fn structured_stream_observation_normalizes_every_field_in_plan_reservation_order() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let vertex_a = wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("observation vertex A"),
+            size: 32,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let vertex_b_and_index = wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("observation vertex B/index"),
+            size: 64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
+            mapped_at_creation: false,
+        });
+        let layout = wgpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("observation bind-group layout"),
+                entries: &[],
+            });
+        let material_bind_group = wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("observation material bind group"),
+            layout: &layout,
+            entries: &[],
+        });
+        let object_bind_group = wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("observation object bind group"),
+            layout: &layout,
+            entries: &[],
+        });
+
+        let mut store = DrawPlanStore::new();
+        // Deliberately intern owners in an order unrelated to binding order.
+        // The observation must expose stable physical IDs, never these slots.
+        let secondary_buffer_slot = store.intern_buffer(&vertex_b_and_index, 202);
+        let primary_buffer_slot = store.intern_buffer(&vertex_a, 101);
+        let object_bind_group_slot = store.intern_bind_group(&object_bind_group, 404);
+        let material_bind_group_slot = store.intern_bind_group(&material_bind_group, 303);
+
+        let transparent = store.reserve_plan(DrawPlanKey::Transparent);
+        let _dead = store.reserve_plan(DrawPlanKey::Shadow {
+            light_id: 9,
+            layer_index: 2,
+        });
+        let opaque = store.reserve_plan(DrawPlanKey::Opaque);
+        store.mark_live(transparent);
+        store.mark_live(opaque);
+
+        // Finalize out of reservation order. The observation remains keyed by
+        // canonical plan order, and a finalized empty stream remains visible.
+        let opaque_start = store.begin_finalize(opaque);
+        store.finish_finalize(opaque, opaque_start);
+
+        let transparent_start = store.begin_finalize(transparent);
+        store.push_command(
+            DrawCommand {
+                frame_source: FrameSourceId::from_index(8),
+                sort_key: 90,
+                pipeline_id: RenderPipelineId(19),
+                vertex_buffer_range: 0..0,
+                index_buffer: Some((secondary_buffer_slot, wgpu::IndexFormat::Uint32, 36)),
+                bind_group_1: Some(material_bind_group_slot),
+                bind_group_2: (object_bind_group_slot, 256),
+                stencil_reference: Some(7),
+                vertex_range: 2..9,
+                instance_range: 3..5,
+            },
+            &[
+                primary_buffer_slot,
+                secondary_buffer_slot,
+                primary_buffer_slot,
+            ],
+        );
+        store.push_command(
+            DrawCommand {
+                frame_source: FrameSourceId::from_index(2),
+                sort_key: 10,
+                pipeline_id: RenderPipelineId(3),
+                vertex_buffer_range: 0..0,
+                index_buffer: None,
+                bind_group_1: None,
+                bind_group_2: (object_bind_group_slot, 512),
+                stencil_reference: None,
+                vertex_range: 4..12,
+                instance_range: 0..2,
+            },
+            &[secondary_buffer_slot],
+        );
+        store.sort_commands_from(transparent_start);
+        store.finish_finalize(transparent, transparent_start);
+
+        assert_eq!(store.buffer_owner_count(), 2);
+        assert_eq!(store.bind_group_owner_count(), 2);
+        assert_eq!(
+            store.observe_live_streams(),
+            vec![
+                DrawStreamObservation {
+                    plan_order: 0,
+                    plan_key: DrawPlanKey::Transparent,
+                    commands: vec![
+                        DrawCommandObservation {
+                            frame_source: FrameSourceId::from_index(2),
+                            sort_key: 10,
+                            pipeline_id: RenderPipelineId(3),
+                            vertex_buffer_ids: smallvec::smallvec![202],
+                            index_buffer: None,
+                            material_bind_group_id: None,
+                            object_bind_group_id: 404,
+                            object_dynamic_offset: 512,
+                            stencil_reference: None,
+                            vertex_range: 4..12,
+                            instance_range: 0..2,
+                        },
+                        DrawCommandObservation {
+                            frame_source: FrameSourceId::from_index(8),
+                            sort_key: 90,
+                            pipeline_id: RenderPipelineId(19),
+                            vertex_buffer_ids: smallvec::smallvec![101, 202, 101],
+                            index_buffer: Some(DrawIndexBufferObservation {
+                                buffer_id: 202,
+                                format: wgpu::IndexFormat::Uint32,
+                                index_count: 36,
+                            }),
+                            material_bind_group_id: Some(303),
+                            object_bind_group_id: 404,
+                            object_dynamic_offset: 256,
+                            stencil_reference: Some(7),
+                            vertex_range: 2..9,
+                            instance_range: 3..5,
+                        },
+                    ],
+                },
+                DrawStreamObservation {
+                    plan_order: 2,
+                    plan_key: DrawPlanKey::Opaque,
+                    commands: Vec::new(),
+                },
+            ]
+        );
     }
 
     #[test]

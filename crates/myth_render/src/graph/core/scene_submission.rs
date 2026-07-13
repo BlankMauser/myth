@@ -12,16 +12,14 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::core::gpu::Tracked;
-use crate::graph::asset_frame::GeometryFramePhysical;
 use crate::graph::capacity::{
     CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
     shrink_vec_by_family_ratio, vec_footprint,
 };
 use crate::graph::frame::{
     DrawBindGroupSlot, DrawBufferSlot, DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanResolver,
-    DrawPlanStore, FrameSourceId, PreparedDrawSource,
+    DrawPlanStore,
 };
-use crate::pipeline::RenderPipelineId;
 
 #[cfg(test)]
 use super::types::BufferNodeId;
@@ -476,7 +474,7 @@ impl SceneSubmissionStore {
 
     /// Resolve a plan to its private CpuDirect reservation without exposing
     /// the backend tag to Feature code.
-    fn cpu_direct_plan(&self, plan: SceneSubmissionPlanId) -> Option<DrawPlanId> {
+    pub(super) fn cpu_direct_plan(&self, plan: SceneSubmissionPlanId) -> Option<DrawPlanId> {
         match self.record(plan)?.backend {
             SceneSubmissionBackend::CpuDirect(draw_plan) => Some(draw_plan),
             #[cfg(test)]
@@ -549,6 +547,12 @@ impl<'a> SceneSubmissionResolver<'a> {
 
     #[inline]
     #[must_use]
+    pub(crate) fn vertex_buffers(self, command: &DrawCommand) -> &'a [DrawBufferSlot] {
+        self.draw_plan_store.command_vertex_buffers(command)
+    }
+
+    #[inline]
+    #[must_use]
     pub(crate) fn buffer(self, slot: DrawBufferSlot) -> &'a Tracked<wgpu::Buffer> {
         self.draw_plans.buffer(slot)
     }
@@ -557,75 +561,6 @@ impl<'a> SceneSubmissionResolver<'a> {
     #[must_use]
     pub(crate) fn bind_group(self, slot: DrawBindGroupSlot) -> &'a Tracked<wgpu::BindGroup> {
         self.draw_plans.bind_group(slot)
-    }
-}
-
-/// Exclusive prepare-time writer for the current CPU-direct backend.
-///
-/// Feature nodes never receive the underlying [`DrawPlanId`], command range,
-/// or physical resource slots. They append already-prepared sources through
-/// this narrow facade and finish one contiguous stream. This preserves the
-/// existing zero-copy execute path while leaving backend selection private to
-/// the scene-submission coordinator.
-pub(crate) struct SceneSubmissionWriter<'a> {
-    draw_plans: &'a mut DrawPlanStore,
-    draw_plan: DrawPlanId,
-    start: u32,
-}
-
-impl<'a> SceneSubmissionWriter<'a> {
-    /// Open an unfinalized live submission. `None` means another prepare path
-    /// already finalized the canonical plan and no duplicate work is needed.
-    #[must_use]
-    pub(super) fn begin(
-        submissions: &SceneSubmissionStore,
-        draw_plans: &'a mut DrawPlanStore,
-        plan: SceneSubmissionPlanId,
-        expected_commands: usize,
-    ) -> Option<Self> {
-        let draw_plan = submissions
-            .cpu_direct_plan(plan)
-            .expect("scene-submission writer requires a live CpuDirect plan");
-        if draw_plans.resolve_plan(draw_plan).is_some() {
-            return None;
-        }
-        draw_plans.reserve_commands(expected_commands);
-        let start = draw_plans.begin_finalize(draw_plan);
-        Some(Self {
-            draw_plans,
-            draw_plan,
-            start,
-        })
-    }
-
-    /// Append one prepared source without exposing command/slot internals to
-    /// the Feature. No physical owner or command payload is cloned here beyond
-    /// the exact compact fields required by the direct backend.
-    pub(crate) fn push_prepared_source(
-        &mut self,
-        frame_source: FrameSourceId,
-        source: &PreparedDrawSource,
-        geometry: &GeometryFramePhysical,
-        pipeline_id: RenderPipelineId,
-        sort_key: u64,
-        stencil_reference: Option<u32>,
-    ) {
-        crate::graph::bake::push_prepared_source_command(
-            self.draw_plans,
-            frame_source,
-            source,
-            geometry,
-            pipeline_id,
-            sort_key,
-            stencil_reference,
-        );
-    }
-
-    /// Sort the direct stream by its precomputed key and publish its exact
-    /// contiguous command range. An empty range is a valid finalized stream.
-    pub(crate) fn finish_sorted(self) {
-        self.draw_plans.sort_commands_from(self.start);
-        self.draw_plans.finish_finalize(self.draw_plan, self.start);
     }
 }
 
@@ -660,11 +595,11 @@ mod tests {
         store.mark_live(plan);
         let resolver = SceneSubmissionResolver::new(&store, &draw_plans);
         let stream = resolver.stream(plan);
-        let resolved = resolver.commands(stream);
+        let commands = resolver.commands(stream);
 
-        assert_eq!(resolved.as_ptr(), original_ptr);
-        assert_eq!(resolved.len(), original.len());
-        assert_eq!(resolved[0].sort_key, 73);
+        assert_eq!(commands.as_ptr(), original_ptr);
+        assert_eq!(commands.len(), original.len());
+        assert_eq!(commands[0].sort_key, 73);
     }
 
     #[test]

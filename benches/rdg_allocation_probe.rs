@@ -12,7 +12,8 @@ use myth_render::graph::bench_support::{
     DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern, DrawDemandRoot,
     DrawDemandTextureTopology, HighFanOutBenchHarness, HighFanOutBenchSpec, HighFanOutRoot,
     HighFanOutRunToken, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
-    RdgRecorderLifecycleToken,
+    RdgRecorderLifecycleToken, ScenePipelineWarmBenchHarness, ScenePipelineWarmBenchSpec,
+    ScenePipelineWarmRunToken,
 };
 
 #[global_allocator]
@@ -225,6 +226,11 @@ fn main() {
     for live_passes in [0, 32, 64, 128] {
         run_recorder_scenario(live_passes);
     }
+
+    println!(
+        "scene_pipeline_warm plans draws_per_plan vertex_bindings alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+    );
+    run_scene_pipeline_warm_scenario();
 }
 
 fn verify_counter_is_live() {
@@ -583,5 +589,77 @@ fn measure_recorder_plateau(
     (
         token.expect("recorder lifecycle workload was not sampled"),
         baseline.expect("recorder lifecycle allocation baseline was not sampled"),
+    )
+}
+
+fn run_scene_pipeline_warm_scenario() {
+    let spec = ScenePipelineWarmBenchSpec {
+        plan_count: 8,
+        draws_per_plan: 64,
+        pipeline_variant_count: 16,
+        vertex_bindings_per_draw: 4,
+    };
+    let mut harness = ScenePipelineWarmBenchHarness::new();
+    let (token, stats) = measure_scene_pipeline_warm_plateau(&mut harness, spec);
+
+    assert_eq!(
+        stats,
+        AllocationStats::default(),
+        "warm M6 Gather/Plan/Finalize regressed from its zero-allocation plateau"
+    );
+    assert_eq!(token.plan_count, spec.plan_count);
+    assert_eq!(token.command_count, spec.plan_count * spec.draws_per_plan);
+    assert_eq!(
+        token.vertex_binding_count,
+        token.command_count * spec.vertex_bindings_per_draw
+    );
+    assert_eq!(
+        token.exact_pipeline_request_count,
+        spec.plan_count * spec.pipeline_variant_count
+    );
+    assert_ne!(token.checksum, 0);
+
+    println!(
+        "scene_pipeline_warm {} {} {} {} {} {} {} {} {} {} {}",
+        spec.plan_count,
+        spec.draws_per_plan,
+        spec.vertex_bindings_per_draw,
+        stats.alloc_calls,
+        stats.alloc_zeroed_calls,
+        stats.realloc_calls,
+        stats.dealloc_calls,
+        stats.allocated_bytes,
+        stats.reallocated_old_bytes,
+        stats.reallocated_new_bytes,
+        stats.deallocated_bytes,
+    );
+}
+
+fn measure_scene_pipeline_warm_plateau(
+    harness: &mut ScenePipelineWarmBenchHarness,
+    spec: ScenePipelineWarmBenchSpec,
+) -> (ScenePipelineWarmRunToken, AllocationStats) {
+    for _ in 0..3 {
+        black_box(harness.run_iteration(spec));
+    }
+
+    let mut baseline = None;
+    let mut token = None;
+    for _ in 0..3 {
+        let (current_token, stats) = measure(|| black_box(harness.run_iteration(spec)));
+        if let Some(expected) = baseline {
+            assert_eq!(
+                stats, expected,
+                "warm scene-pipeline allocation counts did not plateau"
+            );
+        } else {
+            baseline = Some(stats);
+        }
+        token = Some(current_token);
+    }
+
+    (
+        token.expect("warm scene-pipeline workload was not sampled"),
+        baseline.expect("warm scene-pipeline allocation baseline was not sampled"),
     )
 }

@@ -2030,20 +2030,32 @@ impl<'a> FrameComposer<'a> {
                 self.ctx.resource_manager,
                 &mut graph.storage.draw_plans,
             );
-            let material_plans = graph.storage.material_plans.resolver();
-            let geometry_frames = graph.storage.geometry_frames.resolver();
-            self.ctx.extracted_scene.prepare_draw_resources(
-                self.ctx.scene,
-                self.ctx.assets,
-                self.ctx.resource_manager,
-                &live_frame_sources,
-                self.ctx.render_lists,
-                geometry_frames,
-                material_plans,
-                &mut graph.storage.object_interfaces,
-                &mut graph.storage.prepared_draws,
-                &mut graph.storage.draw_plans,
-            );
+            {
+                let storage = &mut *graph.storage;
+                storage.scene_source_prepare.gather(
+                    self.ctx.extracted_scene,
+                    &live_frame_sources,
+                    self.ctx.render_lists,
+                    storage.geometry_frames.resolver(),
+                    storage.material_plans.resolver(),
+                );
+                storage.scene_source_prepare.plan();
+                storage.scene_source_prepare.materialize(
+                    self.ctx.scene,
+                    self.ctx.resource_manager,
+                    storage.geometry_frames.resolver(),
+                    storage.material_plans.resolver(),
+                );
+                storage.scene_source_prepare.finalize(
+                    self.ctx.scene,
+                    storage.geometry_frames.resolver(),
+                    storage.material_plans.resolver(),
+                    self.ctx.resource_manager,
+                    &mut storage.object_interfaces,
+                    &mut storage.prepared_draws,
+                    &mut storage.draw_plans,
+                );
+            }
 
             rdg_diagnostics.enter_phase(RdgFramePhase::PreparePasses);
 
@@ -2084,7 +2096,7 @@ impl<'a> FrameComposer<'a> {
                         self.ctx.wgpu_ctx.depth_format,
                         self.ctx.wgpu_ctx.pipeline_settings_version,
                         &graph.storage.scene_submissions,
-                        &mut graph.storage.draw_plans,
+                        &mut graph.storage.scene_pipeline_prepare,
                     ),
                     mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
@@ -2110,39 +2122,44 @@ impl<'a> FrameComposer<'a> {
                     pass.prepare(&mut prepare_ctx);
                     rdg_diagnostics.record_prepared_pass();
                 }
-            }
 
-            rdg_diagnostics.enter_phase(RdgFramePhase::FinalizeDrawPlans);
+                // ─── 3c. Gather barrier + typed scene coordinators ─────────
+                //
+                // All live nodes have now emitted immutable recipes. The
+                // serial owner restores semantic order, exact-deduplicates
+                // canonical requests, creates only cold physical pipelines,
+                // and assigns Copy IDs before Feature L1 publication.
+                rdg_diagnostics.enter_phase(RdgFramePhase::FinalizeDrawPlans);
+                prepare_ctx.coordinate_scene_draws(
+                    &graph.storage.draw_plans,
+                    finalized_global_state_key,
+                    self.ctx.wgpu_ctx,
+                    &self.ctx.camera,
+                );
+
+                for &pass_idx in &graph.storage.execution_queue {
+                    // SAFETY: This is the second serial barrier over the same
+                    // live arena nodes; no competing mutable reference exists.
+                    let pass = unsafe { graph.storage.passes[pass_idx].get_pass_mut() };
+                    pass.finalize_prepare(&mut prepare_ctx);
+                }
+
+                // Execute will consume only these immutable, contiguous
+                // Direct streams. No shader/cache/asset lookup occurs here.
+                prepare_ctx.finalize_scene_draws(&mut graph.storage.draw_plans);
+            }
 
             #[cfg(feature = "3dgs")]
             if let Some(snapshot) = gaussian_snapshot {
                 graph.release_gaussian_frame_batch(snapshot.batch_id());
             }
 
-            // ─── 3c. Finalize live draw plans ──────────────────────────────
-            //
-            // DPE-selected PassRecords have already marked their reserved
-            // plan IDs live. Resolve only those plans into graph-attempt-owned
-            // physical resource tables and compact command ranges.
-            crate::graph::bake::finalize_live_draw_plans(
-                &mut graph.storage.draw_plans,
-                &graph.storage.prepared_draws,
-                graph.storage.geometry_frames.resolver(),
-                graph.storage.material_plans.resolver(),
-                graph.storage.object_interfaces.resolver(),
-                self.ctx.render_lists,
-                self.ctx.extracted_scene,
-                self.ctx.render_state,
-                self.ctx.wgpu_ctx,
-                self.ctx.resource_manager,
-                self.ctx.pipeline_cache,
-                self.ctx.shader_manager,
-                &self.ctx.camera,
-            );
             // Execute consumes only finalized DrawCommands. Release exact CPU
             // asset/interface owners as soon as every live plan is baked;
             // DrawPlanStore continues to own the physical WGPU handles.
             graph.storage.sample_retained_capacity();
+            graph.storage.scene_pipeline_prepare.clear();
+            graph.storage.scene_source_prepare.clear();
             graph.storage.prepared_draws.clear();
             graph.storage.object_interfaces.clear();
             graph.storage.geometry_frames.clear();

@@ -27,7 +27,7 @@ impl BindingInterfaceId {
         Self(NonZeroU64::new(generate_gpu_resource_id()).expect("GPU resource IDs are non-zero"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "rdg_bench_support"))]
     #[inline]
     pub(crate) fn from_raw(value: u64) -> Self {
         Self(NonZeroU64::new(value).expect("binding interface ID must be non-zero"))

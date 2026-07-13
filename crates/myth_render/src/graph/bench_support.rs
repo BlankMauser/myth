@@ -4,12 +4,23 @@
 //! builds, but absent from default shipping builds. Its narrow semantic API
 //! avoids exposing backend command-plan internals or timing an approximate public topology.
 
+use myth_assets::{GeometryHandle, MaterialHandle};
+use slotmap::KeyData;
+
+use crate::core::BindingInterfaceId;
 use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
 use crate::graph::core::types::ErasedResourceNodeId;
 use crate::graph::core::{
     BufferDesc, ExecuteContext, FrameArena, GraphStorage, PassBuilder, PassNode,
     RdgDiagnosticsRecorder, RdgFramePhase, RenderGraph, TextureDesc, TextureNodeId,
 };
+use crate::graph::frame::{
+    DrawPlanId, DrawPlanKey, DrawPlanStore, FrameSourceId, PreparedSourceId,
+};
+use crate::graph::scene_pipeline_prepare::{
+    PrepassPipelineL1Key, ScenePipelinePrepareStore, SceneRecipeOrdinal,
+};
+use crate::pipeline::RenderPipelineId;
 
 const CUBE_LIGHT_ID_BASE: u64 = 1 << 32;
 
@@ -384,12 +395,8 @@ impl DrawDemandBenchHarness {
                     plan_ids
                         .iter()
                         .enumerate()
-                        .filter_map(|(index, &id)| {
-                            graph
-                                .storage
-                                .scene_submission_is_live(id)
-                                .then(|| project_plan_key(shadow_plan_key(index, d2_plan_count)))
-                        })
+                        .filter(|&(_, &id)| graph.storage.scene_submission_is_live(id))
+                        .map(|(index, _)| project_plan_key(shadow_plan_key(index, d2_plan_count)))
                         .collect()
                 } else {
                     Vec::new()
@@ -681,6 +688,272 @@ fn dependency_desc() -> TextureDesc {
         wgpu::TextureFormat::R8Unorm,
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
     )
+}
+
+/// Pure-CPU workload for the retained M6 ScenePipeline planner/finalizer.
+///
+/// `vertex_bindings_per_draw` must exceed the old two-binding inline shape so
+/// the probe proves that variable geometry payloads stay in one retained flat
+/// table instead of allocating once per command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScenePipelineWarmBenchSpec {
+    pub plan_count: usize,
+    pub draws_per_plan: usize,
+    pub pipeline_variant_count: usize,
+    pub vertex_bindings_per_draw: usize,
+}
+
+/// O(1) correctness token returned from allocation-counted iterations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScenePipelineWarmRunToken {
+    pub plan_count: usize,
+    pub command_count: usize,
+    pub vertex_binding_count: usize,
+    pub exact_pipeline_request_count: usize,
+    pub checksum: u64,
+}
+
+/// One synthetic finalized command header.
+///
+/// This mirrors the allocation-relevant shape of the production draw stream:
+/// fixed headers address variable vertex bindings through ranges into one flat
+/// table. Physical WGPU owners are deliberately absent so the allocation probe
+/// can isolate CPU planning without creating a device.
+#[derive(Debug, Clone, Copy)]
+struct ScenePipelineFlatCommand {
+    ordinal: SceneRecipeOrdinal,
+    pipeline: RenderPipelineId,
+    sort_key: u64,
+    vertex_binding_start: u32,
+    vertex_binding_count: u32,
+}
+
+/// Retained M6 Gather -> Plan -> Finalize allocation harness.
+///
+/// Every iteration clears and rebuilds the production Prepass recipe store and
+/// its exact request map, restores canonical semantic order, creates per-plan
+/// ranges, and materializes a sorted flat command stream. All pipeline results
+/// enter Gather as warm L1 hits, so no WGPU object is created or approximated.
+pub struct ScenePipelineWarmBenchHarness {
+    planner: ScenePipelinePrepareStore,
+    plan_store: DrawPlanStore,
+    plan_ids: Vec<DrawPlanId>,
+    commands: Vec<ScenePipelineFlatCommand>,
+    command_vertex_bindings: Vec<u32>,
+    command_ranges: Vec<std::ops::Range<u32>>,
+}
+
+impl ScenePipelineWarmBenchHarness {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            planner: ScenePipelinePrepareStore::new(),
+            plan_store: DrawPlanStore::new(),
+            plan_ids: Vec::new(),
+            commands: Vec::new(),
+            command_vertex_bindings: Vec::new(),
+            command_ranges: Vec::new(),
+        }
+    }
+
+    /// Run one complete retained CPU planning iteration.
+    #[must_use]
+    pub fn run_iteration(&mut self, spec: ScenePipelineWarmBenchSpec) -> ScenePipelineWarmRunToken {
+        validate_scene_pipeline_warm_spec(spec);
+
+        self.planner.clear();
+        self.plan_store.clear();
+        self.plan_ids.clear();
+        self.commands.clear();
+        self.command_vertex_bindings.clear();
+        self.command_ranges.clear();
+
+        self.plan_ids.reserve(spec.plan_count);
+        self.command_ranges.reserve(spec.plan_count);
+        let command_count = spec
+            .plan_count
+            .checked_mul(spec.draws_per_plan)
+            .expect("scene-pipeline benchmark command count overflowed");
+        self.commands.reserve(command_count);
+        self.command_vertex_bindings.reserve(
+            command_count
+                .checked_mul(spec.vertex_bindings_per_draw)
+                .expect("scene-pipeline benchmark vertex binding count overflowed"),
+        );
+
+        for plan_index in 0..spec.plan_count {
+            self.plan_ids
+                .push(self.plan_store.reserve_plan(DrawPlanKey::Prepass {
+                    needs_normal: plan_index & 1 != 0,
+                    needs_feature_id: plan_index & 2 != 0,
+                    needs_velocity: plan_index & 4 != 0,
+                }));
+        }
+
+        // Gather each plan in reverse intent order. Planning must restore
+        // `(plan reservation, intent)` order independently of gather order.
+        for gather_plan in 0..spec.plan_count {
+            let plan_index = spec.plan_count - gather_plan - 1;
+            let plan = self.plan_ids[plan_index];
+            for gather_intent in 0..spec.draws_per_plan {
+                let intent_index = spec.draws_per_plan - gather_intent - 1;
+                let source_index = plan_index * spec.draws_per_plan + intent_index;
+                let variant = source_index % spec.pipeline_variant_count;
+                self.planner.push_prepass(
+                    plan,
+                    SceneRecipeOrdinal::new(plan_index, intent_index),
+                    FrameSourceId::from_index(source_index),
+                    PreparedSourceId::from_index(source_index),
+                    scene_pipeline_prepass_key(variant, plan_index),
+                    Some(RenderPipelineId(
+                        u32::try_from(variant).expect("pipeline variant exceeds u32"),
+                    )),
+                    u32::try_from(variant).expect("material index exceeds u32"),
+                    intent_index as f32,
+                );
+            }
+        }
+
+        self.planner.plan(spec.plan_count);
+        let mut checksum = 0_u64;
+        for plan_index in 0..spec.plan_count {
+            let command_start = u32::try_from(self.commands.len())
+                .expect("scene-pipeline command table exceeds u32");
+            let recipes = self.planner.prepass_draws(plan_index);
+            assert_eq!(recipes.len(), spec.draws_per_plan);
+            for (intent_index, &recipe) in recipes.iter().enumerate() {
+                assert_eq!(
+                    recipe.ordinal,
+                    SceneRecipeOrdinal::new(plan_index, intent_index),
+                    "planner did not restore canonical recipe order"
+                );
+                assert_eq!(recipe.draw_plan, self.plan_ids[plan_index]);
+                let pipeline = self
+                    .planner
+                    .prepass_result(recipe.pipeline)
+                    .expect("warm Prepass request lost its cached pipeline ID");
+                let vertex_binding_start = u32::try_from(self.command_vertex_bindings.len())
+                    .expect("scene-pipeline vertex table exceeds u32");
+                for binding_index in 0..spec.vertex_bindings_per_draw {
+                    let token = recipe
+                        .prepared_source
+                        .index()
+                        .checked_mul(spec.vertex_bindings_per_draw)
+                        .and_then(|base| base.checked_add(binding_index))
+                        .and_then(|token| u32::try_from(token).ok())
+                        .expect("scene-pipeline vertex token exceeds u32");
+                    self.command_vertex_bindings.push(token);
+                }
+                let sort_key =
+                    (u64::try_from(pipeline.index()).expect("pipeline index overflowed") << 32)
+                        | u64::from(recipe.material_index);
+                self.commands.push(ScenePipelineFlatCommand {
+                    ordinal: recipe.ordinal,
+                    pipeline,
+                    sort_key,
+                    vertex_binding_start,
+                    vertex_binding_count: u32::try_from(spec.vertex_bindings_per_draw)
+                        .expect("vertex binding count exceeds u32"),
+                });
+            }
+            let command_end = u32::try_from(self.commands.len())
+                .expect("scene-pipeline command table exceeds u32");
+            self.commands[command_start as usize..command_end as usize]
+                .sort_unstable_by_key(|command| command.sort_key);
+            self.command_ranges.push(command_start..command_end);
+        }
+
+        for (plan_index, range) in self.command_ranges.iter().enumerate() {
+            assert_eq!(range.end - range.start, spec.draws_per_plan as u32);
+            for command in &self.commands[range.start as usize..range.end as usize] {
+                let vertex_end = command
+                    .vertex_binding_start
+                    .checked_add(command.vertex_binding_count)
+                    .expect("scene-pipeline vertex range overflowed");
+                let vertices = &self.command_vertex_bindings
+                    [command.vertex_binding_start as usize..vertex_end as usize];
+                checksum = checksum
+                    .wrapping_mul(0x9e37_79b1_85eb_ca87)
+                    .wrapping_add(plan_index as u64)
+                    .wrapping_add(u64::from(command.ordinal.intent_index))
+                    .wrapping_add(command.pipeline.index() as u64)
+                    .wrapping_add(command.sort_key)
+                    .wrapping_add(u64::from(vertices[0]))
+                    .wrapping_add(u64::from(vertices[vertices.len() - 1]));
+            }
+        }
+
+        ScenePipelineWarmRunToken {
+            plan_count: self.command_ranges.len(),
+            command_count: self.commands.len(),
+            vertex_binding_count: self.command_vertex_bindings.len(),
+            exact_pipeline_request_count: self.planner.prepass_request_count(),
+            checksum,
+        }
+    }
+}
+
+impl Default for ScenePipelineWarmBenchHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn validate_scene_pipeline_warm_spec(spec: ScenePipelineWarmBenchSpec) {
+    assert!(spec.plan_count > 0, "benchmark requires at least one plan");
+    assert!(
+        spec.plan_count <= 8,
+        "synthetic Prepass keys encode the plan output mask in three bits"
+    );
+    assert!(
+        spec.draws_per_plan > 0,
+        "benchmark requires at least one draw per plan"
+    );
+    assert!(
+        spec.pipeline_variant_count > 0,
+        "benchmark requires at least one pipeline variant"
+    );
+    assert!(
+        spec.vertex_bindings_per_draw > 2,
+        "benchmark must cross the old two-binding inline shape"
+    );
+}
+
+fn scene_pipeline_prepass_key(variant: usize, plan_index: usize) -> PrepassPipelineL1Key {
+    let variant_u64 = u64::try_from(variant).expect("pipeline variant exceeds u64");
+    let variant_u32 = u32::try_from(variant).expect("pipeline variant exceeds u32");
+    let discriminator = variant_u64 + 1;
+    PrepassPipelineL1Key {
+        geometry_handle: GeometryHandle::from(KeyData::from_ffi(discriminator * 2 + 1)),
+        geometry_asset_version: variant_u32,
+        geometry_asset_identity: discriminator * 11 + 1,
+        geometry_layout_version: discriminator * 13 + 1,
+        material_handle: MaterialHandle::from(KeyData::from_ffi(discriminator * 2 + 2)),
+        material_asset_version: variant_u32,
+        material_asset_identity: discriminator * 17 + 1,
+        material_version: discriminator * 19 + 1,
+        item_variants: variant_u32,
+        item_shader_defines_hash: discriminator * 23 + 1,
+        shader_source_identity: discriminator * 29 + 1,
+        scene_defines_hash: discriminator * 31 + 1,
+        pipeline_settings_version: discriminator * 37 + 1,
+        global_binding_interface_id: BindingInterfaceId::from_raw(discriminator * 3 + 1),
+        material_binding_interface_id: BindingInterfaceId::from_raw(discriminator * 3 + 2),
+        object_binding_interface_id: BindingInterfaceId::from_raw(discriminator * 3 + 3),
+        vertex_layout_id: discriminator * 41 + 1,
+        bind_group_layout_ids: [
+            discriminator * 43 + 1,
+            discriminator * 43 + 2,
+            discriminator * 43 + 3,
+        ],
+        depth_format: wgpu::TextureFormat::Depth32Float,
+        topology: wgpu::PrimitiveTopology::TriangleList,
+        cull_mode: Some(wgpu::Face::Back),
+        front_face: wgpu::FrontFace::Ccw,
+        needs_normal: plan_index & 1 != 0,
+        needs_feature_id: plan_index & 2 != 0,
+        needs_velocity: plan_index & 4 != 0,
+    }
 }
 
 /// Whether the high-fan-out workload is rooted or entirely removed by DPE.

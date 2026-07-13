@@ -27,6 +27,8 @@ use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, Gau
 use crate::graph::frame::DrawPlanKey;
 use crate::graph::frame::{DrawPlanStore, PreparedDrawStore};
 use crate::graph::material_plan::MaterialPlanStore;
+use crate::graph::scene_pipeline_prepare::ScenePipelinePrepareStore;
+use crate::graph::scene_source_prepare::SceneSourcePrepareStore;
 
 use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
@@ -465,6 +467,11 @@ pub struct GraphStorage {
     /// Graph-attempt source records materialized only for the source-item
     /// union selected by DPE-live draw plans.
     pub(crate) prepared_draws: PreparedDrawStore,
+    /// Retained POD recipes and typed coordinator scratch for the exact
+    /// DPE-live scene-source union.
+    pub(crate) scene_source_prepare: SceneSourcePrepareStore,
+    /// Retained typed pipeline requests and immutable Direct draw recipes.
+    pub(crate) scene_pipeline_prepare: ScenePipelinePrepareStore,
     /// Exact CPU geometry owners and unique physical interfaces for the
     /// DPE-live source union.
     pub(crate) geometry_frames: GeometryFrameStore,
@@ -550,6 +557,8 @@ impl GraphStorage {
             scene_submissions: SceneSubmissionStore::new(),
             scene_submission_demands: Vec::with_capacity(64),
             prepared_draws: PreparedDrawStore::new(),
+            scene_source_prepare: SceneSourcePrepareStore::new(),
+            scene_pipeline_prepare: ScenePipelinePrepareStore::new(),
             geometry_frames: GeometryFrameStore::new(),
             object_interfaces: ObjectInterfaceStore::new(),
             material_plans: MaterialPlanStore::new(),
@@ -620,10 +629,12 @@ impl GraphStorage {
             self.scene_buffer_imports.capacity_usage();
         snapshot[GraphCapacityFamily::PreparedBindGroups.index()] =
             self.prepared_bind_groups.capacity_usage();
-        snapshot[GraphCapacityFamily::DrawPlans.index()] = self.draw_plans.capacity_usage();
+        snapshot[GraphCapacityFamily::DrawPlans.index()] =
+            self.draw_plans.capacity_usage() + self.scene_pipeline_prepare.capacity_usage();
         snapshot[GraphCapacityFamily::SceneSubmissions.index()] =
             self.scene_submissions.capacity_usage();
-        snapshot[GraphCapacityFamily::PreparedDraws.index()] = self.prepared_draws.capacity_usage();
+        snapshot[GraphCapacityFamily::PreparedDraws.index()] =
+            self.prepared_draws.capacity_usage() + self.scene_source_prepare.capacity_usage();
         snapshot[GraphCapacityFamily::Geometry.index()] = self.geometry_frames.capacity_usage();
         snapshot[GraphCapacityFamily::ObjectInterfaces.index()] =
             self.object_interfaces.capacity_usage();
@@ -841,6 +852,8 @@ impl GraphStorage {
             }
             family if family == GraphCapacityFamily::DrawPlans.index() => {
                 self.draw_plans.trim_capacity(target_bytes, retained_before);
+                self.scene_pipeline_prepare
+                    .trim_capacity(target_bytes, retained_before);
             }
             family if family == GraphCapacityFamily::SceneSubmissions.index() => {
                 self.scene_submissions
@@ -848,6 +861,8 @@ impl GraphStorage {
             }
             family if family == GraphCapacityFamily::PreparedDraws.index() => {
                 self.prepared_draws
+                    .trim_capacity(target_bytes, retained_before);
+                self.scene_source_prepare
                     .trim_capacity(target_bytes, retained_before);
             }
             family if family == GraphCapacityFamily::Geometry.index() => {
@@ -1130,6 +1145,8 @@ impl GraphStorage {
         self.mipmap_batches.clear();
         self.mipmap_encode_coordinator.clear();
         self.prepared_bind_groups.clear();
+        self.scene_pipeline_prepare.clear();
+        self.scene_source_prepare.clear();
         // Source records address resource slots owned by draw_plans, so drop
         // those records before resetting the sibling slot tables/token.
         self.prepared_draws.clear();
@@ -3634,8 +3651,13 @@ mod tests {
             layout: &layout,
             entries: &[],
         });
+        let tracked_layout = Tracked::new(layout.clone());
 
         let mut storage = GraphStorage::new();
+        storage
+            .scene_pipeline_prepare
+            .intern_shadow_layout(&tracked_layout);
+        assert!(!storage.scene_pipeline_prepare.is_empty());
         let buffer_slot = storage.draw_plans.intern_buffer(&buffer, 41);
         let duplicate_buffer_slot = storage.draw_plans.intern_buffer(&buffer, 41);
         let bind_group_slot = storage.draw_plans.intern_bind_group(&bind_group, 73);
@@ -3668,25 +3690,27 @@ mod tests {
         let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
         storage.draw_plans.mark_live(plan);
         let start = storage.draw_plans.begin_finalize(plan);
-        storage
-            .draw_plans
-            .push_command(crate::graph::frame::DrawCommand {
+        storage.draw_plans.push_command(
+            crate::graph::frame::DrawCommand {
                 frame_source,
                 sort_key: 0,
                 pipeline_id: crate::pipeline::RenderPipelineId(0),
-                vertex_buffers: smallvec::smallvec![buffer_slot],
+                vertex_buffer_range: 0..0,
                 index_buffer: None,
                 bind_group_1: Some(bind_group_slot),
                 bind_group_2: (bind_group_slot, 0),
                 stencil_reference: None,
                 vertex_range: 0..3,
                 instance_range: 0..1,
-            });
+            },
+            &[buffer_slot],
+        );
         storage.draw_plans.finish_finalize(plan, start);
         assert_eq!(storage.draw_plans.resolve_plan(plan).unwrap().len(), 1);
 
         drop(buffer);
         drop(bind_group);
+        drop(tracked_layout);
         drop(layout);
         assert_eq!(
             storage.draw_plans.resolver().buffer(buffer_slot).size(),
@@ -3695,6 +3719,8 @@ mod tests {
         );
         let _ = storage.draw_plans.resolver().bind_group(bind_group_slot);
         storage.release_frame_owners();
+        assert!(storage.scene_pipeline_prepare.is_empty());
+        assert!(storage.scene_source_prepare.is_empty());
         assert!(storage.prepared_draws.source(prepared_source).is_none());
         assert!(
             storage

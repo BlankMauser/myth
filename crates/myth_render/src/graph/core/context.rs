@@ -8,8 +8,16 @@ use crate::core::gpu::{
     MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
 use crate::graph::asset_frame::{GeometryFrameResolver, ObjectInterfaceResolver};
-use crate::graph::frame::{DrawPlanStore, PreparedDrawStore, RenderLists};
+use crate::graph::frame::{
+    DrawPlanStore, FrameSourceId, PreparedDrawStore, PreparedSourceId, RenderLists,
+};
 use crate::graph::material_plan::MaterialPlanResolver;
+use crate::graph::scene_pipeline_coordinator::{
+    coordinate_scene_pipelines, finalize_live_draw_plans, gather_live_pipeline_recipes,
+};
+use crate::graph::scene_pipeline_prepare::{
+    PrepassPipelineL1Key, ScenePipelinePrepareStore, SceneRecipeOrdinal, ShadowPipelineLayoutId,
+};
 use crate::graph::{ExtractedScene, RenderState};
 use crate::pipeline::ComputePipelineId;
 use crate::pipeline::RenderPipelineId;
@@ -24,7 +32,7 @@ use super::gaussian::GaussianFrameResolver;
 use super::graph::MipmapEncodeCoordinator;
 use super::persistent::HistoryRegistry;
 use super::scene_submission::{
-    SceneSubmissionPlanId, SceneSubmissionResolver, SceneSubmissionStore, SceneSubmissionWriter,
+    SceneSubmissionPlanId, SceneSubmissionResolver, SceneSubmissionStore,
 };
 use super::types::{
     BufferNodeId, GraphResourceType, RenderTargetOps, ResourceKind, ResourceNodeId, ResourceRecord,
@@ -81,7 +89,7 @@ pub(crate) struct SceneDrawPrepareContext<'a> {
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) pipeline_settings_version: u64,
     scene_submissions: &'a SceneSubmissionStore,
-    draw_plans: &'a mut DrawPlanStore,
+    scene_pipeline_prepare: &'a mut ScenePipelinePrepareStore,
 }
 
 impl<'a> SceneDrawPrepareContext<'a> {
@@ -96,7 +104,7 @@ impl<'a> SceneDrawPrepareContext<'a> {
         depth_format: wgpu::TextureFormat,
         pipeline_settings_version: u64,
         scene_submissions: &'a SceneSubmissionStore,
-        draw_plans: &'a mut DrawPlanStore,
+        scene_pipeline_prepare: &'a mut ScenePipelinePrepareStore,
     ) -> Self {
         Self {
             render_lists,
@@ -108,23 +116,122 @@ impl<'a> SceneDrawPrepareContext<'a> {
             depth_format,
             pipeline_settings_version,
             scene_submissions,
-            draw_plans,
+            scene_pipeline_prepare,
         }
     }
 
-    /// Open the backend-selected writer without exposing its physical store or
-    /// command-range identity to the Feature.
-    pub(crate) fn begin_submission_writer(
+    /// Register one exact Prepass recipe without exposing the Direct backend
+    /// plan identity or command store to the Feature.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_prepass_recipe(
         &mut self,
         submission: SceneSubmissionPlanId,
-        expected_commands: usize,
-    ) -> Option<SceneSubmissionWriter<'_>> {
-        SceneSubmissionWriter::begin(
-            self.scene_submissions,
-            self.draw_plans,
-            submission,
-            expected_commands,
-        )
+        intent_index: usize,
+        frame_source: FrameSourceId,
+        prepared_source: PreparedSourceId,
+        key: PrepassPipelineL1Key,
+        cached: Option<RenderPipelineId>,
+        material_index: u32,
+        distance_sq: f32,
+    ) {
+        assert!(
+            self.scene_submissions.is_live(submission),
+            "dead scene submission cannot gather a Prepass recipe"
+        );
+        let draw_plan = self
+            .scene_submissions
+            .cpu_direct_plan(submission)
+            .expect("Prepass recipe requires the CpuDirect backend");
+        self.scene_pipeline_prepare.push_prepass(
+            draw_plan,
+            SceneRecipeOrdinal::new(draw_plan.index(), intent_index),
+            frame_source,
+            prepared_source,
+            key,
+            cached,
+            material_index,
+            distance_sq,
+        );
+    }
+
+    /// Retain one physical Shadow Group 0 layout exactly once for this
+    /// attempt. Later Shadow recipes carry only the returned Copy ID.
+    pub(crate) fn intern_shadow_pipeline_layout(
+        &mut self,
+        layout: &Tracked<wgpu::BindGroupLayout>,
+    ) -> ShadowPipelineLayoutId {
+        self.scene_pipeline_prepare.intern_shadow_layout(layout)
+    }
+
+    /// Publish only coordinator-accepted Prepass results into Feature-owned
+    /// cross-frame L1 state.
+    pub(crate) fn publish_prepass_pipeline_l1(
+        &self,
+        cache: &mut rustc_hash::FxHashMap<PrepassPipelineL1Key, RenderPipelineId>,
+    ) {
+        cache.extend(self.scene_pipeline_prepare.prepass_publications());
+    }
+
+    /// Close the serial Gather -> Plan -> Coordinate transaction for every
+    /// DPE-live CPU-direct plan. Pass nodes have already contributed their
+    /// Feature-owned recipes; this is the sole physical pipeline-cache writer
+    /// for the transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn coordinate_pipeline_recipes(
+        &mut self,
+        draw_plans: &DrawPlanStore,
+        gpu_world: Option<&crate::core::gpu::GpuGlobalState>,
+        wgpu_ctx: &WgpuContext,
+        system_textures: &SystemTextures,
+        pipeline_cache: &mut PipelineCache,
+        shader_manager: &mut ShaderManager,
+        camera: &RenderCamera,
+    ) {
+        gather_live_pipeline_recipes(
+            self.scene_pipeline_prepare,
+            draw_plans,
+            self.prepared_draws,
+            self.geometry_frames,
+            self.material_frames,
+            self.object_interfaces,
+            self.render_lists,
+            self.extracted_scene,
+            gpu_world,
+            wgpu_ctx,
+            shader_manager,
+            camera,
+        );
+        coordinate_scene_pipelines(
+            self.scene_pipeline_prepare,
+            draw_plans.plan_count(),
+            self.prepared_draws,
+            self.geometry_frames,
+            self.material_frames,
+            self.object_interfaces,
+            self.render_lists,
+            self.extracted_scene,
+            gpu_world,
+            wgpu_ctx,
+            system_textures,
+            pipeline_cache,
+            shader_manager,
+            camera,
+        );
+    }
+
+    /// Freeze contiguous immutable Direct streams after every Feature has
+    /// accepted coordinator results into its cross-frame L1 state.
+    fn finalize_direct_streams(&self, draw_plans: &mut DrawPlanStore) {
+        finalize_live_draw_plans(
+            self.scene_pipeline_prepare,
+            draw_plans,
+            self.prepared_draws,
+            self.geometry_frames,
+            self.material_frames,
+            self.object_interfaces,
+            self.render_lists,
+            self.extracted_scene,
+        );
     }
 }
 
@@ -185,6 +292,34 @@ pub struct PrepareContext<'a> {
     /// Drop-aware ownership for the exact bind groups used by this graph
     /// attempt. Nodes receive only generational IDs into this store.
     pub(crate) prepared_bind_groups: &'a mut PreparedBindGroupStore,
+}
+
+impl PrepareContext<'_> {
+    /// Run the single-threaded M6 coordinator after all live pass nodes have
+    /// gathered recipes. Keeping this inside the existing context preserves
+    /// the exact attempt capabilities across both prepare barriers.
+    pub(crate) fn coordinate_scene_draws(
+        &mut self,
+        draw_plans: &DrawPlanStore,
+        global_state_key: Option<crate::core::gpu::GlobalStateKey>,
+        wgpu_ctx: &WgpuContext,
+        camera: &RenderCamera,
+    ) {
+        let gpu_world = global_state_key.and_then(|key| self.global_states.get(key));
+        self.scene_draws.coordinate_pipeline_recipes(
+            draw_plans,
+            gpu_world,
+            wgpu_ctx,
+            self.system_textures,
+            self.pipeline_cache,
+            self.shader_manager,
+            camera,
+        );
+    }
+
+    pub(crate) fn finalize_scene_draws(&self, draw_plans: &mut DrawPlanStore) {
+        self.scene_draws.finalize_direct_streams(draw_plans);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

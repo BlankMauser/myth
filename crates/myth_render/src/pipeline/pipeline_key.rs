@@ -343,7 +343,11 @@ pub struct SimpleGeometryPipelineKey {
 
 // ─── Convenience helpers ──────────────────────────────────────────────────────
 
-/// Compute a `u64` hash of any `Hash`-able value using `FxBuildHasher`.
+/// Compute a diagnostic `u64` fingerprint using `FxHasher`.
+///
+/// This value is not a canonical identity: callers must retain and compare the
+/// complete key with `Eq` whenever correctness depends on distinguishing hash
+/// collisions.
 #[inline]
 pub fn fx_hash_key<K: Hash>(key: &K) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();

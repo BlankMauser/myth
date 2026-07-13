@@ -16,7 +16,7 @@ use crate::pipeline::{PipelineCache, RenderPipelineId};
 /// Submit a pre-baked draw plan through a raw render pass.
 ///
 /// The pipeline cache is append-only for the lifetime of a graph attempt.
-/// Its deprecated `clear()` API must not run between bake finalization and
+/// Its deprecated `clear()` API must not run between stream finalization and
 /// execute; the composer's immutable cache borrow enforces that contract on
 /// the current serial path. Pipelines are resolved only when their stable ID
 /// changes.
@@ -76,7 +76,7 @@ pub(crate) fn submit_scene_submission<'pass>(
             cur_stencil = cmd.stencil_reference;
         }
 
-        for (binding, &slot) in cmd.vertex_buffers.iter().enumerate() {
+        for (binding, &slot) in submissions.vertex_buffers(cmd).iter().enumerate() {
             if cur_vertex_b[binding] != Some(slot) {
                 let buffer = submissions.buffer(slot);
                 pass.set_vertex_buffer(binding as u32, buffer.slice(..));

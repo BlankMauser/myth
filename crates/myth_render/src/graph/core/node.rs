@@ -17,14 +17,17 @@ use wgpu::CommandEncoder;
 ///
 /// Resource topology and naming are declared **outside** the `PassNode`,
 /// inside the closure passed to [`RenderGraph::add_pass`].  The node
-/// itself participates in three runtime phases:
+/// itself participates in four runtime phases:
 ///
 /// 1. **`prepare`** — called after graph compilation and transient memory
 ///    allocation, and only for passes that survived dead-pass elimination.
 ///    Materialize pipelines, uploads, and bind groups without changing graph
 ///    topology or resource descriptors.
-/// 2. **`execute`** — record GPU commands into the shared encoder.
-/// 3. **`after_submit`** — retire pass-owned resources only after the shared
+/// 2. **`finalize_prepare`** — after every live node has gathered recipes and
+///    the serial coordinators have assigned physical IDs, publish
+///    Feature-owned L1 state without creating resources.
+/// 3. **`execute`** — record GPU commands into the shared encoder.
+/// 4. **`after_submit`** — retire pass-owned resources only after the shared
 ///    command buffer has been handed to the queue.
 ///
 /// # Lifetime Model
@@ -48,6 +51,12 @@ pub trait PassNode<'a>: Send + Sync {
     /// not affect graph topology, resource descriptors, or dependency edges.
     #[allow(unused_variables)]
     fn prepare(&mut self, ctx: &mut PrepareContext<'a>) {}
+
+    /// Publish coordinator results after the global Gather -> Plan ->
+    /// Coordinate barrier. The default is intentionally empty; only nodes
+    /// that own a cross-frame L1 derived from a shared recipe need this hook.
+    #[allow(unused_variables)]
+    fn finalize_prepare(&mut self, ctx: &mut PrepareContext<'a>) {}
 
     /// Record GPU commands into the shared encoder.
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut CommandEncoder);
@@ -197,7 +206,8 @@ impl PassRecord {
     /// [`FrameArena`](super::arena::FrameArena) remain alive, the returned
     /// reference does not escape that graph attempt, and no aliasing mutable
     /// references exist. In practice, the sequential
-    /// prepare→execute→after-submit pipeline guarantees these conditions.
+    /// prepare→finalize-prepare→execute→after-submit pipeline guarantees these
+    /// conditions.
     #[inline]
     #[allow(clippy::transmute_ptr_to_ptr)]
     pub(crate) unsafe fn get_pass_mut<'a>(&mut self) -> &mut (dyn PassNode<'a> + 'a) {

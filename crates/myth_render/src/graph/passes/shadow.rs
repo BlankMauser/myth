@@ -55,6 +55,16 @@ use crate::graph::extracted::ExtractedScene;
 use crate::graph::frame::{RenderLists, ShadowLightInstance};
 use crate::graph::passes::draw::submit_scene_submission;
 
+/// Canonical Shadow Group 0 declaration shared by the physical layout owner
+/// and the central scene-pipeline coordinator.
+pub(crate) const SHADOW_BINDING_WGSL: &str = "
+struct Struct_shadow_light {
+    view_projection: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u_shadow_light: Struct_shadow_light;
+";
+
 /// Output returned by [`ShadowFeature::add_to_graph`].
 ///
 /// Consumer passes wire `read_texture` dependencies against these IDs.
@@ -358,6 +368,10 @@ impl<'a> PassNode<'a> for ShadowVpUploadNode<'a> {
             .write_buffer(ctx.views.get_buffer(self.buffer), 0, &uniform_data);
 
         let layout = self.feature.ensure_bind_group_layout(ctx.device);
+        // Register the actual Feature-owned Group 0 layout before central
+        // pipeline planning. The attempt store retains the physical owner and
+        // exposes only a Copy layout ID to Shadow recipes/coordinators.
+        ctx.scene_draws.intern_shadow_pipeline_layout(layout);
         let matrix_size = wgpu::BufferSize::new(std::mem::size_of::<Mat4>() as u64)
             .expect("Mat4 has a non-zero binding size");
         let bind_group = ctx

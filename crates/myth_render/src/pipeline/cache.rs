@@ -13,8 +13,10 @@
 //!
 //! All pipeline families share the **L2 canonical cache** keyed by the full
 //! state descriptor (`GraphicsPipelineKey`, `FullscreenPipelineKey`,
-//! `ComputePipelineKey`, `SimpleGeometryPipelineKey`). A full-state hash is computed
-//! only on L1 miss (or for families without L1).
+//! `ComputePipelineKey`, `SimpleGeometryPipelineKey`). The L2 maps retain the
+//! complete canonical key and use `Eq` after hashing, so a hash collision can
+//! never alias distinct physical pipeline state. Keys are cloned only when a
+//! cold pipeline is published.
 //!
 //! # Shader Modules
 //!
@@ -34,7 +36,7 @@ use crate::graph::extracted::SceneFeatures;
 use crate::pipeline::pipeline_id::{ComputePipelineId, RenderPipelineId};
 use crate::pipeline::pipeline_key::{
     ComputePipelineKey, FullscreenPipelineKey, GraphicsPipelineKey, PipelineFlags,
-    SimpleGeometryPipelineKey, fx_hash_key,
+    SimpleGeometryPipelineKey,
 };
 use crate::pipeline::shader_gen::ShaderCompilationOptions;
 use crate::pipeline::shader_manager::{ShaderManager, ShaderSource};
@@ -116,11 +118,11 @@ pub struct PipelineCache {
     /// Per-compute-pipeline tracked bind-group layouts.
     compute_layouts: Vec<Option<SmallVec<[Tracked<wgpu::BindGroupLayout>; 4]>>>,
 
-    // ---- L2 canonical lookups (full-state hash → Id) ----
-    graphics_lookup: FxHashMap<u64, RenderPipelineId>,
-    fullscreen_lookup: FxHashMap<u64, RenderPipelineId>,
-    simple_geometry_lookup: FxHashMap<u64, RenderPipelineId>,
-    compute_lookup: FxHashMap<u64, ComputePipelineId>,
+    // ---- L2 canonical lookups (complete full-state key → Id) ----
+    graphics_lookup: FxHashMap<GraphicsPipelineKey, RenderPipelineId>,
+    fullscreen_lookup: FxHashMap<FullscreenPipelineKey, RenderPipelineId>,
+    simple_geometry_lookup: FxHashMap<SimpleGeometryPipelineKey, RenderPipelineId>,
+    compute_lookup: FxHashMap<ComputePipelineKey, ComputePipelineId>,
 
     // ---- L1 fast lookups (handle+version → Id) ----
     fast_cache: FxHashMap<FastPipelineKey, RenderPipelineId>,
@@ -177,9 +179,7 @@ impl PipelineCache {
         &self,
         canonical_key: &FullscreenPipelineKey,
     ) -> Option<RenderPipelineId> {
-        self.fullscreen_lookup
-            .get(&fx_hash_key(canonical_key))
-            .copied()
+        self.fullscreen_lookup.get(canonical_key).copied()
     }
 
     /// Look up a compute pipeline by its canonical descriptor without
@@ -194,9 +194,7 @@ impl PipelineCache {
         &self,
         canonical_key: &ComputePipelineKey,
     ) -> Option<ComputePipelineId> {
-        self.compute_lookup
-            .get(&fx_hash_key(canonical_key))
-            .copied()
+        self.compute_lookup.get(canonical_key).copied()
     }
 
     // ── Layout Registration & Retrieval ──────────────────────────────────────
@@ -330,8 +328,7 @@ impl PipelineCache {
         gpu_world: &GpuGlobalState,
         screen_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> RenderPipelineId {
-        let hash = fx_hash_key(&canonical_key);
-        if let Some(&id) = self.graphics_lookup.get(&hash) {
+        if let Some(&id) = self.graphics_lookup.get(canonical_key) {
             return id;
         }
 
@@ -430,7 +427,7 @@ impl PipelineCache {
         });
 
         let id = self.push_render_pipeline(pipeline);
-        self.graphics_lookup.insert(hash, id);
+        self.graphics_lookup.insert(canonical_key.clone(), id);
         id
     }
 
@@ -476,8 +473,7 @@ impl PipelineCache {
         compilation_options: &wgpu::PipelineCompilationOptions<'_>,
         label: &str,
     ) -> RenderPipelineId {
-        let hash = fx_hash_key(canonical_key);
-        if let Some(&id) = self.fullscreen_lookup.get(&hash) {
+        if let Some(&id) = self.fullscreen_lookup.get(canonical_key) {
             return id;
         }
 
@@ -566,7 +562,7 @@ impl PipelineCache {
         });
 
         let id = self.push_render_pipeline(pipeline);
-        self.fullscreen_lookup.insert(hash, id);
+        self.fullscreen_lookup.insert(canonical_key.clone(), id);
         id
     }
 
@@ -586,8 +582,7 @@ impl PipelineCache {
         label: &str,
         vertex_buffers: &[wgpu::VertexBufferLayout<'_>],
     ) -> RenderPipelineId {
-        let hash = fx_hash_key(canonical_key);
-        if let Some(&id) = self.simple_geometry_lookup.get(&hash) {
+        if let Some(&id) = self.simple_geometry_lookup.get(canonical_key) {
             return id;
         }
 
@@ -675,7 +670,8 @@ impl PipelineCache {
         });
 
         let id = self.push_render_pipeline(pipeline);
-        self.simple_geometry_lookup.insert(hash, id);
+        self.simple_geometry_lookup
+            .insert(canonical_key.clone(), id);
         id
     }
 
@@ -691,8 +687,7 @@ impl PipelineCache {
         compilation_options: &wgpu::PipelineCompilationOptions<'_>,
         label: &str,
     ) -> ComputePipelineId {
-        let hash = fx_hash_key(canonical_key);
-        if let Some(&id) = self.compute_lookup.get(&hash) {
+        if let Some(&id) = self.compute_lookup.get(canonical_key) {
             return id;
         }
 
@@ -706,7 +701,7 @@ impl PipelineCache {
         });
 
         let id = self.push_compute_pipeline(pipeline);
-        self.compute_lookup.insert(hash, id);
+        self.compute_lookup.insert(canonical_key.clone(), id);
         id
     }
 
@@ -745,4 +740,142 @@ impl PipelineCache {
         self.compute_layouts.push(None);
         id
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::pipeline_key::{ColorTargetKey, DepthStencilKey};
+
+    fn color_target(format: wgpu::TextureFormat) -> ColorTargetKey {
+        wgpu::ColorTargetState {
+            format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        }
+        .into()
+    }
+
+    fn graphics_key(shader_hash: u64) -> GraphicsPipelineKey {
+        GraphicsPipelineKey {
+            shader_hash,
+            vertex_layout_id: 2,
+            bind_group_layout_ids: [3, 4, 5, 6],
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            front_face: wgpu::FrontFace::Ccw,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            blend_state: None,
+            color_targets: smallvec::smallvec![color_target(wgpu::TextureFormat::Rgba16Float)],
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            sample_count: 1,
+            flags: PipelineFlags::DEPTH_WRITE,
+        }
+    }
+
+    fn simple_geometry_key(shader_hash: u128) -> SimpleGeometryPipelineKey {
+        SimpleGeometryPipelineKey {
+            shader_hash,
+            vertex_layout_id: 12,
+            bind_group_layout_ids: [13, 14, 15],
+            color_targets: smallvec::smallvec![color_target(wgpu::TextureFormat::Rgba16Float)],
+            depth_stencil: DepthStencilKey::from(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            front_face: wgpu::FrontFace::Ccw,
+            sample_count: 1,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn l2_lookups_retain_complete_canonical_keys() {
+        let mut cache = PipelineCache::new();
+
+        let graphics_a = graphics_key(101);
+        let graphics_b = graphics_key(102);
+        let graphics_a_id = RenderPipelineId(1);
+        let graphics_b_id = RenderPipelineId(2);
+        cache
+            .graphics_lookup
+            .insert(graphics_a.clone(), graphics_a_id);
+        cache
+            .graphics_lookup
+            .insert(graphics_b.clone(), graphics_b_id);
+        assert_eq!(cache.graphics_lookup.get(&graphics_a), Some(&graphics_a_id));
+        assert_eq!(cache.graphics_lookup.get(&graphics_b), Some(&graphics_b_id));
+        assert_eq!(cache.graphics_lookup.len(), 2);
+
+        let fullscreen_a = FullscreenPipelineKey::fullscreen(
+            201,
+            smallvec::smallvec![color_target(wgpu::TextureFormat::Rgba16Float)],
+            None,
+        );
+        let fullscreen_b = FullscreenPipelineKey::fullscreen(
+            202,
+            smallvec::smallvec![color_target(wgpu::TextureFormat::Rgba16Float)],
+            None,
+        );
+        let fullscreen_a_id = RenderPipelineId(3);
+        let fullscreen_b_id = RenderPipelineId(4);
+        cache
+            .fullscreen_lookup
+            .insert(fullscreen_a.clone(), fullscreen_a_id);
+        cache
+            .fullscreen_lookup
+            .insert(fullscreen_b.clone(), fullscreen_b_id);
+        assert_eq!(
+            cache.get_fullscreen_pipeline_id(&fullscreen_a),
+            Some(fullscreen_a_id)
+        );
+        assert_eq!(
+            cache.get_fullscreen_pipeline_id(&fullscreen_b),
+            Some(fullscreen_b_id)
+        );
+        assert_eq!(cache.fullscreen_lookup.len(), 2);
+
+        let simple_a = simple_geometry_key(301);
+        let simple_b = simple_geometry_key(302);
+        let simple_a_id = RenderPipelineId(5);
+        let simple_b_id = RenderPipelineId(6);
+        cache
+            .simple_geometry_lookup
+            .insert(simple_a.clone(), simple_a_id);
+        cache
+            .simple_geometry_lookup
+            .insert(simple_b.clone(), simple_b_id);
+        assert_eq!(
+            cache.simple_geometry_lookup.get(&simple_a),
+            Some(&simple_a_id)
+        );
+        assert_eq!(
+            cache.simple_geometry_lookup.get(&simple_b),
+            Some(&simple_b_id)
+        );
+        assert_eq!(cache.simple_geometry_lookup.len(), 2);
+
+        let compute_a = ComputePipelineKey::new(401);
+        let compute_b = ComputePipelineKey::new(402);
+        let compute_a_id = ComputePipelineId(7);
+        let compute_b_id = ComputePipelineId(8);
+        cache.compute_lookup.insert(compute_a.clone(), compute_a_id);
+        cache.compute_lookup.insert(compute_b.clone(), compute_b_id);
+        assert_eq!(
+            cache.get_compute_pipeline_id(&compute_a),
+            Some(compute_a_id)
+        );
+        assert_eq!(
+            cache.get_compute_pipeline_id(&compute_b),
+            Some(compute_b_id)
+        );
+        assert_eq!(cache.compute_lookup.len(), 2);
+    }
+
+
 }
