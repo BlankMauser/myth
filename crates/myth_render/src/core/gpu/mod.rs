@@ -52,10 +52,11 @@ pub(crate) use crate::core::gpu::environment::{
 };
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
 pub(crate) use crate::core::gpu::material::{GpuMaterial, PlannedMaterialTexture};
+#[cfg(test)]
+pub(crate) use crate::core::gpu::texture::snapshot_asset_texture;
 pub(crate) use crate::core::gpu::texture::{
     AssetTextureMaterialization, AssetTextureSnapshot, AssetTextureStateSnapshot, GpuImage,
-    GpuImageSpec, PhysicalImageId, TextureBinding, TextureImageLease, snapshot_asset_texture,
-    snapshot_asset_texture_state,
+    GpuImageSpec, PhysicalImageId, TextureBinding, TextureImageLease, snapshot_asset_texture_state,
 };
 pub use bind_group_store::{
     BindGroupContext, BindingInterfaceId, GlobalStateKey, GlobalStateResolver, GpuGlobalState,

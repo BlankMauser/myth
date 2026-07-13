@@ -51,7 +51,6 @@ use crate::core::binding::GlobalBindGroupCache;
 use crate::core::gpu::{
     AssetTextureSnapshot, BufferUploadContext, CubeSourceType, GlobalStateKey,
     GlobalStatePhysicalFailure, GlobalStateResolver, MipmapRequestResolver, Tracked,
-    snapshot_asset_texture,
 };
 use crate::core::{ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
@@ -264,6 +263,15 @@ impl GraphBuilderContext<'_, '_> {
 #[derive(Debug, Clone, Copy)]
 enum TextureSkyboxSourcePlan {
     Asset(AssetTextureSnapshot),
+    Attachment {
+        source: TextureSource,
+        logical_version: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TextureSkyboxSourceRequest {
+    Asset(crate::graph::asset_texture_batch::AssetTextureBatchId),
     Attachment {
         source: TextureSource,
         logical_version: u64,
@@ -624,8 +632,8 @@ impl<'a> FrameComposer<'a> {
             self.ctx.extracted_scene,
             self.ctx.render_lists,
             geometry_eligibility,
+            &mut graph.storage.asset_texture_plans,
         );
-        let draw_texture_dependencies = graph.storage.material_plans.take_topology_recipes();
 
         let surface_out =
             graph.import_external_resource("Surface_View", surface_desc, &surface_view_tracked);
@@ -789,54 +797,114 @@ impl<'a> FrameComposer<'a> {
         } else {
             self.frame_config.surface_format
         };
-        let texture_skybox_plan = if needs_skybox
+        let texture_skybox_request = if needs_skybox
             && let myth_scene::background::BackgroundMode::Texture {
                 source, mapping, ..
             } = &self.ctx.scene.background.mode
         {
-            let logical = self
-                .ctx
-                .resource_manager
-                .snapshot_texture_source(self.ctx.assets, *source);
-            if logical.ready && skybox_mapping_accepts(*mapping, logical.view_dimension) {
-                let source_plan = match *source {
-                    TextureSource::Asset(handle) => snapshot_asset_texture(self.ctx.assets, handle)
-                        .filter(|&snapshot| {
-                            asset_skybox_format_supported(&self.ctx.wgpu_ctx.device, snapshot)
-                        })
-                        .and_then(|snapshot| {
-                            debug_assert_eq!(
-                                snapshot.logical_version, logical.version,
-                                "asset Skybox snapshots must share one logical identity"
-                            );
-                            (snapshot.logical_version == logical.version)
-                                .then_some(TextureSkyboxSourcePlan::Asset(snapshot))
-                        }),
-                    TextureSource::Attachment(_, _) => Some(TextureSkyboxSourcePlan::Attachment {
-                        source: *source,
-                        logical_version: logical.version,
-                    }),
-                };
-                source_plan.map(|source_plan| {
-                    (
-                        self.ctx.skybox_pass.extract_texture(
-                            &self.ctx.scene.background.uniforms,
+            match *source {
+                TextureSource::Asset(handle) => Some((
+                    *mapping,
+                    TextureSkyboxSourceRequest::Asset(
+                        graph_ctx.graph.storage.asset_texture_plans.request(handle),
+                    ),
+                )),
+                TextureSource::Attachment(_, _) => {
+                    let logical = self
+                        .ctx
+                        .resource_manager
+                        .snapshot_texture_source(self.ctx.assets, *source);
+                    (logical.ready && skybox_mapping_accepts(*mapping, logical.view_dimension))
+                        .then_some((
                             *mapping,
-                            logical.version,
-                            skybox_global_state_key,
-                            skybox_color_format,
-                            self.frame_config.depth_format,
-                            self.frame_config.msaa_samples,
-                        ),
-                        source_plan,
-                    )
-                })
-            } else {
-                None
+                            TextureSkyboxSourceRequest::Attachment {
+                                source: *source,
+                                logical_version: logical.version,
+                            },
+                        ))
+                }
             }
         } else {
             None
         };
+
+        // Material and Skybox requests are now complete. Seal the one
+        // graph-attempt Texture -> Image batch before either publishes an RDG
+        // consumer edge, then resolve all Copy topology snapshots from it.
+        graph_ctx
+            .graph
+            .storage
+            .asset_texture_plans
+            .capture_requested(self.ctx.assets);
+        {
+            let storage = &mut *graph_ctx.graph.storage;
+            storage.material_plans.finalize_texture_snapshots(
+                self.ctx.assets,
+                self.ctx.extracted_scene,
+                self.ctx.render_lists,
+                &storage.asset_texture_plans,
+            );
+        }
+        let draw_texture_dependencies = graph_ctx
+            .graph
+            .storage
+            .material_plans
+            .take_topology_recipes();
+        let texture_skybox_plan = texture_skybox_request.and_then(|(mapping, request)| {
+            let (source_plan, logical_version, view_dimension) = match request {
+                TextureSkyboxSourceRequest::Asset(id) => {
+                    let snapshot = graph_ctx
+                        .graph
+                        .storage
+                        .asset_texture_plans
+                        .state(id)?
+                        .ready?;
+                    if !asset_skybox_format_supported(&self.ctx.wgpu_ctx.device, snapshot) {
+                        return None;
+                    }
+                    (
+                        TextureSkyboxSourcePlan::Asset(snapshot),
+                        snapshot.logical_version,
+                        snapshot.view_dimension,
+                    )
+                }
+                TextureSkyboxSourceRequest::Attachment {
+                    source,
+                    logical_version,
+                } => {
+                    let logical = self
+                        .ctx
+                        .resource_manager
+                        .snapshot_texture_source(self.ctx.assets, source);
+                    if !logical.ready || logical.version != logical_version {
+                        return None;
+                    }
+                    (
+                        TextureSkyboxSourcePlan::Attachment {
+                            source,
+                            logical_version,
+                        },
+                        logical_version,
+                        logical.view_dimension,
+                    )
+                }
+            };
+            if !skybox_mapping_accepts(mapping, view_dimension) {
+                return None;
+            }
+            Some((
+                self.ctx.skybox_pass.extract_texture(
+                    &self.ctx.scene.background.uniforms,
+                    mapping,
+                    logical_version,
+                    skybox_global_state_key,
+                    skybox_color_format,
+                    self.frame_config.depth_format,
+                    self.frame_config.msaa_samples,
+                ),
+                source_plan,
+            ))
+        });
         let gradient_skybox_snapshot = matches!(
             &self.ctx.scene.background.mode,
             myth_scene::background::BackgroundMode::Gradient { .. }
@@ -2083,6 +2151,7 @@ impl<'a> FrameComposer<'a> {
             graph.storage.object_interfaces.clear();
             graph.storage.geometry_frames.clear();
             graph.storage.material_plans.clear();
+            graph.storage.asset_texture_plans.clear();
 
             rdg_diagnostics.enter_phase(RdgFramePhase::RecordCommands);
 

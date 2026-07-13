@@ -9,6 +9,7 @@
 //! - [`RenderLists`]: CPU-only main/shadow draw-intent lists
 
 pub(crate) mod asset_frame;
+pub(crate) mod asset_texture_batch;
 pub mod bake;
 #[cfg(any(test, feature = "rdg_bench_support"))]
 #[doc(hidden)]

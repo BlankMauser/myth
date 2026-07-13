@@ -12,6 +12,7 @@ use crate::core::gpu::{
     MipmapRequestBatch, PhysicalImageGenerationKey, Tracked,
 };
 use crate::graph::asset_frame::{GeometryFrameStore, ObjectInterfaceStore};
+use crate::graph::asset_texture_batch::AssetTextureBatch;
 use crate::graph::capacity::{
     CapacityGovernor, CapacityUsage, PendingCapacityTrim, binary_heap_footprint,
     estimated_hash_map_footprint, estimated_hash_set_footprint, shrink_binary_heap_by_family_ratio,
@@ -429,6 +430,9 @@ pub struct GraphStorage {
     persistent_texture_lookup: FxHashMap<PersistentTextureId, PersistentTextureImport>,
     /// Logical asset roots and destructible live-prepare materialization slots.
     pub(crate) asset_texture_imports: AssetTextureImportStore,
+    /// Canonical CPU Texture -> Image owners shared by every graph producer
+    /// before logical imports are published.
+    pub(crate) asset_texture_plans: AssetTextureBatch,
     /// Logical scene-buffer roots and destructible live materialization slots.
     pub(crate) scene_buffer_imports: SceneBufferImportStore,
     /// Grouped history publications evaluated after DPE and applied post-submit.
@@ -534,6 +538,7 @@ impl GraphStorage {
             topology_compiled: false,
             persistent_texture_lookup: FxHashMap::default(),
             asset_texture_imports: AssetTextureImportStore::new(),
+            asset_texture_plans: AssetTextureBatch::new(),
             scene_buffer_imports: SceneBufferImportStore::new(),
             history_commit_requests: Vec::new(),
             cache_commit_requests: Vec::new(),
@@ -610,7 +615,7 @@ impl GraphStorage {
         snapshot[GraphCapacityFamily::CompileScratch.index()] = compile;
         snapshot[GraphCapacityFamily::Mipmap.index()] = mipmap;
         snapshot[GraphCapacityFamily::AssetTextures.index()] =
-            self.asset_texture_imports.capacity_usage();
+            self.asset_texture_imports.capacity_usage() + self.asset_texture_plans.capacity_usage();
         snapshot[GraphCapacityFamily::SceneBuffers.index()] =
             self.scene_buffer_imports.capacity_usage();
         snapshot[GraphCapacityFamily::PreparedBindGroups.index()] =
@@ -822,6 +827,8 @@ impl GraphStorage {
             }
             family if family == GraphCapacityFamily::AssetTextures.index() => {
                 self.asset_texture_imports
+                    .trim_capacity(target_bytes, retained_before);
+                self.asset_texture_plans
                     .trim_capacity(target_bytes, retained_before);
             }
             family if family == GraphCapacityFamily::SceneBuffers.index() => {
@@ -1118,6 +1125,7 @@ impl GraphStorage {
     /// them until the next graph is constructed.
     pub(crate) fn release_frame_owners(&mut self) {
         self.asset_texture_imports.clear();
+        self.asset_texture_plans.clear();
         self.scene_buffer_imports.clear();
         self.mipmap_batches.clear();
         self.mipmap_encode_coordinator.clear();
@@ -3378,6 +3386,7 @@ impl<'a> RenderGraph<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
 
     use super::*;
     use crate::core::gpu::snapshot_asset_texture;
@@ -3454,6 +3463,51 @@ mod tests {
         assert!(
             after.estimated_attempt_store_bytes() > before.estimated_attempt_store_bytes(),
             "attempt-owned mipmap capacity must be visible in the attempt-store ledger"
+        );
+    }
+
+    #[test]
+    fn release_frame_owners_accounts_and_clears_cross_storage_asset_texture_plans() {
+        let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            1,
+            1,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![255; 4]),
+        ));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("attempt owner"), image));
+        let texture_owner = assets.textures.get(texture).expect("texture missing");
+        let image_owner = assets.images.get(image).expect("image missing");
+        let mut storage = GraphStorage::new();
+        storage.asset_texture_plans.request(texture);
+        storage.asset_texture_plans.capture_requested(&assets);
+        assert!(!storage.asset_texture_plans.is_empty());
+        assert_eq!(Arc::strong_count(&texture_owner), 3);
+        assert_eq!(Arc::strong_count(&image_owner), 3);
+
+        let populated = storage.capacity_snapshot()[GraphCapacityFamily::AssetTextures.index()];
+        assert!(populated.active_bytes > 0);
+        storage.sample_retained_capacity();
+
+        storage.release_frame_owners();
+
+        assert!(storage.asset_texture_plans.is_empty());
+        assert_eq!(Arc::strong_count(&texture_owner), 2);
+        assert_eq!(Arc::strong_count(&image_owner), 2);
+        let released = storage.capacity_snapshot()[GraphCapacityFamily::AssetTextures.index()];
+        assert_eq!(released.active_bytes, 0);
+        assert_eq!(released.retained_bytes, populated.retained_bytes);
+
+        storage.finish_retained_capacity_sample();
+        assert!(
+            storage
+                .retained_capacity_stats()
+                .last_attempt_active_bytes()
+                >= populated.active_bytes
         );
     }
 
@@ -3663,6 +3717,63 @@ mod tests {
         storage.clear();
         storage.clear();
         assert_eq!(storage.latest_diagnostics(), Some(submitted));
+    }
+
+    #[test]
+    fn all_dead_graph_releases_cross_storage_cpu_owners_without_execution() {
+        let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            1,
+            1,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![255; 4]),
+        ));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("all-dead owner"), image));
+        let texture_owner = assets.textures.get(texture).expect("texture missing");
+        let image_owner = assets.images.get(image).expect("image missing");
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            let request = graph.storage.asset_texture_plans.request(texture);
+            graph.storage.asset_texture_plans.capture_requested(&assets);
+            let snapshot = graph
+                .storage
+                .asset_texture_plans
+                .state(request)
+                .and_then(|state| state.ready)
+                .expect("ready attempt snapshot missing");
+            let imported = graph.import_asset_texture("Dead_Asset", snapshot);
+            assert_eq!(Arc::strong_count(&texture_owner), 3);
+            assert_eq!(Arc::strong_count(&image_owner), 3);
+
+            graph.add_pass("Dead_Asset_Consumer", |builder| {
+                builder.read_texture(imported);
+                (MockExec, ())
+            });
+            graph.compile_topology();
+            assert_eq!(graph.diagnostics().live_passes(), Some(0));
+            graph.finish();
+        }
+
+        assert_eq!(Arc::strong_count(&texture_owner), 2);
+        assert_eq!(Arc::strong_count(&image_owner), 2);
+        assert!(storage.asset_texture_plans.is_empty());
+        assert!(storage.asset_texture_imports.is_empty());
+        assert!(storage.mipmap_batches.is_empty());
+        let diagnostics = storage.latest_diagnostics().unwrap();
+        assert_eq!(
+            diagnostics.outcome(),
+            RdgAttemptOutcome::CompletedWithoutSubmission
+        );
+        assert!(!diagnostics.queue_submitted());
+        assert_eq!(diagnostics.prepared_passes(), 0);
+        assert_eq!(diagnostics.executed_passes(), 0);
     }
 
     #[test]

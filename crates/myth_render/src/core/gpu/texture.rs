@@ -94,7 +94,7 @@ pub(crate) struct AssetTextureStateSnapshot {
 }
 
 impl AssetTextureSnapshot {
-    fn from_loaded(
+    pub(crate) fn from_loaded(
         texture_handle: TextureHandle,
         texture: &Texture,
         texture_version: u32,
