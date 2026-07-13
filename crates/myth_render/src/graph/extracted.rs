@@ -15,14 +15,13 @@ use std::collections::HashSet;
 
 use glam::{Mat4, Vec3};
 
-use bitflags::{Flags, bitflags};
-use smallvec::SmallVec;
-
 use crate::core::ResourceManager;
+use crate::graph::asset_frame::{GeometryFrameResolver, ObjectInterfaceStore};
 use crate::graph::frame::{
     DrawPlanStore, FrameSourceId, PreparedDrawSource, PreparedDrawStore, RenderLists,
 };
 use crate::graph::material_plan::MaterialPlanResolver;
+use bitflags::{Flags, bitflags};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::buffer::CpuBuffer;
 use myth_resources::material::AlphaMode;
@@ -650,7 +649,9 @@ impl ExtractedScene {
         resource_manager: &mut ResourceManager,
         live_frame_sources: &[FrameSourceId],
         render_lists: &RenderLists,
+        geometry_frames: GeometryFrameResolver<'_>,
         material_plans: MaterialPlanResolver<'_>,
+        object_interfaces: &mut ObjectInterfaceStore,
         prepared_draws: &mut PreparedDrawStore,
         draw_plans: &mut DrawPlanStore,
     ) {
@@ -675,6 +676,7 @@ impl ExtractedScene {
             if material_plans
                 .prepared_material(frame_source, item)
                 .is_none()
+                || geometry_frames.geometry_id(frame_source, item).is_none()
             {
                 continue;
             }
@@ -719,6 +721,18 @@ impl ExtractedScene {
             else {
                 continue;
             };
+            let Some(geometry_id) = geometry_frames.geometry_id(frame_source, item) else {
+                continue;
+            };
+            let Some(geometry) = geometry_frames.geometry(geometry_id) else {
+                continue;
+            };
+            if geometry_frames.physical(geometry_id).is_none()
+                || !geometry_frames.pipeline_state_is_current(geometry_id)
+                || !planned_material.pipeline_state_is_current()
+            {
+                continue;
+            }
             let skeleton = item.skeleton.and_then(|key| skeleton_pool.get(key));
             let Some(mesh) = meshes.get_mut(item.node_handle) else {
                 continue;
@@ -728,29 +742,12 @@ impl ExtractedScene {
                 // intent classification with a different physical mesh.
                 continue;
             }
-            let Some((geometry_asset, geometry_asset_version, geometry_asset_identity)) =
-                assets.geometries.get_entry_with_identity(item.geometry)
-            else {
-                continue;
-            };
-            let Some((current_material, material_asset_version, material_asset_identity)) =
-                assets.materials.get_entry_with_identity(item.material)
-            else {
-                continue;
-            };
-            if (geometry_asset_version, geometry_asset_identity)
+            if (geometry.key.asset_version, geometry.key.asset_identity)
                 != (item.geometry_asset_version, item.geometry_asset_identity)
-                || (material_asset_version, material_asset_identity)
-                    != (item.material_asset_version, item.material_asset_identity)
-                || !std::sync::Arc::ptr_eq(&current_material, planned_material)
-                || planned_material.data.version() != item.material_version
-                || !resource_manager
-                    .get_material(item.material)
-                    .is_some_and(|gpu_material| {
-                        (gpu_material.asset_version, gpu_material.asset_identity)
-                            == (material_asset_version, material_asset_identity)
-                            && gpu_material.version == item.material_version
-                    })
+                || (
+                    planned_material.asset_version(),
+                    planned_material.asset_identity(),
+                ) != (item.material_asset_version, item.material_asset_identity)
             {
                 // A material changed after the pre-graph producer snapshot.
                 // Defer it to the next frame instead of creating an untracked
@@ -761,96 +758,52 @@ impl ExtractedScene {
             // Pack current/previous morph weights only after target acquire.
             // Temporal history remains unchanged until successful submit.
             mesh.prepare_morph_uniforms();
-            let Some(object_bind_group) =
-                resource_manager.prepare_draw_object(assets, mesh, skeleton)
-            else {
+            let Some(object_bind_group_id) = resource_manager.prepare_draw_object_exact_geometry(
+                assets,
+                mesh,
+                skeleton,
+                &geometry.asset,
+                geometry.key.asset_version,
+                geometry.key.asset_identity,
+            ) else {
                 continue;
             };
-            if assets.geometries.get_version_and_identity(item.geometry)
-                != Some((geometry_asset_version, geometry_asset_identity))
-                || assets.materials.get_version_and_identity(item.material)
-                    != Some((material_asset_version, material_asset_identity))
-                || planned_material.data.version() != item.material_version
+            if !geometry_frames.pipeline_state_is_current(geometry_id)
+                || !planned_material.pipeline_state_is_current()
             {
                 // An asynchronous replacement raced physical preparation.
                 // The persistent cache may warm, but this graph attempt never
                 // publishes a mixed old/new source record.
                 continue;
             }
+            let object_bind_group = resource_manager
+                .prepared_object_bind_group(object_bind_group_id)
+                .expect("prepared object BindGroup was not retained by its cache");
 
-            let Some(gpu_geometry) = resource_manager.get_geometry(item.geometry) else {
-                continue;
-            };
-            let Some(gpu_material) = resource_manager.get_material(item.material) else {
-                continue;
-            };
-            if (gpu_geometry.asset_version, gpu_geometry.asset_identity)
-                != (geometry_asset_version, geometry_asset_identity)
-                || (gpu_material.asset_version, gpu_material.asset_identity)
-                    != (material_asset_version, material_asset_identity)
-                || gpu_geometry.version != geometry_asset.structure_version()
-                || gpu_material.version != item.material_version
-            {
-                continue;
-            }
-            assert_eq!(
-                gpu_geometry.vertex_buffers.len(),
-                gpu_geometry.vertex_buffer_ids.len(),
-                "geometry buffer handles and physical IDs must stay aligned"
+            let material_interface = planned_material.interface();
+            let material_bind_group_slot = draw_plans.intern_bind_group(
+                &material_interface.bind_group,
+                material_interface.bind_group_id,
             );
-
-            let mut vertex_buffers = SmallVec::with_capacity(gpu_geometry.vertex_buffers.len());
-            for (buffer, &id) in gpu_geometry
-                .vertex_buffers
-                .iter()
-                .zip(&gpu_geometry.vertex_buffer_ids)
-            {
-                vertex_buffers.push(draw_plans.intern_buffer(buffer, id));
-            }
-            let index_buffer =
-                gpu_geometry
-                    .index_buffer
-                    .as_ref()
-                    .map(|(buffer, format, count, id)| {
-                        (draw_plans.intern_buffer(buffer, *id), *format, *count)
-                    });
-            let material_bind_group =
-                draw_plans.intern_bind_group(&gpu_material.bind_group, gpu_material.bind_group_id);
             let object_bind_group_slot = draw_plans.intern_bind_group(
                 &object_bind_group.bind_group,
                 object_bind_group.bind_group_id,
             );
-            let geometry_layout_version = geometry_asset.layout_version();
+            let object_interface = object_interfaces.intern(
+                object_bind_group.layout_id,
+                object_bind_group.binding_wgsl_hash,
+                &object_bind_group.layout,
+                &object_bind_group.binding_wgsl,
+            );
 
             prepared_draws.insert_source(
                 frame_source,
                 PreparedDrawSource {
-                    geometry_asset,
-                    material_asset: planned_material.clone(),
-                    geometry_asset_version,
-                    geometry_asset_identity,
-                    material_asset_version,
-                    material_asset_identity,
-                    vertex_buffers,
-                    index_buffer,
-                    material_bind_group,
-                    material_bind_group_id: gpu_material.bind_group_id,
+                    geometry: geometry_id,
+                    material: planned_material.id(),
+                    object_interface,
+                    material_bind_group: material_bind_group_slot,
                     object_bind_group: (object_bind_group_slot, dynamic_offset),
-                    draw_range: gpu_geometry.draw_range.clone(),
-                    instance_range: gpu_geometry.instance_range.clone(),
-                    geometry_layout_info: gpu_geometry.layout_info.clone(),
-                    geometry_layout_id: gpu_geometry.layout_id,
-                    geometry_version: gpu_geometry.version,
-                    geometry_layout_version,
-                    material_layout: gpu_material.layout.clone(),
-                    material_layout_id: gpu_material.layout_id,
-                    material_binding_wgsl: gpu_material.binding_wgsl.clone(),
-                    material_binding_wgsl_hash: gpu_material.binding_wgsl_hash,
-                    material_version: gpu_material.version,
-                    object_layout: object_bind_group.layout,
-                    object_layout_id: object_bind_group.layout_id,
-                    object_binding_wgsl: object_bind_group.binding_wgsl,
-                    object_binding_wgsl_hash: object_bind_group.binding_wgsl_hash,
                 },
             );
         }

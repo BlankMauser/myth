@@ -7,7 +7,9 @@ use crate::core::gpu::{
     BufferUploadContext, CommonSampler, GlobalStateResolver, MipmapGenerator,
     MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
+use crate::graph::asset_frame::{GeometryFrameResolver, ObjectInterfaceResolver};
 use crate::graph::frame::{DrawPlanStore, PreparedDrawStore, RenderLists};
+use crate::graph::material_plan::MaterialPlanResolver;
 use crate::graph::{ExtractedScene, RenderState};
 use crate::pipeline::ComputePipelineId;
 use crate::pipeline::RenderPipelineId;
@@ -73,6 +75,9 @@ pub(crate) struct SceneDrawPrepareContext<'a> {
     pub(crate) render_lists: &'a RenderLists,
     pub(crate) extracted_scene: &'a ExtractedScene,
     pub(crate) prepared_draws: &'a PreparedDrawStore,
+    pub(crate) geometry_frames: GeometryFrameResolver<'a>,
+    pub(crate) material_frames: MaterialPlanResolver<'a>,
+    pub(crate) object_interfaces: ObjectInterfaceResolver<'a>,
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) pipeline_settings_version: u64,
     scene_submissions: &'a SceneSubmissionStore,
@@ -85,6 +90,9 @@ impl<'a> SceneDrawPrepareContext<'a> {
         render_lists: &'a RenderLists,
         extracted_scene: &'a ExtractedScene,
         prepared_draws: &'a PreparedDrawStore,
+        geometry_frames: GeometryFrameResolver<'a>,
+        material_frames: MaterialPlanResolver<'a>,
+        object_interfaces: ObjectInterfaceResolver<'a>,
         depth_format: wgpu::TextureFormat,
         pipeline_settings_version: u64,
         scene_submissions: &'a SceneSubmissionStore,
@@ -94,6 +102,9 @@ impl<'a> SceneDrawPrepareContext<'a> {
             render_lists,
             extracted_scene,
             prepared_draws,
+            geometry_frames,
+            material_frames,
+            object_interfaces,
             depth_format,
             pipeline_settings_version,
             scene_submissions,

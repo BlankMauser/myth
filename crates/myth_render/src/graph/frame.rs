@@ -22,25 +22,21 @@ use glam::Mat4;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
-use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::gpu::Tracked;
 use crate::core::{RenderView, ResourceManager};
 use crate::pipeline::RenderPipelineId;
-use crate::pipeline::vertex::GeneratedVertexLayout;
 use crate::renderer::FrameTime;
 use crate::settings::{ClusteredShadingMode, RenderPath};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
-use myth_resources::RenderableMaterialTrait;
-use myth_resources::geometry::Geometry;
-use myth_resources::material::Material;
 use myth_scene::Scene;
 use myth_scene::camera::RenderCamera;
 
+use super::asset_frame::{GeometryFrameId, ObjectInterfaceId};
 use super::core::TextureNodeId;
-use super::extracted::{ExtractedRenderItem, ExtractedScene, SceneFeatures};
+use super::extracted::{ExtractedScene, SceneFeatures};
+use super::material_plan::MaterialFrameId;
 use super::render_state::RenderState;
 use super::shadow_utils;
 
@@ -257,71 +253,17 @@ pub(crate) struct DrawCommand {
     pub instance_range: std::ops::Range<u32>,
 }
 
-/// Exact graph-attempt physical state for one extracted draw source.
+/// Exact graph-attempt physical state unique to one prepared draw instance.
 ///
-/// Buffer and bind-group slots are owned by the sibling [`DrawPlanStore`].
-/// This record retains only compact slots plus the cloned layout/interface
-/// metadata required to derive live pipelines after DPE. It deliberately owns
-/// no vertex buffer or material/object BindGroup directly.
+/// Shared Geometry, Material, and object-interface owners are interned in
+/// sibling attempt stores. This dense record contains only Copy IDs plus the
+/// genuinely per-instance object binding and dynamic offset.
 pub(crate) struct PreparedDrawSource {
-    /// Exact CPU assets selected for this graph attempt. These Arc owners close
-    /// the same-handle/same-version ABA gap during deferred pipeline creation.
-    pub(crate) geometry_asset: Arc<Geometry>,
-    pub(crate) material_asset: Arc<Material>,
-    pub(crate) geometry_asset_version: u32,
-    pub(crate) geometry_asset_identity: u64,
-    pub(crate) material_asset_version: u32,
-    pub(crate) material_asset_identity: u64,
-
-    pub(crate) vertex_buffers: SmallVec<[DrawBufferSlot; 2]>,
-    pub(crate) index_buffer: Option<(DrawBufferSlot, wgpu::IndexFormat, u32)>,
+    pub(crate) geometry: GeometryFrameId,
+    pub(crate) material: MaterialFrameId,
+    pub(crate) object_interface: ObjectInterfaceId,
     pub(crate) material_bind_group: DrawBindGroupSlot,
-    pub(crate) material_bind_group_id: u64,
     pub(crate) object_bind_group: (DrawBindGroupSlot, u32),
-    pub(crate) draw_range: Range<u32>,
-    pub(crate) instance_range: Range<u32>,
-
-    /// Shared immutable vertex interface. Sources that reuse one geometry
-    /// clone only this Arc rather than reallocating the generated layout.
-    pub(crate) geometry_layout_info: Arc<GeneratedVertexLayout>,
-    pub(crate) geometry_layout_id: u64,
-    pub(crate) geometry_version: u64,
-    pub(crate) geometry_layout_version: u64,
-    pub(crate) material_layout: wgpu::BindGroupLayout,
-    pub(crate) material_layout_id: u64,
-    pub(crate) material_binding_wgsl: Arc<str>,
-    pub(crate) material_binding_wgsl_hash: u64,
-    pub(crate) material_version: u64,
-    pub(crate) object_layout: wgpu::BindGroupLayout,
-    pub(crate) object_layout_id: u64,
-    pub(crate) object_binding_wgsl: Arc<str>,
-    pub(crate) object_binding_wgsl_hash: u64,
-}
-
-impl PreparedDrawSource {
-    #[inline]
-    pub(crate) fn matches_extracted(
-        &self,
-        item: &ExtractedRenderItem,
-        geometry_handle: GeometryHandle,
-        material_handle: MaterialHandle,
-    ) -> bool {
-        (item.geometry, item.material) == (geometry_handle, material_handle)
-            && (item.geometry_asset_version, item.geometry_asset_identity)
-                == (self.geometry_asset_version, self.geometry_asset_identity)
-            && (item.material_asset_version, item.material_asset_identity)
-                == (self.material_asset_version, self.material_asset_identity)
-    }
-
-    /// Validate shader/raster-relevant interior versions around deferred
-    /// derivation. Exact Arc identity closes storage ABA; these counters close
-    /// concurrent in-place mutation of the same allocation.
-    #[inline]
-    pub(crate) fn pipeline_state_is_current(&self) -> bool {
-        self.geometry_asset.structure_version() == self.geometry_version
-            && self.geometry_asset.layout_version() == self.geometry_layout_version
-            && self.material_asset.data.version() == self.material_version
-    }
 }
 
 /// Compact graph-attempt source preparation addressed through frame-local IDs.

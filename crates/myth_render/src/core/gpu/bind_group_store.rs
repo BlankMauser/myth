@@ -271,16 +271,17 @@ impl BindGroupStore {
         self.bind_group_id_lookup.clear();
     }
 
+    /// Touch an object cache entry without cloning any WGPU/Arc owner.
     #[inline]
     #[must_use]
-    pub(super) fn cached_object_bind_group(
+    pub(super) fn touch_cached_object_bind_group(
         &mut self,
         key: &ObjectBindGroupKey,
         frame_index: u64,
-    ) -> Option<BindGroupContext> {
+    ) -> Option<u64> {
         let entry = self.object_bind_group_cache.get_mut(key)?;
         entry.last_used_frame = frame_index;
-        Some(entry.context.clone())
+        Some(entry.context.bind_group_id)
     }
 
     #[inline]

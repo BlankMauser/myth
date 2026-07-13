@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use wgpu::ShaderStages;
 
 use myth_assets::{AssetServer, TextureHandle};
-use myth_resources::Mesh;
 use myth_resources::buffer::BufferRef;
 use myth_resources::texture::TextureSource;
 use myth_resources::uniforms::WgslStruct;
 use myth_resources::uniforms::{DynamicModelUniforms, EnvironmentUniforms, RenderStateUniforms};
+use myth_resources::{Mesh, geometry::Geometry};
 use myth_scene::skeleton::Skeleton;
 
 use crate::core::binding::Bindings;
@@ -202,13 +202,35 @@ impl ResourceManager {
     /// Live DrawPlan materialization uses this entry point after DPE. It must
     /// not discover a new material texture/mipmap producer after topology has
     /// already been compiled, so a missing planned material fails closed.
-    pub(crate) fn prepare_draw_object(
+    /// Prepare one graph-planned draw from the exact retained Geometry asset.
+    ///
+    /// The caller owns the asset keep-alive and the stamps captured by the
+    /// graph attempt. This path never reopens Geometry `AssetStorage` while
+    /// preparing each live instance.
+    pub(crate) fn prepare_draw_object_exact_geometry(
         &mut self,
         assets: &AssetServer,
         mesh: &Mesh,
         skeleton: Option<&Skeleton>,
-    ) -> Option<BindGroupContext> {
-        self.prepare_mesh_internal(assets, mesh, skeleton, false)
+        geometry: &Geometry,
+        geometry_asset_version: u32,
+        geometry_asset_identity: u64,
+    ) -> Option<u64> {
+        // Object bindings are valid only after every source item has reserved
+        // its dynamic slot and the model buffer can no longer grow this frame.
+        self.model_allocator.assert_frozen();
+
+        self.ensure_buffer(&mesh.morph_uniforms);
+        if !self.get_geometry(mesh.geometry).is_some_and(|gpu| {
+            (gpu.asset_version, gpu.asset_identity)
+                == (geometry_asset_version, geometry_asset_identity)
+                && gpu.version == geometry.structure_version()
+        }) {
+            return None;
+        }
+        self.get_material(mesh.material)?;
+
+        Some(self.prepare_object_bindings_id(assets, mesh, skeleton, geometry))
     }
 
     fn prepare_mesh_internal(
@@ -234,7 +256,17 @@ impl ResourceManager {
         }
 
         let geometry = assets.geometries.get(mesh.geometry)?;
+        let bind_group_id = self.prepare_object_bindings_id(assets, mesh, skeleton, &geometry);
+        self.bind_groups.cached_bind_group(bind_group_id).cloned()
+    }
 
+    fn prepare_object_bindings_id(
+        &mut self,
+        assets: &AssetServer,
+        mesh: &Mesh,
+        skeleton: Option<&Skeleton>,
+        geometry: &Geometry,
+    ) -> u64 {
         // Build the exact binding recipe once. Resource preparation and cache
         // fingerprinting must use this same recipe so a future binding cannot
         // be created while silently missing from the cache key.
@@ -283,11 +315,11 @@ impl ResourceManager {
         let cache_key = self.object_bind_group_fingerprint(&builder, layout_id);
 
         // Check global cache
-        if let Some(binding_data) = self
+        if let Some(bind_group_id) = self
             .bind_groups
-            .cached_object_bind_group(&cache_key, self.frame_index)
+            .touch_cached_object_bind_group(&cache_key, self.frame_index)
         {
-            return Some(binding_data);
+            return bind_group_id;
         }
 
         // Cache miss: reuse the exact builder that was prepared and
@@ -316,7 +348,18 @@ impl ResourceManager {
             data.clone(),
             self.frame_index,
         );
-        Some(data)
+        bind_group_id
+    }
+
+    /// Resolve the stable cache-owned object context after exact preparation.
+    /// The caller may intern its physical bind group and interface without a
+    /// temporary per-draw clone of the shared WGPU/Arc owners.
+    #[inline]
+    pub(crate) fn prepared_object_bind_group(
+        &self,
+        bind_group_id: u64,
+    ) -> Option<&BindGroupContext> {
+        self.bind_groups.cached_bind_group(bind_group_id)
     }
 
     fn object_bind_group_fingerprint(

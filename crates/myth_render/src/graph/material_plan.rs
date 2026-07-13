@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use myth_assets::{AssetServer, ImageHandle, MaterialHandle, TextureHandle};
 use myth_resources::material::{Material, RenderableMaterialTrait};
+use myth_resources::material::{MaterialSettings, ShaderTemplateMode};
+use myth_resources::shader_defines::ShaderDefines;
 use myth_resources::texture::TextureSource;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -22,11 +24,11 @@ use super::extracted::{ExtractedRenderItem, ExtractedScene};
 use super::frame::{DrawPlanKey, FrameSourceId, RenderLists};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct MaterialPlanId(u32);
+pub(crate) struct MaterialFrameId(u32);
 
-impl MaterialPlanId {
+impl MaterialFrameId {
     #[inline]
-    fn from_index(index: usize) -> Self {
+    pub(crate) fn from_index(index: usize) -> Self {
         Self(u32::try_from(index).expect("material plan index exceeds u32"))
     }
 
@@ -59,14 +61,83 @@ impl MaterialPlanKey {
     }
 }
 
-struct MaterialPlanRecord {
+/// Immutable shader/raster state captured once for one exact material
+/// generation. Pipeline derivation consumes this coherent representative
+/// instead of repeatedly locking the live material for every draw source.
+pub(crate) struct MaterialPipelineSnapshot {
+    settings: MaterialSettings,
+    use_transmission: bool,
+    shader_name: &'static str,
+    shader_template: Option<&'static str>,
+    shader_template_mode: ShaderTemplateMode,
+    shader_defines: ShaderDefines,
+}
+
+impl MaterialPipelineSnapshot {
+    fn capture(material: &Material) -> Self {
+        Self {
+            settings: material.settings(),
+            use_transmission: material.use_transmission(),
+            shader_name: material.shader_name(),
+            shader_template: material.shader_template(),
+            shader_template_mode: material.shader_template_mode(),
+            shader_defines: material.shader_defines(),
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn settings(&self) -> MaterialSettings {
+        self.settings
+    }
+
+    #[inline]
+    pub(crate) const fn use_transmission(&self) -> bool {
+        self.use_transmission
+    }
+
+    #[inline]
+    pub(crate) const fn shader_name(&self) -> &'static str {
+        self.shader_name
+    }
+
+    #[inline]
+    pub(crate) const fn shader_template(&self) -> Option<&'static str> {
+        self.shader_template
+    }
+
+    #[inline]
+    pub(crate) const fn shader_template_mode(&self) -> ShaderTemplateMode {
+        self.shader_template_mode
+    }
+
+    #[inline]
+    pub(crate) const fn shader_defines(&self) -> &ShaderDefines {
+        &self.shader_defines
+    }
+}
+
+/// Physical Group 1 interface published only after this material's live
+/// post-DPE preparation succeeds. One exact material generation owns one copy.
+pub(crate) struct MaterialFrameInterface {
+    pub(crate) layout: wgpu::BindGroupLayout,
+    pub(crate) layout_id: u64,
+    pub(crate) bind_group: wgpu::BindGroup,
+    pub(crate) bind_group_id: u64,
+    pub(crate) binding_wgsl: Arc<str>,
+    pub(crate) binding_wgsl_hash: u64,
+}
+
+struct MaterialFrameRecord {
     key: MaterialPlanKey,
     material: Arc<Material>,
+    pipeline: MaterialPipelineSnapshot,
     textures: SmallVec<[PlannedMaterialTexture; 8]>,
     /// Success gate for this graph attempt. A persistent `GpuMaterial` with
     /// matching material stamps is insufficient when an Image changed and
     /// this attempt's exact texture materialization failed.
     prepared: bool,
+    attempted: bool,
+    interface: Option<MaterialFrameInterface>,
 }
 
 /// Owned topology recipe returned to Composer before draw consumers are added.
@@ -102,11 +173,12 @@ impl From<AssetTextureSnapshot> for AssetTextureKey {
 
 /// Destructor-aware material owners and source joins for one graph attempt.
 pub(crate) struct MaterialPlanStore {
-    plans: Vec<MaterialPlanRecord>,
-    lookup: FxHashMap<MaterialPlanKey, MaterialPlanId>,
+    plans: Vec<MaterialFrameRecord>,
+    lookup: FxHashMap<MaterialPlanKey, MaterialFrameId>,
+    failed: FxHashSet<MaterialPlanKey>,
     /// Dense join indexed exclusively by the intent-visible frame domain.
     /// ExtractedScene may be much larger after view culling.
-    source_plans: Vec<Option<MaterialPlanId>>,
+    source_plans: Vec<Option<MaterialFrameId>>,
     recipes: Vec<DrawMaterialTextureRecipe>,
     initialized: bool,
 }
@@ -117,6 +189,7 @@ impl MaterialPlanStore {
         Self {
             plans: Vec::with_capacity(128),
             lookup: FxHashMap::default(),
+            failed: FxHashSet::default(),
             source_plans: Vec::with_capacity(512),
             recipes: Vec::with_capacity(16),
             initialized: false,
@@ -137,6 +210,7 @@ impl MaterialPlanStore {
         );
         debug_assert!(self.plans.is_empty());
         debug_assert!(self.lookup.is_empty());
+        debug_assert!(self.failed.is_empty());
         debug_assert!(self.source_plans.is_empty());
         debug_assert!(self.recipes.is_empty());
 
@@ -193,18 +267,24 @@ impl MaterialPlanStore {
             self.source_plans[source.index()] = Some(id);
             return;
         }
+        if self.failed.contains(&key) {
+            return;
+        }
 
         let Some((material, asset_version, asset_identity)) =
             assets.materials.get_entry_with_identity(key.handle)
         else {
+            self.failed.insert(key);
             return;
         };
         if (asset_version, asset_identity) != (key.asset_version, key.asset_identity)
             || material.data.version() != key.material_version
         {
+            self.failed.insert(key);
             return;
         }
 
+        let pipeline = MaterialPipelineSnapshot::capture(&material);
         let mut textures = SmallVec::<[PlannedMaterialTexture; 8]>::new();
         material.data.visit_textures(&mut |source| {
             textures.push(PlannedMaterialTexture {
@@ -217,17 +297,28 @@ impl MaterialPlanStore {
                 },
             });
         });
-        let record = MaterialPlanRecord {
+        // Every field above belongs to the same serial capture window. A
+        // mutation observed during capture rejects this attempt instead of
+        // publishing a mixed classification/shader/binding recipe.
+        if material.data.version() != key.material_version {
+            self.failed.insert(key);
+            return;
+        }
+        let record = MaterialFrameRecord {
             key,
             material,
+            pipeline,
             textures,
             prepared: false,
+            attempted: false,
+            interface: None,
         };
         if !material_plan_is_current(assets, &record) {
+            self.failed.insert(key);
             return;
         }
 
-        let id = MaterialPlanId::from_index(self.plans.len());
+        let id = MaterialFrameId::from_index(self.plans.len());
         self.plans.push(record);
         assert!(self.lookup.insert(key, id).is_none());
         self.source_plans[source.index()] = Some(id);
@@ -274,14 +365,14 @@ impl MaterialPlanStore {
         live_sources: &[FrameSourceId],
     ) {
         assert!(self.initialized, "material plans were not captured");
-        let mut visited = FxHashSet::default();
         for &source in live_sources {
             let Some(id) = self.source_plans.get(source.index()).copied().flatten() else {
                 continue;
             };
-            if !visited.insert(id) {
+            if self.plans[id.index()].attempted {
                 continue;
             }
+            self.plans[id.index()].attempted = true;
             let prepared = {
                 let record = &self.plans[id.index()];
                 resource_manager.prepare_planned_material(
@@ -295,7 +386,27 @@ impl MaterialPlanStore {
                 )
             };
             if prepared && material_plan_is_current(assets, &self.plans[id.index()]) {
-                self.plans[id.index()].prepared = true;
+                let record = &self.plans[id.index()];
+                let Some(gpu_material) = resource_manager.get_material(record.key.handle) else {
+                    continue;
+                };
+                if (gpu_material.asset_version, gpu_material.asset_identity)
+                    != (record.key.asset_version, record.key.asset_identity)
+                    || gpu_material.version != record.key.material_version
+                {
+                    continue;
+                }
+                let interface = MaterialFrameInterface {
+                    layout: gpu_material.layout.clone(),
+                    layout_id: gpu_material.layout_id,
+                    bind_group: gpu_material.bind_group.clone(),
+                    bind_group_id: gpu_material.bind_group_id,
+                    binding_wgsl: gpu_material.binding_wgsl.clone(),
+                    binding_wgsl_hash: gpu_material.binding_wgsl_hash,
+                };
+                let record = &mut self.plans[id.index()];
+                record.interface = Some(interface);
+                record.prepared = true;
             }
         }
     }
@@ -309,6 +420,7 @@ impl MaterialPlanStore {
         self.recipes.clear();
         self.source_plans.clear();
         self.lookup.clear();
+        self.failed.clear();
         self.plans.clear();
         self.initialized = false;
     }
@@ -318,6 +430,7 @@ impl MaterialPlanStore {
     pub(crate) fn is_empty(&self) -> bool {
         self.plans.is_empty()
             && self.lookup.is_empty()
+            && self.failed.is_empty()
             && self.source_plans.is_empty()
             && self.recipes.is_empty()
             && !self.initialized
@@ -342,7 +455,7 @@ impl<'a> MaterialPlanResolver<'a> {
         self,
         source: FrameSourceId,
         item: &ExtractedRenderItem,
-    ) -> Option<&'a Arc<Material>> {
+    ) -> Option<PreparedMaterialFrame<'a>> {
         let id = self
             .store
             .source_plans
@@ -350,11 +463,70 @@ impl<'a> MaterialPlanResolver<'a> {
             .copied()
             .flatten()?;
         let plan = self.store.plans.get(id.index())?;
-        (plan.prepared && plan.key.matches_item(item)).then_some(&plan.material)
+        (plan.prepared && plan.interface.is_some() && plan.key.matches_item(item))
+            .then_some(PreparedMaterialFrame { id, record: plan })
+    }
+
+    #[must_use]
+    pub(crate) fn material(self, id: MaterialFrameId) -> Option<PreparedMaterialFrame<'a>> {
+        let record = self.store.plans.get(id.index())?;
+        (record.prepared && record.interface.is_some())
+            .then_some(PreparedMaterialFrame { id, record })
     }
 }
 
-fn material_plan_is_current(assets: &AssetServer, record: &MaterialPlanRecord) -> bool {
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedMaterialFrame<'a> {
+    id: MaterialFrameId,
+    record: &'a MaterialFrameRecord,
+}
+
+impl<'a> PreparedMaterialFrame<'a> {
+    #[inline]
+    pub(crate) const fn id(self) -> MaterialFrameId {
+        self.id
+    }
+
+    #[inline]
+    pub(crate) const fn pipeline(self) -> &'a MaterialPipelineSnapshot {
+        &self.record.pipeline
+    }
+
+    #[inline]
+    pub(crate) fn interface(self) -> &'a MaterialFrameInterface {
+        self.record
+            .interface
+            .as_ref()
+            .expect("prepared material lacks its physical interface")
+    }
+
+    #[inline]
+    pub(crate) const fn handle(self) -> MaterialHandle {
+        self.record.key.handle
+    }
+
+    #[inline]
+    pub(crate) const fn asset_version(self) -> u32 {
+        self.record.key.asset_version
+    }
+
+    #[inline]
+    pub(crate) const fn asset_identity(self) -> u64 {
+        self.record.key.asset_identity
+    }
+
+    #[inline]
+    pub(crate) const fn material_version(self) -> u64 {
+        self.record.key.material_version
+    }
+
+    #[inline]
+    pub(crate) fn pipeline_state_is_current(self) -> bool {
+        self.record.material.data.version() == self.record.key.material_version
+    }
+}
+
+fn material_plan_is_current(assets: &AssetServer, record: &MaterialFrameRecord) -> bool {
     let Some((material, asset_version, asset_identity)) =
         assets.materials.get_entry_with_identity(record.key.handle)
     else {
@@ -412,7 +584,7 @@ mod tests {
     use crate::core::WgpuContext;
     use crate::settings::{RendererInitConfig, RendererSettings};
     use myth_resources::image::{Image, ImageDimension, PixelFormat};
-    use myth_resources::material::{MaterialType, UnlitMaterial};
+    use myth_resources::material::{AlphaMode, MaterialType, UnlitMaterial};
     use myth_resources::texture::Texture;
 
     fn image_8x8() -> Image {
@@ -432,7 +604,7 @@ mod tests {
         Material::new(MaterialType::Unlit(unlit))
     }
 
-    fn capture_record(assets: &AssetServer, handle: MaterialHandle) -> MaterialPlanRecord {
+    fn capture_record(assets: &AssetServer, handle: MaterialHandle) -> MaterialFrameRecord {
         let (material, asset_version, asset_identity) = assets
             .materials
             .get_entry_with_identity(handle)
@@ -450,7 +622,8 @@ mod tests {
                 },
             });
         });
-        MaterialPlanRecord {
+        let pipeline = MaterialPipelineSnapshot::capture(&material);
+        MaterialFrameRecord {
             key: MaterialPlanKey {
                 handle,
                 asset_version,
@@ -458,8 +631,11 @@ mod tests {
                 material_version,
             },
             material,
+            pipeline,
             textures,
             prepared: false,
+            attempted: false,
+            interface: None,
         }
     }
 
@@ -500,6 +676,30 @@ mod tests {
         assert!(
             !material_plan_is_current(&assets, &record),
             "two unavailable states with different exact identities must not compare equal"
+        );
+    }
+
+    #[test]
+    fn pipeline_snapshot_never_mixes_with_a_later_material_generation() {
+        let assets = AssetServer::new();
+        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+        let record = capture_record(&assets, material);
+        assert_eq!(record.pipeline.settings().alpha_mode, AlphaMode::Opaque);
+
+        let current = assets.materials.get(material).expect("material missing");
+        current
+            .as_unlit()
+            .expect("expected unlit material")
+            .set_alpha_mode(AlphaMode::Blend);
+
+        assert_eq!(
+            record.pipeline.settings().alpha_mode,
+            AlphaMode::Opaque,
+            "the representative is immutable even when the live asset mutates"
+        );
+        assert!(
+            !material_plan_is_current(&assets, &record),
+            "a mixed snapshot must be rejected instead of being published"
         );
     }
 

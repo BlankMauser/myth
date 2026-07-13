@@ -12,6 +12,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::core::gpu::Tracked;
+use crate::graph::asset_frame::GeometryFramePhysical;
 use crate::graph::frame::{
     DrawBindGroupSlot, DrawBufferSlot, DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanResolver,
     DrawPlanStore, FrameSourceId, PreparedDrawSource,
@@ -587,6 +588,7 @@ impl<'a> SceneSubmissionWriter<'a> {
         &mut self,
         frame_source: FrameSourceId,
         source: &PreparedDrawSource,
+        geometry: &GeometryFramePhysical,
         pipeline_id: RenderPipelineId,
         sort_key: u64,
         stencil_reference: Option<u32>,
@@ -595,6 +597,7 @@ impl<'a> SceneSubmissionWriter<'a> {
             self.draw_plans,
             frame_source,
             source,
+            geometry,
             pipeline_id,
             sort_key,
             stencil_reference,

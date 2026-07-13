@@ -19,15 +19,17 @@ use crate::pipeline::{
     GraphicsPipelineKey, PipelineCache, RenderPipelineId, SimpleGeometryPipelineKey,
 };
 use crate::settings::RenderPath;
+use myth_resources::AntiAliasingMode;
 use myth_resources::material::{AlphaMode, Side};
-use myth_resources::{AntiAliasingMode, RenderableMaterialTrait};
 use myth_scene::camera::RenderCamera;
 
+use super::asset_frame::{GeometryFramePhysical, GeometryFrameResolver, ObjectInterfaceResolver};
 use super::extracted::{ExtractedScene, SceneFeatures};
 use super::frame::{
     DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanStore, FrameSourceId, PreparedDrawSource,
     PreparedDrawStore, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,
 };
+use super::material_plan::MaterialPlanResolver;
 use super::render_state::RenderState;
 
 /// Shadow-only WGSL binding declaration, injected into shadow depth shaders.
@@ -48,6 +50,9 @@ struct Struct_shadow_light {
 pub(crate) fn finalize_live_draw_plans(
     draw_plans: &mut DrawPlanStore,
     prepared_draws: &PreparedDrawStore,
+    geometry_frames: GeometryFrameResolver<'_>,
+    material_frames: MaterialPlanResolver<'_>,
+    object_interfaces: ObjectInterfaceResolver<'_>,
     render_lists: &RenderLists,
     extracted_scene: &ExtractedScene,
     render_state: &RenderState,
@@ -75,6 +80,9 @@ pub(crate) fn finalize_live_draw_plans(
                 false,
                 draw_plans,
                 prepared_draws,
+                geometry_frames,
+                material_frames,
+                object_interfaces,
                 extracted_scene,
                 render_state,
                 wgpu_ctx,
@@ -90,6 +98,9 @@ pub(crate) fn finalize_live_draw_plans(
                 true,
                 draw_plans,
                 prepared_draws,
+                geometry_frames,
+                material_frames,
+                object_interfaces,
                 extracted_scene,
                 render_state,
                 wgpu_ctx,
@@ -130,6 +141,9 @@ pub(crate) fn finalize_live_draw_plans(
                     render_lists,
                     draw_plans,
                     prepared_draws,
+                    geometry_frames,
+                    material_frames,
+                    object_interfaces,
                     extracted_scene,
                     wgpu_ctx,
                     layout,
@@ -152,6 +166,9 @@ fn bake_main_intents(
     transparent_plan: bool,
     draw_plans: &mut DrawPlanStore,
     prepared_draws: &PreparedDrawStore,
+    geometry_frames: GeometryFrameResolver<'_>,
+    material_frames: MaterialPlanResolver<'_>,
+    object_interfaces: ObjectInterfaceResolver<'_>,
     extracted_scene: &ExtractedScene,
     render_state: &RenderState,
     wgpu_ctx: &WgpuContext,
@@ -200,55 +217,77 @@ fn bake_main_intents(
         let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
             continue;
         };
-        if !source.matches_extracted(item, intent.geometry_handle, intent.material_handle) {
+        let Some(geometry) = geometry_frames.geometry(source.geometry) else {
+            continue;
+        };
+        let Some(geometry_physical) = geometry_frames.physical(source.geometry) else {
+            continue;
+        };
+        let Some(material) = material_frames.material(source.material) else {
+            continue;
+        };
+        let Some(object_interface) = object_interfaces.interface(source.object_interface) else {
+            continue;
+        };
+        if (item.geometry, item.material) != (intent.geometry_handle, intent.material_handle)
+            || geometry.key.handle != intent.geometry_handle
+            || material.handle() != intent.material_handle
+            || (geometry.key.asset_version, geometry.key.asset_identity)
+                != (item.geometry_asset_version, item.geometry_asset_identity)
+            || (material.asset_version(), material.asset_identity())
+                != (item.material_asset_version, item.material_asset_identity)
+            || !geometry_frames.pipeline_state_is_current(source.geometry)
+            || !material.pipeline_state_is_current()
+        {
             continue;
         }
-        if !source.pipeline_state_is_current() {
-            continue;
-        }
-        let geometry = &source.geometry_asset;
-        let material = &source.material_asset;
-        let is_transparent = material.is_transparent() || material.use_transmission();
+        let material_pipeline = material.pipeline();
+        let material_settings = material_pipeline.settings();
+        let material_interface = material.interface();
+        let is_transparent = matches!(
+            material_settings.alpha_mode,
+            AlphaMode::Blend | AlphaMode::BlendMask
+        ) || material_pipeline.use_transmission();
         if is_transparent != transparent_plan {
             continue;
         }
-        let shader_source = if let Some(template_source) = material.shader_template() {
+        let shader_source = if let Some(template_source) = material_pipeline.shader_template() {
             ShaderSource::Inline {
-                name: material.shader_name(),
+                name: material_pipeline.shader_name(),
                 source: template_source,
-                mode: material.shader_template_mode(),
+                mode: material_pipeline.shader_template_mode(),
             }
         } else {
-            ShaderSource::File(material.shader_name())
+            ShaderSource::File(material_pipeline.shader_name())
         };
         let shader_source_identity = *shader_source_identities
             .entry((
                 intent.material_handle,
-                source.material_asset_version,
-                source.material_asset_identity,
-                source.material_version,
+                material.asset_version(),
+                material.asset_identity(),
+                material.material_version(),
             ))
             .or_insert_with(|| shader_manager.source_identity_hash(shader_source));
 
         let fast_key = FastPipelineKey {
             material_handle: intent.material_handle,
-            material_asset_version: source.material_asset_version,
-            material_asset_identity: source.material_asset_identity,
-            material_version: source.material_version,
+            material_asset_version: material.asset_version(),
+            material_asset_identity: material.asset_identity(),
+            material_version: material.material_version(),
             geometry_handle: intent.geometry_handle,
-            geometry_asset_version: source.geometry_asset_version,
-            geometry_asset_identity: source.geometry_asset_identity,
-            geometry_version: source.geometry_layout_version,
-            vertex_layout_id: source.geometry_layout_id,
+            geometry_asset_version: geometry.key.asset_version,
+            geometry_asset_identity: geometry.key.asset_identity,
+            geometry_version: geometry.key.layout_version,
+            vertex_layout_id: geometry_physical.layout_id,
             instance_variants: item.item_variant_flags,
             item_shader_defines_hash: item.item_shader_defines_hash,
             shader_source_identity,
             global_layout_id: gpu_world.layout_id,
             global_binding_wgsl_hash: gpu_world.binding_wgsl_hash,
-            material_layout_id: source.material_layout_id,
-            material_binding_wgsl_hash: source.material_binding_wgsl_hash,
-            object_layout_id: source.object_layout_id,
-            object_binding_wgsl_hash: source.object_binding_wgsl_hash,
+            material_layout_id: material_interface.layout_id,
+            material_binding_wgsl_hash: material_interface.binding_wgsl_hash,
+            object_layout_id: object_interface.layout_id,
+            object_binding_wgsl_hash: object_interface.binding_wgsl_hash,
             scene_variants: extracted_scene.scene_variants,
             scene_defines_hash,
             taa_enabled,
@@ -261,14 +300,14 @@ fn bake_main_intents(
         {
             (id, false)
         } else {
-            let geo_defines = geometry.shader_defines();
-            let mat_defines = material.shader_defines();
+            let geo_defines = &geometry.shader_defines;
+            let mat_defines = material_pipeline.shader_defines();
             let mut flags = PipelineFlags::empty();
-            let final_a2c_enable = matches!(material.alpha_mode(), AlphaMode::Mask)
-                && material.alpha_to_coverage()
+            let final_a2c_enable = matches!(material_settings.alpha_mode, AlphaMode::Mask)
+                && material_settings.alpha_to_coverage
                 && sample_count > 1;
             let mut options = ShaderCompilationOptions::from_merged(
-                &mat_defines,
+                mat_defines,
                 geo_defines,
                 &extracted_scene.scene_defines,
                 &item.item_shader_defines,
@@ -318,12 +357,12 @@ fn bake_main_intents(
             let depth_write = if is_opaque_item && use_depth_pre {
                 false
             } else {
-                material.depth_write()
+                material_settings.depth_write
             };
             if depth_write {
                 flags |= PipelineFlags::DEPTH_WRITE;
             }
-            let depth_compare = if material.depth_test() {
+            let depth_compare = if material_settings.depth_test {
                 if is_opaque_item && use_depth_pre {
                     wgpu::CompareFunction::Equal
                 } else {
@@ -335,9 +374,11 @@ fn bake_main_intents(
 
             let main_color_target = ColorTargetKey::from(wgpu::ColorTargetState {
                 format: color_format,
-                blend: material
-                    .is_transparent()
-                    .then_some(wgpu::BlendState::ALPHA_BLENDING),
+                blend: matches!(
+                    material_settings.alpha_mode,
+                    AlphaMode::Blend | AlphaMode::BlendMask
+                )
+                .then_some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             });
             let mut color_targets = smallvec::smallvec![main_color_target];
@@ -363,23 +404,25 @@ fn bake_main_intents(
             };
             let canonical_key = GraphicsPipelineKey {
                 shader_hash,
-                vertex_layout_id: source.geometry_layout_id,
+                vertex_layout_id: geometry_physical.layout_id,
                 bind_group_layout_ids: [
                     gpu_world.layout_id,
-                    source.material_layout_id,
-                    source.object_layout_id,
+                    material_interface.layout_id,
+                    object_interface.layout_id,
                     screen_layout.id(),
                 ],
                 topology: geometry.topology,
-                cull_mode: match material.side() {
+                cull_mode: match material_settings.side {
                     Side::Front => Some(wgpu::Face::Back),
                     Side::Back => Some(wgpu::Face::Front),
                     Side::Double => None,
                 },
                 depth_compare,
-                blend_state: material
-                    .is_transparent()
-                    .then(|| BlendStateKey::from(wgpu::BlendState::ALPHA_BLENDING)),
+                blend_state: matches!(
+                    material_settings.alpha_mode,
+                    AlphaMode::Blend | AlphaMode::BlendMask
+                )
+                .then(|| BlendStateKey::from(wgpu::BlendState::ALPHA_BLENDING)),
                 color_targets,
                 depth_format,
                 sample_count,
@@ -397,11 +440,11 @@ fn bake_main_intents(
                 shader_source,
                 &canonical_key,
                 &options,
-                &source.geometry_layout_info,
-                &source.material_layout,
-                &source.material_binding_wgsl,
-                &source.object_layout,
-                &source.object_binding_wgsl,
+                &geometry_physical.layout_info,
+                &material_interface.layout,
+                &material_interface.binding_wgsl,
+                &object_interface.layout,
+                &object_interface.binding_wgsl,
                 gpu_world,
                 screen_layout,
             );
@@ -414,7 +457,9 @@ fn bake_main_intents(
             intent.distance_sq,
             transparent_plan,
         );
-        if !source.pipeline_state_is_current() {
+        if !geometry_frames.pipeline_state_is_current(source.geometry)
+            || !material.pipeline_state_is_current()
+        {
             continue;
         }
         if publish_l1 {
@@ -424,6 +469,7 @@ fn bake_main_intents(
             draw_plans,
             intent.source,
             source,
+            geometry_physical,
             pipeline_id,
             sort_key.bits(),
             None,
@@ -441,6 +487,9 @@ fn bake_shadow_intents(
     render_lists: &RenderLists,
     draw_plans: &mut DrawPlanStore,
     prepared_draws: &PreparedDrawStore,
+    geometry_frames: GeometryFrameResolver<'_>,
+    material_frames: MaterialPlanResolver<'_>,
+    object_interfaces: ObjectInterfaceResolver<'_>,
     extracted_scene: &ExtractedScene,
     wgpu_ctx: &WgpuContext,
     shadow_global_layout: &wgpu::BindGroupLayout,
@@ -465,36 +514,55 @@ fn bake_shadow_intents(
         let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
             continue;
         };
-        if !source.matches_extracted(item, intent.geometry_handle, intent.material_handle) {
+        let Some(geometry) = geometry_frames.geometry(source.geometry) else {
+            continue;
+        };
+        let Some(geometry_physical) = geometry_frames.physical(source.geometry) else {
+            continue;
+        };
+        let Some(material) = material_frames.material(source.material) else {
+            continue;
+        };
+        let Some(object_interface) = object_interfaces.interface(source.object_interface) else {
+            continue;
+        };
+        if (item.geometry, item.material) != (intent.geometry_handle, intent.material_handle)
+            || geometry.key.handle != intent.geometry_handle
+            || material.handle() != intent.material_handle
+            || (geometry.key.asset_version, geometry.key.asset_identity)
+                != (item.geometry_asset_version, item.geometry_asset_identity)
+            || (material.asset_version(), material.asset_identity())
+                != (item.material_asset_version, item.material_asset_identity)
+            || !geometry_frames.pipeline_state_is_current(source.geometry)
+            || !material.pipeline_state_is_current()
+        {
             continue;
         }
-        if !source.pipeline_state_is_current() {
-            continue;
-        }
-        let geometry = &source.geometry_asset;
-        let material = &source.material_asset;
-        if material.alpha_mode() == AlphaMode::Blend {
+        let material_pipeline = material.pipeline();
+        let material_settings = material_pipeline.settings();
+        let material_interface = material.interface();
+        if material_settings.alpha_mode == AlphaMode::Blend {
             continue;
         }
 
         let fast_key = FastShadowPipelineKey {
             material_handle: intent.material_handle,
-            material_asset_version: source.material_asset_version,
-            material_asset_identity: source.material_asset_identity,
-            material_version: source.material_version,
+            material_asset_version: material.asset_version(),
+            material_asset_identity: material.asset_identity(),
+            material_version: material.material_version(),
             geometry_handle: intent.geometry_handle,
-            geometry_asset_version: source.geometry_asset_version,
-            geometry_asset_identity: source.geometry_asset_identity,
-            geometry_version: source.geometry_layout_version,
-            vertex_layout_id: source.geometry_layout_id,
+            geometry_asset_version: geometry.key.asset_version,
+            geometry_asset_identity: geometry.key.asset_identity,
+            geometry_version: geometry.key.layout_version,
+            vertex_layout_id: geometry_physical.layout_id,
             instance_variants: item.item_variant_flags,
             item_shader_defines_hash: item.item_shader_defines_hash,
             shader_source_identity,
             shadow_global_layout_id,
-            material_layout_id: source.material_layout_id,
-            material_binding_wgsl_hash: source.material_binding_wgsl_hash,
-            object_layout_id: source.object_layout_id,
-            object_binding_wgsl_hash: source.object_binding_wgsl_hash,
+            material_layout_id: material_interface.layout_id,
+            material_binding_wgsl_hash: material_interface.binding_wgsl_hash,
+            object_layout_id: object_interface.layout_id,
+            object_binding_wgsl_hash: object_interface.binding_wgsl_hash,
             pipeline_settings_version: wgpu_ctx.pipeline_settings_version,
         };
         let (pipeline_id, publish_l1) = if let Some(id) =
@@ -502,10 +570,10 @@ fn bake_shadow_intents(
         {
             (id, false)
         } else {
-            let geo_defines = geometry.shader_defines();
-            let mat_defines = material.shader_defines();
+            let geo_defines = &geometry.shader_defines;
+            let mat_defines = material_pipeline.shader_defines();
             let mut options = ShaderCompilationOptions::from_merged(
-                &mat_defines,
+                mat_defines,
                 geo_defines,
                 &myth_resources::shader_defines::ShaderDefines::new(),
                 &item.item_shader_defines,
@@ -513,13 +581,15 @@ fn bake_shadow_intents(
             options.add_define("SHADOW_PASS", "1");
             options.inject_code(
                 "vertex_input_code",
-                &source.geometry_layout_info.vertex_input_code,
+                &geometry_physical.layout_info.vertex_input_code,
             );
             options.inject_code(
                 "binding_code",
                 format!(
                     "{}\n{}\n{}",
-                    SHADOW_BINDING_WGSL, source.material_binding_wgsl, source.object_binding_wgsl
+                    SHADOW_BINDING_WGSL,
+                    material_interface.binding_wgsl,
+                    object_interface.binding_wgsl
                 ),
             );
             options.inject_code(
@@ -534,24 +604,24 @@ fn bake_shadow_intents(
                     label: Some("Shadow Pipeline Layout"),
                     bind_group_layouts: &[
                         Some(shadow_global_layout),
-                        Some(&source.material_layout),
-                        Some(&source.object_layout),
+                        Some(&material_interface.layout),
+                        Some(&object_interface.layout),
                     ],
                     immediate_size: 0,
                 });
-            let vertex_buffers_layout: Vec<_> = source
-                .geometry_layout_info
+            let vertex_buffers_layout: Vec<_> = geometry_physical
+                .layout_info
                 .buffers
                 .iter()
                 .map(|layout| layout.as_wgpu())
                 .collect();
             let canonical_key = SimpleGeometryPipelineKey {
                 shader_hash: code_hash,
-                vertex_layout_id: source.geometry_layout_id,
+                vertex_layout_id: geometry_physical.layout_id,
                 bind_group_layout_ids: [
                     shadow_global_layout_id,
-                    source.material_layout_id,
-                    source.object_layout_id,
+                    material_interface.layout_id,
+                    object_interface.layout_id,
                 ],
                 color_targets: smallvec::smallvec![],
                 depth_stencil: DepthStencilKey::from(wgpu::DepthStencilState {
@@ -581,9 +651,11 @@ fn bake_shadow_intents(
             (id, true)
         };
 
-        let material_bits = source.material_bind_group_id & 0xffff_ffff;
+        let material_bits = material_interface.bind_group_id & 0xffff_ffff;
         let sort_key = u64::from(pipeline_id.0) << 32 | material_bits;
-        if !source.pipeline_state_is_current() {
+        if !geometry_frames.pipeline_state_is_current(source.geometry)
+            || !material.pipeline_state_is_current()
+        {
             continue;
         }
         if publish_l1 {
@@ -593,6 +665,7 @@ fn bake_shadow_intents(
             draw_plans,
             intent.source,
             source,
+            geometry_physical,
             pipeline_id,
             sort_key,
             None,
@@ -610,6 +683,7 @@ pub(crate) fn push_prepared_source_command(
     draw_plans: &mut DrawPlanStore,
     frame_source: FrameSourceId,
     source: &PreparedDrawSource,
+    geometry: &GeometryFramePhysical,
     pipeline_id: RenderPipelineId,
     sort_key: u64,
     stencil_reference: Option<u32>,
@@ -618,12 +692,12 @@ pub(crate) fn push_prepared_source_command(
         frame_source,
         sort_key,
         pipeline_id,
-        vertex_buffers: source.vertex_buffers.clone(),
-        index_buffer: source.index_buffer,
+        vertex_buffers: geometry.vertex_buffers.clone(),
+        index_buffer: geometry.index_buffer,
         bind_group_1: Some(source.material_bind_group),
         bind_group_2: source.object_bind_group,
         stencil_reference,
-        vertex_range: source.draw_range.clone(),
-        instance_range: source.instance_range.clone(),
+        vertex_range: geometry.draw_range.clone(),
+        instance_range: geometry.instance_range.clone(),
     });
 }

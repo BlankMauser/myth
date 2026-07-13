@@ -1946,14 +1946,28 @@ impl<'a> FrameComposer<'a> {
                 self.ctx.resource_manager,
                 &live_frame_sources,
             );
+            graph.storage.geometry_frames.capture_live(
+                self.ctx.assets,
+                self.ctx.extracted_scene,
+                self.ctx.render_lists,
+                &live_frame_sources,
+            );
+            graph.storage.geometry_frames.prepare_live(
+                self.ctx.assets,
+                self.ctx.resource_manager,
+                &mut graph.storage.draw_plans,
+            );
             let material_plans = graph.storage.material_plans.resolver();
+            let geometry_frames = graph.storage.geometry_frames.resolver();
             self.ctx.extracted_scene.prepare_draw_resources(
                 self.ctx.scene,
                 self.ctx.assets,
                 self.ctx.resource_manager,
                 &live_frame_sources,
                 self.ctx.render_lists,
+                geometry_frames,
                 material_plans,
+                &mut graph.storage.object_interfaces,
                 &mut graph.storage.prepared_draws,
                 &mut graph.storage.draw_plans,
             );
@@ -1991,6 +2005,9 @@ impl<'a> FrameComposer<'a> {
                         self.ctx.render_lists,
                         self.ctx.extracted_scene,
                         &graph.storage.prepared_draws,
+                        graph.storage.geometry_frames.resolver(),
+                        graph.storage.material_plans.resolver(),
+                        graph.storage.object_interfaces.resolver(),
                         self.ctx.wgpu_ctx.depth_format,
                         self.ctx.wgpu_ctx.pipeline_settings_version,
                         &graph.storage.scene_submissions,
@@ -2037,6 +2054,9 @@ impl<'a> FrameComposer<'a> {
             crate::graph::bake::finalize_live_draw_plans(
                 &mut graph.storage.draw_plans,
                 &graph.storage.prepared_draws,
+                graph.storage.geometry_frames.resolver(),
+                graph.storage.material_plans.resolver(),
+                graph.storage.object_interfaces.resolver(),
                 self.ctx.render_lists,
                 self.ctx.extracted_scene,
                 self.ctx.render_state,
@@ -2050,6 +2070,9 @@ impl<'a> FrameComposer<'a> {
             // asset/interface owners as soon as every live plan is baked;
             // DrawPlanStore continues to own the physical WGPU handles.
             graph.storage.prepared_draws.clear();
+            graph.storage.object_interfaces.clear();
+            graph.storage.geometry_frames.clear();
+            graph.storage.material_plans.clear();
 
             rdg_diagnostics.enter_phase(RdgFramePhase::RecordCommands);
 

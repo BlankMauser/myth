@@ -8,6 +8,7 @@
 //! - [`FrameComposer`]: Chainable API for frame composition (hook-based RDG)
 //! - [`RenderLists`]: CPU-only main/shadow draw-intent lists
 
+pub(crate) mod asset_frame;
 pub mod bake;
 #[cfg(any(test, feature = "rdg_bench_support"))]
 #[doc(hidden)]

@@ -27,7 +27,7 @@ use crate::pipeline::{
     SimpleGeometryPipelineKey,
 };
 use myth_assets::{GeometryHandle, MaterialHandle};
-use myth_resources::material::Side;
+use myth_resources::material::{AlphaMode, Side};
 
 /// Normal texture format — Rgba8Unorm ([-1,1] → [0,1] mapping).
 pub(crate) const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -161,6 +161,9 @@ impl PrepassFeature {
         let render_lists = ctx.scene_draws.render_lists;
         let extracted_scene = ctx.scene_draws.extracted_scene;
         let prepared_draws = ctx.scene_draws.prepared_draws;
+        let geometry_frames = ctx.scene_draws.geometry_frames;
+        let material_frames = ctx.scene_draws.material_frames;
+        let object_interfaces = ctx.scene_draws.object_interfaces;
         let depth_format = ctx.scene_draws.depth_format;
         let pipeline_settings_version = ctx.scene_draws.pipeline_settings_version;
         let Some(mut writer) = ctx
@@ -194,23 +197,50 @@ impl PrepassFeature {
             else {
                 continue;
             };
-            if !source.matches_extracted(
-                extracted_item,
-                intent.geometry_handle,
-                intent.material_handle,
-            ) {
+            let Some(geometry) = geometry_frames.geometry(source.geometry) else {
+                continue;
+            };
+            let Some(geometry_physical) = geometry_frames.physical(source.geometry) else {
+                continue;
+            };
+            let Some(material) = material_frames.material(source.material) else {
+                continue;
+            };
+            let Some(object_interface) = object_interfaces.interface(source.object_interface)
+            else {
+                continue;
+            };
+            if (extracted_item.geometry, extracted_item.material)
+                != (intent.geometry_handle, intent.material_handle)
+                || geometry.key.handle != intent.geometry_handle
+                || material.handle() != intent.material_handle
+                || (geometry.key.asset_version, geometry.key.asset_identity)
+                    != (
+                        extracted_item.geometry_asset_version,
+                        extracted_item.geometry_asset_identity,
+                    )
+                || (material.asset_version(), material.asset_identity())
+                    != (
+                        extracted_item.material_asset_version,
+                        extracted_item.material_asset_identity,
+                    )
+                || !geometry_frames.pipeline_state_is_current(source.geometry)
+                || !material.pipeline_state_is_current()
+            {
                 continue;
             }
-            if !source.pipeline_state_is_current() {
-                continue;
-            }
-            let geometry = &source.geometry_asset;
-            let material = &source.material_asset;
-            if material.is_transparent() || material.use_transmission() {
+            let material_pipeline = material.pipeline();
+            let material_settings = material_pipeline.settings();
+            let material_interface = material.interface();
+            if matches!(
+                material_settings.alpha_mode,
+                AlphaMode::Blend | AlphaMode::BlendMask
+            ) || material_pipeline.use_transmission()
+            {
                 continue;
             }
 
-            let cull_mode = match material.side() {
+            let cull_mode = match material_settings.side {
                 Side::Front => Some(wgpu::Face::Back),
                 Side::Back => Some(wgpu::Face::Front),
                 Side::Double => None,
@@ -222,26 +252,26 @@ impl PrepassFeature {
             };
             let l1_key = PrepassPipelineL1Key {
                 geometry_handle: intent.geometry_handle,
-                geometry_asset_version: source.geometry_asset_version,
-                geometry_asset_identity: source.geometry_asset_identity,
-                geometry_layout_version: source.geometry_layout_version,
+                geometry_asset_version: geometry.key.asset_version,
+                geometry_asset_identity: geometry.key.asset_identity,
+                geometry_layout_version: geometry.key.layout_version,
                 material_handle: intent.material_handle,
-                material_asset_version: source.material_asset_version,
-                material_asset_identity: source.material_asset_identity,
-                material_version: source.material_version,
+                material_asset_version: material.asset_version(),
+                material_asset_identity: material.asset_identity(),
+                material_version: material.material_version(),
                 item_variants: extracted_item.item_variant_flags,
                 item_shader_defines_hash: extracted_item.item_shader_defines_hash,
                 shader_source_identity,
                 scene_defines_hash,
                 pipeline_settings_version,
                 global_binding_wgsl_hash,
-                material_binding_wgsl_hash: source.material_binding_wgsl_hash,
-                object_binding_wgsl_hash: source.object_binding_wgsl_hash,
-                vertex_layout_id: source.geometry_layout_id,
+                material_binding_wgsl_hash: material_interface.binding_wgsl_hash,
+                object_binding_wgsl_hash: object_interface.binding_wgsl_hash,
+                vertex_layout_id: geometry_physical.layout_id,
                 bind_group_layout_ids: [
                     global_layout_id,
-                    source.material_layout_id,
-                    source.object_layout_id,
+                    material_interface.layout_id,
+                    object_interface.layout_id,
                 ],
                 depth_format,
                 topology: geometry.topology,
@@ -256,10 +286,10 @@ impl PrepassFeature {
                 if let Some(&pipeline_id) = self.local_cache.get(&l1_key) {
                     (pipeline_id, false)
                 } else {
-                    let geo_defines = geometry.shader_defines();
-                    let mat_defines = material.shader_defines();
+                    let geo_defines = &geometry.shader_defines;
+                    let mat_defines = material_pipeline.shader_defines();
                     let mut options = ShaderCompilationOptions::from_merged(
-                        &mat_defines,
+                        mat_defines,
                         geo_defines,
                         &extracted_scene.scene_defines,
                         &extracted_item.item_shader_defines,
@@ -276,15 +306,15 @@ impl PrepassFeature {
                     }
                     options.inject_code(
                         "vertex_input_code",
-                        &source.geometry_layout_info.vertex_input_code,
+                        &geometry_physical.layout_info.vertex_input_code,
                     );
                     options.inject_code(
                         "binding_code",
                         format!(
                             "{}\n{}\n{}",
                             gpu_world.binding_wgsl.as_str(),
-                            source.material_binding_wgsl,
-                            source.object_binding_wgsl
+                            material_interface.binding_wgsl,
+                            object_interface.binding_wgsl
                         ),
                     );
                     options.inject_code(
@@ -300,13 +330,13 @@ impl PrepassFeature {
                                 label: Some("Prepass Pipeline Layout"),
                                 bind_group_layouts: &[
                                     Some(&gpu_world.layout),
-                                    Some(&source.material_layout),
-                                    Some(&source.object_layout),
+                                    Some(&material_interface.layout),
+                                    Some(&object_interface.layout),
                                 ],
                                 immediate_size: 0,
                             });
-                    let vertex_buffers_layout: Vec<_> = source
-                        .geometry_layout_info
+                    let vertex_buffers_layout: Vec<_> = geometry_physical
+                        .layout_info
                         .buffers
                         .iter()
                         .map(|layout| layout.as_wgpu())
@@ -335,11 +365,11 @@ impl PrepassFeature {
                     }
                     let canonical_key = SimpleGeometryPipelineKey {
                         shader_hash,
-                        vertex_layout_id: source.geometry_layout_id,
+                        vertex_layout_id: geometry_physical.layout_id,
                         bind_group_layout_ids: [
                             global_layout_id,
-                            source.material_layout_id,
-                            source.object_layout_id,
+                            material_interface.layout_id,
+                            object_interface.layout_id,
                         ],
                         color_targets,
                         depth_stencil: DepthStencilKey::from(wgpu::DepthStencilState {
@@ -365,7 +395,9 @@ impl PrepassFeature {
                     (pipeline_id, true)
                 };
 
-            if !source.pipeline_state_is_current() {
+            if !geometry_frames.pipeline_state_is_current(source.geometry)
+                || !material.pipeline_state_is_current()
+            {
                 continue;
             }
             if publish_l1 {
@@ -378,7 +410,14 @@ impl PrepassFeature {
                 intent.distance_sq,
                 false,
             );
-            writer.push_prepared_source(intent.source, source, pipeline_id, sort_key.bits(), None);
+            writer.push_prepared_source(
+                intent.source,
+                source,
+                geometry_physical,
+                pipeline_id,
+                sort_key.bits(),
+                None,
+            );
         }
 
         writer.finish_sorted();

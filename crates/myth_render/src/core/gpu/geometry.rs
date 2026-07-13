@@ -44,6 +44,22 @@ impl ResourceManager {
             return false;
         };
 
+        self.prepare_geometry_exact(handle, &geometry, asset_version, asset_identity)
+    }
+
+    /// Prepare one exact, already-retained Geometry asset revision.
+    ///
+    /// Post-DPE draw preparation uses the same retained asset for validation,
+    /// GPU materialization, and object-binding construction. Keeping the
+    /// borrowed asset and its stamps together avoids reopening `AssetStorage`
+    /// for every live instance while preserving the handle-addressed GPU cache.
+    pub(crate) fn prepare_geometry_exact(
+        &mut self,
+        handle: GeometryHandle,
+        geometry: &Geometry,
+        asset_version: u32,
+        asset_identity: u64,
+    ) -> bool {
         // Fast path: check if any update is needed
         if let Some(gpu_geo) = self.resources.geometry_mut(handle)
             && gpu_geo.asset_version == asset_version
@@ -86,7 +102,7 @@ impl ResourceManager {
         };
 
         if needs_rebuild {
-            self.create_gpu_geometry(&geometry, handle, asset_version, asset_identity);
+            self.create_gpu_geometry(geometry, handle, asset_version, asset_identity);
         } else {
             // Only update the data version
             if let Some(gpu_geo) = self.resources.geometry_mut(handle) {
