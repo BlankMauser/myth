@@ -710,10 +710,14 @@ impl ExtractedScene {
                 .render_items
                 .get(extracted_source.index())
                 .expect("live frame source exceeds the extracted item table");
+            let Some(geometry_id) = geometry_frames.geometry_id(frame_source, item) else {
+                continue;
+            };
             if material_plans
                 .prepared_material(frame_source, item)
                 .is_none()
-                || geometry_frames.geometry_id(frame_source, item).is_none()
+                || geometry_frames.physical(geometry_id).is_none()
+                || !geometry_frames.pipeline_state_is_current(geometry_id)
             {
                 continue;
             }

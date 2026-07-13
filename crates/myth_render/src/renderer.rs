@@ -3628,7 +3628,7 @@ mod tests {
         assert_eq!(
             state.render_lists.opaque.len(),
             1,
-            "culling must retain the coherently extracted intent; GeometryFrame capture is the fail-closed asset-identity boundary"
+            "culling must retain the coherently extracted intent; the graph-build geometry qualification gate is the fail-closed asset-identity boundary"
         );
         assert_eq!(state.resource_manager.model_allocator.len(), 0);
         assert!(
@@ -3641,8 +3641,8 @@ mod tests {
             state
                 .resource_manager
                 .get_material(material_handle)
-                .is_some(),
-            "the independently current material may be prepared and retained even though the stale geometry closes the draw source"
+                .is_none(),
+            "a geometry generation rejected by the front-door qualification gate must suppress material preparation for that draw source"
         );
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);

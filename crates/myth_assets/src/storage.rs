@@ -8,10 +8,114 @@ use uuid::Uuid;
 use myth_resources::ImageHandle;
 use myth_resources::image::{DynamicImageError, Image};
 
+/// Maximum number of asset slots inspected while holding one storage read lock.
+///
+/// Batch APIs split larger inputs into chunks of this width so asset streaming
+/// writers are never blocked behind an unbounded read-side scan.
+pub const ASSET_READ_BATCH_WIDTH: usize = 64;
+
 /// Process-wide exact identity for a loaded asset allocation. Keeping this
 /// global (rather than per `AssetStorage`) also distinguishes two AssetServer
 /// instances whose slot handles and public versions happen to coincide.
 static NEXT_LOADED_ASSET_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+/// One loaded asset owner and the exact storage stamp observed with it.
+///
+/// The `Arc` keeps the observed allocation alive after the storage read lock is
+/// released. It does not promise that the allocation is still current; use
+/// [`AssetStorage::revalidate_batched`] before publishing derived state.
+#[derive(Debug)]
+pub struct LoadedAssetSnapshot<T> {
+    asset: Arc<T>,
+    version: u32,
+    identity: u64,
+}
+
+impl<T> LoadedAssetSnapshot<T> {
+    /// Returns the retained asset owner.
+    #[inline]
+    #[must_use]
+    pub fn asset(&self) -> &Arc<T> {
+        &self.asset
+    }
+
+    /// Returns the public content version observed with the asset.
+    #[inline]
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns the process-wide identity of the observed loaded allocation.
+    #[inline]
+    #[must_use]
+    pub const fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    /// Moves the retained asset owner out of the snapshot.
+    #[inline]
+    #[must_use]
+    pub fn into_asset(self) -> Arc<T> {
+        self.asset
+    }
+
+    /// Splits the snapshot without cloning its retained asset owner.
+    #[inline]
+    #[must_use]
+    pub fn into_parts(self) -> (Arc<T>, u32, u64) {
+        (self.asset, self.version, self.identity)
+    }
+}
+
+/// Input-aligned observation of one asset handle.
+///
+/// A missing [`loaded`](Self::loaded) value represents every state that is not
+/// currently renderable (`Loading`, `Failed`, or an invalid handle). Keeping
+/// the handle in the observation lets batch revalidation preserve this
+/// availability state without a second join table.
+#[derive(Debug)]
+pub struct AssetSnapshot<H: Key, T> {
+    handle: H,
+    loaded: Option<LoadedAssetSnapshot<T>>,
+}
+
+impl<H: Key, T> AssetSnapshot<H, T> {
+    /// Returns the handle associated with this input position.
+    #[inline]
+    #[must_use]
+    pub const fn handle(&self) -> H {
+        self.handle
+    }
+
+    /// Returns the exact loaded observation, or `None` when unavailable.
+    #[inline]
+    #[must_use]
+    pub const fn loaded(&self) -> Option<&LoadedAssetSnapshot<T>> {
+        self.loaded.as_ref()
+    }
+
+    /// Returns whether this handle was loaded when the batch was captured.
+    #[inline]
+    #[must_use]
+    pub const fn is_loaded(&self) -> bool {
+        self.loaded.is_some()
+    }
+
+    /// Moves the exact loaded observation out without cloning its asset owner.
+    #[inline]
+    #[must_use]
+    pub fn into_loaded(self) -> Option<LoadedAssetSnapshot<T>> {
+        self.loaded
+    }
+
+    /// Splits the input-aligned observation without cloning its asset owner.
+    #[inline]
+    #[must_use]
+    pub fn into_parts(self) -> (H, Option<LoadedAssetSnapshot<T>>) {
+        (self.handle, self.loaded)
+    }
+}
 
 /// Failure modes for zero-allocation dynamic image updates in [`AssetStorage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +462,147 @@ impl<H: Key, T> AssetStorage<H, T> {
         }
     }
 
+    /// Captures input-aligned loaded owners and exact storage stamps in bounded
+    /// read-side critical sections.
+    ///
+    /// `out` is caller-owned and reused across calls. Existing snapshots are
+    /// dropped and any required capacity is reserved before a storage lock is
+    /// acquired. Inputs longer than [`ASSET_READ_BATCH_WIDTH`] are deliberately
+    /// split across independent lock acquisitions; this is therefore a set of
+    /// exact per-entry observations, not one globally atomic storage snapshot.
+    /// Callers that need one retained owner per unique asset should
+    /// stable-deduplicate repeated handles before calling this method; input
+    /// order and duplicates are otherwise preserved exactly.
+    pub fn snapshot_batched(&self, handles: &[H], out: &mut Vec<AssetSnapshot<H, T>>) {
+        // Dropping retained Arcs or growing the output may invoke arbitrary
+        // destructors/allocator code, so both operations must precede locking.
+        out.clear();
+        out.reserve(handles.len());
+
+        for chunk in handles.chunks(ASSET_READ_BATCH_WIDTH) {
+            self.append_snapshot_chunk(chunk, out);
+        }
+    }
+
+    /// Revalidates input-aligned snapshots in bounded read-side critical
+    /// sections without cloning any asset owner.
+    ///
+    /// A loaded observation remains current only when its version, process-wide
+    /// identity, and exact `Arc` allocation all match. An unavailable
+    /// observation remains current while the handle is still not loaded.
+    pub fn revalidate_batched(&self, snapshots: &[AssetSnapshot<H, T>], out: &mut Vec<bool>) {
+        out.clear();
+        out.reserve(snapshots.len());
+
+        for chunk in snapshots.chunks(ASSET_READ_BATCH_WIDTH) {
+            self.append_revalidation_chunk(chunk, out);
+        }
+    }
+
+    /// Revalidates only selected snapshot positions in bounded read-side
+    /// critical sections.
+    ///
+    /// `indices` order and duplicates are preserved in `out`; an out-of-range
+    /// index fails closed as `false`. This lets a demand-driven consumer keep a
+    /// CPU-visible owner table while scanning only its stable-deduplicated live
+    /// subset after graph compilation.
+    pub fn revalidate_selected_batched(
+        &self,
+        snapshots: &[AssetSnapshot<H, T>],
+        indices: &[usize],
+        out: &mut Vec<bool>,
+    ) {
+        out.clear();
+        out.reserve(indices.len());
+
+        for chunk in indices.chunks(ASSET_READ_BATCH_WIDTH) {
+            self.append_selected_revalidation_chunk(snapshots, chunk, out);
+        }
+    }
+
+    #[inline]
+    fn append_snapshot_chunk(&self, handles: &[H], out: &mut Vec<AssetSnapshot<H, T>>) {
+        debug_assert!(handles.len() <= ASSET_READ_BATCH_WIDTH);
+        debug_assert!(out.capacity() - out.len() >= handles.len());
+
+        let guard = self.inner.read();
+        for &handle in handles {
+            let loaded = guard.get_loaded(handle).map(|entry| LoadedAssetSnapshot {
+                asset: Arc::clone(&entry.asset),
+                version: entry.version,
+                identity: entry.identity,
+            });
+            out.push(AssetSnapshot { handle, loaded });
+        }
+    }
+
+    #[inline]
+    fn append_revalidation_chunk(&self, snapshots: &[AssetSnapshot<H, T>], out: &mut Vec<bool>) {
+        debug_assert!(snapshots.len() <= ASSET_READ_BATCH_WIDTH);
+        debug_assert!(out.capacity() - out.len() >= snapshots.len());
+
+        let guard = self.inner.read();
+        for snapshot in snapshots {
+            out.push(Self::snapshot_is_current(&guard, snapshot));
+        }
+    }
+
+    #[inline]
+    fn append_selected_revalidation_chunk(
+        &self,
+        snapshots: &[AssetSnapshot<H, T>],
+        indices: &[usize],
+        out: &mut Vec<bool>,
+    ) {
+        debug_assert!(indices.len() <= ASSET_READ_BATCH_WIDTH);
+        debug_assert!(out.capacity() - out.len() >= indices.len());
+
+        let guard = self.inner.read();
+        for &index in indices {
+            out.push(
+                snapshots
+                    .get(index)
+                    .is_some_and(|snapshot| Self::snapshot_is_current(&guard, snapshot)),
+            );
+        }
+    }
+
+    #[inline]
+    fn snapshot_is_current(guard: &StorageInner<H, T>, snapshot: &AssetSnapshot<H, T>) -> bool {
+        let current = guard.get_loaded(snapshot.handle);
+        match (&snapshot.loaded, current) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => {
+                current.version == expected.version
+                    && current.identity == expected.identity
+                    && Arc::ptr_eq(&current.asset, &expected.asset)
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot_batched_with_chunk_hook(
+        &self,
+        handles: &[H],
+        out: &mut Vec<AssetSnapshot<H, T>>,
+        mut after_chunk: impl FnMut(usize),
+    ) {
+        out.clear();
+        out.reserve(handles.len());
+
+        let mut completed_chunks = 0;
+        for chunk in handles.chunks(ASSET_READ_BATCH_WIDTH) {
+            self.append_snapshot_chunk(chunk, out);
+            completed_chunks += 1;
+            if out.len() < handles.len() {
+                // append_snapshot_chunk's guard has been dropped before this
+                // test-only observation point.
+                after_chunk(completed_chunks);
+            }
+        }
+    }
+
     /// Queries the lifecycle state of a slot.
     pub fn get_state(&self, handle: H) -> Option<&'static str> {
         let guard = self.inner.read();
@@ -501,6 +746,162 @@ mod tests {
     use myth_resources::image::{ImageDimension, PixelFormat};
 
     use super::*;
+
+    fn loaded_value(snapshot: &AssetSnapshot<ImageHandle, u32>) -> Option<u32> {
+        snapshot.loaded().map(|loaded| **loaded.asset())
+    }
+
+    #[test]
+    fn batch_snapshot_preserves_input_order_and_unavailable_slots() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let first = storage.add(10_u32);
+        let loading = storage.reserve();
+        let failed = storage.reserve();
+        storage.mark_failed(failed, "expected failure".to_string());
+        let last = storage.add(40_u32);
+        let handles = [last, loading, first, failed];
+
+        let mut snapshots = Vec::new();
+        storage.snapshot_batched(&handles, &mut snapshots);
+
+        assert_eq!(snapshots.len(), handles.len());
+        for (snapshot, handle) in snapshots.iter().zip(handles) {
+            assert_eq!(snapshot.handle(), handle);
+        }
+        assert_eq!(loaded_value(&snapshots[0]), Some(40));
+        assert!(!snapshots[1].is_loaded());
+        assert_eq!(loaded_value(&snapshots[2]), Some(10));
+        assert!(!snapshots[3].is_loaded());
+
+        let mut current = Vec::new();
+        storage.revalidate_batched(&snapshots, &mut current);
+        assert_eq!(current, [true, true, true, true]);
+        storage.revalidate_selected_batched(&snapshots, &[2, 0, usize::MAX, 2], &mut current);
+        assert_eq!(current, [true, true, false, true]);
+
+        storage.insert_ready(loading, 20_u32);
+        storage.revalidate_batched(&snapshots, &mut current);
+        assert_eq!(current, [true, false, true, true]);
+    }
+
+    #[test]
+    fn batch_width_bounds_each_read_lock_critical_section() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let handles: Vec<_> = (0..=(ASSET_READ_BATCH_WIDTH * 2))
+            .map(|value| storage.add(value as u32))
+            .collect();
+        let mut snapshots = Vec::new();
+
+        for len in [
+            0,
+            ASSET_READ_BATCH_WIDTH - 1,
+            ASSET_READ_BATCH_WIDTH,
+            ASSET_READ_BATCH_WIDTH + 1,
+            ASSET_READ_BATCH_WIDTH * 2,
+            ASSET_READ_BATCH_WIDTH * 2 + 1,
+        ] {
+            let mut hooks = 0;
+            storage
+                .snapshot_batched_with_chunk_hook(&handles[..len], &mut snapshots, |_| hooks += 1);
+            assert_eq!(hooks, len.saturating_sub(1) / ASSET_READ_BATCH_WIDTH);
+            assert_eq!(snapshots.len(), len);
+        }
+
+        let mut cross_boundary_hooks = 0;
+        storage.snapshot_batched_with_chunk_hook(
+            &handles[..=ASSET_READ_BATCH_WIDTH],
+            &mut snapshots,
+            |completed| {
+                cross_boundary_hooks += 1;
+                assert_eq!(completed, 1);
+                assert!(
+                    storage.inner.try_write().is_some(),
+                    "the read guard must be released between chunks"
+                );
+                assert_eq!(
+                    storage.update(handles[ASSET_READ_BATCH_WIDTH], 999_u32),
+                    Some(2)
+                );
+            },
+        );
+
+        assert_eq!(cross_boundary_hooks, 1);
+        assert_eq!(snapshots.len(), ASSET_READ_BATCH_WIDTH + 1);
+        let last = snapshots.last().unwrap().loaded().unwrap();
+        assert_eq!(**last.asset(), 999);
+        assert_eq!(last.version(), 2);
+    }
+
+    #[test]
+    fn replacement_repopulation_and_slot_reuse_fail_exact_revalidation() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let handle = storage.add(1_u32);
+        let mut snapshots = Vec::new();
+        let mut current = Vec::new();
+
+        storage.snapshot_batched(&[handle], &mut snapshots);
+        let first_identity = snapshots[0].loaded().unwrap().identity();
+        assert_eq!(storage.update(handle, 2_u32), Some(2));
+        storage.revalidate_batched(&snapshots, &mut current);
+        assert_eq!(current, [false]);
+
+        storage.snapshot_batched(&[handle], &mut snapshots);
+        let replacement_identity = snapshots[0].loaded().unwrap().identity();
+        assert_ne!(replacement_identity, first_identity);
+        storage.insert_ready(handle, 3_u32);
+        let (_, repopulated_version, repopulated_identity) = storage
+            .get_entry_with_identity(handle)
+            .expect("repopulated asset missing");
+        assert_eq!(repopulated_version, 1);
+        assert_ne!(repopulated_identity, replacement_identity);
+        storage.revalidate_batched(&snapshots, &mut current);
+        assert_eq!(current, [false]);
+
+        storage.snapshot_batched(&[handle], &mut snapshots);
+        drop(storage.remove(handle).expect("asset slot missing"));
+        let reused = storage.add(4_u32);
+        assert_ne!(reused, handle, "SlotMap generation must change on reuse");
+        storage.revalidate_batched(&snapshots, &mut current);
+        assert_eq!(current, [false]);
+    }
+
+    #[test]
+    fn batch_output_capacity_is_reused() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let handles: Vec<_> = (0..(ASSET_READ_BATCH_WIDTH * 2))
+            .map(|value| storage.add(value as u32))
+            .collect();
+        let mut snapshots = Vec::new();
+
+        storage.snapshot_batched(&handles, &mut snapshots);
+        let allocation = snapshots.as_ptr();
+        let capacity = snapshots.capacity();
+        assert!(capacity >= handles.len());
+
+        storage.snapshot_batched(&handles[..1], &mut snapshots);
+        assert_eq!(snapshots.as_ptr(), allocation);
+        assert_eq!(snapshots.capacity(), capacity);
+        assert_eq!(snapshots.len(), 1);
+    }
+
+    #[test]
+    fn batch_revalidation_does_not_clone_retained_asset_owners() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let handle = storage.add(7_u32);
+        let mut snapshots = Vec::new();
+        storage.snapshot_batched(&[handle], &mut snapshots);
+
+        let retained = snapshots[0].loaded().unwrap().asset();
+        let owners_before = Arc::strong_count(retained);
+        let mut current = Vec::new();
+        storage.revalidate_batched(&snapshots, &mut current);
+
+        assert_eq!(current, [true]);
+        assert_eq!(Arc::strong_count(retained), owners_before);
+        storage.revalidate_selected_batched(&snapshots, &[0, 0], &mut current);
+        assert_eq!(current, [true, true]);
+        assert_eq!(Arc::strong_count(retained), owners_before);
+    }
 
     fn dynamic_image(value: u8) -> Image {
         Image::new_dynamic(

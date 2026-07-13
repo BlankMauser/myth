@@ -6,18 +6,17 @@
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use myth_assets::{AssetServer, GeometryHandle};
+use myth_assets::{AssetServer, AssetSnapshot, GeometryHandle};
 use myth_resources::geometry::Geometry;
 use myth_resources::shader_defines::ShaderDefines;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::core::{BindingInterfaceId, ResourceManager};
 
 use super::capacity::{
-    CapacityUsage, estimated_hash_map_footprint, estimated_hash_set_footprint,
-    shrink_hash_map_by_family_ratio, shrink_hash_set_by_family_ratio, shrink_vec_by_family_ratio,
-    vec_footprint,
+    CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
+    shrink_vec_by_family_ratio, vec_footprint,
 };
 #[cfg(test)]
 use super::extracted::MaterialClassification;
@@ -37,6 +36,51 @@ impl GeometryFrameId {
             .and_then(|index| index.checked_add(1))
             .and_then(NonZeroU32::new)
             .expect("geometry frame record index exceeds u32::MAX - 1");
+        Self(raw)
+    }
+
+    #[inline]
+    const fn index(self) -> usize {
+        self.0.get() as usize - 1
+    }
+}
+
+/// Compact index into the stable-deduplicated asset batch captured before
+/// material topology is registered in the graph.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct GeometryAssetSnapshotId(NonZeroU32);
+
+impl GeometryAssetSnapshotId {
+    #[inline]
+    fn from_index(index: usize) -> Self {
+        let raw = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .expect("geometry asset snapshot index exceeds u32::MAX - 1");
+        Self(raw)
+    }
+
+    #[inline]
+    const fn index(self) -> usize {
+        self.0.get() as usize - 1
+    }
+}
+
+/// Dense post-DPE index into the selected subset of visible snapshots.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct GeometryLiveSnapshotId(NonZeroU32);
+
+impl GeometryLiveSnapshotId {
+    #[inline]
+    fn from_index(index: usize) -> Self {
+        let raw = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .expect("live geometry snapshot index exceeds u32::MAX - 1");
         Self(raw)
     }
 
@@ -86,37 +130,139 @@ pub(crate) struct GeometryFramePhysical {
 
 /// Compact source join and unique geometry-owner table for one graph attempt.
 pub(crate) struct GeometryFrameStore {
+    /// Stable first-occurrence handle order for bounded AssetStorage capture.
+    asset_handles: Vec<GeometryHandle>,
+    asset_handle_lookup: FxHashMap<GeometryHandle, GeometryAssetSnapshotId>,
+    /// Exact CPU owners captured before material texture topology is emitted.
+    /// The batch is per-entry coherent, then revalidated at each publication
+    /// boundary; it is intentionally not presented as one atomic storage view.
+    asset_snapshots: Vec<AssetSnapshot<GeometryHandle, Geometry>>,
+    asset_current: Vec<bool>,
+    /// Stable-deduplicated post-DPE selection. Values index asset_snapshots;
+    /// revalidation therefore touches only unique live owners.
+    live_snapshot_indices: Vec<usize>,
+    live_snapshot_lookup: FxHashMap<GeometryAssetSnapshotId, GeometryLiveSnapshotId>,
+    live_current: Vec<bool>,
     records: Vec<GeometryFrameRecord>,
-    lookup: FxHashMap<GeometryFrameKey, GeometryFrameId>,
-    /// The extracted snapshot does not contain the interior geometry epochs.
-    /// This secondary lookup lets repeated sources reuse the first coherent
-    /// record without another AssetStorage read or `Arc` clone.
-    stamp_lookup: FxHashMap<(GeometryHandle, u32, u64), GeometryFrameId>,
-    failed_stamps: FxHashSet<(GeometryHandle, u32, u64)>,
+    /// Parallel joins between the post-DPE record and its exact pregraph owner.
+    record_snapshots: Vec<GeometryLiveSnapshotId>,
+    snapshot_records: Vec<Option<GeometryFrameId>>,
+    /// Memoizes an incoherent interior-epoch capture without allocating a
+    /// failure hash entry or retrying it for every source sharing the owner.
+    failed_snapshots: Vec<bool>,
     source_geometries: Vec<Option<GeometryFrameId>>,
     initialized: bool,
+    live_captured: bool,
 }
 
 const GEOMETRY_FRAME_RECORD_BASELINE: usize = 256;
 const GEOMETRY_FRAME_SOURCE_BASELINE: usize = 512;
-const GEOMETRY_FRAME_FAILED_BASELINE: usize = 64;
+
+#[inline]
+fn bit_vec_footprint(value: &Vec<bool>, baseline_capacity: usize) -> CapacityUsage {
+    CapacityUsage::new(
+        value.len().div_ceil(8),
+        value.capacity().div_ceil(8),
+        baseline_capacity.div_ceil(8),
+    )
+}
 
 impl GeometryFrameStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
+            asset_handles: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
+            asset_handle_lookup: FxHashMap::default(),
+            asset_snapshots: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
+            asset_current: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
+            live_snapshot_indices: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
+            live_snapshot_lookup: FxHashMap::default(),
+            live_current: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
             records: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
-            lookup: FxHashMap::default(),
-            stamp_lookup: FxHashMap::default(),
-            failed_stamps: FxHashSet::default(),
+            record_snapshots: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
+            snapshot_records: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
+            failed_snapshots: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
             source_geometries: Vec::with_capacity(GEOMETRY_FRAME_SOURCE_BASELINE),
             initialized: false,
+            live_captured: false,
         }
     }
 
-    /// Capture the unique geometry owners referenced by the post-DPE source
-    /// union. AssetStorage traffic and `Arc` clones are O(unique geometries),
-    /// never O(draw sources).
+    /// Capture one exact CPU owner for every stable-deduplicated geometry
+    /// handle in the CPU-visible source domain.
+    ///
+    /// This runs before material topology is registered so a stale geometry
+    /// cannot cause texture producers or material work to enter the graph.
+    /// The AssetStorage read lock is bounded to the storage batch width and is
+    /// never held while deriving geometry state.
+    pub(crate) fn capture_visible(
+        &mut self,
+        assets: &AssetServer,
+        extracted_scene: &ExtractedScene,
+        render_lists: &RenderLists,
+    ) {
+        assert!(
+            !self.initialized,
+            "geometry frame store may be captured only once per graph attempt"
+        );
+        debug_assert!(self.asset_handles.is_empty());
+        debug_assert!(self.asset_handle_lookup.is_empty());
+        debug_assert!(self.asset_snapshots.is_empty());
+        debug_assert!(self.asset_current.is_empty());
+        debug_assert!(self.live_snapshot_indices.is_empty());
+        debug_assert!(self.live_snapshot_lookup.is_empty());
+        debug_assert!(self.live_current.is_empty());
+        debug_assert!(self.records.is_empty());
+        debug_assert!(self.record_snapshots.is_empty());
+        debug_assert!(self.snapshot_records.is_empty());
+        debug_assert!(self.failed_snapshots.is_empty());
+        debug_assert!(self.source_geometries.is_empty());
+
+        for source in render_lists.frame_source_ids() {
+            let Some(extracted_source) = render_lists.extracted_source(source) else {
+                continue;
+            };
+            let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
+                continue;
+            };
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.asset_handle_lookup.entry(item.geometry)
+            {
+                let id = GeometryAssetSnapshotId::from_index(self.asset_handles.len());
+                self.asset_handles.push(item.geometry);
+                entry.insert(id);
+            }
+        }
+
+        assets
+            .geometries
+            .snapshot_batched(&self.asset_handles, &mut self.asset_snapshots);
+        assets
+            .geometries
+            .revalidate_batched(&self.asset_snapshots, &mut self.asset_current);
+        debug_assert_eq!(self.asset_handles.len(), self.asset_snapshots.len());
+        debug_assert_eq!(self.asset_snapshots.len(), self.asset_current.len());
+
+        self.initialized = true;
+    }
+
+    #[must_use]
+    pub(crate) const fn eligibility<'a>(
+        &'a self,
+        extracted_scene: &'a ExtractedScene,
+        render_lists: &'a RenderLists,
+    ) -> GeometryEligibilityResolver<'a> {
+        GeometryEligibilityResolver {
+            store: self,
+            extracted_scene,
+            render_lists,
+        }
+    }
+
+    /// Derive interior geometry state only for the post-DPE source union.
+    /// Post-DPE AssetStorage traffic and retained record owners are O(unique
+    /// live geometries), never O(visible or draw sources); all storage critical
+    /// sections use the fixed-width batch API.
     pub(crate) fn capture_live(
         &mut self,
         assets: &AssetServer,
@@ -125,57 +271,80 @@ impl GeometryFrameStore {
         live_sources: &[FrameSourceId],
     ) {
         assert!(
-            !self.initialized,
-            "geometry frame store may be captured only once per graph attempt"
+            self.initialized,
+            "visible geometry owners were not captured before graph topology"
+        );
+        assert!(
+            !self.live_captured,
+            "live geometry state may be captured only once per graph attempt"
         );
         debug_assert!(self.records.is_empty());
-        debug_assert!(self.lookup.is_empty());
-        debug_assert!(self.stamp_lookup.is_empty());
-        debug_assert!(self.failed_stamps.is_empty());
+        debug_assert!(self.live_snapshot_indices.is_empty());
+        debug_assert!(self.live_snapshot_lookup.is_empty());
+        debug_assert!(self.live_current.is_empty());
+        debug_assert!(self.record_snapshots.is_empty());
+        debug_assert!(self.snapshot_records.is_empty());
+        debug_assert!(self.failed_snapshots.is_empty());
         debug_assert!(self.source_geometries.is_empty());
 
-        self.source_geometries
-            .resize(render_lists.frame_source_count(), None);
-        self.initialized = true;
-
+        // Project the source union into one compact, stable first-occurrence
+        // list before touching AssetStorage again. The all-visible owner table
+        // remains available for topology identity, but every post-DPE scan is
+        // bounded by unique live Geometry count.
         for &source in live_sources {
-            let Some(slot) = self.source_geometries.get(source.index()) else {
-                continue;
-            };
-            if slot.is_some() {
-                continue;
-            }
             let Some(extracted_source) = render_lists.extracted_source(source) else {
                 continue;
             };
             let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
                 continue;
             };
-            let stamp = (
-                item.geometry,
-                item.geometry_asset_version,
-                item.geometry_asset_identity,
-            );
-            if let Some(&id) = self.stamp_lookup.get(&stamp) {
-                self.source_geometries[source.index()] = Some(id);
-                continue;
-            }
-            if self.failed_stamps.contains(&stamp) {
-                continue;
-            }
-
-            let Some((asset, asset_version, asset_identity)) =
-                assets.geometries.get_entry_with_identity(item.geometry)
-            else {
-                self.failed_stamps.insert(stamp);
+            let Some(snapshot_id) = self.snapshot_id_for_item(item) else {
                 continue;
             };
-            if (asset_version, asset_identity)
-                != (item.geometry_asset_version, item.geometry_asset_identity)
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.live_snapshot_lookup.entry(snapshot_id)
             {
-                self.failed_stamps.insert(stamp);
+                let live_id = GeometryLiveSnapshotId::from_index(self.live_snapshot_indices.len());
+                self.live_snapshot_indices.push(snapshot_id.index());
+                entry.insert(live_id);
+            }
+        }
+        assets.geometries.revalidate_selected_batched(
+            &self.asset_snapshots,
+            &self.live_snapshot_indices,
+            &mut self.live_current,
+        );
+        self.snapshot_records
+            .resize(self.live_snapshot_indices.len(), None);
+        self.failed_snapshots
+            .resize(self.live_snapshot_indices.len(), false);
+        self.source_geometries
+            .resize(render_lists.frame_source_count(), None);
+
+        for &source in live_sources {
+            let Some(extracted_source) = render_lists.extracted_source(source) else {
+                continue;
+            };
+            let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
+                continue;
+            };
+            let Some(snapshot_id) = self.snapshot_id_for_item(item) else {
+                continue;
+            };
+            let Some(&live_id) = self.live_snapshot_lookup.get(&snapshot_id) else {
+                continue;
+            };
+            if self.live_current.get(live_id.index()).copied() != Some(true)
+                || self.snapshot_records[live_id.index()].is_some()
+                || self.failed_snapshots[live_id.index()]
+            {
                 continue;
             }
+            let Some(loaded) = self.asset_snapshots[snapshot_id.index()].loaded() else {
+                self.failed_snapshots[live_id.index()] = true;
+                continue;
+            };
+            let asset = loaded.asset();
 
             let structure_version = asset.structure_version();
             let layout_version = asset.layout_version();
@@ -184,37 +353,57 @@ impl GeometryFrameStore {
             // Keep the CPU interface snapshot coherent with its exact owner.
             if (structure_version, layout_version)
                 != (asset.structure_version(), asset.layout_version())
-                || assets.geometries.get_version_and_identity(item.geometry)
-                    != Some((asset_version, asset_identity))
             {
-                self.failed_stamps.insert(stamp);
+                self.failed_snapshots[live_id.index()] = true;
                 continue;
             }
 
             let key = GeometryFrameKey {
                 handle: item.geometry,
-                asset_version,
-                asset_identity,
+                asset_version: loaded.version(),
+                asset_identity: loaded.identity(),
                 structure_version,
                 layout_version,
             };
-            let id = if let Some(&id) = self.lookup.get(&key) {
-                id
-            } else {
-                let id = GeometryFrameId::from_index(self.records.len());
-                self.records.push(GeometryFrameRecord {
-                    key,
-                    asset,
-                    shader_defines,
-                    topology,
-                    physical: None,
-                });
-                assert!(self.lookup.insert(key, id).is_none());
-                id
-            };
-            assert!(self.stamp_lookup.insert(stamp, id).is_none());
-            self.source_geometries[source.index()] = Some(id);
+            let id = GeometryFrameId::from_index(self.records.len());
+            self.records.push(GeometryFrameRecord {
+                key,
+                asset: Arc::clone(asset),
+                shader_defines,
+                topology,
+                physical: None,
+            });
+            self.record_snapshots.push(live_id);
+            self.snapshot_records[live_id.index()] = Some(id);
         }
+
+        // Revalidate after CPU derivation, then publish only coherent joins.
+        assets.geometries.revalidate_selected_batched(
+            &self.asset_snapshots,
+            &self.live_snapshot_indices,
+            &mut self.live_current,
+        );
+        for &source in live_sources {
+            let Some(extracted_source) = render_lists.extracted_source(source) else {
+                continue;
+            };
+            let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
+                continue;
+            };
+            let Some(snapshot_id) = self.snapshot_id_for_item(item) else {
+                continue;
+            };
+            let Some(&live_id) = self.live_snapshot_lookup.get(&snapshot_id) else {
+                continue;
+            };
+            let Some(id) = self.snapshot_records[live_id.index()] else {
+                continue;
+            };
+            if self.record_is_current_from_batch(id) {
+                self.source_geometries[source.index()] = Some(id);
+            }
+        }
+        self.live_captured = true;
     }
 
     /// Materialize and intern each unique DPE-live geometry exactly once.
@@ -226,10 +415,15 @@ impl GeometryFrameStore {
         resource_manager: &mut ResourceManager,
         draw_plans: &mut DrawPlanStore,
     ) {
-        assert!(self.initialized, "geometry frame store was not captured");
+        assert!(self.live_captured, "live geometry state was not captured");
+        assets.geometries.revalidate_selected_batched(
+            &self.asset_snapshots,
+            &self.live_snapshot_indices,
+            &mut self.live_current,
+        );
         for index in 0..self.records.len() {
             let id = GeometryFrameId::from_index(index);
-            if !self.is_current(assets, id) {
+            if !self.record_is_current_from_batch(id) {
                 continue;
             }
             let record = &self.records[index];
@@ -275,6 +469,20 @@ impl GeometryFrameStore {
                 layout_id: gpu.layout_id,
             });
         }
+
+        // A writer may have replaced an owner while physical preparation ran.
+        // Close that window in one bounded pass and retract stale publication.
+        assets.geometries.revalidate_selected_batched(
+            &self.asset_snapshots,
+            &self.live_snapshot_indices,
+            &mut self.live_current,
+        );
+        for index in 0..self.records.len() {
+            let id = GeometryFrameId::from_index(index);
+            if !self.record_is_current_from_batch(id) {
+                self.records[index].physical = None;
+            }
+        }
     }
 
     #[must_use]
@@ -284,6 +492,7 @@ impl GeometryFrameStore {
 
     /// Validate both the exact AssetStorage owner and its pipeline-relevant
     /// interior epochs. This is the fail-closed boundary before publication.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_current(&self, assets: &AssetServer, id: GeometryFrameId) -> bool {
         let Some(record) = self.records.get(id.index()) else {
@@ -300,6 +509,56 @@ impl GeometryFrameStore {
             })
     }
 
+    #[inline]
+    fn snapshot_matches_item(
+        &self,
+        id: GeometryAssetSnapshotId,
+        item: &ExtractedRenderItem,
+    ) -> bool {
+        self.asset_current.get(id.index()).copied() == Some(true)
+            && self
+                .asset_snapshots
+                .get(id.index())
+                .is_some_and(|snapshot| {
+                    snapshot.handle() == item.geometry
+                        && snapshot.loaded().is_some_and(|loaded| {
+                            (loaded.version(), loaded.identity())
+                                == (item.geometry_asset_version, item.geometry_asset_identity)
+                        })
+                })
+    }
+
+    #[inline]
+    fn snapshot_id_for_item(&self, item: &ExtractedRenderItem) -> Option<GeometryAssetSnapshotId> {
+        let &id = self.asset_handle_lookup.get(&item.geometry)?;
+        self.snapshot_matches_item(id, item).then_some(id)
+    }
+
+    #[inline]
+    fn record_is_current_from_batch(&self, id: GeometryFrameId) -> bool {
+        let Some(record) = self.records.get(id.index()) else {
+            return false;
+        };
+        let Some(&live_id) = self.record_snapshots.get(id.index()) else {
+            return false;
+        };
+        let Some(&snapshot_index) = self.live_snapshot_indices.get(live_id.index()) else {
+            return false;
+        };
+        self.live_current.get(live_id.index()).copied() == Some(true)
+            && self
+                .asset_snapshots
+                .get(snapshot_index)
+                .and_then(AssetSnapshot::loaded)
+                .is_some_and(|loaded| {
+                    loaded.version() == record.key.asset_version
+                        && loaded.identity() == record.key.asset_identity
+                        && Arc::ptr_eq(loaded.asset(), &record.asset)
+                        && record.asset.structure_version() == record.key.structure_version
+                        && record.asset.layout_version() == record.key.layout_version
+                })
+    }
+
     /// Cheap owner-local double-check used around deferred pipeline derivation.
     #[must_use]
     pub(crate) fn pipeline_state_is_current(&self, id: GeometryFrameId) -> bool {
@@ -312,43 +571,106 @@ impl GeometryFrameStore {
     /// Release every graph-attempt owner while retaining allocations.
     pub(crate) fn clear(&mut self) {
         self.source_geometries.clear();
-        self.stamp_lookup.clear();
-        self.failed_stamps.clear();
-        self.lookup.clear();
+        self.snapshot_records.clear();
+        self.failed_snapshots.clear();
+        self.record_snapshots.clear();
         self.records.clear();
+        self.live_current.clear();
+        self.live_snapshot_lookup.clear();
+        self.live_snapshot_indices.clear();
+        self.asset_current.clear();
+        self.asset_snapshots.clear();
+        self.asset_handle_lookup.clear();
+        self.asset_handles.clear();
         self.initialized = false;
+        self.live_captured = false;
     }
 
     pub(crate) fn capacity_usage(&self) -> CapacityUsage {
-        vec_footprint(&self.records, GEOMETRY_FRAME_RECORD_BASELINE)
-            + estimated_hash_map_footprint(&self.lookup, GEOMETRY_FRAME_RECORD_BASELINE)
-            + estimated_hash_map_footprint(&self.stamp_lookup, GEOMETRY_FRAME_RECORD_BASELINE)
-            + estimated_hash_set_footprint(&self.failed_stamps, GEOMETRY_FRAME_FAILED_BASELINE)
+        vec_footprint(&self.asset_handles, GEOMETRY_FRAME_RECORD_BASELINE)
+            + estimated_hash_map_footprint(
+                &self.asset_handle_lookup,
+                GEOMETRY_FRAME_RECORD_BASELINE,
+            )
+            + vec_footprint(&self.asset_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
+            + bit_vec_footprint(&self.asset_current, GEOMETRY_FRAME_RECORD_BASELINE)
+            + vec_footprint(&self.live_snapshot_indices, GEOMETRY_FRAME_RECORD_BASELINE)
+            + estimated_hash_map_footprint(
+                &self.live_snapshot_lookup,
+                GEOMETRY_FRAME_RECORD_BASELINE,
+            )
+            + bit_vec_footprint(&self.live_current, GEOMETRY_FRAME_RECORD_BASELINE)
+            + vec_footprint(&self.records, GEOMETRY_FRAME_RECORD_BASELINE)
+            + vec_footprint(&self.record_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
+            + vec_footprint(&self.snapshot_records, GEOMETRY_FRAME_RECORD_BASELINE)
+            + bit_vec_footprint(&self.failed_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.source_geometries, GEOMETRY_FRAME_SOURCE_BASELINE)
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        shrink_vec_by_family_ratio(
+            &mut self.asset_handles,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.asset_handle_lookup,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.asset_snapshots,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.asset_current,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.live_snapshot_indices,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.live_snapshot_lookup,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.live_current,
+            GEOMETRY_FRAME_RECORD_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
         shrink_vec_by_family_ratio(
             &mut self.records,
             GEOMETRY_FRAME_RECORD_BASELINE,
             target_bytes,
             retained_bytes,
         );
-        shrink_hash_map_by_family_ratio(
-            &mut self.lookup,
+        shrink_vec_by_family_ratio(
+            &mut self.record_snapshots,
             GEOMETRY_FRAME_RECORD_BASELINE,
             target_bytes,
             retained_bytes,
         );
-        shrink_hash_map_by_family_ratio(
-            &mut self.stamp_lookup,
+        shrink_vec_by_family_ratio(
+            &mut self.snapshot_records,
             GEOMETRY_FRAME_RECORD_BASELINE,
             target_bytes,
             retained_bytes,
         );
-        shrink_hash_set_by_family_ratio(
-            &mut self.failed_stamps,
-            GEOMETRY_FRAME_FAILED_BASELINE,
+        shrink_vec_by_family_ratio(
+            &mut self.failed_snapshots,
+            GEOMETRY_FRAME_RECORD_BASELINE,
             target_bytes,
             retained_bytes,
         );
@@ -375,18 +697,54 @@ impl GeometryFrameStore {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.records.is_empty()
-            && self.lookup.is_empty()
-            && self.stamp_lookup.is_empty()
-            && self.failed_stamps.is_empty()
+        self.asset_handles.is_empty()
+            && self.asset_handle_lookup.is_empty()
+            && self.asset_snapshots.is_empty()
+            && self.asset_current.is_empty()
+            && self.live_snapshot_indices.is_empty()
+            && self.live_snapshot_lookup.is_empty()
+            && self.live_current.is_empty()
+            && self.records.is_empty()
+            && self.record_snapshots.is_empty()
+            && self.snapshot_records.is_empty()
+            && self.failed_snapshots.is_empty()
             && self.source_geometries.is_empty()
             && !self.initialized
+            && !self.live_captured
     }
 }
 
 impl Default for GeometryFrameStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Read-only graph-build gate for material and texture topology.
+#[derive(Clone, Copy)]
+pub(crate) struct GeometryEligibilityResolver<'a> {
+    store: &'a GeometryFrameStore,
+    extracted_scene: &'a ExtractedScene,
+    render_lists: &'a RenderLists,
+}
+
+impl GeometryEligibilityResolver<'_> {
+    /// Return true only when this source still names the exact pregraph owner
+    /// captured for its extracted geometry stamp.
+    #[must_use]
+    pub(crate) fn source_is_eligible(
+        self,
+        source: FrameSourceId,
+        item: &ExtractedRenderItem,
+    ) -> bool {
+        debug_assert!(
+            self.render_lists
+                .extracted_source(source)
+                .and_then(|source| self.extracted_scene.render_items.get(source.index()))
+                .is_some_and(|resolved| std::ptr::eq(resolved, item)),
+            "geometry eligibility received an item from a different frame source"
+        );
+        self.store.snapshot_id_for_item(item).is_some()
     }
 }
 
@@ -596,9 +954,15 @@ mod tests {
     fn frame_asset_ids_are_copy_sized_handles() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<GeometryFrameId>();
+        assert_copy::<GeometryAssetSnapshotId>();
+        assert_copy::<GeometryLiveSnapshotId>();
         assert_copy::<ObjectInterfaceId>();
         assert_eq!(std::mem::size_of::<GeometryFrameId>(), 4);
         assert_eq!(std::mem::size_of::<Option<GeometryFrameId>>(), 4);
+        assert_eq!(std::mem::size_of::<GeometryAssetSnapshotId>(), 4);
+        assert_eq!(std::mem::size_of::<Option<GeometryAssetSnapshotId>>(), 4);
+        assert_eq!(std::mem::size_of::<GeometryLiveSnapshotId>(), 4);
+        assert_eq!(std::mem::size_of::<Option<GeometryLiveSnapshotId>>(), 4);
         assert_eq!(std::mem::size_of::<ObjectInterfaceId>(), 4);
     }
 
@@ -634,6 +998,7 @@ mod tests {
         let first = lists.intern_frame_source(ExtractedSourceId::from_index(0));
         let second = lists.intern_frame_source(ExtractedSourceId::from_index(1));
         let mut store = GeometryFrameStore::new();
+        store.capture_visible(&assets, &extracted, &lists);
         store.capture_live(&assets, &extracted, &lists, &[first, second]);
 
         let resolver = store.resolver();
@@ -648,8 +1013,8 @@ mod tests {
         assert_eq!(store.joined_source_count(), 2);
         assert_eq!(
             Arc::strong_count(&resolver.geometry(first_id).unwrap().asset),
-            2,
-            "AssetStorage plus one frame record must be the only Geometry owners"
+            3,
+            "owner count must remain storage + one unique snapshot + one live record, independent of draw count"
         );
         assert!(store.is_current(&assets, first_id));
         assert!(store.pipeline_state_is_current(first_id));
@@ -679,14 +1044,177 @@ mod tests {
         }
 
         let mut store = GeometryFrameStore::new();
+        store.capture_visible(&assets, &extracted, &lists);
         store.capture_live(&assets, &extracted, &lists, &live);
 
         assert_eq!(store.records.len(), 1);
+        assert_eq!(store.asset_handles.len(), 1);
+        assert_eq!(store.asset_snapshots.len(), 1);
+        assert_eq!(store.live_snapshot_indices.len(), 1);
+        assert_eq!(store.live_snapshot_lookup.len(), 1);
+        assert_eq!(store.live_current.len(), 1);
+        assert_eq!(store.record_snapshots.len(), 1);
+        assert_eq!(store.snapshot_records.len(), 1);
+        assert_eq!(store.failed_snapshots.len(), 1);
         assert!(
             store.records.capacity() < SOURCE_COUNT / 4,
             "unique Geometry records must retain a unique-asset high-water mark"
         );
-        assert!(store.lookup.capacity() < SOURCE_COUNT / 4);
-        assert!(store.stamp_lookup.capacity() < SOURCE_COUNT / 4);
+        assert!(store.asset_handles.capacity() < SOURCE_COUNT / 4);
+        assert!(store.asset_handle_lookup.capacity() < SOURCE_COUNT / 4);
+        assert!(store.asset_snapshots.capacity() < SOURCE_COUNT / 4);
+        assert!(store.asset_current.capacity() < SOURCE_COUNT / 4);
+        assert!(store.live_snapshot_indices.capacity() < SOURCE_COUNT / 4);
+        assert!(store.live_snapshot_lookup.capacity() < SOURCE_COUNT / 4);
+        assert!(store.live_current.capacity() < SOURCE_COUNT / 4);
+        assert!(store.record_snapshots.capacity() < SOURCE_COUNT / 4);
+        assert!(store.snapshot_records.capacity() < SOURCE_COUNT / 4);
+        assert!(store.failed_snapshots.capacity() < SOURCE_COUNT / 4);
+        assert_eq!(store.source_geometries.len(), SOURCE_COUNT);
+    }
+
+    #[test]
+    fn post_dpe_geometry_revalidation_projects_only_the_nonprefix_live_subset() {
+        const VISIBLE_COUNT: usize = 130;
+        let assets = AssetServer::new();
+        let mut extracted = ExtractedScene::new();
+        let mut lists = RenderLists::new();
+        let mut sources = Vec::with_capacity(VISIBLE_COUNT);
+        for index in 0..VISIBLE_COUNT {
+            let handle = assets.geometries.add(Geometry::new());
+            let (_, version, identity) = assets
+                .geometries
+                .get_entry_with_identity(handle)
+                .expect("geometry missing");
+            extracted
+                .render_items
+                .push(extracted_item(handle, version, identity));
+            sources.push(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
+        }
+
+        let live = *sources.last().expect("visible source list is empty");
+        let mut store = GeometryFrameStore::new();
+        store.capture_visible(&assets, &extracted, &lists);
+        store.capture_live(&assets, &extracted, &lists, &[live]);
+
+        assert_eq!(store.asset_snapshots.len(), VISIBLE_COUNT);
+        assert_eq!(store.live_snapshot_indices, [VISIBLE_COUNT - 1]);
+        assert_eq!(store.live_current, [true]);
+        assert_eq!(store.records.len(), 1);
+        assert_eq!(
+            store.records[0].key.handle,
+            extracted.render_items.last().unwrap().geometry
+        );
+        assert!(
+            store
+                .resolver()
+                .geometry_id(live, extracted.render_items.last().unwrap())
+                .is_some()
+        );
+        assert!(
+            store
+                .resolver()
+                .geometry_id(sources[0], &extracted.render_items[0])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn selected_live_geometry_rejects_same_version_replacement_after_pregraph_capture() {
+        let assets = AssetServer::new();
+        let handle = assets.geometries.add(Geometry::new());
+        let (_, version, identity) = assets
+            .geometries
+            .get_entry_with_identity(handle)
+            .expect("geometry missing");
+        let mut extracted = ExtractedScene::new();
+        extracted
+            .render_items
+            .push(extracted_item(handle, version, identity));
+        let mut lists = RenderLists::new();
+        let source = lists.intern_frame_source(ExtractedSourceId::from_index(0));
+        let mut store = GeometryFrameStore::new();
+        store.capture_visible(&assets, &extracted, &lists);
+
+        assets.geometries.insert_ready(handle, Geometry::new());
+        assert_eq!(assets.geometries.get_version(handle), Some(version));
+        store.capture_live(&assets, &extracted, &lists, &[source]);
+
+        assert_eq!(store.live_snapshot_indices, [0]);
+        assert_eq!(store.live_current, [false]);
+        assert!(store.records.is_empty());
+        assert_eq!(store.joined_source_count(), 0);
+        assert!(
+            store
+                .resolver()
+                .geometry_id(source, &extracted.render_items[0])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn geometry_snapshot_capacity_is_accounted_trimmed_and_releases_owners() {
+        const UNIQUE_COUNT: usize = 1024;
+        let assets = AssetServer::new();
+        let mut extracted = ExtractedScene::new();
+        let mut lists = RenderLists::new();
+        let mut live = Vec::with_capacity(UNIQUE_COUNT);
+        let mut first_handle = None;
+
+        for index in 0..UNIQUE_COUNT {
+            let handle = assets.geometries.add(Geometry::new());
+            first_handle.get_or_insert(handle);
+            let (_, asset_version, asset_identity) = assets
+                .geometries
+                .get_entry_with_identity(handle)
+                .expect("geometry missing");
+            extracted
+                .render_items
+                .push(extracted_item(handle, asset_version, asset_identity));
+            live.push(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
+        }
+
+        let mut store = GeometryFrameStore::new();
+        store.capture_visible(&assets, &extracted, &lists);
+        store.capture_live(&assets, &extracted, &lists, &live);
+
+        let retained_owner = assets
+            .geometries
+            .get(first_handle.expect("no geometry was inserted"))
+            .expect("first geometry missing");
+        assert_eq!(
+            Arc::strong_count(&retained_owner),
+            4,
+            "storage, test owner, unique snapshot, and live record are the only owners"
+        );
+        let populated = store.capacity_usage();
+        assert!(populated.active_bytes > populated.baseline_bytes);
+
+        store.clear();
+        assert_eq!(
+            Arc::strong_count(&retained_owner),
+            2,
+            "clearing the graph attempt must release both retained Geometry owners"
+        );
+        let cleared = store.capacity_usage();
+        assert_eq!(cleared.active_bytes, 0);
+        assert_eq!(cleared.retained_bytes, populated.retained_bytes);
+
+        store.trim_capacity(cleared.baseline_bytes, cleared.retained_bytes);
+        let trimmed = store.capacity_usage();
+        assert!(trimmed.retained_bytes < cleared.retained_bytes);
+        assert!(trimmed.retained_bytes >= trimmed.baseline_bytes);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn packed_geometry_revalidation_bits_are_accounted_as_bits() {
+        let mut current = Vec::with_capacity(65);
+        current.resize(65, true);
+        let usage = bit_vec_footprint(&current, 64);
+
+        assert_eq!(usage.active_bytes, 65_usize.div_ceil(8));
+        assert_eq!(usage.retained_bytes, current.capacity().div_ceil(8));
+        assert_eq!(usage.baseline_bytes, 64_usize.div_ceil(8));
     }
 }

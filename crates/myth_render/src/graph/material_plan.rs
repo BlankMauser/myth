@@ -20,6 +20,7 @@ use crate::core::gpu::{
 };
 use crate::core::{BindingInterfaceId, ResourceManager};
 
+use super::asset_frame::GeometryEligibilityResolver;
 use super::capacity::{
     CapacityUsage, estimated_hash_map_footprint, estimated_hash_set_footprint,
     shrink_hash_map_by_family_ratio, shrink_hash_set_by_family_ratio, shrink_vec_by_family_ratio,
@@ -218,6 +219,7 @@ impl MaterialPlanStore {
         assets: &AssetServer,
         extracted_scene: &ExtractedScene,
         render_lists: &RenderLists,
+        geometry_eligibility: GeometryEligibilityResolver<'_>,
     ) {
         assert!(
             !self.initialized,
@@ -232,7 +234,13 @@ impl MaterialPlanStore {
         self.source_plans
             .resize_with(render_lists.frame_source_count(), || None);
         for source in render_lists.frame_source_ids() {
-            self.capture_source(assets, extracted_scene, render_lists, source);
+            self.capture_source(
+                assets,
+                extracted_scene,
+                render_lists,
+                geometry_eligibility,
+                source,
+            );
         }
 
         self.push_recipe(
@@ -265,6 +273,7 @@ impl MaterialPlanStore {
         assets: &AssetServer,
         extracted_scene: &ExtractedScene,
         render_lists: &RenderLists,
+        geometry_eligibility: GeometryEligibilityResolver<'_>,
         source: FrameSourceId,
     ) {
         let Some(extracted_source) = render_lists.extracted_source(source) else {
@@ -273,6 +282,12 @@ impl MaterialPlanStore {
         let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
             return;
         };
+        // This check must precede material-key reuse: a stale geometry source
+        // sharing a material with a valid source must not inherit that source's
+        // material join or texture topology.
+        if !geometry_eligibility.source_is_eligible(source, item) {
+            return;
+        }
         let key = MaterialPlanKey::from_item(item);
         if let Some(&id) = self.lookup.get(&key) {
             // The exact record was validated when first captured and is
@@ -638,10 +653,15 @@ fn material_plan_is_current(assets: &AssetServer, record: &MaterialFrameRecord) 
 mod tests {
     use super::*;
     use crate::core::WgpuContext;
+    use crate::graph::extracted::MaterialClassification;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use myth_assets::GeometryHandle;
+    use myth_resources::BoundingBox;
+    use myth_resources::geometry::Geometry;
     use myth_resources::image::{Image, ImageDimension, PixelFormat};
     use myth_resources::material::{AlphaMode, MaterialType, UnlitMaterial};
     use myth_resources::texture::Texture;
+    use slotmap::Key;
 
     fn image_8x8() -> Image {
         Image::new(
@@ -658,6 +678,38 @@ mod tests {
         let unlit = UnlitMaterial::new(glam::Vec4::ONE);
         unlit.set_map(Some(texture));
         Material::new(MaterialType::Unlit(unlit))
+    }
+
+    fn extracted_item(
+        geometry: GeometryHandle,
+        geometry_asset_version: u32,
+        geometry_asset_identity: u64,
+        material: MaterialHandle,
+        material_asset_version: u32,
+        material_asset_identity: u64,
+        material_version: u64,
+    ) -> ExtractedRenderItem {
+        ExtractedRenderItem {
+            node_handle: myth_scene::NodeHandle::null(),
+            world_matrix: glam::Mat4::IDENTITY,
+            prev_world_matrix: glam::Mat4::IDENTITY,
+            geometry,
+            material,
+            geometry_asset_version,
+            geometry_asset_identity,
+            material_asset_version,
+            material_asset_identity,
+            material_version,
+            material_index: 0,
+            material_classification: MaterialClassification::empty(),
+            skeleton: None,
+            item_variant_flags: 0,
+            item_shader_defines: ShaderDefines::new(),
+            item_shader_defines_hash: 0,
+            cast_shadows: true,
+            receive_shadows: true,
+            world_aabb: BoundingBox::default(),
+        }
     }
 
     fn capture_record(assets: &AssetServer, handle: MaterialHandle) -> MaterialFrameRecord {
@@ -719,12 +771,172 @@ mod tests {
             1_000_000,
         ));
 
+        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
         let mut store = MaterialPlanStore::new();
-        store.capture(&assets, &extracted_scene, &render_lists);
+        store.capture(
+            &assets,
+            &extracted_scene,
+            &render_lists,
+            geometry_frames.eligibility(&extracted_scene, &render_lists),
+        );
 
         assert_eq!(render_lists.frame_source_count(), 2);
         assert_eq!(store.source_plans.len(), 2);
         assert!(store.source_plans.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn stale_geometry_cannot_inherit_a_shared_material_plan() {
+        let assets = AssetServer::new();
+        let valid_geometry = assets.geometries.add(Geometry::new());
+        let stale_geometry = assets.geometries.add(Geometry::new());
+        let (_, valid_version, valid_identity) = assets
+            .geometries
+            .get_entry_with_identity(valid_geometry)
+            .expect("valid geometry missing");
+        let (_, stale_version, stale_identity) = assets
+            .geometries
+            .get_entry_with_identity(stale_geometry)
+            .expect("stale geometry missing");
+        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+        let (material_asset, material_version, material_identity) = assets
+            .materials
+            .get_entry_with_identity(material)
+            .expect("material missing");
+        let data_version = material_asset.data.version();
+        drop(material_asset);
+
+        // Preserve the extracted stamp while replacing the slot with a new
+        // same-version owner before the graph-build qualification batch.
+        assets
+            .geometries
+            .insert_ready(stale_geometry, Geometry::new());
+        assert_eq!(assets.geometries.get_version(stale_geometry), Some(1));
+
+        let mut extracted_scene = ExtractedScene::new();
+        extracted_scene.render_items.push(extracted_item(
+            valid_geometry,
+            valid_version,
+            valid_identity,
+            material,
+            material_version,
+            material_identity,
+            data_version,
+        ));
+        extracted_scene.render_items.push(extracted_item(
+            stale_geometry,
+            stale_version,
+            stale_identity,
+            material,
+            material_version,
+            material_identity,
+            data_version,
+        ));
+        let mut render_lists = RenderLists::new();
+        let valid_source =
+            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
+        let stale_source =
+            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(1));
+
+        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
+        let mut store = MaterialPlanStore::new();
+        store.capture(
+            &assets,
+            &extracted_scene,
+            &render_lists,
+            geometry_frames.eligibility(&extracted_scene, &render_lists),
+        );
+
+        assert!(store.source_plans[valid_source.index()].is_some());
+        assert!(store.source_plans[stale_source.index()].is_none());
+        assert_eq!(store.plans.len(), 1);
+
+        // The stale source must also leave no failed material-key poison when
+        // it appears before the valid source in stable frame order.
+        let mut reversed_lists = RenderLists::new();
+        let stale_first = reversed_lists
+            .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(1));
+        let valid_second = reversed_lists
+            .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
+        let mut reversed_geometry = super::super::asset_frame::GeometryFrameStore::new();
+        reversed_geometry.capture_visible(&assets, &extracted_scene, &reversed_lists);
+        let mut reversed_store = MaterialPlanStore::new();
+        reversed_store.capture(
+            &assets,
+            &extracted_scene,
+            &reversed_lists,
+            reversed_geometry.eligibility(&extracted_scene, &reversed_lists),
+        );
+        assert!(reversed_store.source_plans[stale_first.index()].is_none());
+        assert!(reversed_store.source_plans[valid_second.index()].is_some());
+        assert_eq!(reversed_store.plans.len(), 1);
+    }
+
+    #[test]
+    fn stale_only_textured_source_emits_no_opaque_texture_topology() {
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let (_, geometry_version, geometry_identity) = assets
+            .geometries
+            .get_entry_with_identity(geometry)
+            .expect("geometry missing");
+        let image = assets.images.add(image_8x8());
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("stale geometry texture"), image));
+        let material = assets.materials.add(unlit_with_texture(texture));
+        let (material_asset, material_version, material_identity) = assets
+            .materials
+            .get_entry_with_identity(material)
+            .expect("material missing");
+        let data_version = material_asset.data.version();
+        drop(material_asset);
+
+        assets.geometries.insert_ready(geometry, Geometry::new());
+        let mut extracted_scene = ExtractedScene::new();
+        extracted_scene.render_items.push(extracted_item(
+            geometry,
+            geometry_version,
+            geometry_identity,
+            material,
+            material_version,
+            material_identity,
+            data_version,
+        ));
+        let mut render_lists = RenderLists::new();
+        let source =
+            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
+        render_lists.insert_opaque(super::super::frame::RenderIntent {
+            source,
+            geometry_handle: geometry,
+            material_handle: material,
+            material_index: 0,
+            distance_sq: 0.0,
+        });
+
+        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
+        let mut store = MaterialPlanStore::new();
+        store.capture(
+            &assets,
+            &extracted_scene,
+            &render_lists,
+            geometry_frames.eligibility(&extracted_scene, &render_lists),
+        );
+        let recipes = store.take_topology_recipes();
+        let opaque = recipes
+            .iter()
+            .find(|recipe| matches!(recipe.key, DrawPlanKey::Opaque))
+            .expect("opaque topology recipe missing");
+
+        assert!(store.source_plans[source.index()].is_none());
+        assert!(store.plans.is_empty());
+        assert!(
+            opaque.textures.is_empty(),
+            "a stale-only source must not register Asset Texture upload or mipmap topology"
+        );
     }
 
     #[test]

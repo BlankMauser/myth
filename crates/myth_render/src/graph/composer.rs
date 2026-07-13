@@ -610,10 +610,20 @@ impl<'a> FrameComposer<'a> {
                 directional_lights: &self.ctx.extracted_scene.directional_light_storage_buffer,
             },
         );
+        graph.storage.geometry_frames.capture_visible(
+            self.ctx.assets,
+            self.ctx.extracted_scene,
+            self.ctx.render_lists,
+        );
+        let geometry_eligibility = graph
+            .storage
+            .geometry_frames
+            .eligibility(self.ctx.extracted_scene, self.ctx.render_lists);
         graph.storage.material_plans.capture(
             self.ctx.assets,
             self.ctx.extracted_scene,
             self.ctx.render_lists,
+            geometry_eligibility,
         );
         let draw_texture_dependencies = graph.storage.material_plans.take_topology_recipes();
 
