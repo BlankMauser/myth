@@ -3788,6 +3788,59 @@ mod tests {
     }
 
     #[test]
+    fn compact_frame_source_history_maps_back_to_the_nonzero_extracted_item() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let mut extraction_order = scene.meshes.iter().map(|(node, _)| node);
+        let culled_node = extraction_order.next().expect("first test mesh missing");
+        let visible_node = extraction_order.next().expect("second test mesh missing");
+        assert!(extraction_order.next().is_none());
+        scene.node(&culled_node).set_position(1_000_000.0, 0.0, 0.0);
+        for (node, influence) in [(culled_node, 0.25), (visible_node, 1.0)] {
+            let mesh = scene.meshes.get_mut(node).expect("test mesh missing");
+            mesh.init_morph_targets(1, 1);
+            mesh.set_morph_target_influence(0, influence);
+        }
+        scene.update_matrix_world();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert_eq!(state.render_frame.extracted_scene.render_items.len(), 2);
+            assert_eq!(state.render_lists.frame_source_count(), 1);
+            let extracted = state
+                .render_lists
+                .extracted_source(crate::graph::frame::FrameSourceId::from_index(0))
+                .expect("visible frame source mapping missing");
+            assert_eq!(extracted.index(), 1);
+            assert_eq!(
+                state.render_frame.extracted_scene.render_items[extracted.index()].node_handle,
+                visible_node
+            );
+        }
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+        let visible = scene
+            .meshes
+            .get(visible_node)
+            .expect("visible test mesh missing")
+            .morph_uniforms();
+        assert!((visible.prev_weights[0].x - 1.0).abs() <= f32::EPSILON);
+        drop(visible);
+
+        let culled = scene
+            .meshes
+            .get(culled_node)
+            .expect("culled test mesh missing")
+            .morph_uniforms();
+        assert!(culled.weights[0].x.abs() <= f32::EPSILON);
+        assert!(culled.prev_weights[0].x.abs() <= f32::EPSILON);
+    }
+
+    #[test]
     fn stale_skeleton_binding_does_not_select_a_skinned_draw_variant() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();

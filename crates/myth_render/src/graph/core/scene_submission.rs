@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use crate::core::gpu::Tracked;
 use crate::graph::frame::{
     DrawBindGroupSlot, DrawBufferSlot, DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanResolver,
-    DrawPlanStore, PreparedDrawSource,
+    DrawPlanStore, FrameSourceId, PreparedDrawSource,
 };
 use crate::pipeline::RenderPipelineId;
 
@@ -585,7 +585,7 @@ impl<'a> SceneSubmissionWriter<'a> {
     /// the exact compact fields required by the direct backend.
     pub(crate) fn push_prepared_source(
         &mut self,
-        source_item_index: u32,
+        frame_source: FrameSourceId,
         source: &PreparedDrawSource,
         pipeline_id: RenderPipelineId,
         sort_key: u64,
@@ -593,7 +593,7 @@ impl<'a> SceneSubmissionWriter<'a> {
     ) {
         crate::graph::bake::push_prepared_source_command(
             self.draw_plans,
-            source_item_index,
+            frame_source,
             source,
             pipeline_id,
             sort_key,

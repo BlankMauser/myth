@@ -48,14 +48,71 @@ use super::shadow_utils;
 // Render intents, physical commands, and render lists
 // ============================================================================
 
+/// Stable identity of one item in the immutable frame extraction snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ExtractedSourceId(u32);
+
+impl ExtractedSourceId {
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(
+            u32::try_from(index)
+                .expect("one extracted scene cannot contain more than u32::MAX draw sources"),
+        )
+    }
+
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Dense frame-local identity assigned only to sources referenced by intents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct FrameSourceId(u32);
+
+impl FrameSourceId {
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("one frame cannot retain more than u32::MAX draw sources"))
+    }
+
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Dense graph-attempt identity of one physically prepared draw source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PreparedSourceId(u32);
+
+impl PreparedSourceId {
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(
+            u32::try_from(index)
+                .expect("one graph attempt cannot prepare more than u32::MAX draw sources"),
+        )
+    }
+
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// CPU-only main-view draw intent.
 ///
 /// This is produced before RDG compilation and contains no WGPU owner or
-/// pipeline ID. `source_item_index` is the exact identity used to join the
+/// pipeline ID. `source` is the compact frame-local identity used to join the
 /// intent with graph-attempt physical preparation after DPE.
 #[derive(Debug, Clone, Copy)]
 pub struct RenderIntent {
-    pub source_item_index: u32,
+    pub(crate) source: FrameSourceId,
     pub geometry_handle: GeometryHandle,
     pub material_handle: MaterialHandle,
     pub material_index: u32,
@@ -65,7 +122,7 @@ pub struct RenderIntent {
 /// CPU-only per-shadow-view draw intent.
 #[derive(Debug, Clone, Copy)]
 pub struct ShadowRenderIntent {
-    pub source_item_index: u32,
+    pub(crate) source: FrameSourceId,
     pub geometry_handle: GeometryHandle,
     pub material_handle: MaterialHandle,
 }
@@ -158,9 +215,9 @@ pub(crate) struct DrawPlanMeta {
 /// [`bake::finalize_live_draw_plans`]: super::bake::finalize_live_draw_plans
 /// [`submit_scene_submission`]: super::passes::draw::submit_scene_submission
 pub(crate) struct DrawCommand {
-    /// Exact extracted source used only by the post-submit history commit.
+    /// Exact frame source used only by the post-submit history commit.
     /// Execute remains blind to this logical identity.
-    pub(crate) source_item_index: u32,
+    pub(crate) frame_source: FrameSourceId,
 
     /// Composite sort key for minimising GPU state switches.
     ///
@@ -267,14 +324,16 @@ impl PreparedDrawSource {
     }
 }
 
-/// Graph-attempt-scoped source preparation indexed by `source_item_index`.
+/// Compact graph-attempt source preparation addressed through frame-local IDs.
 ///
-/// The parallel `Option` array preserves exact extracted-item identity while
-/// allowing unavailable or DPE-dead sources to remain unprepared. All physical
-/// Buffer/BindGroup owners live in [`DrawPlanStore`], so clearing both stores
-/// deterministically releases one graph attempt.
+/// Only DPE-live sources occupy the dense source vector. The lookup preserves
+/// their frame identity without forcing preparation to mirror the potentially
+/// sparse extracted-scene table. All physical Buffer/BindGroup owners live in
+/// [`DrawPlanStore`], so clearing both stores deterministically releases one
+/// graph attempt.
 pub(crate) struct PreparedDrawStore {
-    sources: Vec<Option<PreparedDrawSource>>,
+    sources: Vec<PreparedDrawSource>,
+    source_lookup: FxHashMap<FrameSourceId, PreparedSourceId>,
     sources_initialized: bool,
 }
 
@@ -283,50 +342,67 @@ impl PreparedDrawStore {
     pub(crate) fn new() -> Self {
         Self {
             sources: Vec::with_capacity(512),
+            source_lookup: FxHashMap::default(),
             sources_initialized: false,
         }
     }
 
-    /// Release graph-attempt metadata while retaining the parallel array's
-    /// allocation for the next frame.
+    /// Release graph-attempt metadata while retaining dense source/index
+    /// allocations for the next frame.
     pub(crate) fn clear(&mut self) {
         self.sources.clear();
+        self.source_lookup.clear();
         self.sources_initialized = false;
     }
 
-    /// Initialize the exact parallel source table once for this graph attempt.
-    pub(crate) fn begin_sources(&mut self, source_count: usize) {
+    /// Reserve the expected DPE-live source count once for this graph attempt.
+    pub(crate) fn begin_sources(&mut self, expected_live: usize) {
         assert!(
             !self.sources_initialized,
             "prepared draw sources may be initialized only once per graph attempt"
         );
         debug_assert!(self.sources.is_empty());
-        self.sources.resize_with(source_count, || None);
+        debug_assert!(self.source_lookup.is_empty());
+        self.sources.reserve(expected_live);
+        self.source_lookup.reserve(expected_live);
         self.sources_initialized = true;
     }
 
     /// Publish one exact physical source after its resources have been interned
     /// into the sibling [`DrawPlanStore`].
-    pub(crate) fn insert_source(&mut self, source_item_index: u32, source: PreparedDrawSource) {
+    pub(crate) fn insert_source(
+        &mut self,
+        frame_source: FrameSourceId,
+        source: PreparedDrawSource,
+    ) -> PreparedSourceId {
         assert!(
             self.sources_initialized,
             "prepared draw source table must be initialized before insertion"
         );
-        let index = source_item_index as usize;
-        let slot = self
-            .sources
-            .get_mut(index)
-            .expect("prepared draw source index exceeds the extracted item table");
-        assert!(slot.is_none(), "prepared draw source was inserted twice");
-        *slot = Some(source);
+        match self.source_lookup.entry(frame_source) {
+            Entry::Occupied(_) => panic!("prepared draw source was inserted twice"),
+            Entry::Vacant(entry) => {
+                let prepared = PreparedSourceId::from_index(self.sources.len());
+                self.sources.push(source);
+                entry.insert(prepared);
+                prepared
+            }
+        }
     }
 
     #[inline]
     #[must_use]
-    pub(crate) fn source(&self, source_item_index: u32) -> Option<&PreparedDrawSource> {
-        self.sources
-            .get(source_item_index as usize)
-            .and_then(Option::as_ref)
+    pub(crate) fn prepared_source_id(
+        &self,
+        frame_source: FrameSourceId,
+    ) -> Option<PreparedSourceId> {
+        self.source_lookup.get(&frame_source).copied()
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn source(&self, prepared: PreparedSourceId) -> Option<&PreparedDrawSource> {
+        self.sources.get(prepared.index())
     }
 }
 
@@ -591,7 +667,7 @@ impl DrawPlanStore {
     #[cfg(test)]
     pub(crate) fn push_test_command(&mut self, sort_key: u64) {
         self.push_command(DrawCommand {
-            source_item_index: 0,
+            frame_source: FrameSourceId::from_index(0),
             sort_key,
             pipeline_id: RenderPipelineId(0),
             vertex_buffers: SmallVec::new(),
@@ -678,10 +754,8 @@ impl DrawPlanStore {
 
     /// Source identities of commands that were actually emitted into at least
     /// one live plan. The caller deduplicates shared main/prepass/shadow uses.
-    pub(crate) fn emitted_source_indices(&self) -> impl Iterator<Item = u32> + '_ {
-        self.commands
-            .iter()
-            .map(|command| command.source_item_index)
+    pub(crate) fn emitted_frame_sources(&self) -> impl Iterator<Item = FrameSourceId> + '_ {
+        self.commands.iter().map(|command| command.frame_source)
     }
 
     fn plan(&self, id: DrawPlanId) -> Option<&DrawPlanRecord> {
@@ -804,7 +878,7 @@ pub struct ShadowLightInstance {
 /// CPU-only render intent lists plus shared frame metadata.
 ///
 /// Intent lists are populated before RDG compilation. After DPE, live
-/// [`DrawPlanKey`] values select an exact, deduplicated source-item union for
+/// [`DrawPlanKey`] values select an exact, deduplicated frame-source union for
 /// physical preparation. Physical slots and finalized commands belong to the
 /// graph-attempt [`PreparedDrawStore`] and [`DrawPlanStore`].
 ///
@@ -822,6 +896,11 @@ pub struct RenderLists {
     ///
     /// Each cascade of a directional light (or each spot light) gets its own queue.
     pub shadow_queues: FxHashMap<(u64, u32), Vec<ShadowRenderIntent>>,
+
+    /// Dense mapping from frame-local source IDs to immutable extraction IDs.
+    /// Both containers retain capacity across frames.
+    frame_sources: Vec<ExtractedSourceId>,
+    frame_source_lookup: FxHashMap<ExtractedSourceId, FrameSourceId>,
 
     /// All active render views for the current frame.
     ///
@@ -842,6 +921,8 @@ impl RenderLists {
             opaque: Vec::with_capacity(512),
             transparent: Vec::with_capacity(128),
             shadow_queues: FxHashMap::default(),
+            frame_sources: Vec::with_capacity(512),
+            frame_source_lookup: FxHashMap::default(),
             active_views: Vec::with_capacity(16),
             use_transmission: false,
         }
@@ -850,11 +931,53 @@ impl RenderLists {
     /// Clears all lists (retains capacity for memory reuse).
     #[inline]
     pub fn clear(&mut self) {
+        self.begin_intent_collection();
+        self.active_views.clear();
+    }
+
+    /// Begin collecting a new frame's intents while preserving extracted views.
+    ///
+    /// This is used after extraction has already populated `active_views`.
+    /// Intent arrays and the dense source interner retain their allocations.
+    #[inline]
+    pub(crate) fn begin_intent_collection(&mut self) {
         self.opaque.clear();
         self.transparent.clear();
         self.shadow_queues.clear();
-        self.active_views.clear();
+        self.frame_sources.clear();
+        self.frame_source_lookup.clear();
         self.use_transmission = false;
+    }
+
+    /// Intern one immutable extraction source into this frame's compact domain.
+    pub(crate) fn intern_frame_source(&mut self, extracted: ExtractedSourceId) -> FrameSourceId {
+        match self.frame_source_lookup.entry(extracted) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let source = FrameSourceId::from_index(self.frame_sources.len());
+                self.frame_sources.push(extracted);
+                entry.insert(source);
+                source
+            }
+        }
+    }
+
+    /// Resolve a compact frame source back to the immutable extraction table.
+    #[must_use]
+    pub(crate) fn extracted_source(&self, source: FrameSourceId) -> Option<ExtractedSourceId> {
+        self.frame_sources.get(source.index()).copied()
+    }
+
+    #[must_use]
+    pub(crate) fn frame_source_count(&self) -> usize {
+        self.frame_sources.len()
+    }
+
+    /// Iterate all valid frame-local source IDs in dense order.
+    pub(crate) fn frame_source_ids(&self) -> impl ExactSizeIterator<Item = FrameSourceId> + '_ {
+        let count = u32::try_from(self.frame_sources.len())
+            .expect("validated frame source count exceeds u32::MAX");
+        (0..count).map(FrameSourceId)
     }
 
     /// Inserts an opaque render intent.
@@ -869,13 +992,13 @@ impl RenderLists {
         self.transparent.push(intent);
     }
 
-    /// Return the exact sorted and deduplicated source-item union selected by
+    /// Return the exact sorted and deduplicated frame-source union selected by
     /// DPE-live draw-plan keys.
     #[must_use]
-    pub(crate) fn live_source_indices(
+    pub(crate) fn live_frame_sources(
         &self,
         live_keys: impl IntoIterator<Item = DrawPlanKey>,
-    ) -> Vec<u32> {
+    ) -> Vec<FrameSourceId> {
         let mut sources = Vec::new();
         for key in live_keys {
             self.extend_sources_for_key(key, &mut sources);
@@ -884,45 +1007,20 @@ impl RenderLists {
         sources
     }
 
-    /// Return every intent's source index, independent of DPE liveness.
-    #[must_use]
-    pub(crate) fn all_source_indices(&self) -> Vec<u32> {
-        let mut sources = Vec::with_capacity(
-            self.opaque.len()
-                + self.transparent.len()
-                + self.shadow_queues.values().map(Vec::len).sum::<usize>(),
-        );
-        sources.extend(self.opaque.iter().map(|intent| intent.source_item_index));
-        sources.extend(
-            self.transparent
-                .iter()
-                .map(|intent| intent.source_item_index),
-        );
-        for queue in self.shadow_queues.values() {
-            sources.extend(queue.iter().map(|intent| intent.source_item_index));
-        }
-        sort_and_dedup_sources(&mut sources);
-        sources
-    }
-
-    fn extend_sources_for_key(&self, key: DrawPlanKey, sources: &mut Vec<u32>) {
+    fn extend_sources_for_key(&self, key: DrawPlanKey, sources: &mut Vec<FrameSourceId>) {
         match key {
             DrawPlanKey::Opaque | DrawPlanKey::Prepass { .. } => {
-                sources.extend(self.opaque.iter().map(|intent| intent.source_item_index));
+                sources.extend(self.opaque.iter().map(|intent| intent.source));
             }
             DrawPlanKey::Transparent => {
-                sources.extend(
-                    self.transparent
-                        .iter()
-                        .map(|intent| intent.source_item_index),
-                );
+                sources.extend(self.transparent.iter().map(|intent| intent.source));
             }
             DrawPlanKey::Shadow {
                 light_id,
                 layer_index,
             } => {
                 if let Some(queue) = self.shadow_queues.get(&(light_id, layer_index)) {
-                    sources.extend(queue.iter().map(|intent| intent.source_item_index));
+                    sources.extend(queue.iter().map(|intent| intent.source));
                 }
             }
         }
@@ -943,7 +1041,7 @@ impl Default for RenderLists {
 }
 
 #[inline]
-fn sort_and_dedup_sources(sources: &mut Vec<u32>) {
+fn sort_and_dedup_sources(sources: &mut Vec<FrameSourceId>) {
     sources.sort_unstable();
     sources.dedup();
 }
@@ -1473,7 +1571,7 @@ mod draw_plan_tests {
 
     fn test_command(sort_key: u64) -> DrawCommand {
         DrawCommand {
-            source_item_index: 0,
+            frame_source: FrameSourceId::from_index(0),
             sort_key,
             pipeline_id: RenderPipelineId(0),
             vertex_buffers: SmallVec::new(),
@@ -1486,22 +1584,48 @@ mod draw_plan_tests {
         }
     }
 
-    fn render_intent(source_item_index: u32) -> RenderIntent {
+    fn render_intent(source: usize) -> RenderIntent {
         RenderIntent {
-            source_item_index,
+            source: FrameSourceId::from_index(source),
             geometry_handle: GeometryHandle::null(),
             material_handle: MaterialHandle::null(),
-            material_index: source_item_index,
-            distance_sq: source_item_index as f32,
+            material_index: source as u32,
+            distance_sq: source as f32,
         }
     }
 
-    fn shadow_intent(source_item_index: u32) -> ShadowRenderIntent {
+    fn shadow_intent(source: usize) -> ShadowRenderIntent {
         ShadowRenderIntent {
-            source_item_index,
+            source: FrameSourceId::from_index(source),
             geometry_handle: GeometryHandle::null(),
             material_handle: MaterialHandle::null(),
         }
+    }
+
+    #[test]
+    fn frame_source_interner_is_dense_deduplicated_and_resettable() {
+        let mut lists = RenderLists::new();
+        let extracted_9 = ExtractedSourceId::from_index(9);
+        let extracted_3 = ExtractedSourceId::from_index(3);
+
+        let first = lists.intern_frame_source(extracted_9);
+        let second = lists.intern_frame_source(extracted_3);
+        let repeated = lists.intern_frame_source(extracted_9);
+
+        assert_eq!(first, FrameSourceId::from_index(0));
+        assert_eq!(second, FrameSourceId::from_index(1));
+        assert_eq!(repeated, first);
+        assert_eq!(lists.frame_source_count(), 2);
+        assert_eq!(lists.extracted_source(first), Some(extracted_9));
+        assert_eq!(lists.extracted_source(second), Some(extracted_3));
+        assert_eq!(
+            lists.frame_source_ids().collect::<Vec<_>>(),
+            vec![first, second]
+        );
+
+        lists.begin_intent_collection();
+        assert_eq!(lists.frame_source_count(), 0);
+        assert_eq!(lists.extracted_source(first), None);
     }
 
     #[test]
@@ -1594,6 +1718,9 @@ mod draw_plan_tests {
     #[test]
     fn live_prepass_and_exact_shadow_select_only_their_deduplicated_sources() {
         let mut lists = RenderLists::new();
+        for extracted in 0..=5 {
+            lists.intern_frame_source(ExtractedSourceId::from_index(extracted));
+        }
         lists.opaque = vec![render_intent(2), render_intent(1)];
         lists.transparent = vec![render_intent(3)];
         lists
@@ -1623,10 +1750,13 @@ mod draw_plan_tests {
         assert!(!plans.is_live(dead_transparent));
         assert!(!plans.is_live(dead_shadow));
         assert_eq!(
-            lists.live_source_indices(plans.live_keys()),
-            vec![1, 2, 4],
+            lists.live_frame_sources(plans.live_keys()),
+            vec![
+                FrameSourceId::from_index(1),
+                FrameSourceId::from_index(2),
+                FrameSourceId::from_index(4)
+            ],
             "Prepass must select opaque sources, the exact live shadow must add only its queue, and shared source 2 must be deduplicated"
         );
-        assert_eq!(lists.all_source_indices(), vec![1, 2, 3, 4, 5]);
     }
 }

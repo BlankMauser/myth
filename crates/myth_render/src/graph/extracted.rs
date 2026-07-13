@@ -19,7 +19,9 @@ use bitflags::{Flags, bitflags};
 use smallvec::SmallVec;
 
 use crate::core::ResourceManager;
-use crate::graph::frame::{DrawPlanStore, PreparedDrawSource, PreparedDrawStore};
+use crate::graph::frame::{
+    DrawPlanStore, FrameSourceId, PreparedDrawSource, PreparedDrawStore, RenderLists,
+};
 use crate::graph::material_plan::MaterialPlanResolver;
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::buffer::CpuBuffer;
@@ -646,34 +648,32 @@ impl ExtractedScene {
         scene: &mut Scene,
         assets: &AssetServer,
         resource_manager: &mut ResourceManager,
-        live_source_indices: &[u32],
+        live_frame_sources: &[FrameSourceId],
+        render_lists: &RenderLists,
         material_plans: MaterialPlanResolver<'_>,
         prepared_draws: &mut PreparedDrawStore,
         draw_plans: &mut DrawPlanStore,
     ) {
-        let prepared_table_len = live_source_indices.last().map_or(0, |&index| {
-            usize::try_from(index)
-                .expect("source index must fit the target pointer width")
-                .checked_add(1)
-                .expect("prepared draw source table length overflowed")
-        });
-        prepared_draws.begin_sources(prepared_table_len);
+        prepared_draws.begin_sources(live_frame_sources.len());
 
-        let mut dynamic_offsets = Vec::with_capacity(live_source_indices.len());
+        let mut dynamic_offsets = Vec::with_capacity(live_frame_sources.len());
         let mut required_skeletons = HashSet::<SkeletonKey>::default();
         let mut previous = None;
-        for &source_item_index in live_source_indices {
+        for &frame_source in live_frame_sources {
             assert!(
-                previous.is_none_or(|previous| previous < source_item_index),
-                "live draw source indices must be sorted and deduplicated"
+                previous.is_none_or(|previous| previous < frame_source),
+                "live frame source IDs must be sorted and deduplicated"
             );
-            previous = Some(source_item_index);
+            previous = Some(frame_source);
+            let extracted_source = render_lists
+                .extracted_source(frame_source)
+                .expect("live frame source does not belong to these render lists");
             let item = self
                 .render_items
-                .get(source_item_index as usize)
-                .expect("live draw source index exceeds the extracted item table");
+                .get(extracted_source.index())
+                .expect("live frame source exceeds the extracted item table");
             if material_plans
-                .prepared_material(source_item_index, item)
+                .prepared_material(frame_source, item)
                 .is_none()
             {
                 continue;
@@ -688,7 +688,7 @@ impl ExtractedScene {
                 previous_world_matrix: item.prev_world_matrix,
                 ..Default::default()
             });
-            dynamic_offsets.push((source_item_index, dynamic_offset));
+            dynamic_offsets.push((frame_source, dynamic_offset));
             if let Some(skeleton) = item.skeleton {
                 required_skeletons.insert(skeleton);
             }
@@ -710,9 +710,12 @@ impl ExtractedScene {
 
         let skeleton_pool = &scene.skeleton_pool;
         let meshes = &mut scene.meshes;
-        for (source_item_index, dynamic_offset) in dynamic_offsets {
-            let item = &self.render_items[source_item_index as usize];
-            let Some(planned_material) = material_plans.prepared_material(source_item_index, item)
+        for (frame_source, dynamic_offset) in dynamic_offsets {
+            let extracted_source = render_lists
+                .extracted_source(frame_source)
+                .expect("prepared frame source does not belong to these render lists");
+            let item = &self.render_items[extracted_source.index()];
+            let Some(planned_material) = material_plans.prepared_material(frame_source, item)
             else {
                 continue;
             };
@@ -820,7 +823,7 @@ impl ExtractedScene {
             let geometry_layout_version = geometry_asset.layout_version();
 
             prepared_draws.insert_source(
-                source_item_index,
+                frame_source,
                 PreparedDrawSource {
                     geometry_asset,
                     material_asset: planned_material.clone(),
@@ -859,14 +862,18 @@ impl ExtractedScene {
     pub(crate) fn commit_prepared_draw_history(
         &self,
         scene: &mut Scene,
+        render_lists: &RenderLists,
         draw_plans: &DrawPlanStore,
     ) {
         let mut committed_sources = HashSet::new();
-        for source_item_index in draw_plans.emitted_source_indices() {
-            if !committed_sources.insert(source_item_index) {
+        for frame_source in draw_plans.emitted_frame_sources() {
+            if !committed_sources.insert(frame_source) {
                 continue;
             }
-            let Some(item) = self.render_items.get(source_item_index as usize) else {
+            let Some(extracted_source) = render_lists.extracted_source(frame_source) else {
+                continue;
+            };
+            let Some(item) = self.render_items.get(extracted_source.index()) else {
                 continue;
             };
             if let Some(mesh) = scene.meshes.get_mut(item.node_handle) {

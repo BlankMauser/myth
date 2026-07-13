@@ -1937,21 +1937,22 @@ impl<'a> FrameComposer<'a> {
             // Prepass, and any number of shadow views share one source slot;
             // dead plan branches never allocate model data, geometry, object
             // bindings, or pipelines.
-            let live_draw_sources = self
+            let live_frame_sources = self
                 .ctx
                 .render_lists
-                .live_source_indices(graph.storage.draw_plans.live_keys());
+                .live_frame_sources(graph.storage.draw_plans.live_keys());
             graph.storage.material_plans.prepare_live(
                 self.ctx.assets,
                 self.ctx.resource_manager,
-                &live_draw_sources,
+                &live_frame_sources,
             );
             let material_plans = graph.storage.material_plans.resolver();
             self.ctx.extracted_scene.prepare_draw_resources(
                 self.ctx.scene,
                 self.ctx.assets,
                 self.ctx.resource_manager,
-                &live_draw_sources,
+                &live_frame_sources,
+                self.ctx.render_lists,
                 material_plans,
                 &mut graph.storage.prepared_draws,
                 &mut graph.storage.draw_plans,
@@ -2111,9 +2112,11 @@ impl<'a> FrameComposer<'a> {
             // effect. Once the queue accepts these commands, advance the
             // previous-weight baseline even if later publication bookkeeping
             // reports an internal error.
-            self.ctx
-                .extracted_scene
-                .commit_prepared_draw_history(self.ctx.scene, &graph.storage.draw_plans);
+            self.ctx.extracted_scene.commit_prepared_draw_history(
+                self.ctx.scene,
+                self.ctx.render_lists,
+                &graph.storage.draw_plans,
+            );
             graph.commit_submitted_asset_texture_mipmaps();
             if let Some(batch) = mipmap_batch {
                 let committed = graph.commit_submitted_mipmap_batch(batch);

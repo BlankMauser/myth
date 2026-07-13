@@ -10,7 +10,7 @@ use slotmap::Key;
 
 use crate::core::view::ViewTarget;
 use crate::graph::extracted::ExtractedScene;
-use crate::graph::frame::{RenderIntent, RenderLists, ShadowRenderIntent};
+use crate::graph::frame::{ExtractedSourceId, RenderIntent, RenderLists, ShadowRenderIntent};
 use myth_assets::AssetServer;
 use myth_resources::RenderableMaterialTrait;
 use myth_resources::material::AlphaMode;
@@ -28,10 +28,7 @@ pub(crate) fn collect_draw_intents(
     camera: &RenderCamera,
     assets: &AssetServer,
 ) {
-    render_lists.opaque.clear();
-    render_lists.transparent.clear();
-    render_lists.shadow_queues.clear();
-    render_lists.use_transmission = false;
+    render_lists.begin_intent_collection();
 
     let camera_frustum = camera.frustum;
     let camera_pos = camera.position;
@@ -69,8 +66,9 @@ pub(crate) fn collect_draw_intents(
         render_lists.use_transmission |= use_transmission;
 
         let item_pos = Vec3A::from(item.world_matrix.w_axis.truncate());
+        let source = render_lists.intern_frame_source(ExtractedSourceId::from_index(item_idx));
         let intent = RenderIntent {
-            source_item_index: checked_source_item_index(item_idx),
+            source,
             geometry_handle: item.geometry,
             material_handle: item.material,
             material_index: item.material.data().as_ffi() as u32,
@@ -86,7 +84,8 @@ pub(crate) fn collect_draw_intents(
 
     // Shadow queues retain the exact active-view topology even when a view
     // has no casters, keeping an empty live plan distinct from no plan.
-    for view in &render_lists.active_views {
+    for view_index in 0..render_lists.active_views.len() {
+        let view = &render_lists.active_views[view_index];
         let ViewTarget::ShadowLight {
             light_id,
             layer_index,
@@ -94,11 +93,13 @@ pub(crate) fn collect_draw_intents(
         else {
             continue;
         };
+        let view_frustum = view.frustum;
 
-        let queue = render_lists
+        let shadow_key = (light_id, layer_index);
+        let mut queue = render_lists
             .shadow_queues
-            .entry((light_id, layer_index))
-            .or_default();
+            .remove(&shadow_key)
+            .unwrap_or_default();
 
         for (item_idx, item) in extracted_scene.render_items.iter().enumerate() {
             if !item.cast_shadows {
@@ -106,7 +107,7 @@ pub(crate) fn collect_draw_intents(
             }
 
             let aabb = item.world_aabb;
-            if aabb.is_finite() && !view.frustum.intersects_aabb(&aabb) {
+            if aabb.is_finite() && !view_frustum.intersects_aabb(&aabb) {
                 continue;
             }
 
@@ -129,16 +130,19 @@ pub(crate) fn collect_draw_intents(
                 continue;
             }
 
+            let source = render_lists.intern_frame_source(ExtractedSourceId::from_index(item_idx));
             queue.push(ShadowRenderIntent {
-                source_item_index: checked_source_item_index(item_idx),
+                source,
                 geometry_handle: item.geometry,
                 material_handle: item.material,
             });
         }
+        assert!(
+            render_lists
+                .shadow_queues
+                .insert(shadow_key, queue)
+                .is_none(),
+            "one active shadow view was inserted twice without ownership transfer"
+        );
     }
-}
-
-#[inline]
-fn checked_source_item_index(item_idx: usize) -> u32 {
-    u32::try_from(item_idx).expect("one frame cannot extract more than u32::MAX render items")
 }

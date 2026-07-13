@@ -25,8 +25,8 @@ use myth_scene::camera::RenderCamera;
 
 use super::extracted::{ExtractedScene, SceneFeatures};
 use super::frame::{
-    DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedDrawSource, PreparedDrawStore,
-    RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,
+    DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanStore, FrameSourceId, PreparedDrawSource,
+    PreparedDrawStore, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,
 };
 use super::render_state::RenderState;
 
@@ -71,6 +71,7 @@ pub(crate) fn finalize_live_draw_plans(
             DrawPlanKey::Opaque => bake_main_intents(
                 meta.id,
                 &render_lists.opaque,
+                render_lists,
                 false,
                 draw_plans,
                 prepared_draws,
@@ -85,6 +86,7 @@ pub(crate) fn finalize_live_draw_plans(
             DrawPlanKey::Transparent => bake_main_intents(
                 meta.id,
                 &render_lists.transparent,
+                render_lists,
                 true,
                 draw_plans,
                 prepared_draws,
@@ -125,6 +127,7 @@ pub(crate) fn finalize_live_draw_plans(
                 bake_shadow_intents(
                     meta.id,
                     intents,
+                    render_lists,
                     draw_plans,
                     prepared_draws,
                     extracted_scene,
@@ -145,6 +148,7 @@ pub(crate) fn finalize_live_draw_plans(
 fn bake_main_intents(
     plan: DrawPlanId,
     intents: &[RenderIntent],
+    render_lists: &RenderLists,
     transparent_plan: bool,
     draw_plans: &mut DrawPlanStore,
     prepared_draws: &PreparedDrawStore,
@@ -184,13 +188,16 @@ fn bake_main_intents(
     let use_depth_pre = sample_count == 1 && wgpu_ctx.render_path.requires_z_prepass();
     let mut shader_source_identities = FxHashMap::default();
     for intent in intents {
-        let Some(source) = prepared_draws.source(intent.source_item_index) else {
+        let Some(prepared_source) = prepared_draws.prepared_source_id(intent.source) else {
             continue;
         };
-        let Some(item) = extracted_scene
-            .render_items
-            .get(intent.source_item_index as usize)
-        else {
+        let Some(source) = prepared_draws.source(prepared_source) else {
+            continue;
+        };
+        let Some(extracted_source) = render_lists.extracted_source(intent.source) else {
+            continue;
+        };
+        let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
             continue;
         };
         if !source.matches_extracted(item, intent.geometry_handle, intent.material_handle) {
@@ -415,7 +422,7 @@ fn bake_main_intents(
         }
         push_prepared_source_command(
             draw_plans,
-            intent.source_item_index,
+            intent.source,
             source,
             pipeline_id,
             sort_key.bits(),
@@ -431,6 +438,7 @@ fn bake_main_intents(
 fn bake_shadow_intents(
     plan: DrawPlanId,
     intents: &[ShadowRenderIntent],
+    render_lists: &RenderLists,
     draw_plans: &mut DrawPlanStore,
     prepared_draws: &PreparedDrawStore,
     extracted_scene: &ExtractedScene,
@@ -445,13 +453,16 @@ fn bake_shadow_intents(
     let shader_source = ShaderSource::File("entry/utility/depth_prepass");
     let shader_source_identity = shader_manager.source_identity_hash(shader_source);
     for intent in intents {
-        let Some(source) = prepared_draws.source(intent.source_item_index) else {
+        let Some(prepared_source) = prepared_draws.prepared_source_id(intent.source) else {
             continue;
         };
-        let Some(item) = extracted_scene
-            .render_items
-            .get(intent.source_item_index as usize)
-        else {
+        let Some(source) = prepared_draws.source(prepared_source) else {
+            continue;
+        };
+        let Some(extracted_source) = render_lists.extracted_source(intent.source) else {
+            continue;
+        };
+        let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
             continue;
         };
         if !source.matches_extracted(item, intent.geometry_handle, intent.material_handle) {
@@ -580,7 +591,7 @@ fn bake_shadow_intents(
         }
         push_prepared_source_command(
             draw_plans,
-            intent.source_item_index,
+            intent.source,
             source,
             pipeline_id,
             sort_key,
@@ -597,14 +608,14 @@ fn bake_shadow_intents(
 /// Prepass reuses this helper after deriving its Feature-owned pipeline.
 pub(crate) fn push_prepared_source_command(
     draw_plans: &mut DrawPlanStore,
-    source_item_index: u32,
+    frame_source: FrameSourceId,
     source: &PreparedDrawSource,
     pipeline_id: RenderPipelineId,
     sort_key: u64,
     stencil_reference: Option<u32>,
 ) {
     draw_plans.push_command(DrawCommand {
-        source_item_index,
+        frame_source,
         sort_key,
         pipeline_id,
         vertex_buffers: source.vertex_buffers.clone(),

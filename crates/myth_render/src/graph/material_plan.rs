@@ -19,7 +19,7 @@ use crate::core::gpu::{
 };
 
 use super::extracted::{ExtractedRenderItem, ExtractedScene};
-use super::frame::{DrawPlanKey, RenderLists};
+use super::frame::{DrawPlanKey, FrameSourceId, RenderLists};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MaterialPlanId(u32);
@@ -104,6 +104,8 @@ impl From<AssetTextureSnapshot> for AssetTextureKey {
 pub(crate) struct MaterialPlanStore {
     plans: Vec<MaterialPlanRecord>,
     lookup: FxHashMap<MaterialPlanKey, MaterialPlanId>,
+    /// Dense join indexed exclusively by the intent-visible frame domain.
+    /// ExtractedScene may be much larger after view culling.
     source_plans: Vec<Option<MaterialPlanId>>,
     recipes: Vec<DrawMaterialTextureRecipe>,
     initialized: bool,
@@ -139,25 +141,18 @@ impl MaterialPlanStore {
         debug_assert!(self.recipes.is_empty());
 
         self.source_plans
-            .resize_with(extracted_scene.render_item_count(), || None);
-        let visible_sources = render_lists.all_source_indices();
-        for source_item_index in visible_sources {
-            self.capture_source(assets, extracted_scene, source_item_index);
+            .resize_with(render_lists.frame_source_count(), || None);
+        for source in render_lists.frame_source_ids() {
+            self.capture_source(assets, extracted_scene, render_lists, source);
         }
 
         self.push_recipe(
             DrawPlanKey::Opaque,
-            render_lists
-                .opaque
-                .iter()
-                .map(|intent| intent.source_item_index),
+            render_lists.opaque.iter().map(|intent| intent.source),
         );
         self.push_recipe(
             DrawPlanKey::Transparent,
-            render_lists
-                .transparent
-                .iter()
-                .map(|intent| intent.source_item_index),
+            render_lists.transparent.iter().map(|intent| intent.source),
         );
         let mut shadow_keys: Vec<_> = render_lists.shadow_queues.keys().copied().collect();
         shadow_keys.sort_unstable();
@@ -169,7 +164,7 @@ impl MaterialPlanStore {
                 },
                 render_lists.shadow_queues[&(light_id, layer_index)]
                     .iter()
-                    .map(|intent| intent.source_item_index),
+                    .map(|intent| intent.source),
             );
         }
 
@@ -180,9 +175,13 @@ impl MaterialPlanStore {
         &mut self,
         assets: &AssetServer,
         extracted_scene: &ExtractedScene,
-        source_item_index: u32,
+        render_lists: &RenderLists,
+        source: FrameSourceId,
     ) {
-        let Some(item) = extracted_scene.render_items.get(source_item_index as usize) else {
+        let Some(extracted_source) = render_lists.extracted_source(source) else {
+            return;
+        };
+        let Some(item) = extracted_scene.render_items.get(extracted_source.index()) else {
             return;
         };
         let key = MaterialPlanKey::from_item(item);
@@ -191,7 +190,7 @@ impl MaterialPlanStore {
             // revalidated again before post-DPE preparation. Rechecking every
             // source here would turn a shared material into O(draw-count ×
             // texture-count) AssetStorage traffic with no additional safety.
-            self.source_plans[source_item_index as usize] = Some(id);
+            self.source_plans[source.index()] = Some(id);
             return;
         }
 
@@ -231,20 +230,15 @@ impl MaterialPlanStore {
         let id = MaterialPlanId::from_index(self.plans.len());
         self.plans.push(record);
         assert!(self.lookup.insert(key, id).is_none());
-        self.source_plans[source_item_index as usize] = Some(id);
+        self.source_plans[source.index()] = Some(id);
     }
 
-    fn push_recipe(&mut self, key: DrawPlanKey, source_indices: impl IntoIterator<Item = u32>) {
+    fn push_recipe(&mut self, key: DrawPlanKey, sources: impl IntoIterator<Item = FrameSourceId>) {
         let mut visited_materials = FxHashSet::default();
         let mut visited_textures = FxHashSet::default();
         let mut textures = Vec::new();
-        for source_item_index in source_indices {
-            let Some(plan) = self
-                .source_plans
-                .get(source_item_index as usize)
-                .copied()
-                .flatten()
-            else {
+        for source in sources {
+            let Some(plan) = self.source_plans.get(source.index()).copied().flatten() else {
                 continue;
             };
             if !visited_materials.insert(plan) {
@@ -277,17 +271,12 @@ impl MaterialPlanStore {
         &mut self,
         assets: &AssetServer,
         resource_manager: &mut ResourceManager,
-        live_source_indices: &[u32],
+        live_sources: &[FrameSourceId],
     ) {
         assert!(self.initialized, "material plans were not captured");
         let mut visited = FxHashSet::default();
-        for &source_item_index in live_source_indices {
-            let Some(id) = self
-                .source_plans
-                .get(source_item_index as usize)
-                .copied()
-                .flatten()
-            else {
+        for &source in live_sources {
+            let Some(id) = self.source_plans.get(source.index()).copied().flatten() else {
                 continue;
             };
             if !visited.insert(id) {
@@ -351,13 +340,13 @@ impl<'a> MaterialPlanResolver<'a> {
     #[must_use]
     pub(crate) fn prepared_material(
         self,
-        source_item_index: u32,
+        source: FrameSourceId,
         item: &ExtractedRenderItem,
     ) -> Option<&'a Arc<Material>> {
         let id = self
             .store
             .source_plans
-            .get(source_item_index as usize)
+            .get(source.index())
             .copied()
             .flatten()?;
         let plan = self.store.plans.get(id.index())?;
@@ -472,6 +461,24 @@ mod tests {
             textures,
             prepared: false,
         }
+    }
+
+    #[test]
+    fn source_plan_join_uses_only_the_visible_frame_domain() {
+        let assets = AssetServer::new();
+        let extracted_scene = ExtractedScene::new();
+        let mut render_lists = RenderLists::new();
+        render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(7));
+        render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(
+            1_000_000,
+        ));
+
+        let mut store = MaterialPlanStore::new();
+        store.capture(&assets, &extracted_scene, &render_lists);
+
+        assert_eq!(render_lists.frame_source_count(), 2);
+        assert_eq!(store.source_plans.len(), 2);
+        assert!(store.source_plans.iter().all(Option::is_none));
     }
 
     #[test]

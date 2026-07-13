@@ -2980,8 +2980,9 @@ mod tests {
         assert_eq!(storage.draw_plans.bind_group_owner_count(), 1);
 
         storage.prepared_draws.begin_sources(1);
-        storage.prepared_draws.insert_source(
-            0,
+        let frame_source = crate::graph::frame::FrameSourceId::from_index(1_000_000);
+        let prepared_source = storage.prepared_draws.insert_source(
+            frame_source,
             crate::graph::frame::PreparedDrawSource {
                 geometry_asset: Arc::new(myth_resources::geometry::Geometry::default()),
                 material_asset: Arc::new(myth_resources::material::Material::new_unlit(
@@ -3017,7 +3018,13 @@ mod tests {
                 object_binding_wgsl_hash: 0,
             },
         );
-        assert!(storage.prepared_draws.source(0).is_some());
+        assert_eq!(prepared_source.index(), 0);
+        assert!(storage.prepared_draws.source(prepared_source).is_some());
+        assert_eq!(
+            storage.prepared_draws.prepared_source_id(frame_source),
+            Some(prepared_source),
+            "a sparse frame ID must occupy one dense prepared slot"
+        );
 
         let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
         storage.draw_plans.mark_live(plan);
@@ -3025,7 +3032,7 @@ mod tests {
         storage
             .draw_plans
             .push_command(crate::graph::frame::DrawCommand {
-                source_item_index: 0,
+                frame_source,
                 sort_key: 0,
                 pipeline_id: crate::pipeline::RenderPipelineId(0),
                 vertex_buffers: smallvec::smallvec![buffer_slot],
@@ -3049,7 +3056,13 @@ mod tests {
         );
         let _ = storage.draw_plans.resolver().bind_group(bind_group_slot);
         storage.release_frame_owners();
-        assert!(storage.prepared_draws.source(0).is_none());
+        assert!(storage.prepared_draws.source(prepared_source).is_none());
+        assert!(
+            storage
+                .prepared_draws
+                .prepared_source_id(frame_source)
+                .is_none()
+        );
         assert!(storage.material_plans.is_empty());
         // clear() resets the one-shot initialization barrier for a new graph
         // attempt while retaining capacity.

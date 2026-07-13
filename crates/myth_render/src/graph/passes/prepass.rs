@@ -181,12 +181,16 @@ impl PrepassFeature {
         let shader_source_identity = ctx.shader_manager.source_identity_hash(shader_source);
 
         for intent in &render_lists.opaque {
-            let Some(source) = prepared_draws.source(intent.source_item_index) else {
+            let Some(prepared_source) = prepared_draws.prepared_source_id(intent.source) else {
                 continue;
             };
-            let Some(extracted_item) = extracted_scene
-                .render_items
-                .get(intent.source_item_index as usize)
+            let Some(source) = prepared_draws.source(prepared_source) else {
+                continue;
+            };
+            let Some(extracted_source) = render_lists.extracted_source(intent.source) else {
+                continue;
+            };
+            let Some(extracted_item) = extracted_scene.render_items.get(extracted_source.index())
             else {
                 continue;
             };
@@ -374,13 +378,7 @@ impl PrepassFeature {
                 intent.distance_sq,
                 false,
             );
-            writer.push_prepared_source(
-                intent.source_item_index,
-                source,
-                pipeline_id,
-                sort_key.bits(),
-                None,
-            );
+            writer.push_prepared_source(intent.source, source, pipeline_id, sort_key.bits(), None);
         }
 
         writer.finish_sorted();
