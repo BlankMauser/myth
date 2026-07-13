@@ -1,19 +1,16 @@
 //! CPU-only scene draw-intent collection.
 //!
 //! This module is the boundary between the extracted scene snapshot and the
-//! post-DPE draw preparation path. It performs only logical asset-readiness
-//! checks, view culling, and material classification. Physical resources,
-//! layouts, bind groups, and pipelines are deliberately absent.
+//! post-DPE draw preparation path. It performs only view culling and consumes
+//! classification facts captured by extraction. Live asset dictionaries,
+//! physical resources, layouts, bind groups, and pipelines are deliberately
+//! absent; later plan capture rejects any asset-generation drift fail-closed.
 
 use glam::Vec3A;
-use slotmap::Key;
 
 use crate::core::view::ViewTarget;
-use crate::graph::extracted::ExtractedScene;
+use crate::graph::extracted::{ExtractedScene, MaterialClassification};
 use crate::graph::frame::{ExtractedSourceId, RenderIntent, RenderLists, ShadowRenderIntent};
-use myth_assets::AssetServer;
-use myth_resources::RenderableMaterialTrait;
-use myth_resources::material::AlphaMode;
 use myth_scene::camera::RenderCamera;
 
 /// Collect CPU-only main-view and per-shadow-view draw intents.
@@ -26,14 +23,11 @@ pub(crate) fn collect_draw_intents(
     extracted_scene: &ExtractedScene,
     render_lists: &mut RenderLists,
     camera: &RenderCamera,
-    assets: &AssetServer,
 ) {
     render_lists.begin_intent_collection();
 
     let camera_frustum = camera.frustum;
     let camera_pos = camera.position;
-    let geo_guard = assets.geometries.read_lock();
-    let mat_guard = assets.materials.read_lock();
 
     // Main-camera intents. Pipeline-dependent ordering is intentionally left
     // to the post-DPE plan finalizer; these records contain only CPU facts.
@@ -43,26 +37,12 @@ pub(crate) fn collect_draw_intents(
             continue;
         }
 
-        let Some(geometry) = geo_guard.get_loaded(item.geometry) else {
-            continue;
-        };
-        let Some(material) = mat_guard.get_loaded(item.material) else {
-            continue;
-        };
-        if (geometry.version, geometry.identity)
-            != (item.geometry_asset_version, item.geometry_asset_identity)
-            || (material.version, material.identity)
-                != (item.material_asset_version, item.material_asset_identity)
-            || material.data.version() != item.material_version
-        {
-            continue;
-        }
-
-        let use_transmission = material.use_transmission();
-        let is_transparent = material.is_transparent();
-        if material.data.version() != item.material_version {
-            continue;
-        }
+        let use_transmission = item
+            .material_classification
+            .contains(MaterialClassification::USES_TRANSMISSION);
+        let is_transparent = item
+            .material_classification
+            .contains(MaterialClassification::TRANSPARENT);
         render_lists.use_transmission |= use_transmission;
 
         let item_pos = Vec3A::from(item.world_matrix.w_axis.truncate());
@@ -71,7 +51,7 @@ pub(crate) fn collect_draw_intents(
             source,
             geometry_handle: item.geometry,
             material_handle: item.material,
-            material_index: item.material.data().as_ffi() as u32,
+            material_index: item.material_index,
             distance_sq: camera_pos.distance_squared(item_pos),
         };
 
@@ -108,25 +88,6 @@ pub(crate) fn collect_draw_intents(
 
             let aabb = item.world_aabb;
             if aabb.is_finite() && !view_frustum.intersects_aabb(&aabb) {
-                continue;
-            }
-
-            let Some(geometry) = geo_guard.get_loaded(item.geometry) else {
-                continue;
-            };
-            let Some(material) = mat_guard.get_loaded(item.material) else {
-                continue;
-            };
-            if (geometry.version, geometry.identity)
-                != (item.geometry_asset_version, item.geometry_asset_identity)
-                || (material.version, material.identity)
-                    != (item.material_asset_version, item.material_asset_identity)
-                || material.data.version() != item.material_version
-            {
-                continue;
-            }
-            let alpha_mode = material.alpha_mode();
-            if material.data.version() != item.material_version || alpha_mode == AlphaMode::Blend {
                 continue;
             }
 

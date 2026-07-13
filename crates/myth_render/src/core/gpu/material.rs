@@ -62,7 +62,7 @@ pub struct GpuMaterial {
     /// Hash of layout entries (for fast comparison to determine if Layout rebuild is needed)
     pub layout_hash: u64,
     pub binding_wgsl: Arc<str>,
-    pub binding_wgsl_hash: u64,
+    pub binding_interface_id: super::BindingInterfaceId,
     /// Set of physical IDs of all dependent resources (guards `BindGroup` validity)
     pub resource_ids: ResourceIdSet,
     /// Records the Material version when this `GpuMaterial` was generated (for Pipeline cache)
@@ -518,8 +518,10 @@ impl ResourceManager {
         };
 
         let (bind_group, bg_id) = self.create_bind_group(&layout, builder);
-        let binding_wgsl = builder.generate_wgsl(1);
-        let binding_wgsl_hash = super::hash_binding_wgsl(&binding_wgsl);
+        let binding_wgsl: Arc<str> = builder.generate_wgsl(1).into();
+        let binding_interface_id = self
+            .bind_groups
+            .intern_binding_interface(layout_id, &binding_wgsl);
 
         GpuMaterial {
             asset_version,
@@ -529,8 +531,8 @@ impl ResourceManager {
             layout,
             layout_id,
             layout_hash,
-            binding_wgsl: binding_wgsl.into(),
-            binding_wgsl_hash,
+            binding_wgsl,
+            binding_interface_id,
             resource_ids,
             version: material_version,
             last_used_frame: self.frame_index,

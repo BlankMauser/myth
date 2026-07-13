@@ -3605,7 +3605,11 @@ mod tests {
         composer.render();
 
         let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(state.render_lists.opaque.is_empty());
+        assert_eq!(
+            state.render_lists.opaque.len(),
+            1,
+            "culling must retain the coherently extracted intent; GeometryFrame capture is the fail-closed asset-identity boundary"
+        );
         assert_eq!(state.resource_manager.model_allocator.len(), 0);
         assert!(
             state
@@ -3617,7 +3621,8 @@ mod tests {
             state
                 .resource_manager
                 .get_material(material_handle)
-                .is_none()
+                .is_some(),
+            "the independently current material may be prepared and retained even though the stale geometry closes the draw source"
         );
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
@@ -3654,7 +3659,11 @@ mod tests {
         composer.render();
 
         let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(state.render_lists.opaque.is_empty());
+        assert_eq!(
+            state.render_lists.opaque.len(),
+            1,
+            "culling must retain the coherently extracted intent; MaterialPlan capture is the fail-closed asset-identity boundary"
+        );
         assert_eq!(state.resource_manager.model_allocator.len(), 0);
         assert_eq!(
             state
@@ -3732,9 +3741,17 @@ mod tests {
         composer.render();
 
         let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(state.render_lists.opaque.is_empty());
+        assert_eq!(
+            state.render_lists.opaque.len(),
+            1,
+            "culling must consume the coherent extracted classification snapshot"
+        );
         assert!(state.render_lists.transparent.is_empty());
-        assert_eq!(state.resource_manager.model_allocator.len(), 0);
+        assert_eq!(
+            state.resource_manager.model_allocator.len(),
+            0,
+            "MaterialPlan must reject the drifted material before physical draw preparation"
+        );
 
         render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
         let state = renderer.context.as_ref().expect("renderer state missing");

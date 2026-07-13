@@ -35,9 +35,18 @@ use myth_scene::camera::RenderCamera;
 use myth_scene::environment::Environment;
 use myth_scene::light::{LightKind, ShadowConfig, SpotLight};
 use myth_scene::{NodeHandle, Scene, SkeletonKey};
+use slotmap::Key;
 
 const SPOT_TIGHT_SPHERE_COS_THRESHOLD: f32 = std::f32::consts::FRAC_1_SQRT_2; // ~ 0.70710678, corresponds to a 90-degree outer cone angle
 const LIGHT_SCORE_DISTANCE_FLOOR: f32 = 1.0;
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) struct MaterialClassification: u8 {
+        const TRANSPARENT = 1 << 0;
+        const USES_TRANSMISSION = 1 << 1;
+    }
+}
 
 /// Minimal CPU-only render item.
 ///
@@ -65,6 +74,13 @@ pub struct ExtractedRenderItem {
     pub(crate) material_asset_identity: u64,
     /// Interior material epoch captured with classification-relevant state.
     pub(crate) material_version: u64,
+
+    /// Copy-only draw classification captured coherently with
+    /// `material_version`. Culling consumes these fields without reopening
+    /// the live asset dictionaries; MaterialPlan capture remains the
+    /// fail-closed authority for a material that drifts after extraction.
+    pub(crate) material_index: u32,
+    pub(crate) material_classification: MaterialClassification,
 
     /// Exact skeleton selected while the Scene is still borrowed.
     pub(crate) skeleton: Option<SkeletonKey>,
@@ -182,6 +198,8 @@ struct CollectedMesh {
     pub material_asset_version: u32,
     pub material_asset_identity: u64,
     pub material_version: u64,
+    pub material_index: u32,
+    pub material_classification: MaterialClassification,
     pub skeleton: Option<SkeletonKey>,
 
     pub world_matrix: Mat4,
@@ -573,8 +591,23 @@ impl ExtractedScene {
                     geometry.bounding_box.transform(&node_world)
                 };
 
+                // Capture every topology/classification fact under one
+                // material epoch. The later Cull phase must be a pure
+                // snapshot consumer; a concurrent mutation is rejected by
+                // MaterialPlan capture rather than observed inconsistently.
                 let material_version = material.data.version();
-                let cast_shadows = mesh.cast_shadows && material.alpha_mode() != AlphaMode::Blend;
+                let material_index = mesh.material.data().as_ffi() as u32;
+                let mut material_classification = MaterialClassification::empty();
+                material_classification.set(
+                    MaterialClassification::TRANSPARENT,
+                    material.is_transparent(),
+                );
+                material_classification.set(
+                    MaterialClassification::USES_TRANSMISSION,
+                    material.use_transmission(),
+                );
+                let shadow_alpha_eligible = material.alpha_mode() != AlphaMode::Blend;
+                let cast_shadows = mesh.cast_shadows && shadow_alpha_eligible;
                 if material.data.version() != material_version {
                     continue;
                 }
@@ -588,6 +621,8 @@ impl ExtractedScene {
                     material_asset_version: material.version,
                     material_asset_identity: material.identity,
                     material_version,
+                    material_index,
+                    material_classification,
                     skeleton: skeleton_key,
                     world_matrix,
                     prev_world_matrix,
@@ -623,6 +658,8 @@ impl ExtractedScene {
                 material_asset_version: item.material_asset_version,
                 material_asset_identity: item.material_asset_identity,
                 material_version: item.material_version,
+                material_index: item.material_index,
+                material_classification: item.material_classification,
                 skeleton: item.skeleton,
                 item_variant_flags: item.item_variant_flags,
                 item_shader_defines_hash: item_shader_defines.compute_hash(),
@@ -790,8 +827,8 @@ impl ExtractedScene {
                 object_bind_group.bind_group_id,
             );
             let object_interface = object_interfaces.intern(
+                object_bind_group.binding_interface_id,
                 object_bind_group.layout_id,
-                object_bind_group.binding_wgsl_hash,
                 &object_bind_group.layout,
                 &object_bind_group.binding_wgsl,
             );

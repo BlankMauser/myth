@@ -4,7 +4,7 @@
 //! physical/CPU owner per exact key for the whole graph attempt, preventing
 //! per-draw `Arc` reference-count traffic while still closing asset ABA gaps.
 
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use myth_assets::{AssetServer, GeometryHandle};
 use myth_resources::geometry::Geometry;
@@ -12,24 +12,32 @@ use myth_resources::shader_defines::ShaderDefines;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
-use crate::core::ResourceManager;
+use crate::core::{BindingInterfaceId, ResourceManager};
 
+#[cfg(test)]
+use super::extracted::MaterialClassification;
 use super::extracted::{ExtractedRenderItem, ExtractedScene};
 use super::frame::{DrawBufferSlot, DrawPlanStore, FrameSourceId, RenderLists};
 
 /// Compact graph-attempt identity of one exact geometry owner.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct GeometryFrameId(u32);
+pub(crate) struct GeometryFrameId(NonZeroU32);
 
 impl GeometryFrameId {
     #[inline]
     pub(crate) fn from_index(index: usize) -> Self {
-        Self(u32::try_from(index).expect("geometry frame record index exceeds u32::MAX"))
+        let raw = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .expect("geometry frame record index exceeds u32::MAX - 1");
+        Self(raw)
     }
 
     #[inline]
     const fn index(self) -> usize {
-        self.0 as usize
+        self.0.get() as usize - 1
     }
 }
 
@@ -391,24 +399,18 @@ impl ObjectInterfaceId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ObjectInterfaceKey {
-    layout_id: u64,
-    binding_wgsl_hash: u64,
-}
-
 /// One exact immutable object binding interface.
 pub(crate) struct ObjectInterfaceRecord {
     pub(crate) layout: wgpu::BindGroupLayout,
     pub(crate) layout_id: u64,
     pub(crate) binding_wgsl: Arc<str>,
-    pub(crate) binding_wgsl_hash: u64,
+    pub(crate) binding_interface_id: BindingInterfaceId,
 }
 
 /// Unique object binding interfaces retained by one graph attempt.
 pub(crate) struct ObjectInterfaceStore {
     records: Vec<ObjectInterfaceRecord>,
-    lookup: FxHashMap<ObjectInterfaceKey, ObjectInterfaceId>,
+    lookup: FxHashMap<BindingInterfaceId, ObjectInterfaceId>,
 }
 
 impl ObjectInterfaceStore {
@@ -424,20 +426,17 @@ impl ObjectInterfaceStore {
     /// WGPU/Arc owners are cloned only for a newly observed interface.
     pub(crate) fn intern(
         &mut self,
+        binding_interface_id: BindingInterfaceId,
         layout_id: u64,
-        binding_wgsl_hash: u64,
         layout: &wgpu::BindGroupLayout,
         binding_wgsl: &Arc<str>,
     ) -> ObjectInterfaceId {
-        let key = ObjectInterfaceKey {
-            layout_id,
-            binding_wgsl_hash,
-        };
-        if let Some(&id) = self.lookup.get(&key) {
-            assert_eq!(
+        if let Some(&id) = self.lookup.get(&binding_interface_id) {
+            debug_assert_eq!(self.records[id.index()].layout_id, layout_id);
+            debug_assert_eq!(
                 self.records[id.index()].binding_wgsl.as_ref(),
                 binding_wgsl.as_ref(),
-                "object interface hash collision for one canonical layout"
+                "canonical binding-interface ID must preserve exact WGSL identity"
             );
             return id;
         }
@@ -447,9 +446,9 @@ impl ObjectInterfaceStore {
             layout: layout.clone(),
             layout_id,
             binding_wgsl: binding_wgsl.clone(),
-            binding_wgsl_hash,
+            binding_interface_id,
         });
-        assert!(self.lookup.insert(key, id).is_none());
+        assert!(self.lookup.insert(binding_interface_id, id).is_none());
         id
     }
 
@@ -509,6 +508,8 @@ mod tests {
             material_asset_version: 0,
             material_asset_identity: 0,
             material_version: 0,
+            material_index: 0,
+            material_classification: MaterialClassification::empty(),
             skeleton: None,
             item_variant_flags: 0,
             item_shader_defines: ShaderDefines::new(),
@@ -525,7 +526,20 @@ mod tests {
         assert_copy::<GeometryFrameId>();
         assert_copy::<ObjectInterfaceId>();
         assert_eq!(std::mem::size_of::<GeometryFrameId>(), 4);
+        assert_eq!(std::mem::size_of::<Option<GeometryFrameId>>(), 4);
         assert_eq!(std::mem::size_of::<ObjectInterfaceId>(), 4);
+    }
+
+    #[test]
+    fn geometry_frame_id_preserves_zero_based_indices_and_rejects_overflow() {
+        assert_eq!(GeometryFrameId::from_index(0).index(), 0);
+        assert_eq!(
+            GeometryFrameId::from_index(u32::MAX as usize - 1).index(),
+            u32::MAX as usize - 1
+        );
+        assert!(
+            std::panic::catch_unwind(|| GeometryFrameId::from_index(u32::MAX as usize)).is_err()
+        );
     }
 
     #[test]

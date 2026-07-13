@@ -578,7 +578,6 @@ impl<'a> FrameComposer<'a> {
             self.ctx.extracted_scene,
             self.ctx.render_lists,
             &self.ctx.camera,
-            self.ctx.assets,
         );
 
         rdg_diagnostics.enter_phase(RdgFramePhase::BuildGraph);

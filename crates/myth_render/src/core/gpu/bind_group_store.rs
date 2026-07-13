@@ -12,6 +12,34 @@ use crate::pipeline::vertex::VertexLayoutSignature;
 
 use super::{ResourceIdSet, generate_gpu_resource_id};
 
+/// Collision-safe canonical identity of one generated binding interface.
+///
+/// The persistent interner assigns this ID only after exact layout-ID and WGSL
+/// string equality. Pipeline fast paths may therefore use it as identity
+/// without treating a short content hash as a correctness contract.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindingInterfaceId(NonZeroU64);
+
+impl BindingInterfaceId {
+    #[inline]
+    fn new() -> Self {
+        Self(NonZeroU64::new(generate_gpu_resource_id()).expect("GPU resource IDs are non-zero"))
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn from_raw(value: u64) -> Self {
+        Self(NonZeroU64::new(value).expect("binding interface ID must be non-zero"))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BindingInterfaceKey {
+    layout_id: u64,
+    binding_wgsl: Arc<str>,
+}
+
 /// Shared source text for one generated binding interface.
 ///
 /// The wrapper preserves the existing `String`-like call sites while making
@@ -23,6 +51,11 @@ impl SharedBindingWgsl {
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[inline]
+    pub(crate) fn as_arc(&self) -> &Arc<str> {
         &self.0
     }
 }
@@ -97,7 +130,7 @@ pub struct GpuGlobalState {
     pub layout: wgpu::BindGroupLayout,
     pub layout_id: u64,
     pub binding_wgsl: SharedBindingWgsl,
-    pub binding_wgsl_hash: u64,
+    pub binding_interface_id: BindingInterfaceId,
     /// Set of physical IDs of all dependent resources (used for automatic change detection)
     pub resource_ids: ResourceIdSet,
     pub last_used_frame: u64,
@@ -174,7 +207,7 @@ pub struct BindGroupContext {
     pub bind_group: wgpu::BindGroup,
     pub bind_group_id: u64,
     pub binding_wgsl: Arc<str>,
-    pub binding_wgsl_hash: u64,
+    pub binding_interface_id: BindingInterfaceId,
 }
 
 struct CachedObjectBindGroup {
@@ -214,7 +247,7 @@ pub(super) struct GlobalBindingInterface {
     pub(super) layout: wgpu::BindGroupLayout,
     pub(super) layout_id: u64,
     pub(super) binding_wgsl: SharedBindingWgsl,
-    pub(super) binding_wgsl_hash: u64,
+    pub(super) binding_interface_id: BindingInterfaceId,
 }
 
 /// Persistent bind-group, layout, and shader-interface caches.
@@ -224,11 +257,34 @@ pub(crate) struct BindGroupStore {
     global_interface: Option<GlobalBindingInterface>,
     layout_cache: FxHashMap<Vec<wgpu::BindGroupLayoutEntry>, (wgpu::BindGroupLayout, u64)>,
     vertex_layout_cache: FxHashMap<VertexLayoutSignature, u64>,
+    binding_interface_cache: FxHashMap<BindingInterfaceKey, BindingInterfaceId>,
     object_bind_group_cache: FxHashMap<ObjectBindGroupKey, CachedObjectBindGroup>,
     bind_group_id_lookup: FxHashMap<u64, BindGroupContext>,
 }
 
 impl BindGroupStore {
+    /// Intern one exact generated interface. HashMap hashing is only a bucket
+    /// accelerator; `BindingInterfaceKey::Eq` compares the complete WGSL text,
+    /// so a hash collision can neither alias resources nor panic the engine.
+    pub(super) fn intern_binding_interface(
+        &mut self,
+        layout_id: u64,
+        binding_wgsl: &Arc<str>,
+    ) -> BindingInterfaceId {
+        let key = BindingInterfaceKey {
+            layout_id,
+            binding_wgsl: binding_wgsl.clone(),
+        };
+        match self.binding_interface_cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let id = BindingInterfaceId::new();
+                entry.insert(id);
+                id
+            }
+        }
+    }
+
     #[inline]
     #[must_use]
     pub(super) fn global_interface(&self) -> Option<&GlobalBindingInterface> {
@@ -378,7 +434,9 @@ impl BindGroupStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{GlobalStateKey, ObjectBindGroupKey};
+    use std::sync::Arc;
+
+    use super::{BindGroupStore, GlobalStateKey, ObjectBindGroupKey};
     use myth_resources::WgslStructName;
 
     fn object_key(bindings: &[(u64, u64, Option<u64>)], layout_id: u64) -> ObjectBindGroupKey {
@@ -400,6 +458,40 @@ mod tests {
 
         assert_eq!(key.render_state_id(), 0x89ab_cdef);
         assert_eq!(key.scene_id(), 0x0123_4567);
+    }
+
+    #[test]
+    fn binding_interface_identity_uses_exact_layout_and_wgsl_equality() {
+        let mut store = BindGroupStore::default();
+        let first: Arc<str> = "@group(1) @binding(0) var<uniform> a: vec4f;".into();
+        let equal_but_distinct: Arc<str> = first.as_ref().into();
+        let different: Arc<str> = "@group(1) @binding(0) var<uniform> b: vec4f;".into();
+
+        let canonical = store.intern_binding_interface(7, &first);
+        assert_eq!(
+            store.intern_binding_interface(7, &equal_but_distinct),
+            canonical,
+            "content equality, not Arc allocation identity, defines an interface"
+        );
+        assert_ne!(store.intern_binding_interface(7, &different), canonical);
+        assert_ne!(store.intern_binding_interface(8, &first), canonical);
+
+        store.clear_object_bind_group_caches();
+        store.prune(u64::MAX);
+        assert_eq!(
+            store.intern_binding_interface(7, &first),
+            canonical,
+            "physical BindGroup eviction must not invalidate persistent pipeline-interface identity"
+        );
+
+        let mut other_store = BindGroupStore::default();
+        assert_ne!(
+            other_store.intern_binding_interface(7, &first),
+            canonical,
+            "interface IDs are scoped to one persistent ResourceManager store"
+        );
+        assert_eq!(std::mem::size_of_val(&canonical), 8);
+        assert_eq!(std::mem::size_of::<Option<super::BindingInterfaceId>>(), 8);
     }
 
     #[test]

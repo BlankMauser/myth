@@ -5,7 +5,7 @@
 //! the frame arena deliberately skips Drop, while render passes and DrawPlans
 //! retain only POD identities and real RDG texture reads.
 
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use myth_assets::{AssetServer, ImageHandle, MaterialHandle, TextureHandle};
 use myth_resources::material::{Material, RenderableMaterialTrait};
@@ -15,26 +15,32 @@ use myth_resources::texture::TextureSource;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
-use crate::core::ResourceManager;
 use crate::core::gpu::{
     AssetTextureSnapshot, PlannedMaterialTexture, snapshot_asset_texture_state,
 };
+use crate::core::{BindingInterfaceId, ResourceManager};
 
 use super::extracted::{ExtractedRenderItem, ExtractedScene};
 use super::frame::{DrawPlanKey, FrameSourceId, RenderLists};
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct MaterialFrameId(u32);
+pub(crate) struct MaterialFrameId(NonZeroU32);
 
 impl MaterialFrameId {
     #[inline]
     pub(crate) fn from_index(index: usize) -> Self {
-        Self(u32::try_from(index).expect("material plan index exceeds u32"))
+        let raw = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .expect("material frame record index exceeds u32::MAX - 1");
+        Self(raw)
     }
 
     #[inline]
     const fn index(self) -> usize {
-        self.0 as usize
+        self.0.get() as usize - 1
     }
 }
 
@@ -124,7 +130,7 @@ pub(crate) struct MaterialFrameInterface {
     pub(crate) bind_group: wgpu::BindGroup,
     pub(crate) bind_group_id: u64,
     pub(crate) binding_wgsl: Arc<str>,
-    pub(crate) binding_wgsl_hash: u64,
+    pub(crate) binding_interface_id: BindingInterfaceId,
 }
 
 struct MaterialFrameRecord {
@@ -402,7 +408,7 @@ impl MaterialPlanStore {
                     bind_group: gpu_material.bind_group.clone(),
                     bind_group_id: gpu_material.bind_group_id,
                     binding_wgsl: gpu_material.binding_wgsl.clone(),
-                    binding_wgsl_hash: gpu_material.binding_wgsl_hash,
+                    binding_interface_id: gpu_material.binding_interface_id,
                 };
                 let record = &mut self.plans[id.index()];
                 record.interface = Some(interface);
@@ -637,6 +643,20 @@ mod tests {
             attempted: false,
             interface: None,
         }
+    }
+
+    #[test]
+    fn material_frame_id_uses_the_nonzero_option_niche() {
+        assert_eq!(std::mem::size_of::<MaterialFrameId>(), 4);
+        assert_eq!(std::mem::size_of::<Option<MaterialFrameId>>(), 4);
+        assert_eq!(MaterialFrameId::from_index(0).index(), 0);
+        assert_eq!(
+            MaterialFrameId::from_index(u32::MAX as usize - 1).index(),
+            u32::MAX as usize - 1
+        );
+        assert!(
+            std::panic::catch_unwind(|| MaterialFrameId::from_index(u32::MAX as usize)).is_err()
+        );
     }
 
     #[test]

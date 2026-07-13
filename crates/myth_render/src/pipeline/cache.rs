@@ -29,7 +29,7 @@ use myth_scene::DebugViewMode;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use crate::core::gpu::{GpuGlobalState, Tracked};
+use crate::core::gpu::{BindingInterfaceId, GpuGlobalState, Tracked};
 use crate::graph::extracted::SceneFeatures;
 use crate::pipeline::pipeline_id::{ComputePipelineId, RenderPipelineId};
 use crate::pipeline::pipeline_key::{
@@ -60,11 +60,11 @@ pub struct FastPipelineKey {
     pub item_shader_defines_hash: u64,
     pub shader_source_identity: u64,
     pub global_layout_id: u64,
-    pub global_binding_wgsl_hash: u64,
+    pub global_binding_interface_id: BindingInterfaceId,
     pub material_layout_id: u64,
-    pub material_binding_wgsl_hash: u64,
+    pub material_binding_interface_id: BindingInterfaceId,
     pub object_layout_id: u64,
-    pub object_binding_wgsl_hash: u64,
+    pub object_binding_interface_id: BindingInterfaceId,
     pub scene_variants: SceneFeatures,
     pub scene_defines_hash: u64,
     pub taa_enabled: bool,
@@ -90,9 +90,9 @@ pub struct FastShadowPipelineKey {
     pub shader_source_identity: u64,
     pub shadow_global_layout_id: u64,
     pub material_layout_id: u64,
-    pub material_binding_wgsl_hash: u64,
+    pub material_binding_interface_id: BindingInterfaceId,
     pub object_layout_id: u64,
-    pub object_binding_wgsl_hash: u64,
+    pub object_binding_interface_id: BindingInterfaceId,
     pub pipeline_settings_version: u64,
 }
 

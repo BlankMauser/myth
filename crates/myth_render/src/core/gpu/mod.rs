@@ -41,7 +41,6 @@ mod system_textures;
 mod texture;
 mod tracked;
 
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::core::gpu::buffer::{BufferUploadContext, GpuBufferHandle};
@@ -58,7 +57,9 @@ pub(crate) use crate::core::gpu::texture::{
     GpuImageSpec, PhysicalImageId, TextureBinding, TextureImageLease, snapshot_asset_texture,
     snapshot_asset_texture_state,
 };
-pub use bind_group_store::{BindGroupContext, GlobalStateKey, GlobalStateResolver, GpuGlobalState};
+pub use bind_group_store::{
+    BindGroupContext, BindingInterfaceId, GlobalStateKey, GlobalStateResolver, GpuGlobalState,
+};
 pub(crate) use bind_group_store::{BindGroupStore, ObjectBindGroupKey};
 pub(crate) use binding::GlobalStatePhysicalFailure;
 pub(crate) use environment_store::EnvironmentStore;
@@ -87,13 +88,6 @@ pub fn generate_gpu_resource_id() -> u64 {
             value.checked_add(1)
         })
         .expect("GPU resource ID space exhausted")
-}
-
-#[inline]
-pub(crate) fn hash_binding_wgsl(binding_wgsl: &str) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
-    binding_wgsl.hash(&mut hasher);
-    hasher.finish()
 }
 
 // ============================================================================

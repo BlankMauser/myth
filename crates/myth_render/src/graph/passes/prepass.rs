@@ -14,6 +14,7 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::core::BindingInterfaceId;
 use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
 use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
@@ -95,9 +96,9 @@ struct PrepassPipelineL1Key {
     shader_source_identity: u64,
     scene_defines_hash: u64,
     pipeline_settings_version: u64,
-    global_binding_wgsl_hash: u64,
-    material_binding_wgsl_hash: u64,
-    object_binding_wgsl_hash: u64,
+    global_binding_interface_id: BindingInterfaceId,
+    material_binding_interface_id: BindingInterfaceId,
+    object_binding_interface_id: BindingInterfaceId,
     vertex_layout_id: u64,
     bind_group_layout_ids: [u64; 3],
     depth_format: wgpu::TextureFormat,
@@ -178,7 +179,7 @@ impl PrepassFeature {
             return;
         };
         let global_layout_id = gpu_world.layout_id;
-        let global_binding_wgsl_hash = gpu_world.binding_wgsl_hash;
+        let global_binding_interface_id = gpu_world.binding_interface_id;
         let scene_defines_hash = extracted_scene.scene_defines.compute_hash();
         let shader_source = ShaderSource::File("entry/utility/depth_prepass");
         let shader_source_identity = ctx.shader_manager.source_identity_hash(shader_source);
@@ -264,9 +265,9 @@ impl PrepassFeature {
                 shader_source_identity,
                 scene_defines_hash,
                 pipeline_settings_version,
-                global_binding_wgsl_hash,
-                material_binding_wgsl_hash: material_interface.binding_wgsl_hash,
-                object_binding_wgsl_hash: object_interface.binding_wgsl_hash,
+                global_binding_interface_id,
+                material_binding_interface_id: material_interface.binding_interface_id,
+                object_binding_interface_id: object_interface.binding_interface_id,
                 vertex_layout_id: geometry_physical.layout_id,
                 bind_group_layout_ids: [
                     global_layout_id,

@@ -2,6 +2,7 @@
 //!
 //! Includes Object `BindGroup` (Group 2), skeleton management, and global bindings (Group 0)
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use wgpu::ShaderStages;
@@ -324,22 +325,24 @@ impl ResourceManager {
 
         // Cache miss: reuse the exact builder that was prepared and
         // fingerprinted above to create the physical BindGroup.
-        let binding_wgsl = builder.generate_wgsl(2);
-        let binding_wgsl_hash = super::hash_binding_wgsl(&binding_wgsl);
+        let binding_wgsl: Arc<str> = builder.generate_wgsl(2).into();
         let layout = newly_created_layout.unwrap_or_else(|| {
             let (layout, resolved_layout_id) = self.get_or_create_layout(&layout_entries);
             debug_assert_eq!(layout_id, resolved_layout_id);
             layout
         });
         let (bind_group, bind_group_id) = self.create_bind_group(&layout, &builder);
+        let binding_interface_id = self
+            .bind_groups
+            .intern_binding_interface(layout_id, &binding_wgsl);
 
         let data = BindGroupContext {
             layout,
             layout_id,
             bind_group,
             bind_group_id,
-            binding_wgsl: binding_wgsl.into(),
-            binding_wgsl_hash,
+            binding_wgsl,
+            binding_interface_id,
         };
 
         self.bind_groups.cache_object_bind_group(
@@ -765,7 +768,7 @@ impl ResourceManager {
             layout: interface.layout,
             layout_id: interface.layout_id,
             binding_wgsl: interface.binding_wgsl,
-            binding_wgsl_hash: interface.binding_wgsl_hash,
+            binding_interface_id: interface.binding_interface_id,
             resource_ids: current_ids,
             last_used_frame: self.frame_index,
         };
@@ -813,11 +816,14 @@ impl ResourceManager {
         let layout_entries = builder.generate_layout_entries();
         let (layout, layout_id) = self.get_or_create_layout(&layout_entries);
         let binding_wgsl = SharedBindingWgsl::from(builder.generate_wgsl(0));
+        let binding_interface_id = self
+            .bind_groups
+            .intern_binding_interface(layout_id, binding_wgsl.as_arc());
         let interface = GlobalBindingInterface {
             layout,
             layout_id,
-            binding_wgsl_hash: super::hash_binding_wgsl(binding_wgsl.as_str()),
             binding_wgsl,
+            binding_interface_id,
         };
         self.bind_groups.insert_global_interface(interface.clone());
         interface
