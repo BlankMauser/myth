@@ -8,7 +8,9 @@
 
 use std::{num::NonZeroU32, ops::Range, sync::Arc};
 
-use myth_assets::{AssetServer, AssetSnapshot, ImageHandle, MaterialHandle, TextureHandle};
+use myth_assets::{AssetServer, AssetSnapshot, MaterialHandle};
+#[cfg(test)]
+use myth_assets::{ImageHandle, TextureHandle};
 use myth_resources::material::{Material, RenderableMaterialTrait};
 use myth_resources::material::{MaterialSettings, ShaderTemplateMode};
 use myth_resources::shader_defines::ShaderDefines;
@@ -182,32 +184,17 @@ struct MaterialFrameRecord {
 /// Owned topology recipe returned to Composer before draw consumers are added.
 pub(crate) struct DrawMaterialTextureRecipe {
     pub(crate) key: DrawPlanKey,
-    pub(crate) textures: Vec<AssetTextureSnapshot>,
+    pub(crate) textures: Vec<PlannedAssetTextureSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct AssetTextureKey {
-    texture_handle: TextureHandle,
-    image_handle: ImageHandle,
-    texture_version: u32,
-    texture_identity: u64,
-    image_version: u32,
-    image_identity: u64,
-    logical_version: u64,
-}
-
-impl From<AssetTextureSnapshot> for AssetTextureKey {
-    fn from(snapshot: AssetTextureSnapshot) -> Self {
-        Self {
-            texture_handle: snapshot.texture_handle,
-            image_handle: snapshot.image_handle,
-            texture_version: snapshot.texture_version,
-            texture_identity: snapshot.texture_identity,
-            image_version: snapshot.image_version,
-            image_identity: snapshot.image_identity,
-            logical_version: snapshot.logical_version,
-        }
-    }
+/// Exact topology snapshot paired with its canonical retained-owner plan.
+///
+/// Carrying the plan ID through graph construction prevents the post-DPE
+/// materializer from rediscovering Texture/Image owners through AssetStorage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlannedAssetTextureSnapshot {
+    pub(crate) owner_plan: AssetTextureBatchId,
+    pub(crate) snapshot: AssetTextureSnapshot,
 }
 
 /// Destructor-aware material owners and source joins for one graph attempt.
@@ -586,12 +573,21 @@ impl MaterialPlanStore {
             if !visited_materials.insert(plan) {
                 continue;
             }
-            for texture in &self.plans[plan.index()].textures {
+            let record = &self.plans[plan.index()];
+            let texture_plan_ids = &self.texture_plan_ids[record.texture_plan_range.clone()];
+            debug_assert_eq!(record.textures.len(), texture_plan_ids.len());
+            for (texture, &owner_plan) in record.textures.iter().zip(texture_plan_ids) {
+                let Some(owner_plan) = owner_plan else {
+                    continue;
+                };
                 let Some(snapshot) = texture.asset.and_then(|state| state.ready) else {
                     continue;
                 };
-                if visited_textures.insert(AssetTextureKey::from(snapshot)) {
-                    textures.push(snapshot);
+                if visited_textures.insert(owner_plan) {
+                    textures.push(PlannedAssetTextureSnapshot {
+                        owner_plan,
+                        snapshot,
+                    });
                 }
             }
         }

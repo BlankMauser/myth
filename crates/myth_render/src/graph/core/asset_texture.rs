@@ -10,15 +10,23 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use myth_assets::AssetServer;
 use rustc_hash::FxHashMap;
 
-use crate::core::gpu::{AssetTextureMaterialization, AssetTextureSnapshot, MipmapRequest, Tracked};
+use crate::core::ResourceManager;
+use crate::core::gpu::{
+    AssetTextureCandidateBatch, AssetTextureCandidateId, AssetTextureMaterialization,
+    AssetTextureSnapshot, MipmapRequest, Tracked,
+};
+use crate::graph::asset_texture_batch::{AssetTextureBatch, AssetTextureBatchId};
 use crate::graph::capacity::{
     CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
     shrink_vec_by_family_ratio, vec_footprint,
 };
 
-use super::types::{TextureDesc, TextureNodeId};
+use super::types::{ResourceRecord, TextureDesc, TextureNodeId};
+
+const ASSET_TEXTURE_IMPORT_BASELINE: usize = 32;
 
 /// Copy index into GraphStorage's destructible asset-import table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,6 +64,15 @@ struct AssetTextureLookupKey {
     logical_version: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PlannedAssetTextureImport {
+    import: AssetTextureImportId,
+    /// Canonical sampling-ready root or mip alias chosen by the first
+    /// built-in consumer. The exact snapshot makes that policy stable for the
+    /// rest of graph construction.
+    ready: Option<TextureNodeId>,
+}
+
 impl From<AssetTextureSnapshot> for AssetTextureLookupKey {
     fn from(snapshot: AssetTextureSnapshot) -> Self {
         Self {
@@ -78,16 +95,24 @@ impl From<AssetTextureSnapshot> for AssetTextureLookupKey {
 pub(crate) struct AssetTextureImportEntry {
     pub(crate) node: TextureNodeId,
     pub(crate) snapshot: AssetTextureSnapshot,
+    /// Canonical graph-attempt owner plan. Built-in production imports always
+    /// carry this ID so post-DPE preparation never reopens AssetStorage.
+    pub(crate) owner_plan: Option<AssetTextureBatchId>,
     mip_ready: Option<TextureNodeId>,
     materialization: OnceLock<AssetTextureMaterialization>,
     mipmaps_encoded: AtomicBool,
 }
 
 impl AssetTextureImportEntry {
-    fn new(node: TextureNodeId, snapshot: AssetTextureSnapshot) -> Self {
+    fn new(
+        node: TextureNodeId,
+        snapshot: AssetTextureSnapshot,
+        owner_plan: Option<AssetTextureBatchId>,
+    ) -> Self {
         Self {
             node,
             snapshot,
+            owner_plan,
             mip_ready: None,
             materialization: OnceLock::new(),
             mipmaps_encoded: AtomicBool::new(false),
@@ -96,10 +121,33 @@ impl AssetTextureImportEntry {
 }
 
 /// GraphStorage-owned lookup and frame slots for logical asset imports.
-#[derive(Default)]
 pub(crate) struct AssetTextureImportStore {
     entries: Vec<AssetTextureImportEntry>,
     lookup: FxHashMap<AssetTextureLookupKey, AssetTextureImportId>,
+    /// Dense canonical-plan join. Repeated shadow/material/skybox consumers
+    /// avoid re-hashing the complete snapshot and re-querying mip residency.
+    planned: Vec<Option<PlannedAssetTextureImport>>,
+    /// Reused post-DPE candidate transaction and input-aligned joins.
+    candidates: AssetTextureCandidateBatch,
+    live_imports: Vec<AssetTextureImportId>,
+    live_owner_plans: Vec<AssetTextureBatchId>,
+    live_candidates: Vec<AssetTextureCandidateId>,
+    live_current: Vec<bool>,
+}
+
+impl Default for AssetTextureImportStore {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            lookup: FxHashMap::default(),
+            planned: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            candidates: AssetTextureCandidateBatch::new(),
+            live_imports: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            live_owner_plans: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            live_candidates: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            live_current: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+        }
+    }
 }
 
 impl AssetTextureImportStore {
@@ -110,15 +158,77 @@ impl AssetTextureImportStore {
 
     #[must_use]
     pub(crate) fn capacity_usage(&self) -> CapacityUsage {
-        vec_footprint(&self.entries, 32) + estimated_hash_map_footprint(&self.lookup, 32)
+        vec_footprint(&self.entries, ASSET_TEXTURE_IMPORT_BASELINE)
+            + estimated_hash_map_footprint(&self.lookup, ASSET_TEXTURE_IMPORT_BASELINE)
+            + vec_footprint(&self.planned, ASSET_TEXTURE_IMPORT_BASELINE)
+            + CapacityUsage::new(
+                self.candidates.active_bytes(),
+                self.candidates.retained_bytes(),
+                AssetTextureCandidateBatch::baseline_bytes(),
+            )
+            + vec_footprint(&self.live_imports, ASSET_TEXTURE_IMPORT_BASELINE)
+            + vec_footprint(&self.live_owner_plans, ASSET_TEXTURE_IMPORT_BASELINE)
+            + vec_footprint(&self.live_candidates, ASSET_TEXTURE_IMPORT_BASELINE)
+            + CapacityUsage::new(
+                self.live_current.len().div_ceil(8),
+                self.live_current.capacity().div_ceil(8),
+                ASSET_TEXTURE_IMPORT_BASELINE.div_ceil(8),
+            )
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
-        shrink_vec_by_family_ratio(&mut self.entries, 32, target_bytes, retained_bytes);
-        shrink_hash_map_by_family_ratio(&mut self.lookup, 32, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(
+            &mut self.entries,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.lookup,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.planned,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        self.candidates.trim_capacity(target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(
+            &mut self.live_imports,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.live_owner_plans,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.live_candidates,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.live_current,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
     }
 
     pub(crate) fn clear(&mut self) {
+        self.live_candidates.clear();
+        self.live_current.clear();
+        self.live_owner_plans.clear();
+        self.live_imports.clear();
+        self.candidates.clear();
+        self.planned.clear();
         self.lookup.clear();
         // Drops tracked views and any unconsumed Drop-bearing mip requests.
         self.entries.clear();
@@ -131,11 +241,49 @@ impl AssetTextureImportStore {
             .copied()
     }
 
+    #[must_use]
+    pub(crate) fn find_planned(
+        &self,
+        owner_plan: AssetTextureBatchId,
+    ) -> Option<AssetTextureImportId> {
+        self.planned
+            .get(owner_plan.index())
+            .copied()
+            .flatten()
+            .map(|planned| planned.import)
+    }
+
+    #[must_use]
+    pub(crate) fn planned_ready(&self, owner_plan: AssetTextureBatchId) -> Option<TextureNodeId> {
+        self.planned
+            .get(owner_plan.index())
+            .copied()
+            .flatten()
+            .and_then(|planned| planned.ready)
+    }
+
+    pub(crate) fn set_planned_ready(
+        &mut self,
+        owner_plan: AssetTextureBatchId,
+        ready: TextureNodeId,
+    ) {
+        let planned = self
+            .planned
+            .get_mut(owner_plan.index())
+            .and_then(Option::as_mut)
+            .expect("asset texture owner plan has no logical import");
+        assert!(
+            planned.ready.replace(ready).is_none_or(|old| old == ready),
+            "asset texture owner plan resolved conflicting sampling roots"
+        );
+    }
+
     pub(crate) fn insert(
         &mut self,
         id: AssetTextureImportId,
         node: TextureNodeId,
         snapshot: AssetTextureSnapshot,
+        owner_plan: Option<AssetTextureBatchId>,
     ) {
         assert_eq!(
             id.index(),
@@ -147,7 +295,45 @@ impl AssetTextureImportStore {
             .insert(AssetTextureLookupKey::from(snapshot), id);
         assert!(old.is_none(), "asset texture import key registered twice");
         self.entries
-            .push(AssetTextureImportEntry::new(node, snapshot));
+            .push(AssetTextureImportEntry::new(node, snapshot, owner_plan));
+        if let Some(owner_plan) = owner_plan {
+            self.bind_owner_plan(id, owner_plan);
+        }
+    }
+
+    /// Attach the canonical retained-owner plan to an import first registered
+    /// through the generic API. Repeated planned imports must agree exactly.
+    pub(crate) fn bind_owner_plan(
+        &mut self,
+        id: AssetTextureImportId,
+        owner_plan: AssetTextureBatchId,
+    ) {
+        let entry = self
+            .entries
+            .get_mut(id.index())
+            .expect("asset texture import ID is out of bounds");
+        match entry.owner_plan {
+            Some(existing) => assert_eq!(
+                existing, owner_plan,
+                "asset texture snapshot registered from conflicting owner plans"
+            ),
+            None => entry.owner_plan = Some(owner_plan),
+        }
+        if self.planned.len() <= owner_plan.index() {
+            self.planned.resize(owner_plan.index() + 1, None);
+        }
+        match self.planned[owner_plan.index()] {
+            Some(planned) => assert_eq!(
+                planned.import, id,
+                "asset texture owner plan registered to conflicting imports"
+            ),
+            None => {
+                self.planned[owner_plan.index()] = Some(PlannedAssetTextureImport {
+                    import: id,
+                    ready: None,
+                });
+            }
+        }
     }
 
     #[must_use]
@@ -160,11 +346,6 @@ impl AssetTextureImportStore {
         self.entries
             .get(id.index())
             .expect("asset texture import ID is out of bounds")
-    }
-
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
     }
 
     /// Return the unique mip-ready alias registered for this lazy import.
@@ -194,6 +375,179 @@ impl AssetTextureImportStore {
         AssetTextureResolver::new(&self.entries)
     }
 
+    /// Build unpublished GPU candidates from retained exact owners, perform
+    /// a selected-live cross-storage postflight, and publish only members that
+    /// remain current. Uploading cold or refreshed physical content adds one
+    /// final postflight; an exact warm-cache frame retains the single-barrier
+    /// path. Built-in imports therefore clone no asset owner in this post-DPE
+    /// phase.
+    pub(crate) fn materialize_live(
+        &mut self,
+        resources: &[ResourceRecord],
+        owner_plans: &mut AssetTextureBatch,
+        assets: &AssetServer,
+        resource_manager: &mut ResourceManager,
+    ) {
+        self.materialize_live_impl(
+            resources,
+            owner_plans,
+            assets,
+            resource_manager,
+            |_| {},
+            |_| {},
+        );
+    }
+
+    fn materialize_live_impl(
+        &mut self,
+        resources: &[ResourceRecord],
+        owner_plans: &mut AssetTextureBatch,
+        assets: &AssetServer,
+        resource_manager: &mut ResourceManager,
+        after_candidates: impl FnOnce(&ResourceManager),
+        after_materialize: impl FnOnce(&ResourceManager),
+    ) {
+        debug_assert!(self.live_imports.is_empty());
+        debug_assert!(self.live_owner_plans.is_empty());
+        debug_assert!(self.live_candidates.is_empty());
+        debug_assert!(self.live_current.is_empty());
+        debug_assert!(self.candidates.is_empty());
+
+        for index in 0..self.entries.len() {
+            let id = AssetTextureImportId::from_index(index);
+            let entry = &self.entries[index];
+            if entry.materialization.get().is_some()
+                || resources[entry.node.index() as usize].first_use == usize::MAX
+            {
+                continue;
+            }
+
+            let Some(owner_plan) = entry.owner_plan else {
+                // The generic import API is retained for isolated graph tests.
+                // All built-in production imports carry an owner plan.
+                let result =
+                    resource_manager.materialize_asset_texture_for_graph(assets, entry.snapshot);
+                assert!(entry.materialization.set(result).is_ok());
+                continue;
+            };
+            let Some((texture, image)) = owner_plans.ready_owners(owner_plan, entry.snapshot)
+            else {
+                assert!(
+                    entry
+                        .materialization
+                        .set(AssetTextureMaterialization::unavailable())
+                        .is_ok()
+                );
+                continue;
+            };
+            let candidate = resource_manager.stage_asset_texture_candidate(
+                &mut self.candidates,
+                entry.snapshot,
+                texture,
+                image,
+            );
+            self.live_imports.push(id);
+            self.live_owner_plans.push(owner_plan);
+            self.live_candidates.push(candidate);
+        }
+
+        after_candidates(resource_manager);
+
+        if !self.live_candidates.is_empty() {
+            self.live_current.extend(
+                owner_plans
+                    .postflight_selected(assets, &self.live_owner_plans)
+                    .iter()
+                    .copied(),
+            );
+            let mut uploaded_any = false;
+            for index in 0..self.live_candidates.len() {
+                if !self.live_current[index] {
+                    continue;
+                }
+                let import = self.live_imports[index];
+                let owner_plan = self.live_owner_plans[index];
+                let snapshot = self.entries[import.index()].snapshot;
+                let Some((_, image)) = owner_plans.ready_owners(owner_plan, snapshot) else {
+                    self.live_current[index] = false;
+                    continue;
+                };
+                uploaded_any |= resource_manager.materialize_asset_texture_candidate(
+                    &mut self.candidates,
+                    self.live_candidates[index],
+                    image,
+                );
+            }
+            after_materialize(resource_manager);
+            if uploaded_any {
+                let upload_current =
+                    owner_plans.postflight_selected(assets, &self.live_owner_plans);
+                for (current, upload_current) in
+                    self.live_current.iter_mut().zip(upload_current.iter())
+                {
+                    *current &= *upload_current;
+                }
+            }
+            resource_manager
+                .publish_asset_texture_candidates(&mut self.candidates, &self.live_current);
+            for (&import, &candidate) in self.live_imports.iter().zip(&self.live_candidates) {
+                let result = self.candidates.take_result(candidate);
+                assert!(
+                    self.entries[import.index()]
+                        .materialization
+                        .set(result)
+                        .is_ok(),
+                    "Asset Texture import materialized more than once"
+                );
+            }
+        }
+
+        self.live_candidates.clear();
+        self.live_current.clear();
+        self.live_owner_plans.clear();
+        self.live_imports.clear();
+        self.candidates.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialize_live_with_hook(
+        &mut self,
+        resources: &[ResourceRecord],
+        owner_plans: &mut AssetTextureBatch,
+        assets: &AssetServer,
+        resource_manager: &mut ResourceManager,
+        after_candidates: impl FnOnce(&ResourceManager),
+    ) {
+        self.materialize_live_impl(
+            resources,
+            owner_plans,
+            assets,
+            resource_manager,
+            after_candidates,
+            |_| {},
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialize_live_with_hooks(
+        &mut self,
+        resources: &[ResourceRecord],
+        owner_plans: &mut AssetTextureBatch,
+        assets: &AssetServer,
+        resource_manager: &mut ResourceManager,
+        after_candidates: impl FnOnce(&ResourceManager),
+        after_materialize: impl FnOnce(&ResourceManager),
+    ) {
+        self.materialize_live_impl(
+            resources,
+            owner_plans,
+            assets,
+            resource_manager,
+            after_candidates,
+            after_materialize,
+        );
+    }
+
     /// Publish only requests encoded by live nodes, then immediately release
     /// every frame-owned request/view owner. Call after queue submission.
     pub(crate) fn commit_submitted_mipmaps(&mut self) -> usize {
@@ -219,7 +573,14 @@ impl AssetTextureImportStore {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.lookup.is_empty()
+        self.entries.is_empty()
+            && self.lookup.is_empty()
+            && self.planned.is_empty()
+            && self.candidates.is_empty()
+            && self.live_imports.is_empty()
+            && self.live_owner_plans.is_empty()
+            && self.live_candidates.is_empty()
+            && self.live_current.is_empty()
     }
 }
 
@@ -245,6 +606,7 @@ impl<'a> AssetTextureResolver<'a> {
     ///
     /// The outcome may contain no view when asset versions drifted. Its mip
     /// request remains owned by GraphStorage independently of that outcome.
+    #[cfg(test)]
     pub(crate) fn materialize(
         self,
         id: AssetTextureImportId,

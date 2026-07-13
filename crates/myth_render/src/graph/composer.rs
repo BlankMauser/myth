@@ -86,12 +86,11 @@ use crate::graph::passes::{
 use crate::pipeline::{PipelineCache, ShaderCompilationOptions, ShaderManager, ShaderSource};
 use crate::renderer::FrameTime;
 use crate::settings::RendererSettings;
-use myth_assets::{AssetServer, ImageHandle, TextureHandle};
+use myth_assets::AssetServer;
 use myth_resources::texture::TextureSource;
 use myth_scene::Scene;
 use myth_scene::background::BackgroundMapping;
 use myth_scene::camera::RenderCamera;
-use rustc_hash::FxHashMap;
 
 fn present_then_reconfigure_if_needed<T>(
     output: T,
@@ -180,32 +179,6 @@ pub struct GraphBuilderContext<'a, 'g> {
     scene_local_light_count: u32,
 }
 
-/// Collision-free exact identity used only while composing one graph.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct DrawAssetTextureKey {
-    texture_handle: TextureHandle,
-    image_handle: ImageHandle,
-    texture_version: u32,
-    texture_identity: u64,
-    image_version: u32,
-    image_identity: u64,
-    logical_version: u64,
-}
-
-impl From<AssetTextureSnapshot> for DrawAssetTextureKey {
-    fn from(snapshot: AssetTextureSnapshot) -> Self {
-        Self {
-            texture_handle: snapshot.texture_handle,
-            image_handle: snapshot.image_handle,
-            texture_version: snapshot.texture_version,
-            texture_identity: snapshot.texture_identity,
-            image_version: snapshot.image_version,
-            image_identity: snapshot.image_identity,
-            logical_version: snapshot.logical_version,
-        }
-    }
-}
-
 impl GraphBuilderContext<'_, '_> {
     #[inline]
     pub(crate) fn new<'a, 'g>(
@@ -262,7 +235,10 @@ impl GraphBuilderContext<'_, '_> {
 
 #[derive(Debug, Clone, Copy)]
 enum TextureSkyboxSourcePlan {
-    Asset(AssetTextureSnapshot),
+    Asset {
+        owner_plan: crate::graph::asset_texture_batch::AssetTextureBatchId,
+        snapshot: AssetTextureSnapshot,
+    },
     Attachment {
         source: TextureSource,
         logical_version: u64,
@@ -863,7 +839,10 @@ impl<'a> FrameComposer<'a> {
                         return None;
                     }
                     (
-                        TextureSkyboxSourcePlan::Asset(snapshot),
+                        TextureSkyboxSourcePlan::Asset {
+                            owner_plan: id,
+                            snapshot,
+                        },
                         snapshot.logical_version,
                         snapshot.view_dimension,
                     )
@@ -1109,22 +1088,25 @@ impl<'a> FrameComposer<'a> {
             let mut atmosphere_bake_params = None;
 
             let mipmap_snapshot = self.ctx.mipmap_pass.extract(self.ctx.resource_manager);
-            let mut asset_texture_nodes = FxHashMap::default();
-
             // Register every lazy material import before its draw consumers.
             // The import store coordinates repeated exact snapshots into one
             // optional Mipmap SSA chain; each canonical submission receives only
             // the roots or aliases sampled by its own source list.
             for plan in &draw_texture_dependencies {
                 let mut dependencies = Vec::with_capacity(plan.textures.len());
-                for &snapshot in &plan.textures {
-                    let key = DrawAssetTextureKey::from(snapshot);
-                    let ready = if let Some(&ready) = asset_texture_nodes.get(&key) {
+                for &planned in &plan.textures {
+                    let snapshot = planned.snapshot;
+                    let imported = graph_ctx.graph.import_planned_asset_texture(
+                        "Material_Asset_Texture",
+                        planned.owner_plan,
+                        snapshot,
+                    );
+                    let ready = if let Some(ready) = graph_ctx
+                        .graph
+                        .planned_asset_texture_ready(planned.owner_plan)
+                    {
                         ready
                     } else {
-                        let imported = graph_ctx
-                            .graph
-                            .import_asset_texture("Material_Asset_Texture", snapshot);
                         let needs_mipmap_generation = snapshot.mip_count > 1
                             && !self
                                 .ctx
@@ -1135,7 +1117,9 @@ impl<'a> FrameComposer<'a> {
                             imported,
                             needs_mipmap_generation,
                         );
-                        asset_texture_nodes.insert(key, ready);
+                        graph_ctx
+                            .graph
+                            .set_planned_asset_texture_ready(planned.owner_plan, ready);
                         ready
                     };
                     dependencies.push(ready);
@@ -1147,14 +1131,20 @@ impl<'a> FrameComposer<'a> {
 
             if let Some((_, source)) = texture_skybox_plan {
                 texture_skybox_input = Some(match source {
-                    TextureSkyboxSourcePlan::Asset(snapshot) => {
-                        let key = DrawAssetTextureKey::from(snapshot);
-                        let mip_ready = if let Some(&ready) = asset_texture_nodes.get(&key) {
+                    TextureSkyboxSourcePlan::Asset {
+                        owner_plan,
+                        snapshot,
+                    } => {
+                        let imported = graph_ctx.graph.import_planned_asset_texture(
+                            "Skybox_Asset_Texture",
+                            owner_plan,
+                            snapshot,
+                        );
+                        let mip_ready = if let Some(ready) =
+                            graph_ctx.graph.planned_asset_texture_ready(owner_plan)
+                        {
                             ready
                         } else {
-                            let imported = graph_ctx
-                                .graph
-                                .import_asset_texture("Skybox_Asset_Texture", snapshot);
                             let needs_mipmap_generation = snapshot.mip_count > 1
                                 && !self
                                     .ctx
@@ -1165,7 +1155,9 @@ impl<'a> FrameComposer<'a> {
                                 imported,
                                 needs_mipmap_generation,
                             );
-                            asset_texture_nodes.insert(key, ready);
+                            graph_ctx
+                                .graph
+                                .set_planned_asset_texture_ready(owner_plan, ready);
                             ready
                         };
                         TextureSkyboxInput::Graph(mip_ready)

@@ -1,5 +1,7 @@
 //! GPU-side asset arenas and reverse indices.
 
+use std::{mem::size_of, num::NonZeroU32};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use slotmap::SecondaryMap;
 use smallvec::SmallVec;
@@ -7,11 +9,239 @@ use smallvec::SmallVec;
 use myth_assets::{GeometryHandle, ImageHandle, MaterialHandle, TextureHandle};
 use myth_resources::buffer::BufferRef;
 use myth_resources::image::Image;
+use myth_resources::texture::{Texture, TextureSampler};
 
+use super::texture::MaterializedAssetTexture;
 use super::{
-    EnsureResult, GpuBuffer, GpuBufferHandle, GpuGeometry, GpuImage, GpuImageSpec, GpuMaterial,
-    MipmapRequest, PhysicalImageGenerationKey, PhysicalImageId, TextureBinding, TextureImageLease,
+    AssetTextureMaterialization, AssetTextureSnapshot, EnsureResult, GpuBuffer, GpuBufferHandle,
+    GpuGeometry, GpuImage, GpuImageSpec, GpuMaterial, MipmapRequest, PhysicalImageGenerationKey,
+    PhysicalImageId, ResourceManager, TextureBinding, TextureImageLease, Tracked,
 };
+
+const ASSET_TEXTURE_CANDIDATE_BASELINE: usize = 128;
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AssetTextureCandidateId(NonZeroU32);
+
+impl AssetTextureCandidateId {
+    #[inline]
+    fn from_index(index: usize) -> Self {
+        let raw = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .expect("asset texture candidate index exceeds u32::MAX - 1");
+        Self(raw)
+    }
+
+    #[inline]
+    const fn index(self) -> usize {
+        self.0.get() as usize - 1
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PhysicalAssetTextureCandidateKey {
+    spec: GpuImageSpec,
+    image_version: u32,
+    image_identity: u64,
+}
+
+/// Complete cache-side content state used by a Fresh candidate's CAS.
+/// Version/identity are retained explicitly so correctness does not depend on
+/// any one allocation-generation implementation detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PhysicalAssetTextureObservedState {
+    generation: PhysicalImageGenerationKey,
+    image_version: u32,
+    image_identity: u64,
+}
+
+enum PhysicalAssetTextureCandidateSource {
+    /// An exact persistent allocation observed while the candidate was built.
+    Existing {
+        expected: PhysicalImageGenerationKey,
+    },
+    /// A deferred same-spec refresh. It preserves the existing allocation and
+    /// is bracketed by selected-live postflights around the upload.
+    Refresh {
+        observed: PhysicalAssetTextureObservedState,
+    },
+    /// No physical allocation existed at staging. The private image is built
+    /// after the first postflight and enters the persistent pool only after
+    /// the upload-side postflight also succeeds.
+    New { image_slot: Option<usize> },
+}
+
+struct PhysicalAssetTextureCandidate {
+    key: PhysicalAssetTextureCandidateKey,
+    source: PhysicalAssetTextureCandidateSource,
+    /// First accepted logical member. This lets a new physical entry be born
+    /// with a member and preserves the no-zero-member pool invariant.
+    first_live_member: Option<TextureHandle>,
+    /// Only a newly inserted absent-cache target is born with this member.
+    /// Existing targets use the lease table for O(1) attachment checks.
+    pre_attached_member: Option<TextureHandle>,
+    resolved: bool,
+    target: Option<PhysicalImageId>,
+    target_state: Option<PhysicalAssetTextureObservedState>,
+}
+
+struct LogicalAssetTextureCandidate {
+    snapshot: AssetTextureSnapshot,
+    sampler: TextureSampler,
+    physical: Option<usize>,
+    sampler_id: Option<usize>,
+    result: Option<AssetTextureMaterialization>,
+}
+
+/// Graph-attempt owner for unpublished Asset Texture GPU candidates.
+///
+/// Physical work is stable-deduplicated in first-occurrence order. Candidate
+/// staging is CPU-only; uploads and persistent cache mutation begin only after
+/// the selected-live T -> I -> T postflight succeeds.
+pub(crate) struct AssetTextureCandidateBatch {
+    physical: Vec<PhysicalAssetTextureCandidate>,
+    physical_lookup: FxHashMap<PhysicalAssetTextureCandidateKey, usize>,
+    /// Cold-path GPU owners live out of line so every warm physical candidate
+    /// does not inherit the size of `GpuImage`. Slots are retained as one
+    /// batch allocation and never allocate once capacity is warm.
+    private_images: Vec<Option<GpuImage>>,
+    logical: Vec<LogicalAssetTextureCandidate>,
+    published: bool,
+}
+
+impl AssetTextureCandidateBatch {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        let mut physical_lookup = FxHashMap::default();
+        physical_lookup.reserve(ASSET_TEXTURE_CANDIDATE_BASELINE);
+        Self {
+            physical: Vec::with_capacity(ASSET_TEXTURE_CANDIDATE_BASELINE),
+            physical_lookup,
+            private_images: Vec::with_capacity(ASSET_TEXTURE_CANDIDATE_BASELINE),
+            logical: Vec::with_capacity(ASSET_TEXTURE_CANDIDATE_BASELINE),
+            published: false,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.logical.is_empty()
+            && self.physical.is_empty()
+            && self.physical_lookup.is_empty()
+            && self.private_images.is_empty()
+    }
+
+    /// Move one publication result out exactly once. An unavailable result is
+    /// still a completed result and is therefore represented by `Some` here.
+    pub(crate) fn take_result(
+        &mut self,
+        id: AssetTextureCandidateId,
+    ) -> AssetTextureMaterialization {
+        assert!(
+            self.published,
+            "asset texture candidates were not published"
+        );
+        self.logical
+            .get_mut(id.index())
+            .and_then(|candidate| candidate.result.take())
+            .expect("asset texture candidate result was already taken or is invalid")
+    }
+
+    /// Release all private GPU owners and materialization attempts while
+    /// retaining the outer allocations for the next graph attempt.
+    pub(crate) fn clear(&mut self) {
+        self.logical.clear();
+        self.private_images.clear();
+        self.physical_lookup.clear();
+        self.physical.clear();
+        self.published = false;
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn active_bytes(&self) -> usize {
+        self.physical
+            .len()
+            .saturating_mul(size_of::<PhysicalAssetTextureCandidate>())
+            .saturating_add(
+                self.logical
+                    .len()
+                    .saturating_mul(size_of::<LogicalAssetTextureCandidate>()),
+            )
+            .saturating_add(self.physical_lookup.len().saturating_mul(
+                size_of::<(PhysicalAssetTextureCandidateKey, usize)>().saturating_add(1),
+            ))
+            .saturating_add(
+                self.private_images
+                    .len()
+                    .saturating_mul(size_of::<Option<GpuImage>>()),
+            )
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.physical
+            .capacity()
+            .saturating_mul(size_of::<PhysicalAssetTextureCandidate>())
+            .saturating_add(
+                self.logical
+                    .capacity()
+                    .saturating_mul(size_of::<LogicalAssetTextureCandidate>()),
+            )
+            .saturating_add(self.physical_lookup.capacity().saturating_mul(
+                size_of::<(PhysicalAssetTextureCandidateKey, usize)>().saturating_add(1),
+            ))
+            .saturating_add(
+                self.private_images
+                    .capacity()
+                    .saturating_mul(size_of::<Option<GpuImage>>()),
+            )
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn baseline_bytes() -> usize {
+        ASSET_TEXTURE_CANDIDATE_BASELINE.saturating_mul(
+            size_of::<PhysicalAssetTextureCandidate>()
+                + size_of::<LogicalAssetTextureCandidate>()
+                + size_of::<(PhysicalAssetTextureCandidateKey, usize)>()
+                + size_of::<Option<GpuImage>>()
+                + 1,
+        )
+    }
+
+    /// Apply the graph capacity governor's family target/current ratio.
+    /// Private GPU owners must have been released before retained CPU storage
+    /// is trimmed.
+    pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        assert!(
+            self.is_empty(),
+            "live asset texture candidates cannot be trimmed"
+        );
+        if retained_bytes == 0 || target_bytes >= retained_bytes {
+            return;
+        }
+        let target = |capacity: usize| {
+            let proportional = ((capacity as u128) * (target_bytes as u128))
+                .div_ceil(retained_bytes as u128)
+                .min(usize::MAX as u128) as usize;
+            proportional
+                .max(ASSET_TEXTURE_CANDIDATE_BASELINE)
+                .min(capacity)
+        };
+        self.physical.shrink_to(target(self.physical.capacity()));
+        self.logical.shrink_to(target(self.logical.capacity()));
+        self.private_images
+            .shrink_to(target(self.private_images.capacity()));
+        self.physical_lookup
+            .shrink_to(target(self.physical_lookup.capacity()));
+    }
+}
 
 struct PhysicalImageEntry {
     spec: GpuImageSpec,
@@ -238,6 +468,398 @@ impl GpuResourceStore {
                         entry.image.generation_key(request.physical_id) == request.key()
                     })
             );
+        }
+    }
+
+    #[inline]
+    fn physical_state_for_spec(
+        &self,
+        spec: GpuImageSpec,
+    ) -> Option<PhysicalAssetTextureObservedState> {
+        let physical_id = *self.physical_image_index.get(&spec)?;
+        let entry = self.physical_images.get(physical_id)?;
+        (entry.spec == spec && !entry.members.is_empty()).then(|| {
+            PhysicalAssetTextureObservedState {
+                generation: entry.image.generation_key(physical_id),
+                image_version: entry.image.image_version,
+                image_identity: entry.image.image_identity,
+            }
+        })
+    }
+
+    #[inline]
+    fn exact_physical_generation(
+        &self,
+        key: PhysicalAssetTextureCandidateKey,
+    ) -> Option<PhysicalImageGenerationKey> {
+        let physical_id = *self.physical_image_index.get(&key.spec)?;
+        let entry = self.physical_images.get(physical_id)?;
+        (entry.spec == key.spec
+            && !entry.members.is_empty()
+            && entry.image.image_version == key.image_version
+            && entry.image.image_identity == key.image_identity)
+            .then(|| entry.image.generation_key(physical_id))
+    }
+
+    fn stage_asset_texture_candidate(
+        &self,
+        batch: &mut AssetTextureCandidateBatch,
+        snapshot: AssetTextureSnapshot,
+        texture: &Texture,
+        image: &Image,
+    ) -> AssetTextureCandidateId {
+        assert!(
+            !batch.published,
+            "asset texture candidates cannot be staged after publication"
+        );
+
+        // The retained batch owners should reproduce the exact plan snapshot.
+        // Treat a coordinator misuse as unavailable instead of uploading bytes
+        // under a mismatched logical identity.
+        let retained_snapshot = AssetTextureSnapshot::from_loaded(
+            snapshot.texture_handle,
+            texture,
+            snapshot.texture_version,
+            snapshot.texture_identity,
+            image,
+            snapshot.image_version,
+            snapshot.image_identity,
+        );
+        let physical = if retained_snapshot == Some(snapshot) {
+            let key = PhysicalAssetTextureCandidateKey {
+                spec: snapshot.physical_spec(),
+                image_version: snapshot.image_version,
+                image_identity: snapshot.image_identity,
+            };
+            if let Some(&index) = batch.physical_lookup.get(&key) {
+                Some(index)
+            } else {
+                let source = if let Some(expected) = self.exact_physical_generation(key) {
+                    PhysicalAssetTextureCandidateSource::Existing { expected }
+                } else {
+                    match self.physical_state_for_spec(key.spec) {
+                        Some(observed) => PhysicalAssetTextureCandidateSource::Refresh { observed },
+                        None => PhysicalAssetTextureCandidateSource::New { image_slot: None },
+                    }
+                };
+                let index = batch.physical.len();
+                batch.physical.push(PhysicalAssetTextureCandidate {
+                    key,
+                    source,
+                    first_live_member: None,
+                    pre_attached_member: None,
+                    resolved: false,
+                    target: None,
+                    target_state: None,
+                });
+                batch.physical_lookup.insert(key, index);
+                Some(index)
+            }
+        } else {
+            None
+        };
+
+        let id = AssetTextureCandidateId::from_index(batch.logical.len());
+        batch.logical.push(LogicalAssetTextureCandidate {
+            snapshot,
+            sampler: texture.sampler,
+            physical,
+            sampler_id: None,
+            result: None,
+        });
+        id
+    }
+
+    /// Resolve one accepted logical candidate into a physical target after
+    /// AssetStorage postflight. Physical work is deduplicated, so only the
+    /// first accepted logical member for a shared image performs this work.
+    fn materialize_asset_texture_candidate(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &mut AssetTextureCandidateBatch,
+        id: AssetTextureCandidateId,
+        image: &Image,
+        frame_index: u64,
+    ) -> bool {
+        let Some(logical) = batch.logical.get(id.index()) else {
+            return false;
+        };
+        let Some(physical_index) = logical.physical else {
+            return false;
+        };
+        let first_member = logical.snapshot.texture_handle;
+        let candidate = &mut batch.physical[physical_index];
+        if candidate.resolved {
+            return false;
+        }
+        candidate.resolved = true;
+        candidate.first_live_member = Some(first_member);
+
+        let (target, uploaded) = match &mut candidate.source {
+            PhysicalAssetTextureCandidateSource::Existing { expected } => (
+                self.exact_physical_generation(candidate.key)
+                    .filter(|current| *current == *expected)
+                    .map(|current| current.physical),
+                false,
+            ),
+            PhysicalAssetTextureCandidateSource::Refresh { observed } => {
+                let observed = *observed;
+                if let Some(exact) = self.exact_physical_generation(candidate.key) {
+                    (Some(exact.physical), false)
+                } else if self.physical_state_for_spec(candidate.key.spec) != Some(observed) {
+                    (None, false)
+                } else {
+                    let physical_id = observed.generation.physical;
+                    self.discard_mipmap_request_for_physical(physical_id);
+                    let (physical_images, texture_bindings) =
+                        (&mut self.physical_images, &mut self.texture_bindings);
+                    let entry = physical_images
+                        .get_mut(physical_id)
+                        .expect("observed physical image disappeared after CAS");
+                    debug_assert_eq!(
+                        PhysicalAssetTextureObservedState {
+                            generation: entry.image.generation_key(physical_id),
+                            image_version: entry.image.image_version,
+                            image_identity: entry.image.image_identity,
+                        },
+                        observed
+                    );
+                    for member in &entry.members {
+                        texture_bindings.remove(*member);
+                    }
+                    entry.image.update_content(
+                        queue,
+                        image,
+                        candidate.key.image_version,
+                        candidate.key.image_identity,
+                    );
+                    entry.image.last_used_frame = frame_index;
+                    (Some(physical_id), true)
+                }
+            }
+            PhysicalAssetTextureCandidateSource::New { image_slot } => {
+                if let Some(exact) = self.exact_physical_generation(candidate.key) {
+                    (Some(exact.physical), false)
+                } else if self.physical_state_for_spec(candidate.key.spec).is_some() {
+                    (None, false)
+                } else {
+                    let mut unpublished = GpuImage::new(
+                        device,
+                        queue,
+                        image,
+                        candidate.key.spec,
+                        candidate.key.image_version,
+                        candidate.key.image_identity,
+                    );
+                    unpublished.last_used_frame = frame_index;
+                    let private_index = batch.private_images.len();
+                    batch.private_images.push(Some(unpublished));
+                    *image_slot = Some(private_index);
+                    (None, true)
+                }
+            }
+        };
+        candidate.target = target;
+        candidate.target_state =
+            target.and_then(|_| self.physical_state_for_spec(candidate.key.spec));
+        uploaded
+    }
+
+    /// Publish postflight-current candidates after their physical targets were
+    /// resolved. A final cache-side CAS protects the short coordinator window
+    /// between physical materialization and logical lease publication.
+    fn publish_asset_texture_candidates(
+        &mut self,
+        batch: &mut AssetTextureCandidateBatch,
+        current: &[bool],
+        frame_index: u64,
+    ) {
+        debug_assert_eq!(batch.logical.len(), current.len());
+
+        // Publish private new allocations only after the upload-side
+        // postflight. Same-content winners are reused; any other cache change
+        // rejects this physical candidate instead of overwriting it.
+        for candidate in &mut batch.physical {
+            if candidate.target_state.is_some() {
+                continue;
+            }
+            let Some(first_member) = candidate.first_live_member else {
+                continue;
+            };
+            let PhysicalAssetTextureCandidateSource::New { image_slot } = &mut candidate.source
+            else {
+                continue;
+            };
+            let target = if let Some(exact) = self.exact_physical_generation(candidate.key) {
+                Some(exact.physical)
+            } else if self.physical_state_for_spec(candidate.key.spec).is_some() {
+                None
+            } else {
+                let Some(unpublished) = image_slot
+                    .take()
+                    .and_then(|slot| batch.private_images.get_mut(slot))
+                    .and_then(Option::take)
+                else {
+                    continue;
+                };
+                // A stale dangling index is not a valid observed allocation.
+                if let Some(stale_id) = self.physical_image_index.remove(&candidate.key.spec)
+                    && self
+                        .physical_images
+                        .get(stale_id)
+                        .is_some_and(|entry| entry.members.is_empty())
+                {
+                    self.discard_mipmap_request_for_physical(stale_id);
+                    self.physical_images.remove(stale_id);
+                }
+                let physical_id = self.physical_images.insert(PhysicalImageEntry {
+                    spec: candidate.key.spec,
+                    image: unpublished,
+                    members: SmallVec::from_slice(&[first_member]),
+                });
+                let replaced = self
+                    .physical_image_index
+                    .insert(candidate.key.spec, physical_id);
+                debug_assert!(replaced.is_none());
+                candidate.pre_attached_member = Some(first_member);
+                Some(physical_id)
+            };
+            candidate.target = target;
+            candidate.target_state =
+                target.and_then(|_| self.physical_state_for_spec(candidate.key.spec));
+        }
+
+        // Validate all targets before migrating logical leases. New
+        // allocations were born with their first accepted member, so the pool
+        // never exposes a zero-member entry even transiently.
+        for candidate in &mut batch.physical {
+            let Some(expected) = candidate.target_state else {
+                continue;
+            };
+            if self.physical_state_for_spec(candidate.key.spec) != Some(expected) {
+                candidate.target = None;
+                candidate.target_state = None;
+            }
+        }
+
+        // Attach every accepted target before detaching any previous lease.
+        // This makes swaps safe: moving the final old member cannot destroy a
+        // physical allocation that another logical candidate will acquire.
+        for (index, candidate) in batch.logical.iter().enumerate() {
+            if current.get(index).copied() != Some(true) || candidate.sampler_id.is_none() {
+                continue;
+            }
+            let Some(physical_index) = candidate.physical else {
+                continue;
+            };
+            let Some(target) = batch.physical[physical_index].target else {
+                continue;
+            };
+            let handle = candidate.snapshot.texture_handle;
+            let already_attached = batch.physical[physical_index].pre_attached_member
+                == Some(handle)
+                || self
+                    .texture_image_leases
+                    .get(handle)
+                    .is_some_and(|lease| lease.physical_id == target);
+            if already_attached {
+                continue;
+            }
+            let entry = self
+                .physical_images
+                .get_mut(target)
+                .expect("published asset texture target disappeared before attachment");
+            debug_assert!(!entry.members.contains(&handle));
+            entry.members.push(handle);
+        }
+
+        for (index, candidate) in batch.logical.iter_mut().enumerate() {
+            let unavailable = || Some(AssetTextureMaterialization::unavailable());
+            if current.get(index).copied() != Some(true) {
+                candidate.result = unavailable();
+                continue;
+            }
+            let (Some(physical_index), Some(sampler_id)) =
+                (candidate.physical, candidate.sampler_id)
+            else {
+                candidate.result = unavailable();
+                continue;
+            };
+            let Some(physical_id) = batch.physical[physical_index].target else {
+                candidate.result = unavailable();
+                continue;
+            };
+            let snapshot = candidate.snapshot;
+            let previous_lease = self
+                .texture_image_leases
+                .get(snapshot.texture_handle)
+                .copied();
+
+            self.texture_image_leases.insert(
+                snapshot.texture_handle,
+                TextureImageLease {
+                    physical_id,
+                    image_handle: snapshot.image_handle,
+                    texture_version: snapshot.texture_version,
+                    texture_identity: snapshot.texture_identity,
+                    image_version: snapshot.image_version,
+                    image_identity: snapshot.image_identity,
+                    last_used_frame: frame_index,
+                },
+            );
+            if let Some(previous) = previous_lease
+                && previous.physical_id != physical_id
+            {
+                self.detach_physical_member(previous.physical_id, snapshot.texture_handle);
+            }
+
+            let (view, generation_key, mipmap_request) = {
+                let entry = self
+                    .physical_images
+                    .get_mut(physical_id)
+                    .expect("asset texture target disappeared during publication");
+                debug_assert!(entry.members.contains(&snapshot.texture_handle));
+                debug_assert_eq!(entry.spec, snapshot.physical_spec());
+                debug_assert_eq!(entry.image.image_version, snapshot.image_version);
+                debug_assert_eq!(entry.image.image_identity, snapshot.image_identity);
+                entry.image.last_used_frame = frame_index;
+                (
+                    Tracked::with_id(entry.image.default_view.clone(), entry.image.id),
+                    entry.image.generation_key(physical_id),
+                    snapshot
+                        .generate_mipmaps
+                        .then(|| entry.image.mipmap_request(physical_id))
+                        .flatten(),
+                )
+            };
+
+            self.latest_texture_for_image
+                .insert(snapshot.image_handle, snapshot.texture_handle);
+            if let Some(previous_image_handle) = previous_lease.map(|lease| lease.image_handle)
+                && previous_image_handle != snapshot.image_handle
+            {
+                self.repair_texture_image_alias(previous_image_handle);
+            }
+            self.insert_texture_binding(
+                snapshot.texture_handle,
+                TextureBinding {
+                    view_id: generation_key.allocation,
+                    image_handle: snapshot.image_handle,
+                    sampler_id,
+                    texture_version: snapshot.texture_version,
+                    texture_identity: snapshot.texture_identity,
+                    image_version: snapshot.image_version,
+                    image_identity: snapshot.image_identity,
+                },
+            );
+            candidate.result = Some(AssetTextureMaterialization {
+                texture: Some(MaterializedAssetTexture {
+                    view,
+                    generation_key,
+                }),
+                mipmap_request,
+            });
         }
     }
 
@@ -703,5 +1325,304 @@ impl GpuResourceStore {
         self.buffer_index
             .get(&cpu_id)
             .and_then(|&handle| self.gpu_buffers.get(handle))
+    }
+}
+
+impl ResourceManager {
+    /// Build one graph-attempt-private physical/logical Asset Texture
+    /// candidate from retained exact CPU owners.
+    ///
+    /// This is CPU-only and does not mutate the persistent physical pool,
+    /// leases, bindings, aliases, residency timestamps, mip state, or sampler
+    /// cache.
+    pub(crate) fn stage_asset_texture_candidate(
+        &mut self,
+        batch: &mut AssetTextureCandidateBatch,
+        snapshot: AssetTextureSnapshot,
+        texture: &Texture,
+        image: &Image,
+    ) -> AssetTextureCandidateId {
+        self.resources
+            .stage_asset_texture_candidate(batch, snapshot, texture, image)
+    }
+
+    /// Materialize one postflight-current candidate from the retained Image
+    /// owner. Same-spec content refreshes update the existing allocation in
+    /// place; missing specs allocate only after postflight succeeds.
+    pub(crate) fn materialize_asset_texture_candidate(
+        &mut self,
+        batch: &mut AssetTextureCandidateBatch,
+        id: AssetTextureCandidateId,
+        image: &Image,
+    ) -> bool {
+        self.resources.materialize_asset_texture_candidate(
+            &self.device,
+            &self.queue,
+            batch,
+            id,
+            image,
+            self.frame_index,
+        )
+    }
+
+    /// Publish only selected-live candidates that passed the final batched
+    /// asset postflight. Results remain in candidate slots and must be moved
+    /// into graph import owners with [`AssetTextureCandidateBatch::take_result`].
+    pub(crate) fn publish_asset_texture_candidates(
+        &mut self,
+        batch: &mut AssetTextureCandidateBatch,
+        current: &[bool],
+    ) {
+        assert!(
+            !batch.published,
+            "asset texture candidate batch may be published only once"
+        );
+        assert_eq!(
+            batch.logical.len(),
+            current.len(),
+            "asset texture postflight bits must match staged logical candidates"
+        );
+
+        for physical in &mut batch.physical {
+            physical.first_live_member = None;
+            physical.pre_attached_member = None;
+        }
+
+        // Sampler cache publication is deliberately delayed until after the
+        // T -> I -> T postflight. Resolve all accepted descriptors before any
+        // physical pool mutation so a creation failure leaves the pool intact.
+        for (index, candidate) in batch.logical.iter_mut().enumerate() {
+            if !current[index] {
+                continue;
+            }
+            let Some(physical) = candidate.physical else {
+                continue;
+            };
+            let ready = batch.physical[physical].target_state.is_some()
+                || matches!(
+                    &batch.physical[physical].source,
+                    PhysicalAssetTextureCandidateSource::New {
+                        image_slot: Some(_)
+                    }
+                );
+            if !ready {
+                continue;
+            }
+            candidate.sampler_id = Some(
+                self.sampler_registry
+                    .get_custom(&self.device, &candidate.sampler)
+                    .0,
+            );
+            batch.physical[physical].first_live_member = Some(candidate.snapshot.texture_handle);
+        }
+
+        self.resources
+            .publish_asset_texture_candidates(batch, current, self.frame_index);
+        batch.published = true;
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use crate::core::WgpuContext;
+    use crate::core::gpu::texture::snapshot_asset_texture;
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use myth_assets::AssetServer;
+    use myth_resources::image::{ImageDimension, PixelFormat};
+
+    fn image_8x8(byte: u8) -> Image {
+        Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![byte; 8 * 8 * 4]),
+        )
+    }
+
+    #[test]
+    fn empty_candidate_capacity_is_reusable_and_trimmable() {
+        let mut batch = AssetTextureCandidateBatch::new();
+        batch.physical.reserve(ASSET_TEXTURE_CANDIDATE_BASELINE * 8);
+        batch.logical.reserve(ASSET_TEXTURE_CANDIDATE_BASELINE * 8);
+        batch
+            .private_images
+            .reserve(ASSET_TEXTURE_CANDIDATE_BASELINE * 8);
+        batch
+            .physical_lookup
+            .reserve(ASSET_TEXTURE_CANDIDATE_BASELINE * 8);
+
+        assert!(batch.is_empty());
+        assert_eq!(batch.active_bytes(), 0);
+        let high_watermark = batch.retained_bytes();
+        assert!(high_watermark > AssetTextureCandidateBatch::baseline_bytes());
+
+        batch.trim_capacity(AssetTextureCandidateBatch::baseline_bytes(), high_watermark);
+
+        assert!(batch.is_empty());
+        assert_eq!(batch.active_bytes(), 0);
+        assert!(batch.retained_bytes() < high_watermark);
+        assert!(batch.retained_bytes() >= AssetTextureCandidateBatch::baseline_bytes());
+    }
+
+    #[test]
+    fn single_mip_candidate_cannot_overwrite_a_newer_cache_generation() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(image_8x8(1));
+        let texture_handle = assets
+            .textures
+            .add(Texture::new_2d(Some("single mip CAS"), image_handle));
+
+        let first = snapshot_asset_texture(&assets, texture_handle).unwrap();
+        assert_eq!(first.mip_count, 1);
+        let first_materialized = resources.materialize_asset_texture_for_graph(&assets, first);
+        assert!(first_materialized.texture.is_some());
+        let first_generation = resources
+            .resources
+            .texture_generation_key(texture_handle)
+            .unwrap();
+
+        assets.images.insert_ready(image_handle, image_8x8(2));
+        let (texture_owner, texture_version, texture_identity) = assets
+            .textures
+            .get_entry_with_identity(texture_handle)
+            .unwrap();
+        let (image_owner, image_version, image_identity) =
+            assets.images.get_entry_with_identity(image_handle).unwrap();
+        let second = AssetTextureSnapshot::from_loaded(
+            texture_handle,
+            &texture_owner,
+            texture_version,
+            texture_identity,
+            &image_owner,
+            image_version,
+            image_identity,
+        )
+        .unwrap();
+        let mut candidates = AssetTextureCandidateBatch::new();
+        let staged = resources.stage_asset_texture_candidate(
+            &mut candidates,
+            second,
+            &texture_owner,
+            &image_owner,
+        );
+
+        assets.images.insert_ready(image_handle, image_8x8(3));
+        let third = snapshot_asset_texture(&assets, texture_handle).unwrap();
+        assert_ne!(second.image_identity, third.image_identity);
+        let third_materialized = resources.materialize_asset_texture_for_graph(&assets, third);
+        assert!(third_materialized.texture.is_some());
+        let third_generation = resources
+            .resources
+            .texture_generation_key(texture_handle)
+            .unwrap();
+        assert_ne!(first_generation, third_generation);
+
+        resources.materialize_asset_texture_candidate(&mut candidates, staged, &image_owner);
+        resources.publish_asset_texture_candidates(&mut candidates, &[true]);
+        let stale_result = candidates.take_result(staged);
+        assert!(stale_result.texture.is_none());
+        assert!(stale_result.mipmap_request.is_none());
+        assert!(resources.asset_texture_binding_matches_snapshot(third));
+        assert!(!resources.asset_texture_binding_matches_snapshot(second));
+        assert_eq!(
+            resources.resources.texture_generation_key(texture_handle),
+            Some(third_generation)
+        );
+    }
+
+    #[test]
+    fn shared_physical_candidate_skips_a_dead_first_member() {
+        const TEXTURE_COUNT: usize = 130;
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image_handle = assets.images.add(image_8x8(7));
+        let (image_owner, image_version, image_identity) =
+            assets.images.get_entry_with_identity(image_handle).unwrap();
+        let mut candidates = AssetTextureCandidateBatch::new();
+        let mut staged = Vec::with_capacity(TEXTURE_COUNT);
+        let mut handles = Vec::with_capacity(TEXTURE_COUNT);
+
+        for _ in 0..TEXTURE_COUNT {
+            let handle = assets
+                .textures
+                .add(Texture::new_2d(Some("shared candidate"), image_handle));
+            let (texture_owner, texture_version, texture_identity) =
+                assets.textures.get_entry_with_identity(handle).unwrap();
+            let snapshot = AssetTextureSnapshot::from_loaded(
+                handle,
+                &texture_owner,
+                texture_version,
+                texture_identity,
+                &image_owner,
+                image_version,
+                image_identity,
+            )
+            .unwrap();
+            staged.push(resources.stage_asset_texture_candidate(
+                &mut candidates,
+                snapshot,
+                &texture_owner,
+                &image_owner,
+            ));
+            handles.push(handle);
+        }
+        assert_eq!(candidates.physical.len(), 1);
+
+        let mut current = vec![true; TEXTURE_COUNT];
+        current[0] = false;
+        for (&candidate, &is_current) in staged.iter().zip(&current) {
+            if is_current {
+                resources.materialize_asset_texture_candidate(
+                    &mut candidates,
+                    candidate,
+                    &image_owner,
+                );
+            }
+        }
+        resources.publish_asset_texture_candidates(&mut candidates, &current);
+        for (index, candidate) in staged.into_iter().enumerate() {
+            assert_eq!(
+                candidates.take_result(candidate).texture.is_some(),
+                index != 0
+            );
+        }
+
+        let physical = resources
+            .resources
+            .texture_image_lease(handles[1])
+            .unwrap()
+            .physical_id;
+        assert_eq!(
+            resources.resources.physical_image_member_count(physical),
+            Some(TEXTURE_COUNT - 1)
+        );
+        assert!(resources.get_texture_binding(handles[0]).is_none());
+        assert!(
+            handles
+                .iter()
+                .skip(1)
+                .all(|&handle| resources.get_texture_binding(handle).is_some())
+        );
+        resources.resources.assert_texture_pool_consistent();
     }
 }

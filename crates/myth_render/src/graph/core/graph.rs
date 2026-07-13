@@ -12,7 +12,7 @@ use crate::core::gpu::{
     MipmapRequestBatch, PhysicalImageGenerationKey, Tracked,
 };
 use crate::graph::asset_frame::{GeometryFrameStore, ObjectInterfaceStore};
-use crate::graph::asset_texture_batch::AssetTextureBatch;
+use crate::graph::asset_texture_batch::{AssetTextureBatch, AssetTextureBatchId};
 use crate::graph::capacity::{
     CapacityGovernor, CapacityUsage, PendingCapacityTrim, binary_heap_footprint,
     estimated_hash_map_footprint, estimated_hash_set_footprint, shrink_binary_heap_by_family_ratio,
@@ -28,7 +28,7 @@ use crate::graph::frame::DrawPlanKey;
 use crate::graph::frame::{DrawPlanStore, PreparedDrawStore};
 use crate::graph::material_plan::MaterialPlanStore;
 
-use super::asset_texture::{AssetTextureImportId, AssetTextureImportStore, snapshot_texture_desc};
+use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
 use super::diagnostics::{
     RdgAttemptOwner, RdgDiagnosticsRecorder, RdgFrameDiagnostics, RdgFramePhase,
@@ -2117,14 +2117,47 @@ impl<'a> RenderGraph<'a> {
     ///
     /// Repeated imports of the same logical snapshot return the same graph
     /// root. No asset lookup, upload, or WGPU allocation happens here.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn import_asset_texture(
         &mut self,
         name: &'static str,
         snapshot: AssetTextureSnapshot,
     ) -> TextureNodeId {
+        self.import_asset_texture_with_owner(name, snapshot, None)
+    }
+
+    /// Import an exact Asset Texture through the canonical retained-owner
+    /// batch captured by Composer. The plan ID is carried to the post-DPE
+    /// materialization barrier; no AssetStorage lookup is needed there.
+    pub(crate) fn import_planned_asset_texture(
+        &mut self,
+        name: &'static str,
+        owner_plan: AssetTextureBatchId,
+        snapshot: AssetTextureSnapshot,
+    ) -> TextureNodeId {
+        assert_eq!(
+            self.storage
+                .asset_texture_plans
+                .state(owner_plan)
+                .and_then(|state| state.ready),
+            Some(snapshot),
+            "planned Asset Texture import disagrees with its retained owner"
+        );
+        self.import_asset_texture_with_owner(name, snapshot, Some(owner_plan))
+    }
+
+    fn import_asset_texture_with_owner(
+        &mut self,
+        name: &'static str,
+        snapshot: AssetTextureSnapshot,
+        owner_plan: Option<AssetTextureBatchId>,
+    ) -> TextureNodeId {
         self.assert_topology_mutable();
         let desc = snapshot_texture_desc(snapshot);
-        if let Some(id) = self.storage.asset_texture_imports.find(snapshot) {
+        let existing = owner_plan
+            .and_then(|owner_plan| self.storage.asset_texture_imports.find_planned(owner_plan))
+            .or_else(|| self.storage.asset_texture_imports.find(snapshot));
+        if let Some(id) = existing {
             let entry = self.storage.asset_texture_imports.entry(id);
             assert_eq!(
                 entry.snapshot, snapshot,
@@ -2135,7 +2168,13 @@ impl<'a> RenderGraph<'a> {
                 desc,
                 "asset texture imported with conflicting graph descriptors"
             );
-            return entry.node;
+            let node = entry.node;
+            if let Some(owner_plan) = owner_plan {
+                self.storage
+                    .asset_texture_imports
+                    .bind_owner_plan(id, owner_plan);
+            }
+            return node;
         }
 
         let import_id = self.storage.asset_texture_imports.next_id();
@@ -2148,8 +2187,28 @@ impl<'a> RenderGraph<'a> {
         ));
         self.storage
             .asset_texture_imports
-            .insert(import_id, node, snapshot);
+            .insert(import_id, node, snapshot, owner_plan);
         node
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn planned_asset_texture_ready(
+        &self,
+        owner_plan: AssetTextureBatchId,
+    ) -> Option<TextureNodeId> {
+        self.storage.asset_texture_imports.planned_ready(owner_plan)
+    }
+
+    #[inline]
+    pub(crate) fn set_planned_asset_texture_ready(
+        &mut self,
+        owner_plan: AssetTextureBatchId,
+        ready: TextureNodeId,
+    ) {
+        self.storage
+            .asset_texture_imports
+            .set_planned_ready(owner_plan, ready);
     }
 
     /// Publish exact mip generations encoded by live logical asset producers.
@@ -2314,25 +2373,13 @@ impl<'a> RenderGraph<'a> {
             self.storage.topology_compiled,
             "Asset Texture materialization requires a compiled graph"
         );
-        let resolver = self.storage.asset_texture_imports.resolver();
-        for index in 0..self.storage.asset_texture_imports.len() {
-            let id = AssetTextureImportId::from_index(index);
-            if resolver.materialization(id).is_some() {
-                continue;
-            }
-            let entry = self.storage.asset_texture_imports.entry(id);
-            let live = self.storage.resources[entry.node.index() as usize].first_use != usize::MAX;
-            if !live {
-                continue;
-            }
-            let materialization =
-                resource_manager.materialize_asset_texture_for_graph(assets, entry.snapshot);
-            resolver.materialize(id, materialization);
-            assert!(
-                resolver.materialization(id).is_some(),
-                "live Asset Texture import must record a materialization outcome"
-            );
-        }
+        let storage = &mut *self.storage;
+        storage.asset_texture_imports.materialize_live(
+            &storage.resources,
+            &mut storage.asset_texture_plans,
+            assets,
+            resource_manager,
+        );
     }
 
     /// Materialize only logical scene buffers touched by DPE-live passes.
@@ -4927,6 +4974,45 @@ mod tests {
     }
 
     #[test]
+    fn planned_asset_texture_uses_dense_import_and_ready_joins() {
+        let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            4,
+            4,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![255; 4 * 4 * 4]),
+        ));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("planned dense join"), image));
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let plan = graph.storage.asset_texture_plans.request(texture);
+        graph.storage.asset_texture_plans.capture_requested(&assets);
+        let snapshot = graph
+            .storage
+            .asset_texture_plans
+            .state(plan)
+            .unwrap()
+            .ready
+            .unwrap();
+
+        // Exercise the generic-to-planned upgrade as well as the normal dense
+        // repeated path. Both must converge on one import and one ready node.
+        let generic = graph.import_asset_texture("Generic_First", snapshot);
+        let planned = graph.import_planned_asset_texture("Planned", plan, snapshot);
+        assert_eq!(generic, planned);
+        graph.set_planned_asset_texture_ready(plan, planned);
+        let repeated = graph.import_planned_asset_texture("Repeated", plan, snapshot);
+        assert_eq!(repeated, planned);
+        assert_eq!(graph.planned_asset_texture_ready(plan), Some(planned));
+    }
+
+    #[test]
     #[should_panic(expected = "is a read-only lazy external input")]
     fn asset_texture_import_root_rejects_a_writer() {
         let mut storage = GraphStorage::new();
@@ -5190,8 +5276,29 @@ mod tests {
         let arena = FrameArena::new();
         {
             let mut graph = begin_test_frame(&mut storage, &arena);
-            let live = graph.import_asset_texture("Live_Asset", live_snapshot);
-            let dead = graph.import_asset_texture("Dead_Asset", dead_snapshot);
+            let live_plan = graph.storage.asset_texture_plans.request(live_handle);
+            let dead_plan = graph.storage.asset_texture_plans.request(dead_handle);
+            graph.storage.asset_texture_plans.capture_requested(&assets);
+            assert_eq!(
+                graph
+                    .storage
+                    .asset_texture_plans
+                    .state(live_plan)
+                    .unwrap()
+                    .ready,
+                Some(live_snapshot)
+            );
+            assert_eq!(
+                graph
+                    .storage
+                    .asset_texture_plans
+                    .state(dead_plan)
+                    .unwrap()
+                    .ready,
+                Some(dead_snapshot)
+            );
+            let live = graph.import_planned_asset_texture("Live_Asset", live_plan, live_snapshot);
+            let dead = graph.import_planned_asset_texture("Dead_Asset", dead_plan, dead_snapshot);
             graph.add_pass("Live_Asset_Consumer", |builder| {
                 builder.read_texture(live);
                 builder.mark_side_effect();
@@ -5199,7 +5306,19 @@ mod tests {
             });
 
             graph.compile_topology();
-            graph.materialize_live_asset_textures(&assets, &mut resource_manager);
+            {
+                let storage = &mut *graph.storage;
+                storage.asset_texture_imports.materialize_live_with_hook(
+                    &storage.resources,
+                    &mut storage.asset_texture_plans,
+                    &assets,
+                    &mut resource_manager,
+                    |resource_manager| {
+                        assert!(resource_manager.get_texture_binding(live_handle).is_none());
+                        assert!(resource_manager.get_texture_binding(dead_handle).is_none());
+                    },
+                );
+            }
 
             assert!(resource_manager.get_texture_binding(live_handle).is_some());
             assert!(resource_manager.get_texture_binding(dead_handle).is_none());
@@ -5228,6 +5347,296 @@ mod tests {
             !resource_manager.asset_snapshot_mipmaps_submitted(live_snapshot),
             "the next graph must retry the unsubmitted logical mip producer"
         );
+    }
+
+    #[test]
+    fn asset_texture_candidate_postflight_rejects_only_the_drifting_image() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resource_manager = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let make_image = |byte| {
+            Image::new(
+                8,
+                8,
+                1,
+                ImageDimension::D2,
+                PixelFormat::Rgba8Unorm,
+                Some(vec![byte; 8 * 8 * 4]),
+            )
+        };
+        let good_image = assets.images.add(make_image(31));
+        let bad_image = assets.images.add(make_image(47));
+        let mut good_texture = Texture::new_2d(Some("stable candidate"), good_image);
+        good_texture.generate_mipmaps = true;
+        let good_handle = assets.textures.add(good_texture);
+        let mut bad_texture = Texture::new_2d(Some("drifting candidate"), bad_image);
+        bad_texture.generate_mipmaps = true;
+        let bad_handle = assets.textures.add(bad_texture);
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let good_plan = graph.storage.asset_texture_plans.request(good_handle);
+        let bad_plan = graph.storage.asset_texture_plans.request(bad_handle);
+        graph.storage.asset_texture_plans.capture_requested(&assets);
+        let good_snapshot = graph
+            .storage
+            .asset_texture_plans
+            .state(good_plan)
+            .unwrap()
+            .ready
+            .unwrap();
+        let bad_snapshot = graph
+            .storage
+            .asset_texture_plans
+            .state(bad_plan)
+            .unwrap()
+            .ready
+            .unwrap();
+        let good = graph.import_planned_asset_texture("Good", good_plan, good_snapshot);
+        let bad = graph.import_planned_asset_texture("Bad", bad_plan, bad_snapshot);
+        graph.add_pass("Asset_Consumers", |builder| {
+            builder.read_texture(good);
+            builder.read_texture(bad);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+
+        {
+            let storage = &mut *graph.storage;
+            storage.asset_texture_imports.materialize_live_with_hook(
+                &storage.resources,
+                &mut storage.asset_texture_plans,
+                &assets,
+                &mut resource_manager,
+                |resource_manager| {
+                    assert!(resource_manager.get_texture_binding(good_handle).is_none());
+                    assert!(resource_manager.get_texture_binding(bad_handle).is_none());
+                    assets.images.insert_ready(bad_image, make_image(63));
+                },
+            );
+        }
+
+        assert!(resource_manager.get_texture_binding(good_handle).is_some());
+        assert!(resource_manager.get_texture_image(good_handle).is_some());
+        assert!(resource_manager.get_texture_binding(bad_handle).is_none());
+        assert!(resource_manager.get_texture_image(bad_handle).is_none());
+
+        let good_import = graph.storage.resources[good.index() as usize]
+            .asset_texture_import_id()
+            .unwrap();
+        let bad_import = graph.storage.resources[bad.index() as usize]
+            .asset_texture_import_id()
+            .unwrap();
+        let resolver = graph.storage.asset_texture_imports.resolver();
+        assert!(resolver.view(good_import).is_some());
+        assert_eq!(resolver.mipmap_requests(good_import).count(), 1);
+        assert!(resolver.view(bad_import).is_none());
+        assert_eq!(resolver.mipmap_requests(bad_import).count(), 0);
+
+        resolver.mark_mipmaps_encoded(good_import);
+        assert_eq!(graph.commit_submitted_asset_texture_mipmaps(), 1);
+        assert!(resource_manager.asset_snapshot_mipmaps_submitted(good_snapshot));
+        assert!(!resource_manager.asset_snapshot_mipmaps_submitted(bad_snapshot));
+    }
+
+    #[test]
+    fn asset_texture_upload_postflight_drops_a_drifting_private_image() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resource_manager = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let make_image = |byte| {
+            Image::new(
+                8,
+                8,
+                1,
+                ImageDimension::D2,
+                PixelFormat::Rgba8Unorm,
+                Some(vec![byte; 8 * 8 * 4]),
+            )
+        };
+        let image = assets.images.add(make_image(11));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("private upload drift"), image));
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let plan = graph.storage.asset_texture_plans.request(texture);
+        graph.storage.asset_texture_plans.capture_requested(&assets);
+        let snapshot = graph
+            .storage
+            .asset_texture_plans
+            .state(plan)
+            .unwrap()
+            .ready
+            .unwrap();
+        let imported = graph.import_planned_asset_texture("Private_Drift", plan, snapshot);
+        graph.add_pass("Private_Drift_Consumer", |builder| {
+            builder.read_texture(imported);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+
+        {
+            let storage = &mut *graph.storage;
+            storage.asset_texture_imports.materialize_live_with_hooks(
+                &storage.resources,
+                &mut storage.asset_texture_plans,
+                &assets,
+                &mut resource_manager,
+                |_| {},
+                |resource_manager| {
+                    assert!(resource_manager.get_texture_binding(texture).is_none());
+                    assert!(resource_manager.get_texture_image(texture).is_none());
+                    assets.images.insert_ready(image, make_image(29));
+                },
+            );
+        }
+
+        assert!(resource_manager.get_texture_binding(texture).is_none());
+        assert!(resource_manager.get_texture_image(texture).is_none());
+        let import = graph.storage.resources[imported.index() as usize]
+            .asset_texture_import_id()
+            .unwrap();
+        let resolver = graph.storage.asset_texture_imports.resolver();
+        assert!(resolver.view(import).is_none());
+        assert_eq!(resolver.mipmap_requests(import).count(), 0);
+    }
+
+    #[test]
+    fn asset_texture_upload_postflight_rejects_refresh_and_preserves_allocation() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resource_manager = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let make_image = |byte| {
+            Image::new(
+                8,
+                8,
+                1,
+                ImageDimension::D2,
+                PixelFormat::Rgba8Unorm,
+                Some(vec![byte; 8 * 8 * 4]),
+            )
+        };
+        let image = assets.images.add(make_image(37));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("refresh upload drift"), image));
+        let first = snapshot_asset_texture(&assets, texture).unwrap();
+        assert!(
+            resource_manager
+                .materialize_asset_texture_for_graph(&assets, first)
+                .texture
+                .is_some()
+        );
+        let allocation = resource_manager
+            .get_texture_image(texture)
+            .expect("initial physical image missing")
+            .id;
+
+        assets.images.insert_ready(image, make_image(53));
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let plan = graph.storage.asset_texture_plans.request(texture);
+        graph.storage.asset_texture_plans.capture_requested(&assets);
+        let second = graph
+            .storage
+            .asset_texture_plans
+            .state(plan)
+            .unwrap()
+            .ready
+            .unwrap();
+        let imported = graph.import_planned_asset_texture("Refresh_Drift", plan, second);
+        graph.add_pass("Refresh_Drift_Consumer", |builder| {
+            builder.read_texture(imported);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+
+        {
+            let storage = &mut *graph.storage;
+            storage.asset_texture_imports.materialize_live_with_hooks(
+                &storage.resources,
+                &mut storage.asset_texture_plans,
+                &assets,
+                &mut resource_manager,
+                |_| {},
+                |resource_manager| {
+                    assert_eq!(
+                        resource_manager
+                            .get_texture_image(texture)
+                            .expect("refreshed physical image missing")
+                            .id,
+                        allocation
+                    );
+                    assert!(resource_manager.get_texture_binding(texture).is_none());
+                    assets.images.insert_ready(image, make_image(71));
+                },
+            );
+        }
+
+        assert_eq!(
+            resource_manager
+                .get_texture_image(texture)
+                .expect("rejected refresh must retain its allocation")
+                .id,
+            allocation
+        );
+        assert!(resource_manager.get_texture_binding(texture).is_none());
+        let import = graph.storage.resources[imported.index() as usize]
+            .asset_texture_import_id()
+            .unwrap();
+        assert!(
+            graph
+                .storage
+                .asset_texture_imports
+                .resolver()
+                .view(import)
+                .is_none()
+        );
+
+        let third = snapshot_asset_texture(&assets, texture).unwrap();
+        assert!(
+            resource_manager
+                .materialize_asset_texture_for_graph(&assets, third)
+                .texture
+                .is_some()
+        );
+        assert_eq!(
+            resource_manager
+                .get_texture_image(texture)
+                .expect("next attempt failed to recover the refresh")
+                .id,
+            allocation
+        );
+        assert!(resource_manager.asset_texture_binding_matches_snapshot(third));
     }
 
     #[test]

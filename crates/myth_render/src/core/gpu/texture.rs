@@ -147,7 +147,7 @@ impl AssetTextureSnapshot {
     }
 
     #[inline]
-    fn physical_spec(self) -> GpuImageSpec {
+    pub(crate) fn physical_spec(self) -> GpuImageSpec {
         GpuImageSpec {
             image_handle: self.image_handle,
             extent: self.extent,
@@ -413,12 +413,16 @@ impl GpuImage {
     }
 
     #[inline]
-    fn invalidate_mipmaps(&mut self) {
-        if self.mip_level_count <= 1 {
-            return;
-        }
+    fn advance_content_generation(&mut self) {
         self.generation_id = generate_gpu_resource_id();
-        self.submitted_mipmap_generation.store(0, Ordering::Release);
+        self.submitted_mipmap_generation.store(
+            if self.mip_level_count <= 1 {
+                self.generation_id
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
     }
 
     #[must_use]
@@ -471,9 +475,7 @@ impl GpuImage {
             );
             self.image_version = image_version;
             self.image_identity = image_identity;
-            if self.mip_level_count > 1 {
-                self.invalidate_mipmaps();
-            }
+            self.advance_content_generation();
         }
     }
 

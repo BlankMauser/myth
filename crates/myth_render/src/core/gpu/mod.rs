@@ -76,7 +76,9 @@ use myth_resources::buffer::{CpuBuffer, GpuData};
 pub use resource_ids::{
     BindGroupFingerprint, EnsureResult, ResourceId, ResourceIdSet, hash_layout_entries,
 };
-pub(crate) use resource_store::GpuResourceStore;
+pub(crate) use resource_store::{
+    AssetTextureCandidateBatch, AssetTextureCandidateId, GpuResourceStore,
+};
 pub use sampler_registry::{CommonSampler, SamplerRegistry};
 pub use system_textures::SystemTextures;
 pub use tracked::Tracked;
