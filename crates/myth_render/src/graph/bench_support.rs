@@ -4,8 +4,16 @@
 //! builds, but absent from default shipping builds. Its narrow semantic API
 //! avoids exposing backend command-plan internals or timing an approximate public topology.
 
-use myth_assets::{GeometryHandle, MaterialHandle};
-use slotmap::KeyData;
+use myth_assets::{AssetServer, GeometryHandle, MaterialHandle, TextureHandle};
+use myth_resources::{
+    BoundingBox, BufferRef, MaterialTrait, RenderableMaterialTrait, ResourceBuilder,
+    geometry::Geometry,
+    image::{Image, ImageDimension, PixelFormat},
+    material::{Material, MaterialSettings, PhysicalMaterial},
+    shader_defines::ShaderDefines,
+    texture::{Texture, TextureSource},
+};
+use slotmap::{Key, KeyData};
 
 use crate::core::BindingInterfaceId;
 use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
@@ -14,11 +22,20 @@ use crate::graph::core::{
     BufferDesc, ExecuteContext, FrameArena, GraphStorage, PassBuilder, PassNode,
     RdgDiagnosticsRecorder, RdgFramePhase, RenderGraph, TextureDesc, TextureNodeId,
 };
+use crate::graph::extracted::ItemShaderFeatures;
 use crate::graph::frame::{
-    DrawPlanId, DrawPlanKey, DrawPlanStore, FrameSourceId, PreparedSourceId,
+    DrawPlanId, DrawPlanKey, DrawPlanStore, ExtractedSourceId, FrameSourceId, PreparedSourceId,
+    RenderIntent, RenderLists, ShadowRenderIntent,
 };
 use crate::graph::scene_pipeline_prepare::{
     PrepassPipelineL1Key, ScenePipelinePrepareStore, SceneRecipeOrdinal,
+};
+use crate::graph::scene_source_prepare::SceneSourcePrepareStore;
+use crate::graph::{
+    asset_frame::GeometryFrameStore,
+    asset_texture_batch::AssetTextureBatch,
+    extracted::{ExtractedRenderItem, ExtractedScene, MaterialClassification},
+    material_plan::MaterialPlanStore,
 };
 use crate::pipeline::RenderPipelineId;
 
@@ -899,6 +916,74 @@ impl Default for ScenePipelineWarmBenchHarness {
     }
 }
 
+/// Allocation probe for post-finalize morph-history bookkeeping.
+///
+/// `morph_source_stride == 0` models a wholly rigid scene and must leave the
+/// cold morph arena untouched. A nonzero stride records every Nth source once
+/// while `plan_alias_count` replays Opaque/Prepass/Shadow-style aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MorphHistoryWarmBenchSpec {
+    pub source_count: usize,
+    pub plan_alias_count: usize,
+    pub morph_source_stride: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MorphHistoryWarmRunToken {
+    pub recorded_source_count: usize,
+    pub checksum: u64,
+}
+
+pub struct MorphHistoryWarmBenchHarness {
+    plans: DrawPlanStore,
+}
+
+impl MorphHistoryWarmBenchHarness {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            plans: DrawPlanStore::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn run_iteration(&mut self, spec: MorphHistoryWarmBenchSpec) -> MorphHistoryWarmRunToken {
+        assert!(
+            spec.plan_alias_count > 0,
+            "at least one live alias is required"
+        );
+        self.plans.clear();
+
+        if spec.morph_source_stride != 0 {
+            for _ in 0..spec.plan_alias_count {
+                for source_index in (0..spec.source_count).step_by(spec.morph_source_stride) {
+                    self.plans
+                        .record_emitted_morph_history_source(FrameSourceId::from_index(
+                            source_index,
+                        ));
+                }
+            }
+        }
+
+        let mut checksum = 0_u64;
+        for source in self.plans.emitted_morph_history_sources() {
+            checksum = checksum
+                .wrapping_mul(0x9e37_79b1_85eb_ca87)
+                .wrapping_add(source.index() as u64 + 1);
+        }
+        MorphHistoryWarmRunToken {
+            recorded_source_count: self.plans.emitted_morph_history_sources().len(),
+            checksum,
+        }
+    }
+}
+
+impl Default for MorphHistoryWarmBenchHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn validate_scene_pipeline_warm_spec(spec: ScenePipelineWarmBenchSpec) {
     assert!(spec.plan_count > 0, "benchmark requires at least one plan");
     assert!(
@@ -933,7 +1018,7 @@ fn scene_pipeline_prepass_key(variant: usize, plan_index: usize) -> PrepassPipel
         material_asset_identity: discriminator * 17 + 1,
         material_version: discriminator * 19 + 1,
         item_variants: variant_u32,
-        item_shader_defines_hash: discriminator * 23 + 1,
+        item_shader_features: ItemShaderFeatures::from_bits_retain(discriminator as u8 & 3),
         shader_source_identity: discriminator * 29 + 1,
         scene_defines_hash: discriminator * 31 + 1,
         pipeline_settings_version: discriminator * 37 + 1,
@@ -953,6 +1038,430 @@ fn scene_pipeline_prepass_key(variant: usize, plan_index: usize) -> PrepassPipel
         needs_normal: plan_index & 1 != 0,
         needs_feature_id: plan_index & 2 != 0,
         needs_velocity: plan_index & 4 != 0,
+    }
+}
+
+/// Cumulative boundary reached by the M6.5 Helmet-like CPU benchmark.
+///
+/// Criterion measures each prefix independently. Subtracting adjacent prefix
+/// medians gives a phase estimate without adding timers or atomics to the
+/// production renderer. The final stage joins the real Material/AssetTexture
+/// transaction to the retained production ScenePipeline planner.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MaterialSceneCpuBenchStage {
+    /// Exact visible Geometry owner capture used to qualify Material topology.
+    GeometryCapture,
+    /// Add exact Material owner capture, texture visitation, and AssetTexture
+    /// request interning. DPE-live shader derivation is deliberately later.
+    MaterialCapture,
+    /// Add the canonical Texture -> Image -> Texture capture/revalidation batch.
+    AssetTextureCapture,
+    /// Add Material owner/content revalidation and draw-plan texture recipes.
+    MaterialTextureFinalize,
+    /// Add warm Gather -> Plan -> immutable ScenePipeline stream finalization.
+    WarmScenePipeline,
+}
+
+impl MaterialSceneCpuBenchStage {
+    /// Stable Criterion label ordered by the cumulative production boundary.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::GeometryCapture => "00_geometry_capture",
+            Self::MaterialCapture => "01_material_capture",
+            Self::AssetTextureCapture => "02_asset_texture_capture",
+            Self::MaterialTextureFinalize => "03_material_texture_finalize",
+            Self::WarmScenePipeline => "04_warm_scene_pipeline",
+        }
+    }
+}
+
+/// O(1) correctness token for one Helmet-like cumulative CPU iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterialSceneCpuRunToken {
+    /// Number of ready Asset textures configured on the PhysicalMaterial.
+    pub configured_texture_count: usize,
+    /// Number of draw-plan topology recipes published after finalization.
+    pub topology_recipe_count: usize,
+    /// Unique ready Asset textures attached to the Opaque recipe.
+    pub opaque_texture_count: usize,
+    /// Unique ready Asset textures attached to the shadow recipe.
+    pub shadow_texture_count: usize,
+    /// Commands emitted by the final warm ScenePipeline stage.
+    pub scene_command_count: usize,
+    /// Unique source count selected from overlapping Opaque/Prepass/shadow keys.
+    pub selected_source_count: usize,
+    /// Black-box-friendly identity covering both material and pipeline output.
+    pub checksum: u64,
+}
+
+/// Benchmark-only custom-material escape hatch for exercising dependency
+/// counts beyond the built-in Physical material's eight Asset texture slots.
+/// The allocation scenario stops before physical binding preparation; its
+/// texture visitation still uses the exact production MaterialPlan and
+/// AssetTexture transaction.
+#[derive(Debug)]
+struct ManyTextureBenchMaterial {
+    textures: Vec<TextureSource>,
+    uniform: BufferRef,
+}
+
+impl ManyTextureBenchMaterial {
+    fn new(textures: &[TextureHandle]) -> Self {
+        Self {
+            textures: textures.iter().copied().map(TextureSource::Asset).collect(),
+            uniform: BufferRef::empty(wgpu::BufferUsages::UNIFORM, Some("M6.5 bench uniform")),
+        }
+    }
+}
+
+impl MaterialTrait for ManyTextureBenchMaterial {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl RenderableMaterialTrait for ManyTextureBenchMaterial {
+    fn shader_name(&self) -> &'static str {
+        "m65_many_texture_bench"
+    }
+
+    fn version(&self) -> u64 {
+        1
+    }
+
+    fn shader_defines(&self) -> ShaderDefines {
+        ShaderDefines::new()
+    }
+
+    fn settings(&self) -> MaterialSettings {
+        MaterialSettings::default()
+    }
+
+    fn visit_textures(&self, visitor: &mut dyn FnMut(&TextureSource)) {
+        for texture in &self.textures {
+            visitor(texture);
+        }
+    }
+
+    fn define_bindings<'a>(&'a self, _builder: &mut ResourceBuilder<'a>) {}
+
+    fn uniform_buffer(&self) -> BufferRef {
+        self.uniform.clone()
+    }
+
+    fn with_uniform_bytes(&self, f: &mut dyn FnMut(&[u8])) {
+        f(&[]);
+    }
+}
+
+/// Real-asset, GPU-free M6.5 regression harness matching the Helmet hot shape.
+///
+/// The fixture owns one visible source, one built-in PhysicalMaterial (up to
+/// eight textures) or custom Material escape hatch, and distinct ready
+/// Texture/Image pairs. Every iteration reuses the production
+/// graph-attempt stores while running their exact AssetStorage snapshot and
+/// T -> I -> T revalidation paths. The final stage adds one warm production
+/// ScenePipeline recipe. WGPU object creation is intentionally absent: this
+/// isolates the CPU transaction that remains even when all physical resources
+/// and pipelines are resident.
+pub struct MaterialSceneCpuBenchHarness {
+    assets: AssetServer,
+    extracted_scene: ExtractedScene,
+    render_lists: RenderLists,
+    geometry_frames: GeometryFrameStore,
+    material_plans: MaterialPlanStore,
+    asset_textures: AssetTextureBatch,
+    source_selection: SceneSourcePrepareStore,
+    scene_pipeline: ScenePipelineWarmBenchHarness,
+    configured_texture_count: usize,
+}
+
+impl MaterialSceneCpuBenchHarness {
+    /// Create one immutable Helmet-like fixture.
+    ///
+    /// `texture_count = 0` is a useful PhysicalMaterial control arm; five is
+    /// the representative glTF PBR shape and values above eight exercise the
+    /// custom-material spill boundary.
+    #[must_use]
+    pub fn new(texture_count: usize) -> Self {
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let textures: Vec<_> = (0..texture_count)
+            .map(|texture_index| {
+                let texel = u8::try_from(texture_index + 1)
+                    .expect("benchmark texture index exceeds u8")
+                    .wrapping_mul(23);
+                let image = assets.images.add(Image::new(
+                    8,
+                    8,
+                    1,
+                    ImageDimension::D2,
+                    PixelFormat::Rgba8Unorm,
+                    Some(vec![texel; 8 * 8 * 4]),
+                ));
+                assets.textures.add(Texture::new_2d(
+                    Some("M6.5 resident material texture"),
+                    image,
+                ))
+            })
+            .collect();
+
+        let material = if texture_count <= 8 {
+            let physical = PhysicalMaterial::new(glam::Vec4::ONE);
+            configure_physical_texture_slots(&physical, &textures);
+            assets.materials.add(Material::from(physical))
+        } else {
+            assets
+                .materials
+                .add(Material::new_custom(ManyTextureBenchMaterial::new(
+                    &textures,
+                )))
+        };
+
+        let (_, geometry_asset_version, geometry_asset_identity) = assets
+            .geometries
+            .get_entry_with_identity(geometry)
+            .expect("benchmark Geometry missing");
+        let (material_owner, material_asset_version, material_asset_identity) = assets
+            .materials
+            .get_entry_with_identity(material)
+            .expect("benchmark PhysicalMaterial missing");
+        let material_version = material_owner.data.version();
+        drop(material_owner);
+
+        let mut extracted_scene = ExtractedScene::new();
+        extracted_scene.render_items.push(ExtractedRenderItem {
+            node_handle: myth_scene::NodeHandle::null(),
+            world_matrix: glam::Mat4::IDENTITY,
+            prev_world_matrix: glam::Mat4::IDENTITY,
+            geometry,
+            material,
+            geometry_asset_version,
+            geometry_asset_identity,
+            material_asset_version,
+            material_asset_identity,
+            material_version,
+            material_index: 0,
+            material_classification: MaterialClassification::empty(),
+            skeleton: None,
+            item_variant_flags: 0,
+            item_shader_features: ItemShaderFeatures::empty(),
+            cast_shadows: true,
+            receive_shadows: true,
+            world_aabb: BoundingBox::default(),
+        });
+
+        let mut render_lists = RenderLists::new();
+        let source = render_lists.intern_frame_source(ExtractedSourceId::from_index(0));
+        render_lists.insert_opaque(RenderIntent {
+            source,
+            geometry_handle: geometry,
+            material_handle: material,
+            material_index: 0,
+            distance_sq: 0.0,
+        });
+        // The same Material dependency set is consumed by Opaque/Prepass and
+        // one shadow view. Prepass aliases Opaque topology in DrawPlanStore;
+        // the final warm stage exercises its retained production planner.
+        for key in [(CUBE_LIGHT_ID_BASE, 0), (CUBE_LIGHT_ID_BASE + 1, 1)] {
+            render_lists.shadow_queues.insert(
+                key,
+                vec![ShadowRenderIntent {
+                    source,
+                    geometry_handle: geometry,
+                    material_handle: material,
+                }],
+            );
+        }
+
+        Self {
+            assets,
+            extracted_scene,
+            render_lists,
+            geometry_frames: GeometryFrameStore::new(),
+            material_plans: MaterialPlanStore::new(),
+            asset_textures: AssetTextureBatch::new(),
+            source_selection: SceneSourcePrepareStore::new(),
+            scene_pipeline: ScenePipelineWarmBenchHarness::new(),
+            configured_texture_count: texture_count,
+        }
+    }
+
+    /// Run one cumulative production-path prefix.
+    ///
+    /// Attempt stores are cleared first, preserving their capacities exactly
+    /// like GraphStorage. A stage never fabricates the output of a prior phase.
+    #[must_use]
+    pub fn run_iteration(&mut self, stage: MaterialSceneCpuBenchStage) -> MaterialSceneCpuRunToken {
+        self.geometry_frames.clear();
+        self.material_plans.clear();
+        self.asset_textures.clear();
+        self.source_selection.clear();
+
+        self.geometry_frames.capture_visible(
+            &self.assets,
+            &self.extracted_scene,
+            &self.render_lists,
+        );
+
+        if stage == MaterialSceneCpuBenchStage::GeometryCapture {
+            return self.token(0, 0, 0, 0, None);
+        }
+
+        self.material_plans.capture(
+            &self.assets,
+            &self.extracted_scene,
+            &self.render_lists,
+            self.geometry_frames
+                .eligibility(&self.extracted_scene, &self.render_lists),
+            &mut self.asset_textures,
+        );
+
+        if stage == MaterialSceneCpuBenchStage::MaterialCapture {
+            return self.token(0, 0, 0, 0, None);
+        }
+
+        self.asset_textures.capture_requested(&self.assets);
+
+        if stage == MaterialSceneCpuBenchStage::AssetTextureCapture {
+            return self.token(0, 0, 0, 0, None);
+        }
+
+        self.material_plans.finalize_texture_snapshots(
+            &self.assets,
+            &self.extracted_scene,
+            &self.render_lists,
+            &self.asset_textures,
+        );
+        let recipes = self.material_plans.take_topology_recipes();
+        let topology_recipe_count = recipes.len();
+        let opaque_texture_count = recipes
+            .iter()
+            .find(|recipe| recipe.key == DrawPlanKey::Opaque)
+            .map_or(0, |recipe| recipes.textures(recipe).len());
+        let shadow_texture_count = recipes
+            .iter()
+            .find(|recipe| matches!(recipe.key, DrawPlanKey::Shadow { .. }))
+            .map_or(0, |recipe| recipes.textures(recipe).len());
+        let shadow_recipe_count = recipes
+            .iter()
+            .filter(|recipe| matches!(recipe.key, DrawPlanKey::Shadow { .. }))
+            .count();
+
+        assert_eq!(
+            opaque_texture_count, self.configured_texture_count,
+            "stable PhysicalMaterial lost a ready texture dependency"
+        );
+        assert_eq!(
+            shadow_texture_count, self.configured_texture_count,
+            "stable Material lost a ready shadow texture dependency"
+        );
+        assert_eq!(shadow_recipe_count, 2, "benchmark shadow views were lost");
+        assert!(
+            recipes
+                .iter()
+                .filter(|recipe| matches!(recipe.key, DrawPlanKey::Shadow { .. }))
+                .all(|recipe| recipes.textures(recipe).len() == shadow_texture_count),
+            "overlapping shadow views observed different Material dependencies"
+        );
+
+        if stage == MaterialSceneCpuBenchStage::MaterialTextureFinalize {
+            let token = self.token(
+                topology_recipe_count,
+                opaque_texture_count,
+                shadow_texture_count,
+                0,
+                None,
+            );
+            self.material_plans.recycle_topology_recipes(recipes);
+            return token;
+        }
+
+        self.source_selection.select_live_sources(
+            &self.render_lists,
+            [
+                DrawPlanKey::Opaque,
+                DrawPlanKey::Prepass {
+                    needs_normal: true,
+                    needs_feature_id: true,
+                    needs_velocity: true,
+                },
+                DrawPlanKey::Shadow {
+                    light_id: CUBE_LIGHT_ID_BASE,
+                    layer_index: 0,
+                },
+                DrawPlanKey::Shadow {
+                    light_id: CUBE_LIGHT_ID_BASE + 1,
+                    layer_index: 1,
+                },
+            ],
+        );
+        let selected_source_count = self.source_selection.live_sources().len();
+        let scene = self
+            .scene_pipeline
+            .run_iteration(ScenePipelineWarmBenchSpec {
+                plan_count: 1,
+                draws_per_plan: 1,
+                pipeline_variant_count: 1,
+                vertex_bindings_per_draw: 3,
+            });
+        let token = self.token(
+            topology_recipe_count,
+            opaque_texture_count,
+            shadow_texture_count,
+            selected_source_count,
+            Some(scene),
+        );
+        self.material_plans.recycle_topology_recipes(recipes);
+        token
+    }
+
+    fn token(
+        &self,
+        topology_recipe_count: usize,
+        opaque_texture_count: usize,
+        shadow_texture_count: usize,
+        selected_source_count: usize,
+        scene: Option<ScenePipelineWarmRunToken>,
+    ) -> MaterialSceneCpuRunToken {
+        let scene_command_count = scene.map_or(0, |token| token.command_count);
+        let scene_checksum = scene.map_or(0, |token| token.checksum);
+        MaterialSceneCpuRunToken {
+            configured_texture_count: self.configured_texture_count,
+            topology_recipe_count,
+            opaque_texture_count,
+            shadow_texture_count,
+            scene_command_count,
+            selected_source_count,
+            checksum: scene_checksum
+                .wrapping_add(self.configured_texture_count as u64)
+                .wrapping_add((topology_recipe_count as u64) << 16)
+                .wrapping_add((opaque_texture_count as u64) << 32)
+                .wrapping_add((shadow_texture_count as u64) << 48)
+                .wrapping_add((selected_source_count as u64) << 8),
+        }
+    }
+}
+
+fn configure_physical_texture_slots(material: &PhysicalMaterial, textures: &[TextureHandle]) {
+    for (index, &texture) in textures.iter().enumerate() {
+        match index {
+            0 => material.set_map(Some(texture)),
+            1 => material.set_normal_map(Some(texture)),
+            2 => material.set_roughness_map(Some(texture)),
+            3 => material.set_metalness_map(Some(texture)),
+            4 => material.set_emissive_map(Some(texture)),
+            5 => material.set_ao_map(Some(texture)),
+            6 => material.set_specular_map(Some(texture)),
+            7 => material.set_specular_intensity_map(Some(texture)),
+            _ => unreachable!("texture-count validation allows at most eight slots"),
+        }
     }
 }
 
@@ -1169,8 +1678,9 @@ mod tests {
     use super::{
         DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern,
         DrawDemandPlanKey, DrawDemandRoot, DrawDemandTextureTopology, HighFanOutBenchHarness,
-        HighFanOutBenchSpec, HighFanOutRoot, RdgBenchDiagnosticsMode,
-        RdgRecorderLifecycleBenchHarness, project_plan_key, shadow_plan_key,
+        HighFanOutBenchSpec, HighFanOutRoot, MaterialSceneCpuBenchHarness,
+        MaterialSceneCpuBenchStage, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
+        project_plan_key, shadow_plan_key,
     };
 
     fn spec(
@@ -1548,6 +2058,40 @@ mod tests {
             assert_eq!(snapshot.prepared_passes(), live_passes);
             assert_eq!(snapshot.executed_passes(), live_passes);
             assert!(snapshot.queue_submitted());
+        }
+    }
+
+    #[test]
+    fn helmet_like_cpu_harness_preserves_every_cumulative_boundary() {
+        for texture_count in [0, 5, 12] {
+            let mut harness = MaterialSceneCpuBenchHarness::new(texture_count);
+            for stage in [
+                MaterialSceneCpuBenchStage::GeometryCapture,
+                MaterialSceneCpuBenchStage::MaterialCapture,
+                MaterialSceneCpuBenchStage::AssetTextureCapture,
+                MaterialSceneCpuBenchStage::MaterialTextureFinalize,
+                MaterialSceneCpuBenchStage::WarmScenePipeline,
+            ] {
+                let token = harness.run_iteration(stage);
+                assert_eq!(token.configured_texture_count, texture_count);
+                if stage >= MaterialSceneCpuBenchStage::MaterialTextureFinalize {
+                    assert_eq!(token.topology_recipe_count, 4);
+                    assert_eq!(token.opaque_texture_count, texture_count);
+                    assert_eq!(token.shadow_texture_count, texture_count);
+                } else {
+                    assert_eq!(token.topology_recipe_count, 0);
+                    assert_eq!(token.opaque_texture_count, 0);
+                    assert_eq!(token.shadow_texture_count, 0);
+                }
+                assert_eq!(
+                    token.scene_command_count,
+                    usize::from(stage == MaterialSceneCpuBenchStage::WarmScenePipeline)
+                );
+                assert_eq!(
+                    token.selected_source_count,
+                    usize::from(stage == MaterialSceneCpuBenchStage::WarmScenePipeline)
+                );
+            }
         }
     }
 

@@ -6,10 +6,12 @@
 //! graph attempt. Physical buffers and the finalized bind group are retained
 //! only after that demand survives DPE.
 
-use myth_resources::buffer::{BufferRef, CpuBuffer, CpuBufferStamp, GpuData};
+use myth_resources::buffer::{CpuBuffer, CpuBufferStamp, GpuData};
 use myth_resources::uniforms::{EnvironmentUniforms, GpuLightStorage, RenderStateUniforms};
 
-use crate::core::gpu::{BufferUploadContext, GlobalStateKey, Tracked};
+use crate::core::gpu::{
+    BufferUploadContext, GlobalStateKey, HintedBufferSnapshotInput, MaterializedBufferToken,
+};
 
 /// Coherent logical identity of the three persistent buffers in Group 0.
 ///
@@ -56,16 +58,17 @@ pub(crate) enum GlobalStateMaterializationFailure {
     Unavailable,
 }
 
-/// Destructor-aware physical state owned by one graph attempt.
+/// Exact physical state owned by one graph attempt.
 ///
 /// `attempted` makes both success and failure sticky within an attempt. The
-/// three explicit fields avoid a heap allocation and preserve binding order.
+/// three Copy buffer tokens avoid a heap allocation and preserve binding
+/// order; only the finalized BindGroup is a destructor-aware owner.
 #[derive(Default)]
 pub(crate) struct PreparedGlobalState {
     attempted: bool,
-    camera: Option<Tracked<wgpu::Buffer>>,
-    environment: Option<Tracked<wgpu::Buffer>>,
-    directional_lights: Option<Tracked<wgpu::Buffer>>,
+    camera: Option<MaterializedBufferToken>,
+    environment: Option<MaterializedBufferToken>,
+    directional_lights: Option<MaterializedBufferToken>,
     finalized: Option<(GlobalStateKey, wgpu::BindGroup)>,
 }
 
@@ -95,9 +98,9 @@ impl PreparedGlobalState {
 
     fn record_buffers(
         &mut self,
-        camera: Tracked<wgpu::Buffer>,
-        environment: Tracked<wgpu::Buffer>,
-        directional_lights: Tracked<wgpu::Buffer>,
+        camera: MaterializedBufferToken,
+        environment: MaterializedBufferToken,
+        directional_lights: MaterializedBufferToken,
     ) {
         assert!(!self.attempted, "global state batch was attempted twice");
         self.attempted = true;
@@ -111,15 +114,18 @@ impl PreparedGlobalState {
     pub(crate) fn resource_ids(&self) -> Option<[u64; 3]> {
         self.succeeded().then(|| {
             [
-                self.camera.as_ref().expect("camera buffer missing").id(),
+                self.camera
+                    .as_ref()
+                    .expect("camera buffer missing")
+                    .physical_id,
                 self.environment
                     .as_ref()
                     .expect("environment buffer missing")
-                    .id(),
+                    .physical_id,
                 self.directional_lights
                     .as_ref()
                     .expect("directional buffer missing")
-                    .id(),
+                    .physical_id,
             ]
         })
     }
@@ -253,29 +259,39 @@ impl GlobalStateAttempt {
             return Err(GlobalStateMaterializationFailure::SnapshotDrift);
         }
 
-        let camera_ref = snapshot_ref(camera_stamp);
-        let environment_ref = snapshot_ref(environment_stamp);
-        let directional_ref = snapshot_ref(directional_stamp);
-        if !uploads.preflight_buffer_snapshot(&camera_ref, camera.as_bytes())
-            || !uploads.preflight_buffer_snapshot(&environment_ref, environment.as_bytes())
-            || !uploads.preflight_buffer_snapshot(&directional_ref, directional_lights.as_bytes())
-        {
-            self.prepared.record_failure();
-            return Err(GlobalStateMaterializationFailure::ConflictingPhysicalState);
-        }
-
-        let camera_buffer = uploads.materialize_buffer_snapshot(&camera_ref, camera.as_bytes());
-        let environment_buffer =
-            uploads.materialize_buffer_snapshot(&environment_ref, environment.as_bytes());
-        let directional_buffer =
-            uploads.materialize_buffer_snapshot(&directional_ref, directional_lights.as_bytes());
-        let (Some(camera_buffer), Some(environment_buffer), Some(directional_buffer)) =
-            (camera_buffer, environment_buffer, directional_buffer)
+        let Some([camera_buffer, environment_buffer, directional_buffer]) = uploads
+            .materialize_hinted_buffer_snapshot_batch([
+                HintedBufferSnapshotInput {
+                    stamp: camera_stamp,
+                    bytes: camera.as_bytes(),
+                    cached_handle: sources.camera.gpu_handle(),
+                },
+                HintedBufferSnapshotInput {
+                    stamp: environment_stamp,
+                    bytes: environment.as_bytes(),
+                    cached_handle: sources.environment.gpu_handle(),
+                },
+                HintedBufferSnapshotInput {
+                    stamp: directional_stamp,
+                    bytes: directional_lights.as_bytes(),
+                    cached_handle: sources.directional_lights.gpu_handle(),
+                },
+            ])
         else {
             self.prepared.record_failure();
             return Err(GlobalStateMaterializationFailure::ConflictingPhysicalState);
         };
 
+        // Publish cached handles only after the complete atomic batch has
+        // materialized exactly. Subsequent warm attempts can then bypass the
+        // reverse CPU-ID index without exposing a partial batch on failure.
+        sources.camera.set_gpu_handle(camera_buffer.handle);
+        sources
+            .environment
+            .set_gpu_handle(environment_buffer.handle);
+        sources
+            .directional_lights
+            .set_gpu_handle(directional_buffer.handle);
         self.prepared
             .record_buffers(camera_buffer, environment_buffer, directional_buffer);
         Ok(())
@@ -287,24 +303,24 @@ impl GlobalStateAttempt {
         self.prepared.succeeded().then_some(self.live_key).flatten()
     }
 
-    /// Reconstruct owned logical refs from the captured plan only after the
-    /// complete exact batch succeeded. This prevents finalization from reading
-    /// a newer CPU stamp after the upload barrier.
+    /// Return exact Copy tokens only after the complete batch succeeded. This
+    /// prevents finalization from reading a newer CPU stamp or repeating the
+    /// CPU-ID hash lookup after the upload barrier.
     #[must_use]
-    pub(crate) fn materialized_buffer_refs(&self) -> Option<[BufferRef; 3]> {
-        let plan = self.prepared.succeeded().then_some(self.plan).flatten()?;
-        Some([
-            snapshot_ref(plan.camera),
-            snapshot_ref(plan.environment),
-            snapshot_ref(plan.directional_lights),
-        ])
+    pub(crate) fn materialized_buffer_tokens(&self) -> Option<[MaterializedBufferToken; 3]> {
+        self.prepared.succeeded().then(|| {
+            let camera = self.prepared.camera.expect("camera token missing");
+            let environment = self
+                .prepared
+                .environment
+                .expect("environment token missing");
+            let directional = self
+                .prepared
+                .directional_lights
+                .expect("directional token missing");
+            [camera, environment, directional]
+        })
     }
-}
-
-#[inline]
-fn snapshot_ref(stamp: CpuBufferStamp) -> BufferRef {
-    // A static/absent debug label avoids allocating on this per-frame path.
-    BufferRef::with_fixed_id(stamp.id, stamp.size, stamp.usage, stamp.version, None)
 }
 
 #[cfg(test)]
@@ -316,6 +332,7 @@ mod tests {
         ExecuteContext, FrameArena, GraphStorage, PassNode, PrepareContext, RenderGraph,
     };
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use myth_resources::buffer::BufferRef;
 
     struct EmptyNode;
 
@@ -411,7 +428,7 @@ mod tests {
             );
             assert_eq!(graph.global_state_allowed_key(), None);
             assert_eq!(graph.materialized_global_buffer_ids(), None);
-            assert!(graph.materialized_global_buffer_refs().is_none());
+            assert!(graph.materialized_global_buffer_tokens().is_none());
             assert_eq!(graph.finalized_global_state_key(), None);
         }
 
@@ -422,6 +439,7 @@ mod tests {
         ] {
             assert!(resources.get_gpu_buffer_by_cpu_id(id).is_none());
         }
+        assert_eq!(resources.global_state_cached_handle_hit_count(), 0);
     }
 
     #[test]
@@ -434,7 +452,6 @@ mod tests {
             sources.environment.stamp(),
             sources.directional.stamp(),
         ];
-        let expected_refs = expected_stamps.map(snapshot_ref);
         let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
@@ -449,7 +466,7 @@ mod tests {
                 (EmptyNode, ())
             });
             graph.compile_topology();
-            assert!(graph.materialized_global_buffer_refs().is_none());
+            assert!(graph.materialized_global_buffer_tokens().is_none());
             assert_eq!(graph.finalized_global_state_key(), None);
             assert_eq!(
                 materialize(&mut graph, &sources, &wgpu, &mut resources),
@@ -459,17 +476,27 @@ mod tests {
                 .materialized_global_buffer_ids()
                 .expect("live global buffers missing");
             assert_eq!(graph.global_state_allowed_key(), Some(key));
+            let expected_tokens = graph
+                .materialized_global_buffer_tokens()
+                .expect("live global tokens missing");
+            assert_eq!(expected_tokens.map(|token| token.stamp), expected_stamps);
+            assert_eq!(expected_tokens.map(|token| token.physical_id), ids);
             assert_eq!(
-                graph.materialized_global_buffer_refs(),
-                Some(expected_refs.clone())
+                [
+                    sources.camera.gpu_handle(),
+                    sources.environment.gpu_handle(),
+                    sources.directional.gpu_handle(),
+                ],
+                expected_tokens.map(|token| Some(token.handle)),
+                "the complete batch must publish exact cached-handle hints"
             );
 
             // A later CPU write must not change the owned exact refs exposed
             // for finalizing this already-materialized graph snapshot.
             drop(sources.camera.write());
             assert_eq!(
-                graph.materialized_global_buffer_refs(),
-                Some(expected_refs.clone())
+                graph.materialized_global_buffer_tokens(),
+                Some(expected_tokens)
             );
             assert_eq!(graph.finalized_global_state_key(), None);
 
@@ -556,6 +583,54 @@ mod tests {
             );
             assert_eq!(graph.global_state_allowed_key(), Some(key));
         }
+    }
+
+    #[test]
+    fn warm_batch_uses_exact_cached_handles_and_wrong_owner_hint_falls_back() {
+        let wgpu = gpu();
+        let sources = TestSources::new();
+        let key = GlobalStateKey::new(13, 17);
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let run_live = |storage: &mut GraphStorage,
+                        resources: &mut ResourceManager|
+         -> [MaterializedBufferToken; 3] {
+            let mut graph = RenderGraph::new(storage, &arena);
+            graph.capture_global_state_plan(key, sources.get());
+            graph.add_pass("cached global consumer", |builder| {
+                builder.demand_global_state(key);
+                builder.mark_side_effect();
+                (EmptyNode, ())
+            });
+            graph.compile_topology();
+            assert_eq!(materialize(&mut graph, &sources, &wgpu, resources), Ok(()));
+            graph
+                .materialized_global_buffer_tokens()
+                .expect("materialized global tokens missing")
+        };
+
+        let cold = run_live(&mut storage, &mut resources);
+        assert_eq!(resources.global_state_cached_handle_hit_count(), 0);
+
+        let warm = run_live(&mut storage, &mut resources);
+        assert_eq!(warm, cold);
+        assert_eq!(
+            resources.global_state_cached_handle_hit_count(),
+            3,
+            "all three warm global buffers should bypass the reverse index"
+        );
+
+        sources.camera.set_gpu_handle(warm[1].handle);
+        let recovered = run_live(&mut storage, &mut resources);
+        assert_eq!(recovered, cold);
+        assert_eq!(
+            resources.global_state_cached_handle_hit_count(),
+            5,
+            "the wrong-owner camera hint must fall back while the other two stay fast"
+        );
+        assert_eq!(sources.camera.gpu_handle(), Some(cold[0].handle));
     }
 
     #[test]

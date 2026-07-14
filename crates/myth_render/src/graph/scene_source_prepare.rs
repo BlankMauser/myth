@@ -3,14 +3,16 @@
 //! This store makes the source half of scene submission an explicit four-stage
 //! transaction:
 //!
-//! 1. [`SceneSourcePrepareStore::gather`] derives CPU-only, Copy recipes from
+//! 1. [`SceneSourcePrepareStore::select_live_sources`] builds the exact,
+//!    retained DPE-live source union without per-frame allocation.
+//! 2. [`SceneSourcePrepareStore::gather`] derives CPU-only, Copy recipes from
 //!    exact graph-attempt snapshots.
-//! 2. [`SceneSourcePrepareStore::plan`] assigns stable owners to shared
+//! 3. [`SceneSourcePrepareStore::plan`] assigns stable owners to shared
 //!    skeleton uploads without depending on hash-table iteration order.
-//! 3. [`SceneSourcePrepareStore::materialize`] is the sole mutable GPU-resource
+//! 4. [`SceneSourcePrepareStore::materialize`] is the sole mutable GPU-resource
 //!    owner. It allocates model slots in source order, performs one model-buffer
 //!    flush, uploads unique skeletons, and prepares object BindGroups.
-//! 4. [`SceneSourcePrepareStore::finalize`] publishes compact prepared-source
+//! 5. [`SceneSourcePrepareStore::finalize`] publishes compact prepared-source
 //!    IDs and graph-attempt physical owners only after a final drift check.
 //!
 //! The implementation is intentionally serial. Its typed recipes and phase
@@ -21,7 +23,7 @@ use std::num::NonZeroU32;
 
 use rustc_hash::FxHashSet;
 #[cfg(test)]
-use slotmap::KeyData;
+use slotmap::{Key, KeyData};
 
 use crate::core::ResourceManager;
 use myth_resources::uniforms::{DynamicModelUniforms, Mat3Uniform};
@@ -34,7 +36,8 @@ use super::capacity::{
 };
 use super::extracted::ExtractedScene;
 use super::frame::{
-    DrawPlanStore, FrameSourceId, PreparedDrawSource, PreparedDrawStore, RenderLists,
+    DrawPlanKey, DrawPlanStore, ExtractedSourceId, FrameSourceId, PreparedDrawSource,
+    PreparedDrawStore, RenderLists,
 };
 use super::material_plan::{MaterialFrameId, MaterialPlanResolver};
 
@@ -75,6 +78,7 @@ impl SceneSourceRecipeId {
 pub(crate) struct SceneSourceRecipe {
     id: SceneSourceRecipeId,
     frame_source: FrameSourceId,
+    extracted_source: ExtractedSourceId,
     node_handle: NodeHandle,
     geometry: GeometryFrameId,
     material: MaterialFrameId,
@@ -95,12 +99,14 @@ struct MaterializedSceneSource {
     recipe: SceneSourceRecipeId,
     dynamic_offset: u32,
     object_bind_group_id: u64,
+    commits_morph_history: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum SceneSourcePreparePhase {
     #[default]
     Empty,
+    SourcesSelected,
     Gathered,
     Planned,
     Materialized,
@@ -110,7 +116,15 @@ enum SceneSourcePreparePhase {
 /// Retained graph-attempt store for source Gather -> Plan -> Materialize ->
 /// Finalize.
 pub(crate) struct SceneSourcePrepareStore {
+    /// Exact sorted DPE-live source union. Membership is generation-stamped so
+    /// repeated Opaque/Prepass/shadow consumers never inflate this retained
+    /// vector and warm clear does not touch the high-water stamp domain.
+    live_sources: Vec<FrameSourceId>,
+    live_source_stamps: Vec<u32>,
+    live_source_generation: u32,
+    live_source_active_domain_len: usize,
     recipes: Vec<SceneSourceRecipe>,
+    source_domain_len: usize,
     skeleton_lookup: FxHashSet<SkeletonKey>,
     skeleton_plan: Vec<SkeletonKey>,
     allocations: Vec<AllocatedSceneSource>,
@@ -128,7 +142,12 @@ impl SceneSourcePrepareStore {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
+            live_sources: Vec::with_capacity(SCENE_SOURCE_RECIPE_BASELINE),
+            live_source_stamps: Vec::with_capacity(SCENE_SOURCE_RECIPE_BASELINE),
+            live_source_generation: 1,
+            live_source_active_domain_len: 0,
             recipes: Vec::with_capacity(SCENE_SOURCE_RECIPE_BASELINE),
+            source_domain_len: 0,
             skeleton_lookup: FxHashSet::default(),
             skeleton_plan: Vec::with_capacity(SCENE_SOURCE_SKELETON_BASELINE),
             allocations: Vec::with_capacity(SCENE_SOURCE_RECIPE_BASELINE),
@@ -137,30 +156,82 @@ impl SceneSourcePrepareStore {
         }
     }
 
+    /// Build one exact source union from DPE-live plan keys.
+    ///
+    /// Membership work is O(total intents visited), output sorting is
+    /// O(unique-live log unique-live), and no allocation occurs once the live
+    /// shape reaches its retained high-water mark. In particular, a dead graph
+    /// never sizes scratch to the pre-DPE frame-source domain.
+    pub(crate) fn select_live_sources(
+        &mut self,
+        render_lists: &RenderLists,
+        live_keys: impl IntoIterator<Item = DrawPlanKey>,
+    ) {
+        assert_eq!(
+            self.phase,
+            SceneSourcePreparePhase::Empty,
+            "DPE-live sources may be selected only once per graph attempt"
+        );
+        debug_assert!(self.live_sources.is_empty());
+        debug_assert_eq!(self.live_source_active_domain_len, 0);
+
+        self.source_domain_len = render_lists.frame_source_count();
+        for key in live_keys {
+            render_lists.for_each_source_for_key(key, |source| self.mark_live_source(source));
+        }
+        self.live_sources.sort_unstable();
+        self.phase = SceneSourcePreparePhase::SourcesSelected;
+    }
+
+    fn mark_live_source(&mut self, source: FrameSourceId) {
+        let required = source.index() + 1;
+        if self.live_source_stamps.len() < required {
+            self.live_source_stamps.resize(required, 0);
+        }
+        self.live_source_active_domain_len = self.live_source_active_domain_len.max(required);
+        if self.live_source_stamps[source.index()] == self.live_source_generation {
+            return;
+        }
+        self.live_source_stamps[source.index()] = self.live_source_generation;
+        self.live_sources.push(source);
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn live_sources(&self) -> &[FrameSourceId] {
+        assert_eq!(
+            self.phase,
+            SceneSourcePreparePhase::SourcesSelected,
+            "DPE-live source union is available only between selection and Gather"
+        );
+        &self.live_sources
+    }
+
     /// Gather one compact recipe for every source that still has exact
     /// Geometry and Material inputs. This phase performs no ResourceManager,
     /// Device, Queue, cache, or WGPU operation.
     pub(crate) fn gather(
         &mut self,
         extracted_scene: &ExtractedScene,
-        live_frame_sources: &[FrameSourceId],
         render_lists: &RenderLists,
         geometry_frames: GeometryFrameResolver<'_>,
         material_plans: MaterialPlanResolver<'_>,
     ) {
         assert_eq!(
             self.phase,
-            SceneSourcePreparePhase::Empty,
-            "scene sources may be gathered only once per graph attempt"
+            SceneSourcePreparePhase::SourcesSelected,
+            "scene-source Gather must follow DPE-live source selection"
         );
         debug_assert!(self.recipes.is_empty());
         debug_assert!(self.skeleton_plan.is_empty());
         debug_assert!(self.allocations.is_empty());
         debug_assert!(self.materialized.is_empty());
 
-        self.recipes.reserve(live_frame_sources.len());
+        self.recipes.reserve(self.live_sources.len());
         let mut previous = None;
-        for &frame_source in live_frame_sources {
+        let mut geometry_cursor = geometry_frames.monotonic_cursor();
+        for live_index in 0..self.live_sources.len() {
+            let frame_source = self.live_sources[live_index];
             assert!(
                 previous.is_none_or(|previous| previous < frame_source),
                 "live frame source IDs must be sorted and deduplicated"
@@ -174,7 +245,9 @@ impl SceneSourcePrepareStore {
                 .render_items
                 .get(extracted_source.index())
                 .expect("live frame source exceeds the extracted item table");
-            let Some(geometry) = geometry_frames.geometry_id(frame_source, item) else {
+            let Some(geometry) =
+                geometry_frames.geometry_id_monotonic(&mut geometry_cursor, frame_source, item)
+            else {
                 continue;
             };
             let Some(material) = material_plans.prepared_material(frame_source, item) else {
@@ -199,6 +272,7 @@ impl SceneSourcePrepareStore {
             self.recipes.push(SceneSourceRecipe {
                 id,
                 frame_source,
+                extracted_source,
                 node_handle: item.node_handle,
                 geometry,
                 material: material.id(),
@@ -259,21 +333,10 @@ impl SceneSourcePrepareStore {
         self.materialized.reserve(self.recipes.len());
 
         for recipe in &self.recipes {
-            let Some(geometry) = geometry_frames.geometry(recipe.geometry) else {
-                continue;
-            };
-            let Some(material) = material_plans.material(recipe.material) else {
-                continue;
-            };
-            if geometry_frames.physical(recipe.geometry).is_none()
-                || !geometry_frames.pipeline_state_is_current(recipe.geometry)
-                || !material.pipeline_state_is_current()
-                || !scene.meshes.get(recipe.node_handle).is_some_and(|mesh| {
-                    (mesh.geometry, mesh.material) == (geometry.key.handle, material.handle())
-                })
-            {
-                continue;
-            }
+            // Gather already admitted only exact Geometry/Material frame
+            // records. Reserving a model slot is harmless if a source drifts
+            // afterward: the mutable Scene check below gates object work and
+            // the pipeline epoch gate remains the sole publication point.
             let dynamic_offset = resource_manager.allocate_model_uniform(recipe.model_uniform);
             self.allocations.push(AllocatedSceneSource {
                 recipe: recipe.id,
@@ -304,12 +367,6 @@ impl SceneSourcePrepareStore {
             let Some(material) = material_plans.material(recipe.material) else {
                 continue;
             };
-            if geometry_frames.physical(recipe.geometry).is_none()
-                || !geometry_frames.pipeline_state_is_current(recipe.geometry)
-                || !material.pipeline_state_is_current()
-            {
-                continue;
-            }
             let skeleton = recipe.skeleton.and_then(|key| skeleton_pool.get(key));
             let Some(mesh) = meshes.get_mut(recipe.node_handle) else {
                 continue;
@@ -318,7 +375,12 @@ impl SceneSourcePrepareStore {
                 continue;
             }
 
-            mesh.prepare_morph_uniforms();
+            let has_morph_targets = geometry.asset.has_morph_targets();
+            if skeleton.is_some() || has_morph_targets {
+                mesh.prepare_morph_uniforms();
+            }
+            let commits_morph_history =
+                has_morph_targets && !mesh.morph_target_influences().is_empty();
             let Some(object_bind_group_id) = resource_manager.prepare_draw_object_exact_geometry(
                 mesh,
                 skeleton,
@@ -328,15 +390,11 @@ impl SceneSourcePrepareStore {
             ) else {
                 continue;
             };
-            if !geometry_frames.pipeline_state_is_current(recipe.geometry)
-                || !material.pipeline_state_is_current()
-            {
-                continue;
-            }
             self.materialized.push(MaterializedSceneSource {
                 recipe: recipe.id,
                 dynamic_offset: allocation.dynamic_offset,
                 object_bind_group_id,
+                commits_morph_history,
             });
         }
 
@@ -348,8 +406,6 @@ impl SceneSourcePrepareStore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize(
         &mut self,
-        scene: &Scene,
-        geometry_frames: GeometryFrameResolver<'_>,
         material_plans: MaterialPlanResolver<'_>,
         resource_manager: &ResourceManager,
         object_interfaces: &mut ObjectInterfaceStore,
@@ -361,25 +417,13 @@ impl SceneSourcePrepareStore {
             SceneSourcePreparePhase::Materialized,
             "scene-source Finalize must follow Materialize"
         );
-        prepared_draws.begin_sources(self.recipes.len());
+        prepared_draws.begin_sources(self.recipes.len(), self.source_domain_len);
 
         for physical in &self.materialized {
             let recipe = &self.recipes[physical.recipe.index()];
-            let Some(geometry) = geometry_frames.geometry(recipe.geometry) else {
-                continue;
-            };
             let Some(material) = material_plans.material(recipe.material) else {
                 continue;
             };
-            let Some(mesh) = scene.meshes.get(recipe.node_handle) else {
-                continue;
-            };
-            if (mesh.geometry, mesh.material) != (geometry.key.handle, material.handle())
-                || !geometry_frames.pipeline_state_is_current(recipe.geometry)
-                || !material.pipeline_state_is_current()
-            {
-                continue;
-            }
             let Some(object_bind_group) =
                 resource_manager.prepared_object_bind_group(physical.object_bind_group_id)
             else {
@@ -402,16 +446,16 @@ impl SceneSourcePrepareStore {
                 &object_bind_group.binding_wgsl,
             );
 
-            prepared_draws.insert_source(
-                recipe.frame_source,
-                PreparedDrawSource {
-                    geometry: recipe.geometry,
-                    material: recipe.material,
-                    object_interface,
-                    material_bind_group: material_bind_group_slot,
-                    object_bind_group: (object_bind_group_slot, physical.dynamic_offset),
-                },
-            );
+            prepared_draws.insert_source(PreparedDrawSource {
+                frame_source: recipe.frame_source,
+                extracted_source: recipe.extracted_source,
+                geometry: recipe.geometry,
+                material: recipe.material,
+                object_interface,
+                material_bind_group: material_bind_group_slot,
+                object_bind_group: (object_bind_group_slot, physical.dynamic_offset),
+                commits_morph_history: physical.commits_morph_history,
+            });
         }
 
         self.phase = SceneSourcePreparePhase::Finalized;
@@ -424,12 +468,31 @@ impl SceneSourcePrepareStore {
         self.skeleton_plan.clear();
         self.skeleton_lookup.clear();
         self.recipes.clear();
+        self.live_sources.clear();
+        self.source_domain_len = 0;
+        self.live_source_active_domain_len = 0;
+        self.advance_live_source_generation();
         self.phase = SceneSourcePreparePhase::Empty;
+    }
+
+    fn advance_live_source_generation(&mut self) {
+        self.live_source_generation = self.live_source_generation.wrapping_add(1);
+        if self.live_source_generation == 0 {
+            // The only O(high-water) clear occurs once per u32 wrap. Ordinary
+            // frames retain both capacity and untouched membership bytes.
+            self.live_source_stamps.fill(0);
+            self.live_source_generation = 1;
+        }
     }
 
     #[must_use]
     pub(crate) fn capacity_usage(&self) -> CapacityUsage {
-        vec_footprint(&self.recipes, SCENE_SOURCE_RECIPE_BASELINE)
+        vec_footprint(&self.live_sources, SCENE_SOURCE_RECIPE_BASELINE)
+            + live_source_join_footprint(
+                self.live_source_active_domain_len,
+                &self.live_source_stamps,
+            )
+            + vec_footprint(&self.recipes, SCENE_SOURCE_RECIPE_BASELINE)
             + estimated_hash_set_footprint(&self.skeleton_lookup, SCENE_SOURCE_SKELETON_BASELINE)
             + vec_footprint(&self.skeleton_plan, SCENE_SOURCE_SKELETON_BASELINE)
             + vec_footprint(&self.allocations, SCENE_SOURCE_RECIPE_BASELINE)
@@ -441,6 +504,13 @@ impl SceneSourcePrepareStore {
             self.is_empty(),
             "live scene-source recipes cannot be trimmed"
         );
+        shrink_vec_by_family_ratio(
+            &mut self.live_sources,
+            SCENE_SOURCE_RECIPE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        trim_live_source_join(&mut self.live_source_stamps, target_bytes, retained_bytes);
         shrink_vec_by_family_ratio(
             &mut self.recipes,
             SCENE_SOURCE_RECIPE_BASELINE,
@@ -477,7 +547,10 @@ impl SceneSourcePrepareStore {
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.phase == SceneSourcePreparePhase::Empty
+            && self.live_sources.is_empty()
+            && self.live_source_active_domain_len == 0
             && self.recipes.is_empty()
+            && self.source_domain_len == 0
             && self.skeleton_lookup.is_empty()
             && self.skeleton_plan.is_empty()
             && self.allocations.is_empty()
@@ -491,10 +564,12 @@ impl SceneSourcePrepareStore {
             SceneSourcePreparePhase::Empty | SceneSourcePreparePhase::Gathered
         ));
         let index = self.recipes.len();
+        self.source_domain_len = self.source_domain_len.max(index + 1);
         let id = SceneSourceRecipeId::from_index(index);
         self.recipes.push(SceneSourceRecipe {
             id,
             frame_source: FrameSourceId::from_index(index),
+            extracted_source: ExtractedSourceId::from_index(index),
             node_handle: NodeHandle::from(KeyData::from_ffi((index + 1) as u64)),
             geometry: GeometryFrameId::from_index(index),
             material: MaterialFrameId::from_index(index),
@@ -506,13 +581,102 @@ impl SceneSourcePrepareStore {
     }
 }
 
+fn live_source_join_footprint(active_slots: usize, stamps: &Vec<u32>) -> CapacityUsage {
+    let slot_bytes = std::mem::size_of::<u32>();
+    CapacityUsage::new(
+        active_slots.saturating_mul(slot_bytes),
+        stamps.capacity().saturating_mul(slot_bytes),
+        SCENE_SOURCE_RECIPE_BASELINE.saturating_mul(slot_bytes),
+    )
+}
+
+fn trim_live_source_join(stamps: &mut Vec<u32>, target_bytes: usize, retained_bytes: usize) {
+    if retained_bytes == 0 || target_bytes >= retained_bytes {
+        return;
+    }
+    // The initialized stamp length is deliberately retained across ordinary
+    // clears, but trimming follows the allocation high-water mark and keeps
+    // the same baseline floor as every other capacity family.
+    let target_slots = (((stamps.capacity() as u128) * (target_bytes as u128))
+        .div_ceil(retained_bytes as u128)
+        .min(usize::MAX as u128) as usize)
+        .max(SCENE_SOURCE_RECIPE_BASELINE)
+        .min(stamps.capacity());
+    stamps.truncate(target_slots);
+    stamps.shrink_to(target_slots);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::size_of;
 
+    use crate::graph::frame::RenderIntent;
+
     fn skeleton(index: u64) -> SkeletonKey {
         SkeletonKey::from(KeyData::from_ffi(index))
+    }
+
+    fn render_intent(source: FrameSourceId) -> RenderIntent {
+        RenderIntent {
+            source,
+            geometry_handle: myth_resources::GeometryHandle::null(),
+            material_handle: myth_resources::MaterialHandle::null(),
+            material_index: 0,
+            distance_sq: 0.0,
+        }
+    }
+
+    #[test]
+    fn live_source_union_is_unique_retained_and_dead_domain_independent() {
+        let mut lists = RenderLists::new();
+        let mut last = FrameSourceId::from_index(0);
+        for extracted in 0..100_000 {
+            last = lists.intern_frame_source(ExtractedSourceId::from_index(extracted));
+        }
+        let early = FrameSourceId::from_index(3);
+        lists.opaque = vec![
+            render_intent(last),
+            render_intent(early),
+            render_intent(last),
+        ];
+
+        let mut plans = DrawPlanStore::new();
+        let opaque = plans.reserve_plan(DrawPlanKey::Opaque);
+        let prepass = plans.reserve_plan(DrawPlanKey::Prepass {
+            needs_normal: true,
+            needs_feature_id: false,
+            needs_velocity: false,
+        });
+        plans.mark_live(opaque);
+        plans.mark_live(prepass);
+
+        let mut store = SceneSourcePrepareStore::new();
+        store.select_live_sources(&lists, plans.live_keys());
+        assert_eq!(store.live_sources(), [early, last]);
+        assert_eq!(store.live_source_stamps.len(), last.index() + 1);
+        let selected = store.capacity_usage();
+        assert!(selected.active_bytes > 0);
+
+        store.clear();
+        let retained = store.capacity_usage();
+        assert_eq!(retained.active_bytes, 0);
+        assert_eq!(retained.retained_bytes, selected.retained_bytes);
+
+        // A later all-dead graph keeps the retained high-water storage but
+        // neither scans nor marks the 100k pre-DPE source domain.
+        store.select_live_sources(&lists, std::iter::empty());
+        assert!(store.live_sources().is_empty());
+        assert_eq!(store.live_source_active_domain_len, 0);
+        assert_eq!(store.live_source_stamps.len(), last.index() + 1);
+        store.clear();
+
+        // Generation wrap is the sole path that clears retained stamp bytes.
+        store.live_source_generation = u32::MAX;
+        store.select_live_sources(&lists, [DrawPlanKey::Opaque]);
+        store.clear();
+        assert_eq!(store.live_source_generation, 1);
+        assert!(store.live_source_stamps.iter().all(|&stamp| stamp == 0));
     }
 
     #[test]

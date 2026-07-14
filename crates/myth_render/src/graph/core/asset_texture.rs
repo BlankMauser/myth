@@ -16,7 +16,8 @@ use rustc_hash::FxHashMap;
 use crate::core::ResourceManager;
 use crate::core::gpu::{
     AssetTextureCandidateBatch, AssetTextureCandidateId, AssetTextureMaterialization,
-    AssetTextureSnapshot, MipmapRequest, Tracked,
+    AssetTextureSnapshot, ExactAssetTextureResidency, MaterializedAssetTexture, MipmapRequest,
+    Tracked,
 };
 use crate::graph::asset_texture_batch::{AssetTextureBatch, AssetTextureBatchId};
 use crate::graph::capacity::{
@@ -71,6 +72,16 @@ struct PlannedAssetTextureImport {
     /// built-in consumer. The exact snapshot makes that policy stable for the
     /// rest of graph construction.
     ready: Option<TextureNodeId>,
+}
+
+#[derive(Clone, Copy)]
+enum LiveAssetTexturePath {
+    /// Exact logical lease, binding, sampler, physical generation, and full
+    /// image spec observed before the selected AssetStorage postflight.
+    Resident(ExactAssetTextureResidency),
+    /// Cold, refreshed, or otherwise non-exact state owned by the original
+    /// publication transaction.
+    Candidate(AssetTextureCandidateId),
 }
 
 impl From<AssetTextureSnapshot> for AssetTextureLookupKey {
@@ -131,8 +142,11 @@ pub(crate) struct AssetTextureImportStore {
     candidates: AssetTextureCandidateBatch,
     live_imports: Vec<AssetTextureImportId>,
     live_owner_plans: Vec<AssetTextureBatchId>,
-    live_candidates: Vec<AssetTextureCandidateId>,
+    live_paths: Vec<LiveAssetTexturePath>,
     live_current: Vec<bool>,
+    candidate_current: Vec<bool>,
+    #[cfg(test)]
+    resident_hits: usize,
 }
 
 impl Default for AssetTextureImportStore {
@@ -144,8 +158,11 @@ impl Default for AssetTextureImportStore {
             candidates: AssetTextureCandidateBatch::new(),
             live_imports: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
             live_owner_plans: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
-            live_candidates: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            live_paths: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
             live_current: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            candidate_current: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
+            #[cfg(test)]
+            resident_hits: 0,
         }
     }
 }
@@ -168,8 +185,9 @@ impl AssetTextureImportStore {
             )
             + vec_footprint(&self.live_imports, ASSET_TEXTURE_IMPORT_BASELINE)
             + vec_footprint(&self.live_owner_plans, ASSET_TEXTURE_IMPORT_BASELINE)
-            + vec_footprint(&self.live_candidates, ASSET_TEXTURE_IMPORT_BASELINE)
+            + vec_footprint(&self.live_paths, ASSET_TEXTURE_IMPORT_BASELINE)
             + vec_footprint(&self.live_current, ASSET_TEXTURE_IMPORT_BASELINE)
+            + vec_footprint(&self.candidate_current, ASSET_TEXTURE_IMPORT_BASELINE)
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
@@ -205,7 +223,7 @@ impl AssetTextureImportStore {
             retained_bytes,
         );
         shrink_vec_by_family_ratio(
-            &mut self.live_candidates,
+            &mut self.live_paths,
             ASSET_TEXTURE_IMPORT_BASELINE,
             target_bytes,
             retained_bytes,
@@ -216,14 +234,25 @@ impl AssetTextureImportStore {
             target_bytes,
             retained_bytes,
         );
+        shrink_vec_by_family_ratio(
+            &mut self.candidate_current,
+            ASSET_TEXTURE_IMPORT_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
     }
 
     pub(crate) fn clear(&mut self) {
-        self.live_candidates.clear();
+        self.candidate_current.clear();
         self.live_current.clear();
+        self.live_paths.clear();
         self.live_owner_plans.clear();
         self.live_imports.clear();
         self.candidates.clear();
+        #[cfg(test)]
+        {
+            self.resident_hits = 0;
+        }
         self.planned.clear();
         self.lookup.clear();
         // Drops tracked views and any unconsumed Drop-bearing mip requests.
@@ -405,9 +434,12 @@ impl AssetTextureImportStore {
     ) {
         debug_assert!(self.live_imports.is_empty());
         debug_assert!(self.live_owner_plans.is_empty());
-        debug_assert!(self.live_candidates.is_empty());
+        debug_assert!(self.live_paths.is_empty());
         debug_assert!(self.live_current.is_empty());
+        debug_assert!(self.candidate_current.is_empty());
         debug_assert!(self.candidates.is_empty());
+        #[cfg(test)]
+        debug_assert_eq!(self.resident_hits, 0);
 
         for index in 0..self.entries.len() {
             let id = AssetTextureImportId::from_index(index);
@@ -428,6 +460,7 @@ impl AssetTextureImportStore {
             };
             let Some((texture, image)) = owner_plans.ready_owners(owner_plan, entry.snapshot)
             else {
+                owner_plans.publish_physical_binding(owner_plan, entry.snapshot, None);
                 assert!(
                     entry
                         .materialization
@@ -436,20 +469,33 @@ impl AssetTextureImportStore {
                 );
                 continue;
             };
-            let candidate = resource_manager.stage_asset_texture_candidate(
-                &mut self.candidates,
-                entry.snapshot,
-                texture,
-                image,
-            );
+            let path = if let Some(resident) =
+                resource_manager.exact_asset_texture_residency(entry.snapshot)
+            {
+                #[cfg(test)]
+                {
+                    self.resident_hits += 1;
+                }
+                LiveAssetTexturePath::Resident(resident)
+            } else {
+                let candidate = resource_manager.stage_asset_texture_candidate(
+                    &mut self.candidates,
+                    entry.snapshot,
+                    texture,
+                    image,
+                );
+                debug_assert_eq!(candidate.index(), self.candidate_current.len());
+                self.candidate_current.push(false);
+                LiveAssetTexturePath::Candidate(candidate)
+            };
             self.live_imports.push(id);
             self.live_owner_plans.push(owner_plan);
-            self.live_candidates.push(candidate);
+            self.live_paths.push(path);
         }
 
         after_candidates(resource_manager);
 
-        if !self.live_candidates.is_empty() {
+        if !self.live_paths.is_empty() {
             self.live_current.extend(
                 owner_plans
                     .postflight_selected(assets, &self.live_owner_plans)
@@ -457,10 +503,13 @@ impl AssetTextureImportStore {
                     .copied(),
             );
             let mut uploaded_any = false;
-            for index in 0..self.live_candidates.len() {
+            for index in 0..self.live_paths.len() {
                 if !self.live_current[index] {
                     continue;
                 }
+                let LiveAssetTexturePath::Candidate(candidate) = self.live_paths[index] else {
+                    continue;
+                };
                 let import = self.live_imports[index];
                 let owner_plan = self.live_owner_plans[index];
                 let snapshot = self.entries[import.index()].snapshot;
@@ -470,9 +519,10 @@ impl AssetTextureImportStore {
                 };
                 uploaded_any |= resource_manager.materialize_asset_texture_candidate(
                     &mut self.candidates,
-                    self.live_candidates[index],
+                    candidate,
                     image,
                 );
+                self.candidate_current[candidate.index()] = true;
             }
             after_materialize(resource_manager);
             if uploaded_any {
@@ -484,10 +534,42 @@ impl AssetTextureImportStore {
                     *current &= *upload_current;
                 }
             }
-            resource_manager
-                .publish_asset_texture_candidates(&mut self.candidates, &self.live_current);
-            for (&import, &candidate) in self.live_imports.iter().zip(&self.live_candidates) {
-                let result = self.candidates.take_result(candidate);
+            for (live_index, &path) in self.live_paths.iter().enumerate() {
+                if let LiveAssetTexturePath::Candidate(candidate) = path {
+                    self.candidate_current[candidate.index()] &= self.live_current[live_index];
+                }
+            }
+            if !self.candidates.is_empty() {
+                resource_manager.publish_asset_texture_candidates(
+                    &mut self.candidates,
+                    &self.candidate_current,
+                );
+            }
+            for (index, (&import, &path)) in
+                self.live_imports.iter().zip(&self.live_paths).enumerate()
+            {
+                let result = match path {
+                    LiveAssetTexturePath::Resident(expected) if self.live_current[index] => {
+                        resource_manager
+                            .reuse_exact_asset_texture_for_graph(
+                                self.entries[import.index()].snapshot,
+                                expected,
+                            )
+                            .unwrap_or_else(AssetTextureMaterialization::unavailable)
+                    }
+                    LiveAssetTexturePath::Resident(_) => AssetTextureMaterialization::unavailable(),
+                    LiveAssetTexturePath::Candidate(candidate) => {
+                        self.candidates.take_result(candidate)
+                    }
+                };
+                owner_plans.publish_physical_binding(
+                    self.live_owner_plans[index],
+                    self.entries[import.index()].snapshot,
+                    result
+                        .texture
+                        .as_ref()
+                        .map(MaterializedAssetTexture::physical_binding),
+                );
                 assert!(
                     self.entries[import.index()]
                         .materialization
@@ -498,8 +580,9 @@ impl AssetTextureImportStore {
             }
         }
 
-        self.live_candidates.clear();
+        self.candidate_current.clear();
         self.live_current.clear();
+        self.live_paths.clear();
         self.live_owner_plans.clear();
         self.live_imports.clear();
         self.candidates.clear();
@@ -566,6 +649,17 @@ impl AssetTextureImportStore {
         published
     }
 
+    /// Whether this attempt registered any logical Asset Texture imports.
+    ///
+    /// Topology validation can skip its graph-wide derived-import scan when
+    /// the canonical import table is empty. This query observes only length
+    /// and is valid before or after post-DPE materialization.
+    #[inline]
+    #[must_use]
+    pub(crate) fn has_imports(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
@@ -575,8 +669,25 @@ impl AssetTextureImportStore {
             && self.candidates.is_empty()
             && self.live_imports.is_empty()
             && self.live_owner_plans.is_empty()
-            && self.live_candidates.is_empty()
+            && self.live_paths.is_empty()
             && self.live_current.is_empty()
+            && self.candidate_current.is_empty()
+            && {
+                #[cfg(test)]
+                {
+                    self.resident_hits == 0
+                }
+                #[cfg(not(test))]
+                {
+                    true
+                }
+            }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn resident_hit_count(&self) -> usize {
+        self.resident_hits
     }
 }
 

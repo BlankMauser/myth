@@ -44,7 +44,9 @@ mod tracked;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::core::gpu::buffer::{BufferUploadContext, GpuBufferHandle};
-pub(crate) use crate::core::gpu::buffer::{GpuBuffer, PreparedTextureSource};
+pub(crate) use crate::core::gpu::buffer::{
+    GpuBuffer, HintedBufferSnapshotInput, MaterializedBufferToken, PreparedTextureSource,
+};
 #[cfg(test)]
 pub(crate) use crate::core::gpu::environment::procedural_physics_hash;
 pub(crate) use crate::core::gpu::environment::{
@@ -52,20 +54,22 @@ pub(crate) use crate::core::gpu::environment::{
 };
 pub(crate) use crate::core::gpu::geometry::GpuGeometry;
 pub(crate) use crate::core::gpu::material::{
-    GpuMaterial, PlannedMaterialCandidateBatch, PlannedMaterialCandidateId, PlannedMaterialTexture,
+    GpuMaterial, MaterialPipelineSnapshot, PlannedMaterialCandidateBatch,
+    PlannedMaterialCandidateId, PlannedMaterialTexture,
 };
 #[cfg(test)]
 pub(crate) use crate::core::gpu::texture::snapshot_asset_texture;
 #[cfg(test)]
 pub(crate) use crate::core::gpu::texture::snapshot_asset_texture_state;
 pub(crate) use crate::core::gpu::texture::{
-    AssetTextureMaterialization, AssetTextureSnapshot, AssetTextureStateSnapshot, GpuImage,
-    GpuImageSpec, PhysicalImageId, TextureBinding, TextureImageLease,
+    AssetTextureMaterialization, AssetTexturePhysicalBinding, AssetTextureSnapshot,
+    AssetTextureStateSnapshot, GpuImage, GpuImageSpec, MaterializedAssetTexture, PhysicalImageId,
+    TextureBinding, TextureImageLease,
 };
 pub use bind_group_store::{
     BindGroupContext, BindingInterfaceId, GlobalStateKey, GlobalStateResolver, GpuGlobalState,
 };
-pub(crate) use bind_group_store::{BindGroupStore, ObjectBindGroupKey};
+pub(crate) use bind_group_store::{BindGroupStore, ObjectBindGroupKey, RigidObjectBindGroupL0Key};
 pub(crate) use binding::GlobalStatePhysicalFailure;
 pub(crate) use environment_store::EnvironmentStore;
 pub(crate) use internal_texture_registry::InternalTextureRegistry;
@@ -81,7 +85,8 @@ pub use resource_ids::{
     BindGroupFingerprint, EnsureResult, ResourceId, ResourceIdSet, hash_layout_entries,
 };
 pub(crate) use resource_store::{
-    AssetTextureCandidateBatch, AssetTextureCandidateId, GpuResourceStore,
+    AssetTextureCandidateBatch, AssetTextureCandidateId, ExactAssetTextureResidency,
+    GpuResourceStore,
 };
 pub use sampler_registry::{CommonSampler, SamplerRegistry};
 pub use system_textures::SystemTextures;
@@ -115,6 +120,11 @@ pub struct ResourceManager {
 
     // === Model Buffer Allocator ===
     pub(crate) model_allocator: ModelBufferAllocator,
+
+    /// Number of transient WGPU buffer clones performed by cold/rebind Group
+    /// 0 construction. Absent from shipping builds.
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    pub(crate) global_state_cold_buffer_clones: u64,
 
     /// Global system fallback textures and Group 3 bind-group infrastructure.
     ///
@@ -174,6 +184,8 @@ impl ResourceManager {
             internal_textures: InternalTextureRegistry::default(),
             sampler_registry,
             model_allocator,
+            #[cfg(any(test, feature = "rdg_bench_support"))]
+            global_state_cold_buffer_clones: 0,
             system_textures,
         }
     }
@@ -253,6 +265,27 @@ impl ResourceManager {
     #[cfg(test)]
     pub(crate) fn cached_object_bind_group_ids(&self) -> Vec<u64> {
         self.bind_groups.cached_object_bind_group_ids()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rigid_object_bind_group_l0_len(&self) -> usize {
+        self.bind_groups.rigid_object_bind_group_l0_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rigid_object_bind_group_l0_hits(&self) -> usize {
+        self.bind_groups.rigid_object_bind_group_l0_hits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rigid_object_bind_group_l0_contains_model(&self, physical_id: u64) -> bool {
+        self.bind_groups
+            .rigid_object_bind_group_l0_contains_model(physical_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn model_buffer_upload_count(&self) -> usize {
+        self.model_allocator.upload_count()
     }
 
     pub fn prune(&mut self, ttl_frames: u64) {

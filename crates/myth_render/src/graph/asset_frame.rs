@@ -18,9 +18,9 @@ use super::capacity::{
     CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
     shrink_vec_by_family_ratio, vec_footprint,
 };
-#[cfg(test)]
-use super::extracted::MaterialClassification;
 use super::extracted::{ExtractedRenderItem, ExtractedScene};
+#[cfg(test)]
+use super::extracted::{ItemShaderFeatures, MaterialClassification};
 use super::frame::{DrawBufferSlot, DrawPlanStore, FrameSourceId, RenderLists};
 
 /// Compact graph-attempt identity of one exact geometry owner.
@@ -113,9 +113,21 @@ impl GeometryFrameKey {
 pub(crate) struct GeometryFrameRecord {
     pub(crate) key: GeometryFrameKey,
     pub(crate) asset: Arc<Geometry>,
-    pub(crate) shader_defines: ShaderDefines,
+    /// Published only after the exact persistent `GpuGeometry` is available.
+    /// The Arc is generation-owned by that cache entry, so warm frames avoid
+    /// cloning the defines' retained allocation.
+    shader_defines: Option<Arc<ShaderDefines>>,
     pub(crate) topology: wgpu::PrimitiveTopology,
     physical: Option<GeometryFramePhysical>,
+}
+
+impl GeometryFrameRecord {
+    #[inline]
+    pub(crate) fn shader_defines(&self) -> &ShaderDefines {
+        self.shader_defines
+            .as_deref()
+            .expect("prepared Geometry lost its DPE-live shader snapshot")
+    }
 }
 
 /// Physical geometry interface interned once for one exact generation.
@@ -126,6 +138,15 @@ pub(crate) struct GeometryFramePhysical {
     pub(crate) instance_range: std::ops::Range<u32>,
     pub(crate) layout_info: Arc<crate::pipeline::vertex::GeneratedVertexLayout>,
     pub(crate) layout_id: u64,
+}
+
+/// Sparse post-DPE join from the sorted live-source union to its exact
+/// geometry owner. Keeping only live joins avoids touching the full
+/// `FrameSourceId` high-water domain on sparse frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceGeometryJoin {
+    source: FrameSourceId,
+    geometry: GeometryFrameId,
 }
 
 /// Compact source join and unique geometry-owner table for one graph attempt.
@@ -150,13 +171,22 @@ pub(crate) struct GeometryFrameStore {
     /// Memoizes an incoherent interior-epoch capture without allocating a
     /// failure hash entry or retrying it for every source sharing the owner.
     failed_snapshots: Vec<bool>,
-    source_geometries: Vec<Option<GeometryFrameId>>,
+    /// Sorted dense join for only the DPE-live source union. `Vec::clear` is
+    /// O(1) for this Copy record, so warm attempts neither zero nor scan the
+    /// potentially much larger frame-source domain.
+    source_geometry_joins: Vec<SourceGeometryJoin>,
+    /// Recycled spill allocations for physical geometries with more vertex
+    /// streams than the inline representation. A graph attempt owns each
+    /// active list through `GeometryFramePhysical`; `clear` returns the list
+    /// here instead of freeing and reallocating it every frame.
+    vertex_buffer_slot_scratch: Vec<SmallVec<[DrawBufferSlot; 2]>>,
     initialized: bool,
     live_captured: bool,
 }
 
 const GEOMETRY_FRAME_RECORD_BASELINE: usize = 256;
 const GEOMETRY_FRAME_SOURCE_BASELINE: usize = 512;
+const GEOMETRY_VERTEX_BUFFER_SCRATCH_BASELINE: usize = 16;
 
 impl GeometryFrameStore {
     #[must_use]
@@ -173,7 +203,8 @@ impl GeometryFrameStore {
             record_snapshots: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
             snapshot_records: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
             failed_snapshots: Vec::with_capacity(GEOMETRY_FRAME_RECORD_BASELINE),
-            source_geometries: Vec::with_capacity(GEOMETRY_FRAME_SOURCE_BASELINE),
+            source_geometry_joins: Vec::with_capacity(GEOMETRY_FRAME_SOURCE_BASELINE),
+            vertex_buffer_slot_scratch: Vec::with_capacity(GEOMETRY_VERTEX_BUFFER_SCRATCH_BASELINE),
             initialized: false,
             live_captured: false,
         }
@@ -207,7 +238,7 @@ impl GeometryFrameStore {
         debug_assert!(self.record_snapshots.is_empty());
         debug_assert!(self.snapshot_records.is_empty());
         debug_assert!(self.failed_snapshots.is_empty());
-        debug_assert!(self.source_geometries.is_empty());
+        debug_assert!(self.source_geometry_joins.is_empty());
 
         for source in render_lists.frame_source_ids() {
             let Some(extracted_source) = render_lists.extracted_source(source) else {
@@ -276,7 +307,12 @@ impl GeometryFrameStore {
         debug_assert!(self.record_snapshots.is_empty());
         debug_assert!(self.snapshot_records.is_empty());
         debug_assert!(self.failed_snapshots.is_empty());
-        debug_assert!(self.source_geometries.is_empty());
+        debug_assert!(self.source_geometry_joins.is_empty());
+
+        debug_assert!(
+            live_sources.windows(2).all(|pair| pair[0] < pair[1]),
+            "the DPE-live frame-source union must be sorted and deduplicated"
+        );
 
         // Project the source union into one compact, stable first-occurrence
         // list before touching AssetStorage again. The all-visible owner table
@@ -309,8 +345,6 @@ impl GeometryFrameStore {
             .resize(self.live_snapshot_indices.len(), None);
         self.failed_snapshots
             .resize(self.live_snapshot_indices.len(), false);
-        self.source_geometries
-            .resize(render_lists.frame_source_count(), None);
 
         for &source in live_sources {
             let Some(extracted_source) = render_lists.extracted_source(source) else {
@@ -339,7 +373,6 @@ impl GeometryFrameStore {
 
             let structure_version = asset.structure_version();
             let layout_version = asset.layout_version();
-            let shader_defines = asset.shader_defines().clone();
             let topology = asset.topology;
             // Keep the CPU interface snapshot coherent with its exact owner.
             if (structure_version, layout_version)
@@ -360,7 +393,7 @@ impl GeometryFrameStore {
             self.records.push(GeometryFrameRecord {
                 key,
                 asset: Arc::clone(asset),
-                shader_defines,
+                shader_defines: None,
                 topology,
                 physical: None,
             });
@@ -391,7 +424,10 @@ impl GeometryFrameStore {
                 continue;
             };
             if self.record_is_current_from_batch(id) {
-                self.source_geometries[source.index()] = Some(id);
+                self.source_geometry_joins.push(SourceGeometryJoin {
+                    source,
+                    geometry: id,
+                });
             }
         }
         self.live_captured = true;
@@ -437,7 +473,9 @@ impl GeometryFrameStore {
                 continue;
             }
             assert_eq!(gpu.vertex_buffers.len(), gpu.vertex_buffer_ids.len());
-            let mut vertex_buffers = SmallVec::with_capacity(gpu.vertex_buffers.len());
+            let mut vertex_buffers = self.vertex_buffer_slot_scratch.pop().unwrap_or_default();
+            vertex_buffers.clear();
+            vertex_buffers.reserve(gpu.vertex_buffers.len());
             for (buffer, &physical_id) in gpu.vertex_buffers.iter().zip(&gpu.vertex_buffer_ids) {
                 vertex_buffers.push(draw_plans.intern_buffer(buffer, physical_id));
             }
@@ -451,6 +489,7 @@ impl GeometryFrameStore {
                             *count,
                         )
                     });
+            let shader_defines = Arc::clone(&gpu.shader_defines);
             self.records[index].physical = Some(GeometryFramePhysical {
                 vertex_buffers,
                 index_buffer,
@@ -459,6 +498,7 @@ impl GeometryFrameStore {
                 layout_info: gpu.layout_info.clone(),
                 layout_id: gpu.layout_id,
             });
+            self.records[index].shader_defines = Some(shader_defines);
         }
 
         // A writer may have replaced an owner while physical preparation ran.
@@ -471,7 +511,12 @@ impl GeometryFrameStore {
         for index in 0..self.records.len() {
             let id = GeometryFrameId::from_index(index);
             if !self.record_is_current_from_batch(id) {
-                self.records[index].physical = None;
+                if let Some(mut physical) = self.records[index].physical.take() {
+                    physical.vertex_buffers.clear();
+                    self.vertex_buffer_slot_scratch
+                        .push(physical.vertex_buffers);
+                }
+                self.records[index].shader_defines = None;
             }
         }
     }
@@ -561,7 +606,17 @@ impl GeometryFrameStore {
 
     /// Release every graph-attempt owner while retaining allocations.
     pub(crate) fn clear(&mut self) {
-        self.source_geometries.clear();
+        self.source_geometry_joins.clear();
+        // Reverse return order pairs the next attempt's stable record order
+        // with LIFO pops, preserving each exact geometry's prior stream-list
+        // capacity without an auxiliary lookup.
+        for record in self.records.iter_mut().rev() {
+            if let Some(mut physical) = record.physical.take() {
+                physical.vertex_buffers.clear();
+                self.vertex_buffer_slot_scratch
+                    .push(physical.vertex_buffers);
+            }
+        }
         self.snapshot_records.clear();
         self.failed_snapshots.clear();
         self.record_snapshots.clear();
@@ -595,7 +650,8 @@ impl GeometryFrameStore {
             + vec_footprint(&self.record_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.snapshot_records, GEOMETRY_FRAME_RECORD_BASELINE)
             + vec_footprint(&self.failed_snapshots, GEOMETRY_FRAME_RECORD_BASELINE)
-            + vec_footprint(&self.source_geometries, GEOMETRY_FRAME_SOURCE_BASELINE)
+            + vec_footprint(&self.source_geometry_joins, GEOMETRY_FRAME_SOURCE_BASELINE)
+            + self.vertex_buffer_slot_scratch_usage()
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
@@ -666,8 +722,20 @@ impl GeometryFrameStore {
             retained_bytes,
         );
         shrink_vec_by_family_ratio(
-            &mut self.source_geometries,
+            &mut self.source_geometry_joins,
             GEOMETRY_FRAME_SOURCE_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        if target_bytes < retained_bytes {
+            // Scratch entries are empty. Dropping them releases both their
+            // optional spill allocations and lets the outer vector follow the
+            // normal family trim policy.
+            self.vertex_buffer_slot_scratch.clear();
+        }
+        shrink_vec_by_family_ratio(
+            &mut self.vertex_buffer_slot_scratch,
+            GEOMETRY_VERTEX_BUFFER_SCRATCH_BASELINE,
             target_bytes,
             retained_bytes,
         );
@@ -682,7 +750,7 @@ impl GeometryFrameStore {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn joined_source_count(&self) -> usize {
-        self.source_geometries.iter().flatten().count()
+        self.source_geometry_joins.len()
     }
 
     #[cfg(test)]
@@ -699,9 +767,48 @@ impl GeometryFrameStore {
             && self.record_snapshots.is_empty()
             && self.snapshot_records.is_empty()
             && self.failed_snapshots.is_empty()
-            && self.source_geometries.is_empty()
+            && self.source_geometry_joins.is_empty()
             && !self.initialized
             && !self.live_captured
+    }
+
+    fn vertex_buffer_slot_scratch_usage(&self) -> CapacityUsage {
+        let slot_bytes = std::mem::size_of::<DrawBufferSlot>();
+        let outer_slot_bytes = std::mem::size_of::<SmallVec<[DrawBufferSlot; 2]>>();
+        let outer_retained = self
+            .vertex_buffer_slot_scratch
+            .capacity()
+            .saturating_mul(outer_slot_bytes);
+        let outer_baseline =
+            GEOMETRY_VERTEX_BUFFER_SCRATCH_BASELINE.saturating_mul(outer_slot_bytes);
+
+        let mut nested_active = 0usize;
+        let mut nested_retained = 0usize;
+        for slots in self
+            .records
+            .iter()
+            .filter_map(|record| record.physical.as_ref())
+            .map(|physical| &physical.vertex_buffers)
+        {
+            if slots.spilled() {
+                nested_active =
+                    nested_active.saturating_add(slots.len().saturating_mul(slot_bytes));
+                nested_retained =
+                    nested_retained.saturating_add(slots.capacity().saturating_mul(slot_bytes));
+            }
+        }
+        for slots in &self.vertex_buffer_slot_scratch {
+            if slots.spilled() {
+                nested_retained =
+                    nested_retained.saturating_add(slots.capacity().saturating_mul(slot_bytes));
+            }
+        }
+
+        CapacityUsage::new(
+            nested_active,
+            outer_retained.saturating_add(nested_retained),
+            outer_baseline,
+        )
     }
 }
 
@@ -745,25 +852,91 @@ pub(crate) struct GeometryFrameResolver<'a> {
     store: &'a GeometryFrameStore,
 }
 
+/// Stack-local cursor for linearly merging the sorted DPE-live source stream
+/// with [`GeometryFrameStore`]'s compact source join.
+#[derive(Debug, Default)]
+pub(crate) struct GeometrySourceJoinCursor {
+    next_join: usize,
+    previous_source: Option<FrameSourceId>,
+}
+
 impl<'a> GeometryFrameResolver<'a> {
+    /// Create a fresh cursor for one monotonic traversal of the sorted live
+    /// source union. Tests retain a separate random-access resolver for
+    /// validating compact-join semantics.
+    #[must_use]
+    pub(crate) fn monotonic_cursor(self) -> GeometrySourceJoinCursor {
+        debug_assert!(
+            self.store.live_captured,
+            "Geometry source resolution requires a captured live-source union"
+        );
+        GeometrySourceJoinCursor {
+            next_join: 0,
+            previous_source: None,
+        }
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn geometry_id(
         self,
         source: FrameSourceId,
         item: &ExtractedRenderItem,
     ) -> Option<GeometryFrameId> {
-        let id = self
+        let join_index = self
             .store
-            .source_geometries
-            .get(source.index())
-            .copied()
-            .flatten()?;
+            .source_geometry_joins
+            .binary_search_by_key(&source, |join| join.source)
+            .ok()?;
+        let id = self.store.source_geometry_joins[join_index].geometry;
         self.store
             .records
             .get(id.index())?
             .key
             .matches_item(item)
             .then_some(id)
+    }
+
+    /// Resolve the next sorted source in amortized O(1) time.
+    ///
+    /// Both the DPE-live source union and the compact join are strictly sorted
+    /// by `FrameSourceId`, so Gather can advance one cursor rather than doing
+    /// an O(log live) binary search per source. Missing/incoherent joins are
+    /// skipped without consuming a later source's entry.
+    #[must_use]
+    pub(crate) fn geometry_id_monotonic(
+        self,
+        cursor: &mut GeometrySourceJoinCursor,
+        source: FrameSourceId,
+        item: &ExtractedRenderItem,
+    ) -> Option<GeometryFrameId> {
+        debug_assert!(
+            cursor
+                .previous_source
+                .is_none_or(|previous| previous < source),
+            "monotonic Geometry source resolution requires strictly increasing sources"
+        );
+        cursor.previous_source = Some(source);
+
+        while self
+            .store
+            .source_geometry_joins
+            .get(cursor.next_join)
+            .is_some_and(|join| join.source < source)
+        {
+            cursor.next_join += 1;
+        }
+        let join = self.store.source_geometry_joins.get(cursor.next_join)?;
+        if join.source != source {
+            return None;
+        }
+        cursor.next_join += 1;
+        self.store
+            .records
+            .get(join.geometry.index())?
+            .key
+            .matches_item(item)
+            .then_some(join.geometry)
     }
 
     #[must_use]
@@ -906,12 +1079,26 @@ impl<'a> ObjectInterfaceResolver<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::WgpuContext;
+    use crate::settings::{RendererInitConfig, RendererSettings};
     use glam::Mat4;
     use myth_assets::{GeometryHandle, MaterialHandle};
     use myth_resources::{BoundingBox, geometry::Geometry};
     use slotmap::Key;
 
     use crate::graph::frame::ExtractedSourceId;
+
+    fn headless_resource_manager() -> ResourceManager {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1)
+    }
 
     fn extracted_item(
         geometry: GeometryHandle,
@@ -933,8 +1120,7 @@ mod tests {
             material_classification: MaterialClassification::empty(),
             skeleton: None,
             item_variant_flags: 0,
-            item_shader_defines: ShaderDefines::new(),
-            item_shader_defines_hash: 0,
+            item_shader_features: ItemShaderFeatures::empty(),
             cast_shadows: true,
             receive_shadows: true,
             world_aabb: BoundingBox::default(),
@@ -1000,6 +1186,15 @@ mod tests {
             .geometry_id(second, &extracted.render_items[1])
             .expect("second geometry join missing");
         assert_eq!(first_id, second_id);
+        let mut cursor = resolver.monotonic_cursor();
+        assert_eq!(
+            resolver.geometry_id_monotonic(&mut cursor, first, &extracted.render_items[0]),
+            Some(first_id)
+        );
+        assert_eq!(
+            resolver.geometry_id_monotonic(&mut cursor, second, &extracted.render_items[1]),
+            Some(second_id)
+        );
         assert_eq!(store.geometry_count(), 1);
         assert_eq!(store.joined_source_count(), 2);
         assert_eq!(
@@ -1014,6 +1209,90 @@ mod tests {
         assert!(!store.is_current(&assets, first_id));
         store.clear();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn shader_snapshot_is_deferred_until_live_prepare_and_reused_from_exact_gpu_geometry() {
+        let assets = AssetServer::new();
+        let handle = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
+        let (_, asset_version, asset_identity) = assets
+            .geometries
+            .get_entry_with_identity(handle)
+            .expect("geometry missing");
+
+        let capture_attempt = || {
+            let mut extracted = ExtractedScene::new();
+            extracted
+                .render_items
+                .push(extracted_item(handle, asset_version, asset_identity));
+            let mut lists = RenderLists::new();
+            let source = lists.intern_frame_source(ExtractedSourceId::from_index(0));
+            let mut store = GeometryFrameStore::new();
+            store.capture_visible(&assets, &extracted, &lists);
+            store.capture_live(&assets, &extracted, &lists, &[source]);
+            (extracted, lists, source, store)
+        };
+
+        let (extracted, _lists, source, mut store) = capture_attempt();
+        let id = store
+            .resolver()
+            .geometry_id(source, &extracted.render_items[0])
+            .expect("live Geometry join missing");
+        assert!(
+            store.records[id.index()].shader_defines.is_none(),
+            "post-DPE CPU capture must not clone or publish Geometry shader state"
+        );
+
+        let mut resource_manager = headless_resource_manager();
+        assert!(
+            resource_manager.get_geometry(handle).is_none(),
+            "capturing a live Geometry must remain CPU-only"
+        );
+        let mut draw_plans = DrawPlanStore::new();
+        store.prepare_live(&assets, &mut resource_manager, &mut draw_plans);
+
+        let frame_snapshot = store.records[id.index()]
+            .shader_defines
+            .as_ref()
+            .expect("the first live prepare did not publish shader state");
+        let gpu_snapshot = &resource_manager
+            .get_geometry(handle)
+            .expect("the first live prepare did not publish a GPU Geometry")
+            .shader_defines;
+        assert!(
+            Arc::ptr_eq(frame_snapshot, gpu_snapshot),
+            "the frame record must borrow the exact persistent Geometry snapshot"
+        );
+        assert_eq!(
+            store
+                .resolver()
+                .geometry(id)
+                .unwrap()
+                .shader_defines()
+                .compute_hash(),
+            gpu_snapshot.compute_hash()
+        );
+        let persistent_snapshot = Arc::clone(gpu_snapshot);
+
+        let (next_extracted, _next_lists, next_source, mut next_store) = capture_attempt();
+        let next_id = next_store
+            .resolver()
+            .geometry_id(next_source, &next_extracted.render_items[0])
+            .expect("warm Geometry join missing");
+        assert!(
+            next_store.records[next_id.index()].shader_defines.is_none(),
+            "a warm graph attempt must still defer shader-state publication"
+        );
+        let mut next_draw_plans = DrawPlanStore::new();
+        next_store.prepare_live(&assets, &mut resource_manager, &mut next_draw_plans);
+        let next_snapshot = next_store.records[next_id.index()]
+            .shader_defines
+            .as_ref()
+            .expect("the exact warm Geometry lost its shader snapshot");
+        assert!(
+            Arc::ptr_eq(next_snapshot, &persistent_snapshot),
+            "an exact persistent GPU Geometry must reuse its canonical snapshot Arc"
+        );
     }
 
     #[test]
@@ -1061,7 +1340,140 @@ mod tests {
         assert!(store.record_snapshots.capacity() < SOURCE_COUNT / 4);
         assert!(store.snapshot_records.capacity() < SOURCE_COUNT / 4);
         assert!(store.failed_snapshots.capacity() < SOURCE_COUNT / 4);
-        assert_eq!(store.source_geometries.len(), SOURCE_COUNT);
+        assert_eq!(store.source_geometry_joins.len(), SOURCE_COUNT);
+    }
+
+    #[test]
+    fn sparse_live_geometry_join_does_not_materialize_the_frame_source_domain() {
+        const SOURCE_DOMAIN: usize = 100_000;
+        let assets = AssetServer::new();
+        let handle = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
+        let (_, asset_version, asset_identity) = assets
+            .geometries
+            .get_entry_with_identity(handle)
+            .expect("geometry missing");
+        let template = extracted_item(handle, asset_version, asset_identity);
+        let mut extracted = ExtractedScene::new();
+        let mut lists = RenderLists::new();
+        let mut last_source = None;
+        for index in 0..SOURCE_DOMAIN {
+            extracted.render_items.push(template.clone());
+            last_source = Some(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
+        }
+        let last_source = last_source.expect("source domain is empty");
+
+        let mut store = GeometryFrameStore::new();
+        store.capture_visible(&assets, &extracted, &lists);
+        store.capture_live(&assets, &extracted, &lists, &[last_source]);
+
+        assert_eq!(store.source_geometry_joins.len(), 1);
+        assert!(
+            store.source_geometry_joins.capacity() < SOURCE_DOMAIN / 4,
+            "the post-DPE join must retain a live-source, not total-source, high-water mark"
+        );
+        assert!(
+            store
+                .resolver()
+                .geometry_id(last_source, extracted.render_items.last().unwrap())
+                .is_some()
+        );
+        let retained_join_allocation = store.source_geometry_joins.as_ptr();
+
+        // `clear` invalidates the old join without scanning or zeroing the
+        // 100k source domain, and an all-dead attempt publishes no stale slot.
+        store.clear();
+        store.capture_visible(&assets, &extracted, &lists);
+        store.capture_live(&assets, &extracted, &lists, &[]);
+        assert!(store.source_geometry_joins.is_empty());
+        assert!(
+            store
+                .resolver()
+                .geometry_id(last_source, extracted.render_items.last().unwrap())
+                .is_none()
+        );
+
+        // A later warm live attempt reuses the retained compact join storage.
+        store.clear();
+        store.capture_visible(&assets, &extracted, &lists);
+        store.capture_live(&assets, &extracted, &lists, &[last_source]);
+        assert_eq!(
+            store.source_geometry_joins.as_ptr(),
+            retained_join_allocation
+        );
+        assert_eq!(store.source_geometry_joins.len(), 1);
+    }
+
+    #[test]
+    fn multi_stream_geometry_reuses_its_spilled_vertex_slot_allocation() {
+        let assets = AssetServer::new();
+        // Box geometry has separate position, normal, and UV buffers, which
+        // intentionally exceeds GeometryFramePhysical's two-slot inline form.
+        let handle = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
+        let (_, asset_version, asset_identity) = assets
+            .geometries
+            .get_entry_with_identity(handle)
+            .expect("geometry missing");
+        let mut extracted = ExtractedScene::new();
+        extracted
+            .render_items
+            .push(extracted_item(handle, asset_version, asset_identity));
+        let mut lists = RenderLists::new();
+        let source = lists.intern_frame_source(ExtractedSourceId::from_index(0));
+
+        let mut resource_manager = headless_resource_manager();
+        let mut draw_plans = DrawPlanStore::new();
+        let mut store = GeometryFrameStore::new();
+        store.capture_visible(&assets, &extracted, &lists);
+        store.capture_live(&assets, &extracted, &lists, &[source]);
+        store.prepare_live(&assets, &mut resource_manager, &mut draw_plans);
+
+        let geometry = store
+            .resolver()
+            .geometry_id(source, &extracted.render_items[0])
+            .expect("first geometry join missing");
+        let first_slots = &store
+            .resolver()
+            .physical(geometry)
+            .expect("first physical geometry missing")
+            .vertex_buffers;
+        assert!(first_slots.len() > 2);
+        assert!(first_slots.spilled());
+        let retained_slot_allocation = first_slots.as_ptr();
+        let retained_slot_capacity = first_slots.capacity();
+
+        store.clear();
+        draw_plans.clear();
+        assert_eq!(store.vertex_buffer_slot_scratch.len(), 1);
+        assert_eq!(
+            store.vertex_buffer_slot_scratch[0].as_ptr(),
+            retained_slot_allocation
+        );
+
+        store.capture_visible(&assets, &extracted, &lists);
+        store.capture_live(&assets, &extracted, &lists, &[source]);
+        store.prepare_live(&assets, &mut resource_manager, &mut draw_plans);
+        let geometry = store
+            .resolver()
+            .geometry_id(source, &extracted.render_items[0])
+            .expect("warm geometry join missing");
+        let warm_slots = &store
+            .resolver()
+            .physical(geometry)
+            .expect("warm physical geometry missing")
+            .vertex_buffers;
+        assert_eq!(warm_slots.capacity(), retained_slot_capacity);
+        assert_eq!(warm_slots.as_ptr(), retained_slot_allocation);
+        assert!(store.vertex_buffer_slot_scratch.is_empty());
+
+        store.clear();
+        let retained = store.capacity_usage();
+        assert_eq!(store.vertex_buffer_slot_scratch.len(), 1);
+        store.trim_capacity(0, retained.retained_bytes);
+        assert!(
+            store.vertex_buffer_slot_scratch.is_empty(),
+            "capacity trimming must release recycled nested spill allocations"
+        );
+        assert!(store.capacity_usage().retained_bytes < retained.retained_bytes);
     }
 
     #[test]
@@ -1107,6 +1519,19 @@ mod tests {
                 .resolver()
                 .geometry_id(sources[0], &extracted.render_items[0])
                 .is_none()
+        );
+        let resolver = store.resolver();
+        let mut cursor = resolver.monotonic_cursor();
+        assert!(
+            resolver
+                .geometry_id_monotonic(&mut cursor, sources[0], &extracted.render_items[0])
+                .is_none()
+        );
+        assert!(
+            resolver
+                .geometry_id_monotonic(&mut cursor, live, extracted.render_items.last().unwrap(),)
+                .is_some(),
+            "a missing early source must not consume a later compact join"
         );
     }
 

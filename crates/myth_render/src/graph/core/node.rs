@@ -24,8 +24,9 @@ use wgpu::CommandEncoder;
 ///    Materialize pipelines, uploads, and bind groups without changing graph
 ///    topology or resource descriptors.
 /// 2. **`finalize_prepare`** — after every live node has gathered recipes and
-///    the serial coordinators have assigned physical IDs, publish
-///    Feature-owned L1 state without creating resources.
+///    the serial coordinators have assigned physical IDs and closed their
+///    final epoch gates, publish Feature-owned L1 state without creating
+///    resources or mutating scene-source/asset epochs.
 /// 3. **`execute`** — record GPU commands into the shared encoder.
 /// 4. **`after_submit`** — retire pass-owned resources only after the shared
 ///    command buffer has been handed to the queue.
@@ -55,6 +56,8 @@ pub trait PassNode<'a>: Send + Sync {
     /// Publish coordinator results after the global Gather -> Plan ->
     /// Coordinate barrier. The default is intentionally empty; only nodes
     /// that own a cross-frame L1 derived from a shared recipe need this hook.
+    /// The coordinator's accepted streams are already linearized here, so
+    /// implementations must not mutate scene-source or asset epochs.
     #[allow(unused_variables)]
     fn finalize_prepare(&mut self, ctx: &mut PrepareContext<'a>) {}
 

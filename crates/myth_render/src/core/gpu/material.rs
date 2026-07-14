@@ -19,9 +19,13 @@
 use std::{mem::size_of, num::NonZeroU32, sync::Arc};
 
 use crate::core::gpu::texture::ResourceState;
-use crate::core::gpu::{AssetTextureStateSnapshot, EnsureResult};
+use crate::core::gpu::{AssetTexturePhysicalBinding, AssetTextureStateSnapshot, EnsureResult};
 use myth_assets::{AssetServer, MaterialHandle};
-use myth_resources::material::{Material, RenderableMaterialTrait};
+use myth_resources::material::{
+    CanonicalMaterialBindingStamp, Material, MaterialSettings, RenderableMaterialTrait,
+    ShaderTemplateMode,
+};
+use myth_resources::shader_defines::ShaderDefines;
 
 use myth_resources::texture::TextureSource;
 use myth_resources::{BindingDesc, BindingResource, ResourceBuilder};
@@ -36,6 +40,66 @@ use super::{ResourceIdSet, ResourceManager, hash_layout_entries};
 pub(crate) struct PlannedMaterialTexture {
     pub(crate) source: TextureSource,
     pub(crate) asset: Option<AssetTextureStateSnapshot>,
+    pub(crate) physical: Option<AssetTexturePhysicalBinding>,
+}
+
+/// Immutable shader/raster state for one exact Material generation.
+///
+/// The snapshot is derived only after DPE selects a live material. Once its
+/// exact `GpuMaterial` is published, the persistent cache owns this value so
+/// warm frames reuse it without rebuilding `ShaderDefines` during graph
+/// construction.
+pub(crate) struct MaterialPipelineSnapshot {
+    settings: MaterialSettings,
+    use_transmission: bool,
+    shader_name: &'static str,
+    shader_template: Option<&'static str>,
+    shader_template_mode: ShaderTemplateMode,
+    shader_defines: ShaderDefines,
+}
+
+impl MaterialPipelineSnapshot {
+    #[must_use]
+    pub(crate) fn capture(material: &Material) -> Self {
+        Self {
+            settings: material.settings(),
+            use_transmission: material.use_transmission(),
+            shader_name: material.shader_name(),
+            shader_template: material.shader_template(),
+            shader_template_mode: material.shader_template_mode(),
+            shader_defines: material.shader_defines(),
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn settings(&self) -> MaterialSettings {
+        self.settings
+    }
+
+    #[inline]
+    pub(crate) const fn use_transmission(&self) -> bool {
+        self.use_transmission
+    }
+
+    #[inline]
+    pub(crate) const fn shader_name(&self) -> &'static str {
+        self.shader_name
+    }
+
+    #[inline]
+    pub(crate) const fn shader_template(&self) -> Option<&'static str> {
+        self.shader_template
+    }
+
+    #[inline]
+    pub(crate) const fn shader_template_mode(&self) -> ShaderTemplateMode {
+        self.shader_template_mode
+    }
+
+    #[inline]
+    pub(crate) const fn shader_defines(&self) -> &ShaderDefines {
+        &self.shader_defines
+    }
 }
 
 const PLANNED_MATERIAL_CANDIDATE_BASELINE: usize = 128;
@@ -79,8 +143,11 @@ struct PlannedMaterialCandidate {
     asset_identity: u64,
     material_version: u64,
     has_pending_textures: bool,
+    canonical_binding_stamp: Option<CanonicalMaterialBindingStamp>,
     source: PlannedMaterialCandidateSource,
     result: Option<bool>,
+    #[cfg(test)]
+    canonical_fast_path: bool,
 }
 
 /// Graph-attempt owner for unpublished persistent Material candidates.
@@ -122,6 +189,34 @@ impl PlannedMaterialCandidateBatch {
     #[must_use]
     pub(crate) fn all_published(&self) -> bool {
         self.published_count == self.candidates.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn canonical_binding_stamp(
+        &self,
+        id: PlannedMaterialCandidateId,
+    ) -> Option<CanonicalMaterialBindingStamp> {
+        self.candidates
+            .get(id.index())
+            .and_then(|candidate| candidate.canonical_binding_stamp)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reuses_existing(&self, id: PlannedMaterialCandidateId) -> bool {
+        self.candidates.get(id.index()).is_some_and(|candidate| {
+            matches!(
+                candidate.source,
+                PlannedMaterialCandidateSource::Existing { .. }
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used_canonical_fast_path(&self, id: PlannedMaterialCandidateId) -> bool {
+        self.candidates
+            .get(id.index())
+            .is_some_and(|candidate| candidate.canonical_fast_path)
     }
 
     pub(crate) fn clear(&mut self) {
@@ -206,6 +301,28 @@ impl PlannedMaterialCandidateBatch {
         has_pending_textures: bool,
         source: PlannedMaterialCandidateSource,
     ) -> PlannedMaterialCandidateId {
+        self.push_with_stamp(
+            handle,
+            asset_version,
+            asset_identity,
+            material_version,
+            has_pending_textures,
+            None,
+            source,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_with_stamp(
+        &mut self,
+        handle: MaterialHandle,
+        asset_version: u32,
+        asset_identity: u64,
+        material_version: u64,
+        has_pending_textures: bool,
+        canonical_binding_stamp: Option<CanonicalMaterialBindingStamp>,
+        source: PlannedMaterialCandidateSource,
+    ) -> PlannedMaterialCandidateId {
         assert!(
             self.published_count == 0,
             "planned material candidates cannot be staged after publication"
@@ -217,8 +334,11 @@ impl PlannedMaterialCandidateBatch {
             asset_identity,
             material_version,
             has_pending_textures,
+            canonical_binding_stamp,
             source,
             result: None,
+            #[cfg(test)]
+            canonical_fast_path: false,
         });
         id
     }
@@ -267,6 +387,13 @@ pub struct GpuMaterial {
     pub layout_hash: u64,
     pub binding_wgsl: Arc<str>,
     pub binding_interface_id: super::BindingInterfaceId,
+    /// Coherent pipeline state derived for the same exact Material epoch as
+    /// this physical Group 1 entry.
+    pub(crate) pipeline_snapshot: Arc<MaterialPipelineSnapshot>,
+    /// Exact generated binding stamp last accepted by the cache-side CAS.
+    /// `None` keeps hand-written custom materials on the generic discovery
+    /// path.
+    pub(crate) canonical_binding_stamp: Option<CanonicalMaterialBindingStamp>,
     /// Set of physical IDs of all dependent resources (guards `BindGroup` validity)
     pub resource_ids: ResourceIdSet,
     /// Records the Material version when this `GpuMaterial` was generated (for Pipeline cache)
@@ -372,10 +499,29 @@ impl ResourceManager {
         asset_version: u32,
         asset_identity: u64,
         material_version: u64,
+        pipeline_snapshot: &Arc<MaterialPipelineSnapshot>,
         textures: &[PlannedMaterialTexture],
     ) -> PlannedMaterialCandidateId {
         if material.data.version() != material_version {
             return batch.push_unavailable(handle, asset_version, asset_identity, material_version);
+        }
+
+        let canonical_binding_stamp = material
+            .data
+            .canonical_binding_stamp()
+            .filter(|stamp| stamp.topology_epoch == material_version);
+        if let Some(stamp) = canonical_binding_stamp
+            && let Some(candidate) = self.try_prepare_exact_canonical_material(
+                batch,
+                handle,
+                asset_version,
+                asset_identity,
+                material_version,
+                stamp,
+                textures,
+            )
+        {
+            return candidate;
         }
 
         let mut builder = ResourceBuilder::new();
@@ -410,12 +556,13 @@ impl ResourceManager {
                 .material(handle)
                 .expect("exact lagging Material disappeared")
                 .bind_group_id;
-            return batch.push(
+            return batch.push_with_stamp(
                 handle,
                 asset_version,
                 asset_identity,
                 material_version,
                 true,
+                canonical_binding_stamp,
                 PlannedMaterialCandidateSource::Existing {
                     expected_bind_group_id,
                 },
@@ -453,12 +600,13 @@ impl ResourceManager {
                 .material(handle)
                 .expect("reusable Material disappeared")
                 .bind_group_id;
-            return batch.push(
+            return batch.push_with_stamp(
                 handle,
                 asset_version,
                 asset_identity,
                 material_version,
                 has_pending_textures,
+                canonical_binding_stamp,
                 PlannedMaterialCandidateSource::Existing {
                     expected_bind_group_id,
                 },
@@ -476,23 +624,103 @@ impl ResourceManager {
             asset_identity,
             material_version,
             has_pending_textures,
+            Arc::clone(pipeline_snapshot),
+            canonical_binding_stamp,
         ));
         if material.data.version() != material_version {
             return batch.push_unavailable(handle, asset_version, asset_identity, material_version);
         }
         let private_slot = batch.private_materials.len();
         batch.private_materials.push(Some(candidate));
-        batch.push(
+        batch.push_with_stamp(
             handle,
             asset_version,
             asset_identity,
             material_version,
             has_pending_textures,
+            canonical_binding_stamp,
             PlannedMaterialCandidateSource::Rebuild {
                 observed_bind_group_id,
                 private_slot,
             },
         )
+    }
+
+    /// Exact resident path for macro-generated material bindings.
+    ///
+    /// The canonical producer has already materialized every ready Asset
+    /// Texture and exported its physical token into the owner batch. Matching
+    /// those tokens and the exact uniform stamp against the persistent Group 1
+    /// fingerprint makes rebuilding a ResourceBuilder redundant. Hand-written
+    /// custom materials never enter this path.
+    #[allow(clippy::too_many_arguments)]
+    fn try_prepare_exact_canonical_material(
+        &mut self,
+        batch: &mut PlannedMaterialCandidateBatch,
+        handle: MaterialHandle,
+        asset_version: u32,
+        asset_identity: u64,
+        material_version: u64,
+        stamp: CanonicalMaterialBindingStamp,
+        textures: &[PlannedMaterialTexture],
+    ) -> Option<PlannedMaterialCandidateId> {
+        let (expected_bind_group_id, uniform_physical_id) = {
+            let gpu_material = self.resources.material(handle)?;
+            if (gpu_material.asset_version, gpu_material.asset_identity)
+                != (asset_version, asset_identity)
+                || gpu_material.version != material_version
+                || gpu_material.canonical_binding_stamp != Some(stamp)
+            {
+                return None;
+            }
+
+            let resource_ids = gpu_material.resource_ids.as_slice();
+            if resource_ids.len() != 1 + textures.len().saturating_mul(2) {
+                return None;
+            }
+            for (index, texture) in textures.iter().enumerate() {
+                let TextureSource::Asset(handle) = texture.source else {
+                    return None;
+                };
+                let state = texture.asset?;
+                if state.texture_handle != handle || state.ready.is_none() {
+                    return None;
+                }
+                let physical = texture.physical?;
+                let resource_index = 1 + index * 2;
+                if resource_ids[resource_index] != physical.generation_key.allocation
+                    || resource_ids[resource_index + 1] != physical.sampler_id as u64
+                {
+                    return None;
+                }
+            }
+            (gpu_material.bind_group_id, resource_ids[0])
+        };
+
+        if !self.resources.touch_buffer_if_exact(
+            stamp.uniform,
+            uniform_physical_id,
+            self.frame_index,
+        ) {
+            return None;
+        }
+
+        let candidate = batch.push_with_stamp(
+            handle,
+            asset_version,
+            asset_identity,
+            material_version,
+            false,
+            Some(stamp),
+            PlannedMaterialCandidateSource::Existing {
+                expected_bind_group_id,
+            },
+        );
+        #[cfg(test)]
+        {
+            batch.candidates[candidate.index()].canonical_fast_path = true;
+        }
+        Some(candidate)
     }
 
     /// Reserve compact logical slots and dense fresh-owner capacity before
@@ -661,6 +889,7 @@ impl ResourceManager {
                 .material_mut(candidate.handle)
                 .expect("published Material candidate has no cache entry");
             debug_assert!(exact_cache(gpu_mat));
+            gpu_mat.canonical_binding_stamp = candidate.canonical_binding_stamp;
             gpu_mat.last_used_frame = self.frame_index;
             if !candidate.has_pending_textures {
                 gpu_mat.last_verified_frame = self.frame_index;
@@ -836,6 +1065,7 @@ impl ResourceManager {
     ) {
         let mut builder = ResourceBuilder::new();
         material.define_bindings(&mut builder);
+        let pipeline_snapshot = Arc::new(MaterialPipelineSnapshot::capture(material));
 
         self.prepare_binding_resources(assets, &builder.bindings);
 
@@ -846,6 +1076,8 @@ impl ResourceManager {
             asset_identity,
             material.data.version(),
             false,
+            pipeline_snapshot,
+            material.data.canonical_binding_stamp(),
         );
         self.resources.insert_material(handle, gpu_mat);
     }
@@ -861,6 +1093,8 @@ impl ResourceManager {
         asset_identity: u64,
         material_version: u64,
         has_pending_textures: bool,
+        pipeline_snapshot: Arc<MaterialPipelineSnapshot>,
+        canonical_binding_stamp: Option<CanonicalMaterialBindingStamp>,
     ) -> GpuMaterial {
         // Compute hash of layout entries
         let layout_entries = builder.generate_layout_entries();
@@ -887,6 +1121,8 @@ impl ResourceManager {
             layout_hash,
             binding_wgsl,
             binding_interface_id,
+            pipeline_snapshot,
+            canonical_binding_stamp,
             resource_ids,
             version: material_version,
             last_used_frame: self.frame_index,
@@ -900,6 +1136,24 @@ impl ResourceManager {
 
     pub fn get_material(&self, handle: MaterialHandle) -> Option<&GpuMaterial> {
         self.resources.material(handle)
+    }
+
+    /// Return the persistent immutable pipeline snapshot only when the cached
+    /// Material belongs to the exact graph-attempt generation.
+    #[must_use]
+    pub(crate) fn exact_material_pipeline_snapshot(
+        &self,
+        handle: MaterialHandle,
+        asset_version: u32,
+        asset_identity: u64,
+        material_version: u64,
+    ) -> Option<Arc<MaterialPipelineSnapshot>> {
+        self.resources.material(handle).and_then(|material| {
+            (material.asset_version == asset_version
+                && material.asset_identity == asset_identity
+                && material.version == material_version)
+                .then(|| Arc::clone(&material.pipeline_snapshot))
+        })
     }
 }
 
@@ -960,6 +1214,12 @@ mod tests {
         result
     }
 
+    fn test_pipeline_snapshot() -> Arc<MaterialPipelineSnapshot> {
+        Arc::new(MaterialPipelineSnapshot::capture(&Material::new_unlit(
+            glam::Vec4::ONE,
+        )))
+    }
+
     fn clone_gpu_material(source: &GpuMaterial, bind_group_id: u64) -> GpuMaterial {
         GpuMaterial {
             asset_version: source.asset_version,
@@ -971,6 +1231,8 @@ mod tests {
             layout_hash: source.layout_hash,
             binding_wgsl: Arc::clone(&source.binding_wgsl),
             binding_interface_id: source.binding_interface_id,
+            pipeline_snapshot: Arc::clone(&source.pipeline_snapshot),
+            canonical_binding_stamp: source.canonical_binding_stamp,
             resource_ids: source.resource_ids.clone(),
             version: source.version,
             last_used_frame: source.last_used_frame,
@@ -997,6 +1259,8 @@ mod tests {
             ASSET_IDENTITY,
             MATERIAL_VERSION,
             false,
+            test_pipeline_snapshot(),
+            None,
         ));
         let private_slot = batch.private_materials.len();
         batch.private_materials.push(Some(candidate));
@@ -1091,8 +1355,16 @@ mod tests {
         let mut resources = test_resource_manager();
         let handle = test_material_handle(3);
         let builder = ResourceBuilder::new();
-        let cached =
-            resources.build_material_from_builder(&builder, resource_ids(&[301]), 7, 11, 13, false);
+        let cached = resources.build_material_from_builder(
+            &builder,
+            resource_ids(&[301]),
+            7,
+            11,
+            13,
+            false,
+            test_pipeline_snapshot(),
+            None,
+        );
         let cached_bind_group_id = cached.bind_group_id;
         resources.resources.insert_material(handle, cached);
 
@@ -1142,8 +1414,16 @@ mod tests {
         let mut resources = test_resource_manager();
         let handle = test_material_handle(4_096);
         let builder = ResourceBuilder::new();
-        let cached =
-            resources.build_material_from_builder(&builder, resource_ids(&[401]), 7, 11, 13, false);
+        let cached = resources.build_material_from_builder(
+            &builder,
+            resource_ids(&[401]),
+            7,
+            11,
+            13,
+            false,
+            test_pipeline_snapshot(),
+            None,
+        );
         let cached_bind_group_id = cached.bind_group_id;
         resources.resources.insert_material(handle, cached);
 
@@ -1190,8 +1470,16 @@ mod tests {
         let old_handle = test_material_handle_generation(8_192, 1);
         let new_handle = test_material_handle_generation(8_192, 3);
         let builder = ResourceBuilder::new();
-        let obsolete =
-            resources.build_material_from_builder(&builder, resource_ids(&[501]), 7, 11, 13, false);
+        let obsolete = resources.build_material_from_builder(
+            &builder,
+            resource_ids(&[501]),
+            7,
+            11,
+            13,
+            false,
+            test_pipeline_snapshot(),
+            None,
+        );
         resources.resources.insert_material(old_handle, obsolete);
         assert!(resources.get_material(old_handle).is_some());
 
@@ -1222,8 +1510,16 @@ mod tests {
         let stale_handle = test_material_handle_generation(12_288, 1);
         let current_handle = test_material_handle_generation(12_288, 3);
         let builder = ResourceBuilder::new();
-        let current =
-            resources.build_material_from_builder(&builder, resource_ids(&[551]), 7, 11, 13, false);
+        let current = resources.build_material_from_builder(
+            &builder,
+            resource_ids(&[551]),
+            7,
+            11,
+            13,
+            false,
+            test_pipeline_snapshot(),
+            None,
+        );
         let current_bind_group_id = current.bind_group_id;
         resources.resources.insert_material(current_handle, current);
 

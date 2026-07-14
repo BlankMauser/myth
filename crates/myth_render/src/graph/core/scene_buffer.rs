@@ -326,35 +326,11 @@ impl SceneBufferImportStore {
             BufferRef::with_fixed_id(stamp.id, stamp.size, stamp.usage, stamp.version, None)
         });
 
-        let preflight_ok = metadata_ref.as_ref().is_none_or(|buffer_ref| {
-            uploads.preflight_buffer_snapshot(
-                buffer_ref,
-                metadata
-                    .as_ref()
-                    .expect("metadata guard missing")
-                    .1
-                    .as_bytes(),
-            )
-        }) && storage_ref.as_ref().is_none_or(|buffer_ref| {
-            uploads.preflight_buffer_snapshot(
-                buffer_ref,
-                storage
-                    .as_ref()
-                    .expect("storage guard missing")
-                    .1
-                    .as_bytes(),
-            )
-        });
-        if !preflight_ok {
-            self.record_live_unavailable(resources);
-            return Err(SceneBufferMaterializationFailure::ConflictingPhysicalState);
-        }
-
         // All source stamps and all persistent physical states are valid before
         // the first mutation. Keep both CPU guards alive until both uploads
         // finish, then publish graph-owned clones as one logical batch.
-        let mut metadata_buffer = metadata_ref.as_ref().map(|buffer_ref| {
-            uploads.materialize_buffer_snapshot(
+        let metadata_input = metadata_ref.as_ref().map(|buffer_ref| {
+            (
                 buffer_ref,
                 metadata
                     .as_ref()
@@ -363,8 +339,8 @@ impl SceneBufferImportStore {
                     .as_bytes(),
             )
         });
-        let mut storage_buffer = storage_ref.as_ref().map(|buffer_ref| {
-            uploads.materialize_buffer_snapshot(
+        let storage_input = storage_ref.as_ref().map(|buffer_ref| {
+            (
                 buffer_ref,
                 storage
                     .as_ref()
@@ -373,12 +349,14 @@ impl SceneBufferImportStore {
                     .as_bytes(),
             )
         });
-        if metadata_buffer.as_ref().is_some_and(Option::is_none)
-            || storage_buffer.as_ref().is_some_and(Option::is_none)
-        {
+        let Some([metadata_buffer, storage_buffer]) =
+            uploads.materialize_buffer_snapshot_batch([metadata_input, storage_input])
+        else {
             self.record_live_unavailable(resources);
             return Err(SceneBufferMaterializationFailure::ConflictingPhysicalState);
-        }
+        };
+        let mut metadata_buffer = metadata_buffer;
+        let mut storage_buffer = storage_buffer;
 
         let resolver = self.resolver();
         for (index, entry) in self.entries.iter().enumerate() {
@@ -388,8 +366,8 @@ impl SceneBufferImportStore {
                 continue;
             }
             let buffer = match entry.recipe {
-                SceneBufferRecipe::LightMetadata => metadata_buffer.as_mut().and_then(Option::take),
-                SceneBufferRecipe::LightStorage => storage_buffer.as_mut().and_then(Option::take),
+                SceneBufferRecipe::LightMetadata => metadata_buffer.take(),
+                SceneBufferRecipe::LightStorage => storage_buffer.take(),
             };
             let id = SceneBufferImportId::new(self.store_id, self.attempt, index);
             if !resolver.record(id, entry.snapshot, buffer) {

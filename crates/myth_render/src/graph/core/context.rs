@@ -8,9 +8,7 @@ use crate::core::gpu::{
     MipmapRequestResolver, PhysicalImageGenerationKey, SamplerRegistry, SystemTextures, Tracked,
 };
 use crate::graph::asset_frame::{GeometryFrameResolver, ObjectInterfaceResolver};
-use crate::graph::frame::{
-    DrawPlanStore, FrameSourceId, PreparedDrawStore, PreparedSourceId, RenderLists,
-};
+use crate::graph::frame::{DrawPlanStore, PreparedDrawStore, PreparedSourceId, RenderLists};
 use crate::graph::material_plan::MaterialPlanResolver;
 use crate::graph::scene_pipeline_coordinator::{
     coordinate_scene_pipelines, finalize_live_draw_plans, gather_live_pipeline_recipes,
@@ -39,6 +37,8 @@ use super::types::{
     TextureNodeId,
 };
 use super::{AssetTextureImportId, AssetTextureResolver, SceneBufferResolver};
+#[cfg(feature = "rdg_bench_support")]
+use super::{RdgDetailPhase, RdgDiagnosticsRecorder};
 
 // ─── Legacy/template pre-RDG compatibility context ─────────────────────────
 
@@ -90,6 +90,8 @@ pub(crate) struct SceneDrawPrepareContext<'a> {
     pub(crate) pipeline_settings_version: u64,
     scene_submissions: &'a SceneSubmissionStore,
     scene_pipeline_prepare: &'a mut ScenePipelinePrepareStore,
+    #[cfg(feature = "rdg_bench_support")]
+    rdg_diagnostics: &'a RdgDiagnosticsRecorder,
 }
 
 impl<'a> SceneDrawPrepareContext<'a> {
@@ -105,6 +107,7 @@ impl<'a> SceneDrawPrepareContext<'a> {
         pipeline_settings_version: u64,
         scene_submissions: &'a SceneSubmissionStore,
         scene_pipeline_prepare: &'a mut ScenePipelinePrepareStore,
+        #[cfg(feature = "rdg_bench_support")] rdg_diagnostics: &'a RdgDiagnosticsRecorder,
     ) -> Self {
         Self {
             render_lists,
@@ -117,6 +120,8 @@ impl<'a> SceneDrawPrepareContext<'a> {
             pipeline_settings_version,
             scene_submissions,
             scene_pipeline_prepare,
+            #[cfg(feature = "rdg_bench_support")]
+            rdg_diagnostics,
         }
     }
 
@@ -127,7 +132,6 @@ impl<'a> SceneDrawPrepareContext<'a> {
         &mut self,
         submission: SceneSubmissionPlanId,
         intent_index: usize,
-        frame_source: FrameSourceId,
         prepared_source: PreparedSourceId,
         key: PrepassPipelineL1Key,
         cached: Option<RenderPipelineId>,
@@ -142,10 +146,9 @@ impl<'a> SceneDrawPrepareContext<'a> {
             .scene_submissions
             .cpu_direct_plan(submission)
             .expect("Prepass recipe requires the CpuDirect backend");
-        self.scene_pipeline_prepare.push_prepass(
+        self.scene_pipeline_prepare.push_prepass_compact(
             draw_plan,
             SceneRecipeOrdinal::new(draw_plan.index(), intent_index),
-            frame_source,
             prepared_source,
             key,
             cached,
@@ -187,36 +190,48 @@ impl<'a> SceneDrawPrepareContext<'a> {
         shader_manager: &mut ShaderManager,
         camera: &RenderCamera,
     ) {
-        gather_live_pipeline_recipes(
-            self.scene_pipeline_prepare,
-            draw_plans,
-            self.prepared_draws,
-            self.geometry_frames,
-            self.material_frames,
-            self.object_interfaces,
-            self.render_lists,
-            self.extracted_scene,
-            gpu_world,
-            wgpu_ctx,
-            shader_manager,
-            camera,
-        );
-        coordinate_scene_pipelines(
-            self.scene_pipeline_prepare,
-            draw_plans.plan_count(),
-            self.prepared_draws,
-            self.geometry_frames,
-            self.material_frames,
-            self.object_interfaces,
-            self.render_lists,
-            self.extracted_scene,
-            gpu_world,
-            wgpu_ctx,
-            system_textures,
-            pipeline_cache,
-            shader_manager,
-            camera,
-        );
+        {
+            #[cfg(feature = "rdg_bench_support")]
+            let _timing = self
+                .rdg_diagnostics
+                .detail_timer(RdgDetailPhase::PipelineGather);
+            gather_live_pipeline_recipes(
+                self.scene_pipeline_prepare,
+                draw_plans,
+                self.prepared_draws,
+                self.geometry_frames,
+                self.material_frames,
+                self.object_interfaces,
+                self.render_lists,
+                self.extracted_scene,
+                gpu_world,
+                wgpu_ctx,
+                shader_manager,
+                camera,
+            );
+        }
+        {
+            #[cfg(feature = "rdg_bench_support")]
+            let _timing = self
+                .rdg_diagnostics
+                .detail_timer(RdgDetailPhase::PipelineCoordinate);
+            coordinate_scene_pipelines(
+                self.scene_pipeline_prepare,
+                draw_plans.plan_count(),
+                self.prepared_draws,
+                self.geometry_frames,
+                self.material_frames,
+                self.object_interfaces,
+                self.render_lists,
+                self.extracted_scene,
+                gpu_world,
+                wgpu_ctx,
+                system_textures,
+                pipeline_cache,
+                shader_manager,
+                camera,
+            );
+        }
     }
 
     /// Freeze contiguous immutable Direct streams after every Feature has
@@ -225,12 +240,7 @@ impl<'a> SceneDrawPrepareContext<'a> {
         finalize_live_draw_plans(
             self.scene_pipeline_prepare,
             draw_plans,
-            self.prepared_draws,
             self.geometry_frames,
-            self.material_frames,
-            self.object_interfaces,
-            self.render_lists,
-            self.extracted_scene,
         );
     }
 }

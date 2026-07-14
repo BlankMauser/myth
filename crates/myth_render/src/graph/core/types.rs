@@ -271,6 +271,14 @@ pub enum ResourceClass {
 #[derive(Debug, Clone, Copy)]
 pub enum TextureBacking {
     Transient,
+    /// External output whose physical view is deliberately attached only
+    /// after topology compilation has completed.
+    ///
+    /// This lets a windowed frame build and DPE-compile its logical graph
+    /// before waiting for the next swap-chain image.  The placeholder must be
+    /// bound before transient materialization or any prepare/execute resolver
+    /// is allowed to observe it.
+    UnboundExternal,
     External(*const Tracked<wgpu::TextureView>),
     Persistent(PersistentTextureId),
     /// Frame-scoped logical import of one exact asset-texture snapshot.
@@ -324,6 +332,29 @@ impl ResourceKind {
         Self::Texture {
             desc,
             backing: TextureBacking::External(external_view_ptr),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn unbound_external_texture(desc: TextureDesc) -> Self {
+        Self::Texture {
+            desc,
+            backing: TextureBacking::UnboundExternal,
+        }
+    }
+
+    #[inline]
+    pub fn bind_external_texture(&mut self, external_view: &Tracked<wgpu::TextureView>) {
+        match self {
+            Self::Texture { backing, .. } => {
+                assert!(
+                    matches!(backing, TextureBacking::UnboundExternal),
+                    "only an unbound external texture placeholder can be late-bound"
+                );
+                *backing = TextureBacking::External(std::ptr::from_ref(external_view));
+            }
+            Self::Buffer { .. } => panic!("cannot bind a texture view to a buffer resource"),
         }
     }
 
@@ -421,6 +452,18 @@ impl ResourceKind {
             } => Some(*ptr),
             Self::Texture { .. } | Self::Buffer { .. } => None,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_unbound_external_texture(&self) -> bool {
+        matches!(
+            self,
+            Self::Texture {
+                backing: TextureBacking::UnboundExternal,
+                ..
+            }
+        )
     }
 
     #[inline]
@@ -563,6 +606,12 @@ impl ResourceRecord {
     #[must_use]
     pub const fn external_texture_ptr(&self) -> Option<*const Tracked<wgpu::TextureView>> {
         self.kind.external_texture_ptr()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_unbound_external_texture(&self) -> bool {
+        self.kind.is_unbound_external_texture()
     }
 
     #[inline]

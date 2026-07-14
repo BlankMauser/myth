@@ -21,8 +21,9 @@ use myth_resources::{BindingResource, ResourceBuilder, WgslStructName};
 
 use super::bind_group_store::{GlobalBindingInterface, SharedBindingWgsl};
 use super::{
-    BindGroupContext, CommonSampler, GlobalStateKey, GpuGlobalState, ModelBufferAllocator,
-    ObjectBindGroupKey, ResourceManager, Tracked, generate_gpu_resource_id,
+    BindGroupContext, CommonSampler, GlobalStateKey, GpuGlobalState, MaterializedBufferToken,
+    ModelBufferAllocator, ObjectBindGroupKey, ResourceManager, RigidObjectBindGroupL0Key, Tracked,
+    generate_gpu_resource_id,
 };
 
 static NEXT_GLOBAL_STATE_ID: AtomicU32 = AtomicU32::new(0);
@@ -45,11 +46,6 @@ pub(crate) enum GlobalStatePhysicalFailure {
     VersionMismatch(GlobalStateBufferSlot),
     UsageMismatch(GlobalStateBufferSlot),
     SizeMismatch(GlobalStateBufferSlot),
-}
-
-struct MaterializedGlobalBuffer {
-    buffer: wgpu::Buffer,
-    physical_id: u64,
 }
 
 impl ResourceManager {
@@ -214,7 +210,10 @@ impl ResourceManager {
         // its dynamic slot and the model buffer can no longer grow this frame.
         self.model_allocator.assert_frozen();
 
-        self.ensure_buffer(&mesh.morph_uniforms);
+        let is_rigid = skeleton.is_none() && !geometry.has_morph_targets();
+        if !is_rigid {
+            self.ensure_buffer(&mesh.morph_uniforms);
+        }
         if !self.get_geometry(mesh.geometry).is_some_and(|gpu| {
             (gpu.asset_version, gpu.asset_identity)
                 == (geometry_asset_version, geometry_asset_identity)
@@ -238,7 +237,6 @@ impl ResourceManager {
         self.model_allocator.assert_frozen();
 
         // === Ensure phase: ensure all resources are uploaded ===
-        self.ensure_buffer(&mesh.morph_uniforms);
         if !self.prepare_geometry(assets, mesh.geometry) {
             return None;
         }
@@ -249,6 +247,9 @@ impl ResourceManager {
         }
 
         let geometry = assets.geometries.get(mesh.geometry)?;
+        if skeleton.is_some() || geometry.has_morph_targets() {
+            self.ensure_buffer(&mesh.morph_uniforms);
+        }
         let bind_group_id = self.prepare_object_bindings_id(mesh, skeleton, &geometry);
         self.bind_groups.cached_bind_group(bind_group_id).cloned()
     }
@@ -259,6 +260,25 @@ impl ResourceManager {
         skeleton: Option<&Skeleton>,
         geometry: &Geometry,
     ) -> u64 {
+        let is_rigid = skeleton.is_none() && !geometry.has_morph_targets();
+        let rigid_l0_key = if is_rigid {
+            let model_cpu_id = self.model_allocator.buffer_handle().id();
+            let model_physical_id = self
+                .get_gpu_buffer_by_cpu_id(model_cpu_id)
+                .expect("frozen model buffer is not resident")
+                .id;
+            let key = RigidObjectBindGroupL0Key::new(model_physical_id);
+            if let Some(bind_group_id) = self
+                .bind_groups
+                .touch_cached_rigid_object_bind_group(key, self.frame_index)
+            {
+                return bind_group_id;
+            }
+            Some(key)
+        } else {
+            None
+        };
+
         // Build the exact binding recipe once. Resource preparation and cache
         // fingerprinting must use this same recipe so a future binding cannot
         // be created while silently missing from the cache key.
@@ -272,8 +292,14 @@ impl ResourceManager {
             min_binding_size,
             ShaderStages::VERTEX | ShaderStages::FRAGMENT,
         );
-        mesh.define_bindings(&mut builder);
+        if !is_rigid {
+            mesh.define_bindings(&mut builder);
+        }
         geometry.define_bindings(&mut builder);
+        debug_assert!(
+            !is_rigid || (builder.bindings.len() == 1 && builder.bindings[0].name == "model"),
+            "rigid Object Group 2 must remain the canonical model-only interface"
+        );
 
         if let Some(skeleton) = skeleton {
             builder.add_storage_buffer(
@@ -315,6 +341,10 @@ impl ResourceManager {
             .bind_groups
             .touch_cached_object_bind_group(&cache_key, self.frame_index)
         {
+            if let Some(rigid_l0_key) = rigid_l0_key {
+                self.bind_groups
+                    .cache_rigid_object_bind_group_l0(rigid_l0_key, cache_key);
+            }
             return bind_group_id;
         }
 
@@ -340,12 +370,17 @@ impl ResourceManager {
             binding_interface_id,
         };
 
+        let rigid_full_key = rigid_l0_key.map(|_| cache_key.clone());
         self.bind_groups.cache_object_bind_group(
             cache_key,
             bind_group_id,
             data.clone(),
             self.frame_index,
         );
+        if let (Some(rigid_l0_key), Some(full_key)) = (rigid_l0_key, rigid_full_key) {
+            self.bind_groups
+                .cache_rigid_object_bind_group_l0(rigid_l0_key, full_key);
+        }
         bind_group_id
     }
 
@@ -672,47 +707,41 @@ impl ResourceManager {
     /// attempt.
     ///
     /// This entry point performs no CPU-buffer read, upload, asset lookup, or
-    /// generic binding-resource preparation. All three `BufferRef`s must name
+    /// generic binding-resource preparation. All three Copy tokens must name
     /// the exact physical versions installed by the post-DPE materialization
     /// barrier. A mismatch fails closed before either the persistent state or
     /// its liveness timestamp is changed.
     pub(crate) fn prepare_global_from_materialized(
         &mut self,
         state_key: GlobalStateKey,
-        camera: &BufferRef,
-        environment: &BufferRef,
-        directional_lights: &BufferRef,
+        camera: &MaterializedBufferToken,
+        environment: &MaterializedBufferToken,
+        directional_lights: &MaterializedBufferToken,
         pmrem_override: Option<&Tracked<wgpu::TextureView>>,
     ) -> Result<u32, GlobalStatePhysicalFailure> {
-        let camera_physical = self.resolve_materialized_global_buffer(
+        let camera_physical_id = self.resolve_materialized_global_buffer(
             camera,
             GlobalStateBufferSlot::Camera,
             wgpu::BufferUsages::UNIFORM,
         )?;
-        let environment_physical = self.resolve_materialized_global_buffer(
+        let environment_physical_id = self.resolve_materialized_global_buffer(
             environment,
             GlobalStateBufferSlot::Environment,
             wgpu::BufferUsages::UNIFORM,
         )?;
-        let directional_lights_physical = self.resolve_materialized_global_buffer(
+        let directional_lights_physical_id = self.resolve_materialized_global_buffer(
             directional_lights,
             GlobalStateBufferSlot::DirectionalLights,
             wgpu::BufferUsages::STORAGE,
         )?;
 
-        // Clone the selected view into this narrow materialization scope so
-        // no HistoryRegistry or SystemTextures borrow overlaps the persistent
-        // bind-group-store mutation below. The graph and resulting BindGroup
-        // remain the authoritative physical owners for their respective
-        // lifetimes.
-        let pmrem = pmrem_override
-            .cloned()
-            .unwrap_or_else(|| self.system_textures.black_cube.clone());
+        let pmrem_id =
+            pmrem_override.map_or_else(|| self.system_textures.black_cube.id(), Tracked::id);
         let current_ids = global_resource_ids(
-            camera_physical.physical_id,
-            environment_physical.physical_id,
-            directional_lights_physical.physical_id,
-            pmrem.id(),
+            camera_physical_id,
+            environment_physical_id,
+            directional_lights_physical_id,
+            pmrem_id,
         );
 
         if let Some(gpu_state) = self.bind_groups.global_state_mut(state_key)
@@ -722,6 +751,15 @@ impl ResourceManager {
             return Ok(gpu_state.id);
         }
 
+        // Only a cold/rebind path needs owned WGPU handles. Warm Group 0 hits
+        // above compare the exact physical fingerprint and retain no transient
+        // buffer or texture clones.
+        let camera_buffer = self.clone_materialized_global_buffer(*camera);
+        let environment_buffer = self.clone_materialized_global_buffer(*environment);
+        let directional_lights_buffer = self.clone_materialized_global_buffer(*directional_lights);
+        let pmrem = pmrem_override
+            .cloned()
+            .unwrap_or_else(|| self.system_textures.black_cube.clone());
         let interface =
             self.ensure_materialized_global_interface(camera, environment, directional_lights);
         let sampler = self.sampler_registry.get_common(CommonSampler::LinearClamp);
@@ -731,15 +769,15 @@ impl ResourceManager {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: camera_physical.buffer.as_entire_binding(),
+                    resource: camera_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: environment_physical.buffer.as_entire_binding(),
+                    resource: environment_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: directional_lights_physical.buffer.as_entire_binding(),
+                    resource: directional_lights_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -773,41 +811,81 @@ impl ResourceManager {
 
     fn resolve_materialized_global_buffer(
         &self,
-        buffer_ref: &BufferRef,
+        token: &MaterializedBufferToken,
         slot: GlobalStateBufferSlot,
         required_usage: wgpu::BufferUsages,
-    ) -> Result<MaterializedGlobalBuffer, GlobalStatePhysicalFailure> {
+    ) -> Result<u64, GlobalStatePhysicalFailure> {
         let gpu_buffer = self
             .resources
-            .buffer_by_cpu_id(buffer_ref.id())
+            .buffer(token.handle)
             .ok_or(GlobalStatePhysicalFailure::MissingBuffer(slot))?;
-        if gpu_buffer.last_uploaded_version != buffer_ref.version {
+        if gpu_buffer.logical_id != token.stamp.id {
+            return Err(GlobalStatePhysicalFailure::MissingBuffer(slot));
+        }
+        if gpu_buffer.id != token.physical_id
+            || gpu_buffer.last_uploaded_version != token.stamp.version
+        {
             return Err(GlobalStatePhysicalFailure::VersionMismatch(slot));
         }
-        if gpu_buffer.usage != buffer_ref.usage() || !buffer_ref.usage().contains(required_usage) {
+        if gpu_buffer.usage != token.stamp.usage || !token.stamp.usage.contains(required_usage) {
             return Err(GlobalStatePhysicalFailure::UsageMismatch(slot));
         }
-        if buffer_ref.size() == 0 || gpu_buffer.size < buffer_ref.size() as u64 {
+        if token.stamp.size == 0 || gpu_buffer.size < token.stamp.size as u64 {
             return Err(GlobalStatePhysicalFailure::SizeMismatch(slot));
         }
-        Ok(MaterializedGlobalBuffer {
-            buffer: gpu_buffer.buffer.clone(),
-            physical_id: gpu_buffer.id,
-        })
+        Ok(gpu_buffer.id)
+    }
+
+    #[inline]
+    fn clone_materialized_global_buffer(&mut self, token: MaterializedBufferToken) -> wgpu::Buffer {
+        #[cfg(any(test, feature = "rdg_bench_support"))]
+        {
+            self.global_state_cold_buffer_clones =
+                self.global_state_cold_buffer_clones.saturating_add(1);
+        }
+        self.resources
+            .buffer(token.handle)
+            .expect("validated global buffer disappeared before BindGroup creation")
+            .buffer
+            .clone()
+    }
+
+    /// Benchmark-only cumulative number of transient WGPU buffer clones used
+    /// by cold/rebinding Group 0 construction.
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    #[inline]
+    pub const fn global_state_cold_buffer_clone_count(&self) -> u64 {
+        self.global_state_cold_buffer_clones
+    }
+
+    /// Benchmark-only cumulative number of exact cached-handle buffer writes
+    /// that bypassed the CPU-ID reverse index.
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    #[inline]
+    pub const fn global_state_cached_handle_hit_count(&self) -> u64 {
+        self.resources.hinted_buffer_write_hits()
     }
 
     fn ensure_materialized_global_interface(
         &mut self,
-        camera: &BufferRef,
-        environment: &BufferRef,
-        directional_lights: &BufferRef,
+        camera: &MaterializedBufferToken,
+        environment: &MaterializedBufferToken,
+        directional_lights: &MaterializedBufferToken,
     ) -> GlobalBindingInterface {
         if let Some(interface) = self.bind_groups.global_interface() {
             return interface.clone();
         }
 
         let mut builder = ResourceBuilder::new();
-        define_materialized_global_bindings(&mut builder, camera, environment, directional_lights);
+        let camera_ref = camera.buffer_ref();
+        let environment_ref = environment.buffer_ref();
+        let directional_lights_ref = directional_lights.buffer_ref();
+        define_materialized_global_bindings(
+            &mut builder,
+            &camera_ref,
+            &environment_ref,
+            &directional_lights_ref,
+        );
         let layout_entries = builder.generate_layout_entries();
         let (layout, layout_id) = self.get_or_create_layout(&layout_entries);
         let binding_wgsl = SharedBindingWgsl::from(builder.generate_wgsl(0));
@@ -948,14 +1026,23 @@ mod tests {
         GlobalStateBufferSlot, GlobalStatePhysicalFailure, assert_object_bindings_are_buffer_only,
         global_resource_ids,
     };
-    use crate::core::gpu::{GlobalStateKey, GlobalStateResolver, Tracked};
+    use crate::core::gpu::{GlobalStateKey, GlobalStateResolver, MaterializedBufferToken, Tracked};
     use crate::core::{ResourceManager, WgpuContext};
     use crate::settings::{RendererInitConfig, RendererSettings};
     use myth_assets::TextureHandle;
-    use myth_resources::buffer::{BufferRef, CpuBuffer};
+    use myth_resources::buffer::CpuBuffer;
     use myth_resources::texture::TextureSource;
     use myth_resources::uniforms::{EnvironmentUniforms, GpuLightStorage, RenderStateUniforms};
     use myth_resources::{BindingDesc, ResourceBuilder};
+
+    fn ensure_materialized_token<T: myth_resources::buffer::GpuData>(
+        resources: &mut ResourceManager,
+        buffer: &CpuBuffer<T>,
+    ) -> MaterializedBufferToken {
+        let stamp = buffer.stamp();
+        let (handle, result) = resources.ensure_buffer(buffer);
+        MaterializedBufferToken::new(stamp, handle, result.resource_id)
+    }
 
     #[test]
     fn global_fingerprint_contains_only_bound_resource_identities() {
@@ -1043,23 +1130,21 @@ mod tests {
         let camera = CpuBuffer::new(RenderStateUniforms::default(), uniform_usage, None);
         let environment = CpuBuffer::new(EnvironmentUniforms::default(), uniform_usage, None);
         let directional = CpuBuffer::new(vec![GpuLightStorage::default()], storage_usage, None);
-        resources.ensure_buffer(&camera);
-        resources.ensure_buffer(&environment);
-        resources.ensure_buffer(&directional);
-        let camera_ref = camera.handle();
-        let environment_ref = environment.handle();
-        let directional_ref = directional.handle();
+        let camera_token = ensure_materialized_token(&mut resources, &camera);
+        let environment_token = ensure_materialized_token(&mut resources, &environment);
+        let directional_token = ensure_materialized_token(&mut resources, &directional);
         let key = GlobalStateKey::new(7, 11);
 
         let state_id = resources
             .prepare_global_from_materialized(
                 key,
-                &camera_ref,
-                &environment_ref,
-                &directional_ref,
+                &camera_token,
+                &environment_token,
+                &directional_token,
                 None,
             )
             .unwrap();
+        assert_eq!(resources.global_state_cold_buffer_clone_count(), 3);
         let first = resources.bind_groups.global_state(key).unwrap();
         let first_bind_group = first.bind_group_id;
         let first_layout = first.layout_id;
@@ -1070,9 +1155,9 @@ mod tests {
             resources
                 .prepare_global_from_materialized(
                     key,
-                    &camera_ref,
-                    &environment_ref,
-                    &directional_ref,
+                    &camera_token,
+                    &environment_token,
+                    &directional_token,
                     None,
                 )
                 .unwrap(),
@@ -1081,6 +1166,11 @@ mod tests {
         let reused = resources.bind_groups.global_state(key).unwrap();
         assert_eq!(reused.bind_group_id, first_bind_group);
         assert_eq!(reused.last_used_frame, resources.frame_index());
+        assert_eq!(
+            resources.global_state_cold_buffer_clone_count(),
+            3,
+            "an exact warm Group 0 hit must not clone any WGPU buffer"
+        );
 
         let texture = wgpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Global PMREM Test"),
@@ -1103,12 +1193,13 @@ mod tests {
         resources
             .prepare_global_from_materialized(
                 key,
-                &camera_ref,
-                &environment_ref,
-                &directional_ref,
+                &camera_token,
+                &environment_token,
+                &directional_token,
                 Some(&pmrem),
             )
             .unwrap();
+        assert_eq!(resources.global_state_cold_buffer_clone_count(), 6);
         let rebound = resources.bind_groups.global_state(key).unwrap();
         assert_ne!(rebound.bind_group_id, first_bind_group);
         assert_eq!(rebound.id, state_id);
@@ -1144,15 +1235,20 @@ mod tests {
         let camera = CpuBuffer::new(RenderStateUniforms::default(), uniform_usage, None);
         let environment = CpuBuffer::new(EnvironmentUniforms::default(), uniform_usage, None);
         let directional = CpuBuffer::new(vec![GpuLightStorage::default()], storage_usage, None);
-        resources.ensure_buffer(&environment);
-        resources.ensure_buffer(&directional);
+        let environment_token = ensure_materialized_token(&mut resources, &environment);
+        let directional_token = ensure_materialized_token(&mut resources, &directional);
+        let missing_camera = MaterializedBufferToken::new(
+            camera.stamp(),
+            environment_token.handle,
+            environment_token.physical_id,
+        );
         let key = GlobalStateKey::new(3, 5);
         assert_eq!(
             resources.prepare_global_from_materialized(
                 key,
-                &camera.handle(),
-                &environment.handle(),
-                &directional.handle(),
+                &missing_camera,
+                &environment_token,
+                &directional_token,
                 None,
             ),
             Err(GlobalStatePhysicalFailure::MissingBuffer(
@@ -1162,26 +1258,44 @@ mod tests {
         assert!(resources.bind_groups.global_interface().is_none());
         assert!(resources.bind_groups.global_state(key).is_none());
 
-        resources.ensure_buffer(&camera);
-        let exact = camera.handle();
-        let stale = BufferRef::with_fixed_id(
-            exact.id(),
-            exact.size(),
-            exact.usage(),
-            exact.version + 1,
-            None,
-        );
+        let exact = ensure_materialized_token(&mut resources, &camera);
+        let mut stale = exact;
+        stale.stamp.version += 1;
         assert_eq!(
             resources.prepare_global_from_materialized(
                 key,
                 &stale,
-                &environment.handle(),
-                &directional.handle(),
+                &environment_token,
+                &directional_token,
                 None,
             ),
             Err(GlobalStatePhysicalFailure::VersionMismatch(
                 GlobalStateBufferSlot::Camera
             ))
         );
+
+        let replacement_size = u64::try_from(exact.stamp.size)
+            .expect("camera size exceeds u64")
+            .saturating_add(256);
+        resources
+            .resources
+            .buffer_mut(exact.handle)
+            .expect("camera allocation missing")
+            .resize(&wgpu.device, replacement_size);
+        assert_eq!(
+            resources.prepare_global_from_materialized(
+                key,
+                &exact,
+                &environment_token,
+                &directional_token,
+                None,
+            ),
+            Err(GlobalStatePhysicalFailure::VersionMismatch(
+                GlobalStateBufferSlot::Camera
+            )),
+            "an in-slot physical replacement must invalidate the captured token"
+        );
+        assert!(resources.bind_groups.global_interface().is_none());
+        assert!(resources.bind_groups.global_state(key).is_none());
     }
 }

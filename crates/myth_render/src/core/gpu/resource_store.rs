@@ -7,7 +7,7 @@ use slotmap::{SecondaryMap, SparseSecondaryMap};
 use smallvec::SmallVec;
 
 use myth_assets::{GeometryHandle, ImageHandle, MaterialHandle, TextureHandle};
-use myth_resources::buffer::BufferRef;
+use myth_resources::buffer::{BufferRef, CpuBufferStamp};
 use myth_resources::image::Image;
 use myth_resources::texture::{Texture, TextureSampler};
 
@@ -36,9 +36,21 @@ impl AssetTextureCandidateId {
     }
 
     #[inline]
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0.get() as usize - 1
     }
+}
+
+/// Exact cache-side token for a fully resident logical Asset Texture.
+///
+/// The token is captured before the selected AssetStorage postflight and must
+/// compare equal afterward. It covers the physical allocation generation and
+/// the sampler slot; logical lease/binding stamps and the full image spec are
+/// rechecked by the cache-side CAS before any owner is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExactAssetTextureResidency {
+    generation: PhysicalImageGenerationKey,
+    sampler_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -281,6 +293,9 @@ pub(crate) struct GpuResourceStore {
     gpu_buffers: slotmap::SlotMap<GpuBufferHandle, GpuBuffer>,
     /// Reverse index: CPU-side buffer ID -> SlotMap handle.
     buffer_index: FxHashMap<u64, GpuBufferHandle>,
+    /// Benchmark/test visibility for the cached-handle materialization route.
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    hinted_buffer_write_hits: u64,
 
     pending_mipmap_requests: Vec<MipmapRequest>,
     /// At most the newest content generation for one physical allocation is
@@ -304,6 +319,8 @@ impl GpuResourceStore {
             texture_bindings: SecondaryMap::new(),
             gpu_buffers,
             buffer_index,
+            #[cfg(any(test, feature = "rdg_bench_support"))]
+            hinted_buffer_write_hits: 0,
             pending_mipmap_requests: Vec::new(),
             pending_mipmap_indices: FxHashMap::default(),
         }
@@ -913,6 +930,7 @@ impl GpuResourceStore {
                 texture: Some(MaterializedAssetTexture {
                     view,
                     generation_key,
+                    sampler_id,
                 }),
                 mipmap_request,
             });
@@ -1073,6 +1091,110 @@ impl GpuResourceStore {
         } else {
             false
         }
+    }
+
+    /// Observe one exact resident logical binding without changing cache
+    /// state. This is the pre-postflight half of the warm graph fast path.
+    pub(super) fn exact_asset_texture_residency(
+        &self,
+        snapshot: AssetTextureSnapshot,
+    ) -> Option<ExactAssetTextureResidency> {
+        let binding = self.texture_bindings.get(snapshot.texture_handle)?;
+        let lease = self.texture_image_leases.get(snapshot.texture_handle)?;
+        let entry = self.physical_images.get(lease.physical_id)?;
+        let generation = entry.image.generation_key(lease.physical_id);
+        let sampler_id = binding.sampler_id;
+        let exact = lease.image_handle == snapshot.image_handle
+            && lease.texture_version == snapshot.texture_version
+            && lease.texture_identity == snapshot.texture_identity
+            && lease.image_version == snapshot.image_version
+            && lease.image_identity == snapshot.image_identity
+            && entry.members.contains(&snapshot.texture_handle)
+            && entry.spec == snapshot.physical_spec()
+            && entry.image.image_handle == snapshot.image_handle
+            && entry.image.image_version == snapshot.image_version
+            && entry.image.image_identity == snapshot.image_identity
+            && binding.view_id == generation.allocation
+            && binding.image_handle == snapshot.image_handle
+            && binding.sampler_id == sampler_id
+            && binding.texture_version == snapshot.texture_version
+            && binding.texture_identity == snapshot.texture_identity
+            && binding.image_version == snapshot.image_version
+            && binding.image_identity == snapshot.image_identity;
+        exact.then_some(ExactAssetTextureResidency {
+            generation,
+            sampler_id,
+        })
+    }
+
+    /// Recheck an observed resident token and return graph-attempt owners.
+    /// No lease/member/binding table is rewritten on this path.
+    pub(super) fn reuse_exact_asset_texture(
+        &mut self,
+        snapshot: AssetTextureSnapshot,
+        expected: ExactAssetTextureResidency,
+        frame_index: u64,
+    ) -> Option<AssetTextureMaterialization> {
+        // The coordinator owns the sole mutable ResourceManager borrow between
+        // resident observation and this CAS. Recheck only the logical binding,
+        // lease, and physical generation that another candidate can replace;
+        // the full structural recipe was already proven by the observation.
+        let binding = *self.texture_bindings.get(snapshot.texture_handle)?;
+        let lease = *self.texture_image_leases.get(snapshot.texture_handle)?;
+        if binding.view_id != expected.generation.allocation
+            || binding.sampler_id != expected.sampler_id
+            || binding.image_handle != snapshot.image_handle
+            || binding.texture_version != snapshot.texture_version
+            || binding.texture_identity != snapshot.texture_identity
+            || binding.image_version != snapshot.image_version
+            || binding.image_identity != snapshot.image_identity
+            || lease.physical_id != expected.generation.physical
+            || lease.image_handle != snapshot.image_handle
+            || lease.texture_version != snapshot.texture_version
+            || lease.texture_identity != snapshot.texture_identity
+            || lease.image_version != snapshot.image_version
+            || lease.image_identity != snapshot.image_identity
+        {
+            return None;
+        }
+
+        let physical_id = expected.generation.physical;
+        let (view, generation_key, mipmap_request) = {
+            let entry = self.physical_images.get_mut(physical_id)?;
+            if entry.image.generation_key(physical_id) != expected.generation {
+                return None;
+            }
+            debug_assert!(entry.members.contains(&snapshot.texture_handle));
+            debug_assert_eq!(entry.spec, snapshot.physical_spec());
+            debug_assert_eq!(entry.image.image_handle, snapshot.image_handle);
+            debug_assert_eq!(entry.image.image_version, snapshot.image_version);
+            debug_assert_eq!(entry.image.image_identity, snapshot.image_identity);
+            entry.image.last_used_frame = frame_index;
+            (
+                Tracked::with_id(entry.image.default_view.clone(), entry.image.id),
+                entry.image.generation_key(physical_id),
+                snapshot
+                    .generate_mipmaps
+                    .then(|| entry.image.mipmap_request(physical_id))
+                    .flatten(),
+            )
+        };
+        debug_assert_eq!(generation_key, expected.generation);
+        self.texture_image_leases
+            .get_mut(snapshot.texture_handle)
+            .expect("resident Asset Texture lease disappeared after CAS")
+            .last_used_frame = frame_index;
+        self.latest_texture_for_image
+            .insert(snapshot.image_handle, snapshot.texture_handle);
+
+        Some(AssetTextureMaterialization {
+            texture: Some(MaterializedAssetTexture {
+                view,
+                generation_key,
+                sampler_id: expected.sampler_id,
+            }),
+            mipmap_request,
+        })
     }
 
     #[must_use]
@@ -1298,7 +1420,9 @@ impl GpuResourceStore {
         let cpu_id = buffer_ref.id();
 
         if let Some(&handle) = self.buffer_index.get(&cpu_id) {
-            if let Some(gpu_buf) = self.gpu_buffers.get_mut(handle) {
+            if let Some(gpu_buf) = self.gpu_buffers.get_mut(handle)
+                && gpu_buf.logical_id == cpu_id
+            {
                 let mut was_recreated = false;
 
                 if buffer_ref.version > gpu_buf.last_uploaded_version {
@@ -1315,13 +1439,53 @@ impl GpuResourceStore {
             self.buffer_index.remove(&cpu_id);
         }
 
-        let mut buf = GpuBuffer::new(device, data, buffer_ref.usage, buffer_ref.label());
+        let mut buf = GpuBuffer::new(device, cpu_id, data, buffer_ref.usage, buffer_ref.label());
         buf.last_uploaded_version = buffer_ref.version;
         buf.last_used_frame = frame_index;
         let phys_id = buf.id;
         let handle = self.gpu_buffers.insert(buf);
         self.buffer_index.insert(cpu_id, handle);
         (handle, EnsureResult::created(phys_id))
+    }
+
+    /// Cached-handle form of [`Self::write_buffer`] for an exact CPU snapshot.
+    ///
+    /// The hint is accepted only when its SlotMap generation is live and the
+    /// arena entry belongs to the requested CPU logical ID. A stale or
+    /// wrong-owner hint falls back to the canonical reverse index.
+    pub(super) fn write_buffer_snapshot_with_hint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame_index: u64,
+        stamp: CpuBufferStamp,
+        data: &[u8],
+        cached_handle: Option<GpuBufferHandle>,
+    ) -> (GpuBufferHandle, EnsureResult) {
+        if let Some(handle) = cached_handle
+            && let Some(gpu_buf) = self.gpu_buffers.get_mut(handle)
+            && gpu_buf.logical_id == stamp.id
+        {
+            #[cfg(any(test, feature = "rdg_bench_support"))]
+            {
+                self.hinted_buffer_write_hits = self.hinted_buffer_write_hits.saturating_add(1);
+            }
+            let mut was_recreated = false;
+            if stamp.version > gpu_buf.last_uploaded_version {
+                let old_id = gpu_buf.id;
+                was_recreated = gpu_buf.write_to_gpu(device, queue, data);
+                if !was_recreated && gpu_buf.id != old_id {
+                    was_recreated = true;
+                }
+                gpu_buf.last_uploaded_version = stamp.version;
+            }
+            gpu_buf.last_used_frame = frame_index;
+            return (handle, EnsureResult::new(gpu_buf.id, was_recreated));
+        }
+
+        let buffer_ref =
+            BufferRef::with_fixed_id(stamp.id, stamp.size, stamp.usage, stamp.version, None);
+        self.write_buffer(device, queue, frame_index, &buffer_ref, data)
     }
 
     pub(super) fn write_uniform_slot(
@@ -1334,7 +1498,9 @@ impl GpuResourceStore {
         label: &str,
     ) -> EnsureResult {
         if let Some(&handle) = self.buffer_index.get(&slot_id) {
-            if let Some(gpu_buf) = self.gpu_buffers.get_mut(handle) {
+            if let Some(gpu_buf) = self.gpu_buffers.get_mut(handle)
+                && gpu_buf.logical_id == slot_id
+            {
                 let was_recreated = gpu_buf.write_to_gpu(device, queue, data);
                 gpu_buf.last_used_frame = frame_index;
                 return EnsureResult::new(gpu_buf.id, was_recreated);
@@ -1344,6 +1510,7 @@ impl GpuResourceStore {
 
         let mut buf = GpuBuffer::new(
             device,
+            slot_id,
             data,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             Some(label),
@@ -1369,6 +1536,33 @@ impl GpuResourceStore {
         false
     }
 
+    /// Touch a resident buffer only when its complete logical stamp and
+    /// physical allocation match a canonical warm-path expectation.
+    #[inline]
+    pub(super) fn touch_buffer_if_exact(
+        &mut self,
+        stamp: CpuBufferStamp,
+        expected_physical_id: u64,
+        frame_index: u64,
+    ) -> bool {
+        let Some(&handle) = self.buffer_index.get(&stamp.id) else {
+            return false;
+        };
+        let Some(buffer) = self.gpu_buffers.get_mut(handle) else {
+            self.buffer_index.remove(&stamp.id);
+            return false;
+        };
+        if buffer.id != expected_physical_id
+            || buffer.usage != stamp.usage
+            || buffer.size < stamp.size as u64
+            || buffer.last_uploaded_version != stamp.version
+        {
+            return false;
+        }
+        buffer.last_used_frame = frame_index;
+        true
+    }
+
     #[inline]
     pub(super) fn buffer_mut(&mut self, handle: GpuBufferHandle) -> Option<&mut GpuBuffer> {
         self.gpu_buffers.get_mut(handle)
@@ -1384,6 +1578,29 @@ impl GpuResourceStore {
         self.buffer_index
             .get(&cpu_id)
             .and_then(|&handle| self.gpu_buffers.get(handle))
+            .filter(|buffer| buffer.logical_id == cpu_id)
+    }
+
+    /// Resolve a CPU logical buffer through a generation-checked cached handle
+    /// when possible, falling back to the reverse index only on a miss.
+    #[inline]
+    pub(super) fn buffer_by_cpu_id_with_hint(
+        &self,
+        cpu_id: u64,
+        cached_handle: Option<GpuBufferHandle>,
+    ) -> Option<&GpuBuffer> {
+        if let Some(buffer) = cached_handle.and_then(|handle| self.gpu_buffers.get(handle))
+            && buffer.logical_id == cpu_id
+        {
+            return Some(buffer);
+        }
+        self.buffer_by_cpu_id(cpu_id)
+    }
+
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    #[inline]
+    pub(super) const fn hinted_buffer_write_hits(&self) -> u64 {
+        self.hinted_buffer_write_hits
     }
 }
 

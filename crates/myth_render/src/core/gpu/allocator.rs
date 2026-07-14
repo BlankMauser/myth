@@ -31,10 +31,18 @@ enum ModelBufferPhase {
 pub struct ModelBufferAllocator {
     /// CPU-side staging data for the current frame.
     host_data: Vec<DynamicModelUniforms>,
+    /// Exact payload last submitted to the current physical allocation.
+    ///
+    /// The two vectors rotate at frame boundaries, avoiding a copy solely for
+    /// change detection. Byte equality is required: a hash-only shortcut could
+    /// silently retain stale matrices after a collision.
+    submitted_data: Vec<DynamicModelUniforms>,
     capacity: usize,
     logical_ref: BufferRef,
     cached_gpu_handle: AtomicU64,
     phase: ModelBufferPhase,
+    #[cfg(test)]
+    upload_count: usize,
 }
 
 impl ModelBufferAllocator {
@@ -61,15 +69,24 @@ impl ModelBufferAllocator {
 
         Self {
             host_data: Vec::with_capacity(initial_capacity),
+            submitted_data: Vec::with_capacity(initial_capacity),
             capacity: initial_capacity,
             logical_ref,
             cached_gpu_handle: AtomicU64::new(0),
             phase: ModelBufferPhase::Collecting,
+            #[cfg(test)]
+            upload_count: 0,
         }
     }
 
     /// Reset at the beginning of each frame.
     pub fn reset(&mut self) {
+        if self.phase == ModelBufferPhase::Frozen {
+            // `host_data` is now the exact payload most recently offered to
+            // the persistent allocation. Rotate owners so the next frame can
+            // compare without copying the previous byte stream.
+            std::mem::swap(&mut self.host_data, &mut self.submitted_data);
+        }
         self.host_data.clear();
         self.phase = ModelBufferPhase::Collecting;
     }
@@ -113,6 +130,11 @@ impl ModelBufferAllocator {
             "model buffer capacity cannot change after the frame buffer is frozen"
         );
         self.capacity = self.host_data.len().max(128);
+        // Scene-transition trimming deliberately forgets the previous payload;
+        // the next live flush uploads conservatively and re-establishes it.
+        self.submitted_data.clear();
+        self.host_data.shrink_to(self.capacity);
+        self.submitted_data.shrink_to(self.capacity);
     }
 
     pub fn flush_to_buffer(
@@ -123,11 +145,19 @@ impl ModelBufferAllocator {
         buffer_index: &mut rustc_hash::FxHashMap<u64, GpuBufferHandle>,
         frame_index: u64,
     ) -> bool {
+        assert_eq!(
+            self.phase,
+            ModelBufferPhase::Collecting,
+            "model buffer cannot be flushed twice without a frame reset"
+        );
         self.phase = ModelBufferPhase::Frozen;
         let mut was_resized = false;
+        #[cfg(test)]
+        let mut uploaded = false;
 
         let target_size = (self.capacity * std::mem::size_of::<DynamicModelUniforms>()) as u64;
         let active_data = bytemuck::cast_slice(&self.host_data);
+        let payload_unchanged = self.payload_matches_last_submission();
 
         let handle_bits = self.cached_gpu_handle.load(Ordering::Acquire);
         let cached_handle = GpuBufferHandle::from_bits(handle_bits);
@@ -141,6 +171,7 @@ impl ModelBufferAllocator {
             // evicted this long-idle system buffer.
             let mut gpu_buf = GpuBuffer::with_capacity(
                 device,
+                self.logical_ref.id(),
                 target_size,
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 Some("GlobalModelBuffer"),
@@ -149,6 +180,10 @@ impl ModelBufferAllocator {
             // If there is data in the first frame, upload it immediately
             if !active_data.is_empty() {
                 queue.write_buffer(&gpu_buf.buffer, 0, active_data);
+                #[cfg(test)]
+                {
+                    uploaded = true;
+                }
             }
 
             gpu_buf.last_used_frame = frame_index;
@@ -168,10 +203,18 @@ impl ModelBufferAllocator {
                 was_resized = true;
             }
 
-            if !active_data.is_empty() {
+            if !active_data.is_empty() && (was_resized || !payload_unchanged) {
                 queue.write_buffer(&gpu_buf.buffer, 0, active_data);
+                #[cfg(test)]
+                {
+                    uploaded = true;
+                }
             }
             gpu_buf.last_used_frame = frame_index;
+        }
+        #[cfg(test)]
+        if uploaded {
+            self.upload_count += 1;
         }
         was_resized
     }
@@ -186,6 +229,17 @@ impl ModelBufferAllocator {
 
     pub fn host_data(&self) -> &[DynamicModelUniforms] {
         &self.host_data
+    }
+
+    #[inline]
+    fn payload_matches_last_submission(&self) -> bool {
+        bytemuck::cast_slice::<_, u8>(&self.host_data)
+            == bytemuck::cast_slice::<_, u8>(&self.submitted_data)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn upload_count(&self) -> usize {
+        self.upload_count
     }
 
     fn expand_capacity(&mut self) {
@@ -233,5 +287,42 @@ mod tests {
         allocator.reset();
 
         assert_eq!(allocator.allocate(DynamicModelUniforms::default()), 0);
+    }
+
+    #[test]
+    fn frozen_payload_rotates_without_copy_and_matches_exact_bytes() {
+        let mut allocator = ModelBufferAllocator::new_for_test(1);
+        let baseline = DynamicModelUniforms::default();
+        allocator.allocate(baseline);
+        let first_allocation = allocator.host_data.as_ptr();
+        allocator.phase = ModelBufferPhase::Frozen;
+
+        allocator.reset();
+        assert_eq!(allocator.submitted_data.as_ptr(), first_allocation);
+        allocator.allocate(baseline);
+        assert!(allocator.payload_matches_last_submission());
+
+        allocator.host_data[0].instance_tint.x = -0.0;
+        allocator.submitted_data[0].instance_tint.x = 0.0;
+        assert!(
+            !allocator.payload_matches_last_submission(),
+            "bit-distinct float payloads must never alias through numeric equality"
+        );
+    }
+
+    #[test]
+    fn unflushed_collection_does_not_replace_the_last_submitted_payload() {
+        let mut allocator = ModelBufferAllocator::new_for_test(1);
+        allocator
+            .submitted_data
+            .push(DynamicModelUniforms::default());
+        allocator.host_data.push(DynamicModelUniforms::default());
+        allocator.host_data[0].instance_tint.x = 0.5;
+
+        allocator.reset();
+
+        assert_eq!(allocator.submitted_data.len(), 1);
+        assert_eq!(allocator.submitted_data[0].instance_tint.x, 0.0);
+        assert!(allocator.host_data.is_empty());
     }
 }

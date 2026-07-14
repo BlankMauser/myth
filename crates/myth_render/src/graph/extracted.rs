@@ -11,7 +11,7 @@
 //! - Carry cache IDs to avoid repeated lookups each frame
 //! - Single source of truth: one `render_items` list consumed by all `RenderView`s
 
-use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use glam::{Mat4, Vec3};
 
@@ -41,9 +41,53 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// Canonical two-bit object shader variant captured during extraction.
+    ///
+    /// These are the only item-local defines consumed by scene pipelines.
+    /// Keeping this POD selector on every item avoids allocating, hashing, and
+    /// later dropping one `ShaderDefines` Vec per extracted object.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+    pub struct ItemShaderFeatures: u8 {
+        const HAS_SKINNING = 1 << 0;
+        const RECEIVE_SHADOWS = 1 << 1;
+    }
+}
+
+struct ItemShaderVariant {
+    defines: ShaderDefines,
+}
+
+static ITEM_SHADER_VARIANTS: LazyLock<[ItemShaderVariant; 4]> = LazyLock::new(|| {
+    std::array::from_fn(|index| {
+        let features = ItemShaderFeatures::from_bits_retain(index as u8);
+        let mut defines = ShaderDefines::with_capacity(features.bits().count_ones() as usize);
+        if features.contains(ItemShaderFeatures::HAS_SKINNING) {
+            defines.set("HAS_SKINNING", "1");
+        }
+        if features.contains(ItemShaderFeatures::RECEIVE_SHADOWS) {
+            defines.set("RECEIVE_SHADOWS", "1");
+        }
+        ItemShaderVariant { defines }
+    })
+});
+
+impl ItemShaderFeatures {
+    #[inline]
+    #[must_use]
+    pub fn shader_defines(self) -> &'static ShaderDefines {
+        // Only the two shader-semantic bits participate in the canonical
+        // variant index. `bitflags` deliberately permits callers to retain
+        // unknown bits, and those must not turn this public selector into an
+        // out-of-bounds table access.
+        let index = usize::from(self.contains(Self::HAS_SKINNING))
+            | (usize::from(self.contains(Self::RECEIVE_SHADOWS)) << 1);
+        &ITEM_SHADER_VARIANTS[index].defines
+    }
+}
+
 /// Minimal CPU-only render item.
 ///
-/// Uses Clone instead of Copy because `ShaderDefines` owns its entries.
 /// Contains all per-object attributes needed for view-independent filtering and culling.
 #[derive(Clone)]
 pub struct ExtractedRenderItem {
@@ -80,14 +124,21 @@ pub struct ExtractedRenderItem {
 
     pub item_variant_flags: u32,
 
-    pub item_shader_defines: ShaderDefines,
-    pub(crate) item_shader_defines_hash: u64,
+    pub item_shader_features: ItemShaderFeatures,
 
     pub cast_shadows: bool,
     pub receive_shadows: bool,
 
     /// World-space axis-aligned bounding box.
     pub world_aabb: BoundingBox,
+}
+
+impl ExtractedRenderItem {
+    #[inline]
+    #[must_use]
+    pub fn item_shader_defines(&self) -> &'static ShaderDefines {
+        self.item_shader_features.shader_defines()
+    }
 }
 
 #[derive(Clone)]
@@ -177,30 +228,8 @@ pub struct ExtractedScene {
     /// GPU-visible environment uniforms for the current frame.
     pub environment_uniforms_buffer: CpuBuffer<EnvironmentUniforms>,
 
-    collected_meshes: Vec<CollectedMesh>,
     local_light_upload_cache: Vec<GpuLightStorage>,
     directional_light_upload_cache: Vec<GpuLightStorage>,
-}
-
-struct CollectedMesh {
-    pub node_handle: NodeHandle,
-    pub geometry: GeometryHandle,
-    pub material: MaterialHandle,
-    pub geometry_asset_version: u32,
-    pub geometry_asset_identity: u64,
-    pub material_asset_version: u32,
-    pub material_asset_identity: u64,
-    pub material_version: u64,
-    pub material_index: u32,
-    pub material_classification: MaterialClassification,
-    pub skeleton: Option<SkeletonKey>,
-
-    pub world_matrix: Mat4,
-    pub prev_world_matrix: Mat4,
-    pub world_aabb: BoundingBox,
-    pub item_variant_flags: u32,
-    pub cast_shadows: bool,
-    pub receive_shadows: bool,
 }
 
 impl ExtractedScene {
@@ -238,7 +267,6 @@ impl ExtractedScene {
                 Some("ExtractedSceneEnvironmentUniforms"),
             ),
 
-            collected_meshes: Vec::new(),
             local_light_upload_cache: Vec::with_capacity(16),
             directional_light_upload_cache: Vec::with_capacity(4),
         }
@@ -278,7 +306,6 @@ impl ExtractedScene {
                 Some("ExtractedSceneEnvironmentUniforms"),
             ),
 
-            collected_meshes: Vec::with_capacity(item_capacity),
             local_light_upload_cache: Vec::with_capacity(16),
             directional_light_upload_cache: Vec::with_capacity(4),
         }
@@ -291,8 +318,6 @@ impl ExtractedScene {
         self.scene_id = 0;
         self.lights.clear();
         self.local_light_count = 0;
-
-        self.collected_meshes.clear();
     }
 
     #[must_use]
@@ -530,7 +555,7 @@ impl ExtractedScene {
         assets: &AssetServer,
     ) {
         // =========================================================
-        // Phase 1: Collect active meshes (holding read lock)
+        // Capture active meshes under one exact pair of asset read guards.
         // =========================================================
         {
             let geo_guard = assets.geometries.read_lock();
@@ -605,8 +630,18 @@ impl ExtractedScene {
                     continue;
                 }
 
-                self.collected_meshes.push(CollectedMesh {
+                let mut item_shader_features = ItemShaderFeatures::empty();
+                if skeleton_key.is_some() {
+                    item_shader_features.insert(ItemShaderFeatures::HAS_SKINNING);
+                }
+                if mesh.receive_shadows {
+                    item_shader_features.insert(ItemShaderFeatures::RECEIVE_SHADOWS);
+                }
+
+                self.render_items.push(ExtractedRenderItem {
                     node_handle,
+                    world_matrix,
+                    prev_world_matrix,
                     geometry: mesh.geometry,
                     material: mesh.material,
                     geometry_asset_version: geometry.version,
@@ -617,50 +652,13 @@ impl ExtractedScene {
                     material_index,
                     material_classification,
                     skeleton: skeleton_key,
-                    world_matrix,
-                    prev_world_matrix,
-                    world_aabb,
                     item_variant_flags,
+                    item_shader_features,
                     cast_shadows,
                     receive_shadows: mesh.receive_shadows,
+                    world_aabb,
                 });
             }
-        } // release geometry read lock here
-
-        // =========================================================
-        // Phase 2: Build CPU-only render items (no asset lock)
-        // =========================================================
-        for item in &self.collected_meshes {
-            let mut item_shader_defines = ShaderDefines::with_capacity(1);
-
-            if item.skeleton.is_some() {
-                item_shader_defines.set("HAS_SKINNING", "1");
-            }
-            if item.receive_shadows {
-                item_shader_defines.set("RECEIVE_SHADOWS", "1");
-            }
-
-            self.render_items.push(ExtractedRenderItem {
-                node_handle: item.node_handle,
-                world_matrix: item.world_matrix,
-                prev_world_matrix: item.prev_world_matrix,
-                geometry: item.geometry,
-                material: item.material,
-                geometry_asset_version: item.geometry_asset_version,
-                geometry_asset_identity: item.geometry_asset_identity,
-                material_asset_version: item.material_asset_version,
-                material_asset_identity: item.material_asset_identity,
-                material_version: item.material_version,
-                material_index: item.material_index,
-                material_classification: item.material_classification,
-                skeleton: item.skeleton,
-                item_variant_flags: item.item_variant_flags,
-                item_shader_defines_hash: item_shader_defines.compute_hash(),
-                item_shader_defines,
-                cast_shadows: item.cast_shadows,
-                receive_shadows: item.receive_shadows,
-                world_aabb: item.world_aabb,
-            });
         }
     }
 
@@ -673,11 +671,7 @@ impl ExtractedScene {
         render_lists: &RenderLists,
         draw_plans: &DrawPlanStore,
     ) {
-        let mut committed_sources = HashSet::new();
-        for frame_source in draw_plans.emitted_frame_sources() {
-            if !committed_sources.insert(frame_source) {
-                continue;
-            }
+        for &frame_source in draw_plans.emitted_morph_history_sources() {
             let Some(extracted_source) = render_lists.extracted_source(frame_source) else {
                 continue;
             };
@@ -845,11 +839,35 @@ fn spot_bounding_sphere(position: Vec3, direction: Vec3, spot: &SpotLight) -> (V
 
 #[cfg(test)]
 mod tests {
-    use super::{sort_and_truncate_lights, spot_bounding_sphere};
+    use super::{ItemShaderFeatures, sort_and_truncate_lights, spot_bounding_sphere};
     use glam::Vec3;
     use myth_scene::light::{DirectionalLight, LightKind, PointLight, SpotLight};
 
     use crate::graph::extracted::ExtractedLight;
+
+    #[test]
+    fn item_shader_features_resolve_to_four_shared_canonical_variants() {
+        assert_eq!(std::mem::size_of::<ItemShaderFeatures>(), 1);
+
+        for bits in 0..4 {
+            let features = ItemShaderFeatures::from_bits_retain(bits);
+            let defines = features.shader_defines();
+            assert_eq!(
+                defines.contains("HAS_SKINNING"),
+                features.contains(ItemShaderFeatures::HAS_SKINNING)
+            );
+            assert_eq!(
+                defines.contains("RECEIVE_SHADOWS"),
+                features.contains(ItemShaderFeatures::RECEIVE_SHADOWS)
+            );
+            assert!(std::ptr::eq(defines, features.shader_defines()));
+        }
+
+        let retained_unknown =
+            ItemShaderFeatures::from_bits_retain(0x80 | ItemShaderFeatures::RECEIVE_SHADOWS.bits());
+        let canonical = ItemShaderFeatures::RECEIVE_SHADOWS.shader_defines();
+        assert!(std::ptr::eq(retained_unknown.shader_defines(), canonical));
+    }
 
     fn directional_light(id: u64) -> ExtractedLight {
         ExtractedLight {

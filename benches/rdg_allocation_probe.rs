@@ -11,7 +11,9 @@ use std::hint::black_box;
 use myth_render::graph::bench_support::{
     DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern, DrawDemandRoot,
     DrawDemandTextureTopology, HighFanOutBenchHarness, HighFanOutBenchSpec, HighFanOutRoot,
-    HighFanOutRunToken, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
+    HighFanOutRunToken, MaterialSceneCpuBenchHarness, MaterialSceneCpuBenchStage,
+    MaterialSceneCpuRunToken, MorphHistoryWarmBenchHarness, MorphHistoryWarmBenchSpec,
+    MorphHistoryWarmRunToken, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
     RdgRecorderLifecycleToken, ScenePipelineWarmBenchHarness, ScenePipelineWarmBenchSpec,
     ScenePipelineWarmRunToken,
 };
@@ -167,7 +169,7 @@ fn measure<T: Copy>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
 fn main() {
     verify_counter_is_live();
     println!(
-        "RDG full-frame allocation baseline (M1 removes demand-generated churn; flat topology storage is the final zero-allocation gate)"
+        "RDG retained-topology allocation guard (warm samples cover real graph and Material transaction paths)"
     );
     println!(
         "dealloc columns include preceding same-shape topology retirement and current-frame temporaries; bytes are diagnostic, not a leak/net-balance metric"
@@ -194,6 +196,7 @@ fn main() {
             repetitions,
         );
     }
+    run_wide_dependency_scenario();
 
     println!("producer_fan_in");
     println!(
@@ -231,6 +234,20 @@ fn main() {
         "scene_pipeline_warm plans draws_per_plan vertex_bindings alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
     );
     run_scene_pipeline_warm_scenario();
+
+    println!(
+        "morph_history sources aliases stride alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+    );
+    for morph_source_stride in [0, 7] {
+        run_morph_history_warm_scenario(morph_source_stride);
+    }
+
+    println!(
+        "material_scene_cpu textures alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+    );
+    for texture_count in [0, 5, 12] {
+        run_material_scene_cpu_scenario(texture_count);
+    }
 }
 
 fn verify_counter_is_live() {
@@ -661,5 +678,175 @@ fn measure_scene_pipeline_warm_plateau(
     (
         token.expect("warm scene-pipeline workload was not sampled"),
         baseline.expect("warm scene-pipeline allocation baseline was not sampled"),
+    )
+}
+
+fn run_morph_history_warm_scenario(morph_source_stride: usize) {
+    let spec = MorphHistoryWarmBenchSpec {
+        source_count: 8192,
+        plan_alias_count: 3,
+        morph_source_stride,
+    };
+    let mut harness = MorphHistoryWarmBenchHarness::new();
+    let (token, stats) = measure_morph_history_warm_plateau(&mut harness, spec);
+
+    assert_eq!(
+        stats,
+        AllocationStats::default(),
+        "warm morph-history membership regressed from its zero-allocation plateau"
+    );
+    let expected = if morph_source_stride == 0 {
+        0
+    } else {
+        spec.source_count.div_ceil(morph_source_stride)
+    };
+    assert_eq!(token.recorded_source_count, expected);
+    assert_eq!(token.checksum == 0, expected == 0);
+
+    println!(
+        "morph_history {} {} {} {} {} {} {} {} {} {} {}",
+        spec.source_count,
+        spec.plan_alias_count,
+        spec.morph_source_stride,
+        stats.alloc_calls,
+        stats.alloc_zeroed_calls,
+        stats.realloc_calls,
+        stats.dealloc_calls,
+        stats.allocated_bytes,
+        stats.reallocated_old_bytes,
+        stats.reallocated_new_bytes,
+        stats.deallocated_bytes,
+    );
+}
+
+fn measure_morph_history_warm_plateau(
+    harness: &mut MorphHistoryWarmBenchHarness,
+    spec: MorphHistoryWarmBenchSpec,
+) -> (MorphHistoryWarmRunToken, AllocationStats) {
+    for _ in 0..3 {
+        black_box(harness.run_iteration(spec));
+    }
+
+    let mut baseline = None;
+    let mut token = None;
+    for _ in 0..3 {
+        let (current_token, stats) = measure(|| black_box(harness.run_iteration(spec)));
+        if let Some(expected) = baseline {
+            assert_eq!(
+                stats, expected,
+                "warm morph-history allocation counts did not plateau"
+            );
+        } else {
+            baseline = Some(stats);
+        }
+        token = Some(current_token);
+    }
+
+    (
+        token.expect("warm morph-history workload was not sampled"),
+        baseline.expect("warm morph-history allocation baseline was not sampled"),
+    )
+}
+
+fn run_wide_dependency_scenario() {
+    const TEXTURES_PER_PLAN: usize = 12;
+    let spec = DrawDemandBenchSpec {
+        plan_count: 16,
+        textures_per_plan: TEXTURES_PER_PLAN,
+        dependency_pattern: DrawDemandDependencyPattern::Shared,
+        texture_topology: DrawDemandTextureTopology::ResidentInputs,
+        demand_repetitions: 1,
+        compile_topology: true,
+        root: DrawDemandRoot::Both,
+    };
+    let mut harness = DrawDemandBenchHarness::new();
+    let (token, stats) = measure_plateau(&mut harness, spec);
+
+    assert_eq!(
+        stats,
+        AllocationStats::default(),
+        "the >8 texture DrawPlan flat dependency arena regressed from its warm zero-allocation plateau"
+    );
+    assert_eq!(
+        token.d2_demand_count + token.cube_demand_count,
+        spec.plan_count
+    );
+    assert!(token.d2_read_count > TEXTURES_PER_PLAN);
+    assert!(token.cube_read_count > TEXTURES_PER_PLAN);
+    println!(
+        "wide_dependencies {} {} {} {} {} {} {} {} {} {} {} {}",
+        TEXTURES_PER_PLAN,
+        root_label(spec.root),
+        spec.plan_count,
+        spec.demand_repetitions,
+        stats.alloc_calls,
+        stats.alloc_zeroed_calls,
+        stats.realloc_calls,
+        stats.dealloc_calls,
+        stats.allocated_bytes,
+        stats.reallocated_old_bytes,
+        stats.reallocated_new_bytes,
+        stats.deallocated_bytes,
+    );
+}
+
+fn run_material_scene_cpu_scenario(texture_count: usize) {
+    let mut harness = MaterialSceneCpuBenchHarness::new(texture_count);
+    let (token, stats) = measure_material_scene_cpu_plateau(&mut harness);
+
+    assert_eq!(
+        stats,
+        AllocationStats::default(),
+        "warm MaterialPlan/AssetTexture/ScenePipeline transaction regressed from its zero-allocation plateau"
+    );
+    assert_eq!(token.configured_texture_count, texture_count);
+    assert_eq!(token.topology_recipe_count, 4);
+    assert_eq!(token.opaque_texture_count, texture_count);
+    assert_eq!(token.shadow_texture_count, texture_count);
+    assert_eq!(token.selected_source_count, 1);
+    assert_eq!(token.scene_command_count, 1);
+    assert_ne!(token.checksum, 0);
+
+    println!(
+        "material_scene_cpu {} {} {} {} {} {} {} {} {}",
+        texture_count,
+        stats.alloc_calls,
+        stats.alloc_zeroed_calls,
+        stats.realloc_calls,
+        stats.dealloc_calls,
+        stats.allocated_bytes,
+        stats.reallocated_old_bytes,
+        stats.reallocated_new_bytes,
+        stats.deallocated_bytes,
+    );
+}
+
+fn measure_material_scene_cpu_plateau(
+    harness: &mut MaterialSceneCpuBenchHarness,
+) -> (MaterialSceneCpuRunToken, AllocationStats) {
+    for _ in 0..3 {
+        black_box(harness.run_iteration(MaterialSceneCpuBenchStage::WarmScenePipeline));
+    }
+
+    let mut baseline = None;
+    let mut token = None;
+    for _ in 0..3 {
+        let (current_token, stats) = measure(|| {
+            black_box(harness.run_iteration(MaterialSceneCpuBenchStage::WarmScenePipeline))
+        });
+        if let Some(expected) = baseline {
+            assert_eq!(
+                stats, expected,
+                "warm material-scene allocation counts did not plateau"
+            );
+        } else {
+            baseline = Some(stats);
+        }
+        token = Some(current_token);
+    }
+
+    (
+        token.expect("warm material-scene workload was not sampled"),
+        baseline.expect("warm material-scene allocation baseline was not sampled"),
     )
 }

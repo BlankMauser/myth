@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::pipeline::vertex::GeneratedVertexLayout;
 use myth_assets::{AssetServer, GeometryHandle};
 use myth_resources::geometry::Geometry;
+use myth_resources::shader_defines::ShaderDefines;
 
 use super::ResourceManager;
 
@@ -17,6 +18,10 @@ pub struct GpuGeometry {
     pub asset_identity: u64,
     pub layout_info: Arc<GeneratedVertexLayout>,
     pub layout_id: u64,
+    /// Immutable shader interface derived for this exact layout generation.
+    /// Frame-local geometry records share it instead of cloning the define
+    /// vector for every DPE-live graph attempt.
+    pub(crate) shader_defines: Arc<ShaderDefines>,
     pub vertex_buffers: Vec<wgpu::Buffer>,
     pub vertex_buffer_ids: Vec<u64>,
     pub index_buffer: Option<(wgpu::Buffer, wgpu::IndexFormat, u32, u64)>,
@@ -172,6 +177,7 @@ impl ResourceManager {
             asset_identity,
             layout_info: Arc::new(layout_info),
             layout_id,
+            shader_defines: Arc::new(geometry.shader_defines().clone()),
             vertex_buffers,
             vertex_buffer_ids,
             index_buffer,

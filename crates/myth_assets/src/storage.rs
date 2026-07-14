@@ -2,7 +2,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::FxHashMap;
 use slotmap::{Key, SlotMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 use myth_resources::ImageHandle;
@@ -252,7 +252,7 @@ pub struct AssetStorage<H: Key, T> {
     inner: RwLock<StorageInner<H, T>>,
     /// Global mutation epoch — bumped on every write, enabling O(1) "anything
     /// changed?" checks by the render loop without iterating entries.
-    global_version: AtomicU32,
+    global_version: AtomicU64,
 }
 
 impl<H: Key, T> Default for AssetStorage<H, T> {
@@ -266,7 +266,7 @@ impl<H: Key, T> AssetStorage<H, T> {
     pub fn new() -> Self {
         Self {
             inner: RwLock::default(),
-            global_version: AtomicU32::new(0),
+            global_version: AtomicU64::new(0),
         }
     }
 
@@ -276,9 +276,29 @@ impl<H: Key, T> AssetStorage<H, T> {
     }
 
     /// Returns the global mutation epoch.
+    ///
+    /// Writers advance this value before changing any observable slot state.
+    /// An acquire load can therefore be used as a conservative lock-free
+    /// invalidation token around an exact, lock-protected snapshot. Equality
+    /// never replaces per-entry validation after the epoch has changed.
     #[inline]
-    pub fn global_version(&self) -> u32 {
-        self.global_version.load(Ordering::Relaxed)
+    pub fn global_version(&self) -> u64 {
+        self.global_version.load(Ordering::Acquire)
+    }
+
+    /// Announce a storage mutation before the protected data is changed.
+    ///
+    /// The acquire half prevents the following map/slot write from moving
+    /// before the epoch increment. Readers that still observe an older epoch
+    /// are therefore ordered before this mutation and readers that bracket a
+    /// snapshot will fail closed as soon as a writer starts.
+    #[inline]
+    fn begin_mutation(&self) {
+        self.global_version
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .expect("AssetStorage mutation epoch exhausted");
     }
 
     // ── Immediate insertion (asset data available now) ───────────────────
@@ -291,7 +311,7 @@ impl<H: Key, T> AssetStorage<H, T> {
             version: 1,
             identity: Self::allocate_identity(),
         });
-        self.global_version.fetch_add(1, Ordering::Relaxed);
+        self.begin_mutation();
         guard.map.insert(slot)
     }
 
@@ -308,12 +328,13 @@ impl<H: Key, T> AssetStorage<H, T> {
                 && !slot.is_loaded()
             {
                 // includes Loading and Failed states
-                *slot = AssetSlot::Loaded(AssetEntry {
+                let loaded = AssetSlot::Loaded(AssetEntry {
                     asset: Arc::new(asset.into()),
                     version: 1,
                     identity: Self::allocate_identity(),
                 });
-                self.global_version.fetch_add(1, Ordering::Relaxed);
+                self.begin_mutation();
+                *slot = loaded;
             }
 
             return handle;
@@ -323,9 +344,9 @@ impl<H: Key, T> AssetStorage<H, T> {
             version: 1,
             identity: Self::allocate_identity(),
         });
+        self.begin_mutation();
         let handle = guard.map.insert(slot);
         guard.lookup.insert(uuid, handle);
-        self.global_version.fetch_add(1, Ordering::Relaxed);
         handle
     }
 
@@ -338,6 +359,7 @@ impl<H: Key, T> AssetStorage<H, T> {
     /// [`insert_ready`](Self::insert_ready) or [`mark_failed`](Self::mark_failed).
     pub fn reserve(&self) -> H {
         let mut guard = self.inner.write();
+        self.begin_mutation();
         guard.map.insert(AssetSlot::Loading)
     }
 
@@ -351,6 +373,7 @@ impl<H: Key, T> AssetStorage<H, T> {
         if let Some(&handle) = guard.lookup.get(&uuid) {
             return (handle, false);
         }
+        self.begin_mutation();
         let handle = guard.map.insert(AssetSlot::Loading);
         guard.lookup.insert(uuid, handle);
         (handle, true)
@@ -364,12 +387,12 @@ impl<H: Key, T> AssetStorage<H, T> {
     pub fn insert_ready(&self, handle: H, asset: impl Into<T>) {
         let mut guard = self.inner.write();
         if let Some(slot) = guard.map.get_mut(handle) {
+            self.begin_mutation();
             *slot = AssetSlot::Loaded(AssetEntry {
                 asset: Arc::new(asset.into()),
                 version: 1,
                 identity: Self::allocate_identity(),
             });
-            self.global_version.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -377,6 +400,7 @@ impl<H: Key, T> AssetStorage<H, T> {
     pub fn mark_failed(&self, handle: H, error: String) {
         let mut guard = self.inner.write();
         if let Some(slot) = guard.map.get_mut(handle) {
+            self.begin_mutation();
             *slot = AssetSlot::Failed(error);
         }
     }
@@ -390,10 +414,11 @@ impl<H: Key, T> AssetStorage<H, T> {
     pub fn update(&self, handle: H, asset: impl Into<T>) -> Option<u32> {
         let mut guard = self.inner.write();
         if let Some(AssetSlot::Loaded(entry)) = guard.map.get_mut(handle) {
-            entry.asset = Arc::new(asset.into());
+            let asset = Arc::new(asset.into());
+            self.begin_mutation();
+            entry.asset = asset;
             entry.version += 1;
             entry.identity = Self::allocate_identity();
-            self.global_version.fetch_add(1, Ordering::Relaxed);
             Some(entry.version)
         } else {
             None
@@ -403,6 +428,10 @@ impl<H: Key, T> AssetStorage<H, T> {
     /// Removes the slot (any state) and returns the previous value.
     pub fn remove(&self, handle: H) -> Option<AssetSlot<T>> {
         let mut guard = self.inner.write();
+        if !guard.map.contains_key(handle) {
+            return None;
+        }
+        self.begin_mutation();
         guard.map.remove(handle)
     }
 
@@ -740,7 +769,9 @@ impl<H: Key, T> AssetStorage<H, T> {
     /// Returns `true` if the UUID was found and removed.
     pub fn invalidate_uuid(&self, uuid: &Uuid) -> bool {
         let mut guard = self.inner.write();
-        if let Some(handle) = guard.lookup.remove(uuid) {
+        if let Some(handle) = guard.lookup.get(uuid).copied() {
+            self.begin_mutation();
+            guard.lookup.remove(uuid);
             if let Some(slot) = guard.map.get_mut(handle) {
                 *slot = AssetSlot::Loading;
             }
@@ -755,6 +786,10 @@ impl<H: Key, T> AssetStorage<H, T> {
     /// re-populated by fresh background tasks.
     pub fn invalidate_all_uuids(&self) {
         let mut guard = self.inner.write();
+        if guard.lookup.is_empty() {
+            return;
+        }
+        self.begin_mutation();
         let handles: Vec<_> = guard.lookup.values().copied().collect();
         for handle in handles {
             if let Some(slot) = guard.map.get_mut(handle) {
@@ -762,7 +797,6 @@ impl<H: Key, T> AssetStorage<H, T> {
             }
         }
         guard.lookup.clear();
-        self.global_version.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -785,6 +819,7 @@ impl AssetStorage<ImageHandle, Image> {
             return Err(DynamicImageUpdateError::NotLoaded);
         };
 
+        self.begin_mutation();
         entry
             .asset
             .update_dynamic_data(new_bytes)
@@ -797,7 +832,6 @@ impl AssetStorage<ImageHandle, Image> {
             // so `(version, identity)` still cannot ABA against old GPU state.
             entry.identity = Self::allocate_identity();
         }
-        self.global_version.fetch_add(1, Ordering::Relaxed);
         Ok(entry.version)
     }
 }
@@ -810,6 +844,12 @@ mod tests {
 
     fn loaded_value(snapshot: &AssetSnapshot<ImageHandle, u32>) -> Option<u32> {
         snapshot.loaded().map(|loaded| **loaded.asset())
+    }
+
+    fn assert_epoch_advanced<T>(storage: &AssetStorage<ImageHandle, T>, epoch: &mut u64) {
+        let current = storage.global_version();
+        assert_eq!(current, *epoch + 1);
+        *epoch = current;
     }
 
     #[test]
@@ -1056,6 +1096,70 @@ mod tests {
         assert_eq!(Arc::strong_count(retained), owners_before);
     }
 
+    #[test]
+    fn mutation_epoch_covers_every_observable_slot_transition() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        let mut epoch = storage.global_version();
+
+        let immediate = storage.add(1_u32);
+        assert_epoch_advanced(&storage, &mut epoch);
+
+        let loading = storage.reserve();
+        assert_epoch_advanced(&storage, &mut epoch);
+        storage.mark_failed(loading, "expected".to_owned());
+        assert_epoch_advanced(&storage, &mut epoch);
+        storage.insert_ready(loading, 2_u32);
+        assert_epoch_advanced(&storage, &mut epoch);
+        assert_eq!(storage.update(loading, 3_u32), Some(2));
+        assert_epoch_advanced(&storage, &mut epoch);
+        assert!(storage.remove(loading).is_some());
+        assert_epoch_advanced(&storage, &mut epoch);
+        assert!(storage.remove(loading).is_none());
+        assert_eq!(storage.global_version(), epoch);
+
+        let reserved_uuid = Uuid::from_u128(0x100);
+        let (reserved, is_new) = storage.reserve_with_uuid(reserved_uuid);
+        assert!(is_new);
+        assert_epoch_advanced(&storage, &mut epoch);
+        assert_eq!(storage.reserve_with_uuid(reserved_uuid), (reserved, false));
+        assert_eq!(storage.global_version(), epoch);
+
+        assert_eq!(storage.add_with_uuid(reserved_uuid, 4_u32), reserved);
+        assert_epoch_advanced(&storage, &mut epoch);
+        assert_eq!(storage.add_with_uuid(reserved_uuid, 5_u32), reserved);
+        assert_eq!(storage.global_version(), epoch);
+        assert!(storage.invalidate_uuid(&reserved_uuid));
+        assert_epoch_advanced(&storage, &mut epoch);
+        assert!(!storage.invalidate_uuid(&reserved_uuid));
+        assert_eq!(storage.global_version(), epoch);
+
+        let first_uuid = Uuid::from_u128(0x200);
+        let second_uuid = Uuid::from_u128(0x300);
+        storage.add_with_uuid(first_uuid, 6_u32);
+        assert_epoch_advanced(&storage, &mut epoch);
+        storage.add_with_uuid(second_uuid, 7_u32);
+        assert_epoch_advanced(&storage, &mut epoch);
+        storage.invalidate_all_uuids();
+        assert_epoch_advanced(&storage, &mut epoch);
+        storage.invalidate_all_uuids();
+        assert_eq!(storage.global_version(), epoch);
+
+        assert!(storage.remove(immediate).is_some());
+        assert_epoch_advanced(&storage, &mut epoch);
+    }
+
+    #[test]
+    fn mutation_epoch_refuses_to_wrap_before_touching_storage() {
+        let storage = AssetStorage::<ImageHandle, u32>::new();
+        storage.global_version.store(u64::MAX, Ordering::Release);
+
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| storage.reserve())).is_err()
+        );
+        assert_eq!(storage.global_version(), u64::MAX);
+        assert!(storage.inner.read().map.is_empty());
+    }
+
     fn dynamic_image(value: u8) -> Image {
         Image::new_dynamic(
             2,
@@ -1124,5 +1228,18 @@ mod tests {
             .expect("other storage image missing");
         assert_eq!(other_version, 1);
         assert_ne!(other_identity, dynamic_identity);
+    }
+
+    #[test]
+    fn dynamic_image_updates_advance_the_mutation_epoch() {
+        let storage = AssetStorage::<ImageHandle, Image>::new();
+        let handle = storage.add(dynamic_image(1));
+        let before = storage.global_version();
+
+        storage
+            .update_dynamic_data(handle, &[2; 16])
+            .expect("dynamic update failed");
+
+        assert_eq!(storage.global_version(), before + 1);
     }
 }

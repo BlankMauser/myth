@@ -334,6 +334,19 @@ impl<const N: usize> CapacityGovernor<N> {
         }
     }
 
+    /// Return whether a clear boundary needs a point-in-time capacity scan to
+    /// resolve an explicit maintenance request.
+    ///
+    /// Ordinary attempts already feed retained-capacity usage through
+    /// [`Self::observe`].  Rebuilding the full multi-family snapshot at every
+    /// clear boundary is only useful for an explicit request that can be
+    /// resolved immediately; pending work and the global cooldown deliberately
+    /// defer that resolution.
+    #[must_use]
+    pub(crate) const fn needs_requested_trim_resolution(&self) -> bool {
+        self.explicit_request && self.pending.is_none() && self.cooldown_remaining == 0
+    }
+
     /// Resolve an explicitly queued request against the capacity visible at a
     /// safe maintenance boundary without counting a second graph attempt.
     pub(crate) fn resolve_requested_trim(&mut self, usages: [CapacityUsage; N]) {

@@ -10,6 +10,8 @@
 //!
 //! [`CpuBuffer`] caches its assigned [`GpuBufferHandle`] in an `AtomicU64` field,
 //! enabling a lock-free O(1) fast path in [`ResourceManager::ensure_buffer`].
+//! Every arena entry also records its CPU logical ID, so a handle is only a
+//! hint until both its SlotMap generation and exact owner have been validated.
 //!
 //! # Resize Strategy
 //!
@@ -20,7 +22,7 @@
 //! changed and dependent `BindGroup`s must be rebuilt.
 
 use myth_assets::AssetServer;
-use myth_resources::buffer::BufferRef;
+use myth_resources::buffer::{BufferRef, CpuBufferStamp};
 use myth_resources::texture::TextureSource;
 
 use super::environment::{snapshot_attachment_texture_source, snapshot_ready_asset_texture_source};
@@ -56,6 +58,116 @@ pub(crate) struct PreparedTextureSource {
     pub(crate) logical_version: u64,
 }
 
+/// Exact, allocation-free identity of one post-DPE materialized CPU buffer.
+///
+/// The SlotMap handle is generation checked, while `logical_id` on the arena
+/// entry and `physical_id` below close the remaining wrong-owner and in-slot
+/// resize/ABA cases. Keeping this token Copy lets graph-attempt state retain
+/// the exact physical result without cloning a `wgpu::Buffer` on the warm path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaterializedBufferToken {
+    pub(crate) stamp: CpuBufferStamp,
+    pub(crate) handle: GpuBufferHandle,
+    pub(crate) physical_id: u64,
+}
+
+impl MaterializedBufferToken {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new(
+        stamp: CpuBufferStamp,
+        handle: GpuBufferHandle,
+        physical_id: u64,
+    ) -> Self {
+        Self {
+            stamp,
+            handle,
+            physical_id,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn buffer_ref(self) -> BufferRef {
+        BufferRef::with_fixed_id(
+            self.stamp.id,
+            self.stamp.size,
+            self.stamp.usage,
+            self.stamp.version,
+            None,
+        )
+    }
+}
+
+type BufferSnapshotInput<'a> = Option<(&'a BufferRef, &'a [u8])>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct HintedBufferSnapshotInput<'a> {
+    pub(crate) stamp: CpuBufferStamp,
+    pub(crate) bytes: &'a [u8],
+    pub(crate) cached_handle: Option<GpuBufferHandle>,
+}
+
+#[inline]
+fn buffer_snapshot_ids_are_unique<const N: usize>(
+    snapshots: &[BufferSnapshotInput<'_>; N],
+) -> bool {
+    snapshots.iter().enumerate().all(|(index, current)| {
+        let Some((current, _)) = current else {
+            return true;
+        };
+        snapshots[..index]
+            .iter()
+            .flatten()
+            .all(|(previous, _)| previous.id() != current.id())
+    })
+}
+
+#[inline]
+fn hinted_buffer_snapshot_ids_are_unique<const N: usize>(
+    snapshots: &[HintedBufferSnapshotInput<'_>; N],
+) -> bool {
+    snapshots.iter().enumerate().all(|(index, current)| {
+        snapshots[..index]
+            .iter()
+            .all(|previous| previous.stamp.id != current.stamp.id)
+    })
+}
+
+#[cfg(test)]
+mod snapshot_batch_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_logical_buffer_ids_fail_before_materialization() {
+        let first = BufferRef::with_fixed_id(
+            7,
+            4,
+            wgpu::BufferUsages::COPY_DST,
+            1,
+            Some("first duplicate snapshot"),
+        );
+        let second = BufferRef::with_fixed_id(
+            7,
+            8,
+            wgpu::BufferUsages::COPY_DST,
+            2,
+            Some("second duplicate snapshot"),
+        );
+        let first_bytes = [1_u8; 4];
+        let second_bytes = [2_u8; 8];
+
+        assert!(!buffer_snapshot_ids_are_unique(&[
+            Some((&first, &first_bytes)),
+            Some((&second, &second_bytes)),
+        ]));
+        assert!(buffer_snapshot_ids_are_unique(&[
+            Some((&first, &first_bytes)),
+            None,
+        ]));
+    }
+}
+
 impl<'a> BufferUploadContext<'a> {
     pub(crate) fn new(
         device: &'a wgpu::Device,
@@ -79,7 +191,9 @@ impl<'a> BufferUploadContext<'a> {
         cpu_buffer: &super::CpuBuffer<T>,
     ) -> (GpuBufferHandle, EnsureResult) {
         if let Some(handle) = cpu_buffer.gpu_handle() {
-            if let Some(gpu_buf) = self.resources.buffer_mut(handle) {
+            if let Some(gpu_buf) = self.resources.buffer_mut(handle)
+                && gpu_buf.logical_id == cpu_buffer.id()
+            {
                 let buffer_ref = cpu_buffer.handle();
                 let mut was_recreated = false;
 
@@ -109,29 +223,94 @@ impl<'a> BufferUploadContext<'a> {
         (handle, result)
     }
 
-    /// Materialize one exact stamped CPU snapshot without consulting or
-    /// publishing `CpuBuffer`'s process-wide cached handle.
+    /// Materialize one fixed semantic batch after validating every member
+    /// before the first mutation.
     ///
-    /// The canonical lookup is scoped to this ResourceManager's buffer arena.
-    /// A newer physical version is never accepted for an older graph snapshot;
-    /// that drift fails closed instead of binding latest data under a stale
-    /// logical stamp.
-    pub(crate) fn materialize_buffer_snapshot(
+    /// Distinct logical buffer IDs cannot invalidate one another while this
+    /// context holds the resource store exclusively, so each member needs only
+    /// the batch preflight plus the canonical `write_buffer` lookup. Duplicate
+    /// IDs fail closed before mutation: two versions of one physical buffer
+    /// cannot both remain exact after the later upload overwrites or resizes it.
+    pub(crate) fn materialize_buffer_snapshot_batch<const N: usize>(
+        &mut self,
+        snapshots: [BufferSnapshotInput<'_>; N],
+    ) -> Option<[Option<Tracked<wgpu::Buffer>>; N]> {
+        if !buffer_snapshot_ids_are_unique(&snapshots)
+            || snapshots
+                .iter()
+                .flatten()
+                .any(|&(buffer_ref, bytes)| !self.preflight_buffer_snapshot(buffer_ref, bytes))
+        {
+            return None;
+        }
+
+        let mut failed = false;
+        let materialized = std::array::from_fn(|index| {
+            if failed {
+                return None;
+            }
+            let (buffer_ref, bytes) = snapshots[index]?;
+            let buffer = self.materialize_buffer_snapshot_after_preflight(buffer_ref, bytes);
+            if buffer.is_none() {
+                failed = true;
+            }
+            buffer
+        });
+        (!failed).then_some(materialized)
+    }
+
+    /// Materialize an exact fixed-size batch using each `CpuBuffer`'s cached
+    /// arena handle as a generation-checked fast-path hint.
+    ///
+    /// Every member is preflighted before the first mutation. A current hint
+    /// resolves directly through SlotMap and verifies the arena entry's CPU
+    /// logical ID, avoiding the reverse-index hash lookup. Missing or stale
+    /// hints conservatively fall back to the canonical CPU-ID path.
+    pub(crate) fn materialize_hinted_buffer_snapshot_batch<const N: usize>(
+        &mut self,
+        snapshots: [HintedBufferSnapshotInput<'_>; N],
+    ) -> Option<[MaterializedBufferToken; N]> {
+        if !hinted_buffer_snapshot_ids_are_unique(&snapshots)
+            || snapshots.iter().any(|snapshot| {
+                !self.preflight_hinted_buffer_snapshot(
+                    snapshot.stamp,
+                    snapshot.bytes,
+                    snapshot.cached_handle,
+                )
+            })
+        {
+            return None;
+        }
+
+        let mut materialized = [None; N];
+        for (index, snapshot) in snapshots.into_iter().enumerate() {
+            let (handle, result) = self.resources.write_buffer_snapshot_with_hint(
+                self.device,
+                self.queue,
+                self.frame_index,
+                snapshot.stamp,
+                snapshot.bytes,
+                snapshot.cached_handle,
+            );
+            materialized[index] = Some(MaterializedBufferToken::new(
+                snapshot.stamp,
+                handle,
+                result.resource_id,
+            ));
+        }
+
+        Some(materialized.map(|token| token.expect("materialized batch member missing")))
+    }
+
+    fn materialize_buffer_snapshot_after_preflight(
         &mut self,
         buffer_ref: &BufferRef,
         bytes: &[u8],
     ) -> Option<Tracked<wgpu::Buffer>> {
-        if !self.preflight_buffer_snapshot(buffer_ref, bytes) {
-            return None;
-        }
-
-        let (handle, _) = self.resources.write_buffer(
-            self.device,
-            self.queue,
-            self.frame_index,
-            buffer_ref,
-            bytes,
-        );
+        let handle = self
+            .resources
+            .write_buffer(self.device, self.queue, self.frame_index, buffer_ref, bytes)
+            .0;
         let gpu_buffer = self
             .resources
             .buffer(handle)
@@ -144,8 +323,7 @@ impl<'a> BufferUploadContext<'a> {
 
     /// Validate an exact snapshot without mutating ResourceManager state.
     ///
-    /// This is deliberately separate from [`Self::materialize_buffer_snapshot`]
-    /// so a fixed-size batch can validate every live input before the first GPU
+    /// A fixed-size batch validates every live input before the first GPU
     /// upload. An equal-version allocation must already cover the snapshot's
     /// logical byte range because `write_buffer` correctly skips an upload for
     /// an identical version and therefore cannot resize it afterward.
@@ -162,6 +340,28 @@ impl<'a> BufferUploadContext<'a> {
             && buffer.last_uploaded_version <= buffer_ref.version
             && (buffer.last_uploaded_version != buffer_ref.version
                 || buffer.size >= bytes.len() as u64)
+    }
+
+    #[inline]
+    #[must_use]
+    fn preflight_hinted_buffer_snapshot(
+        &self,
+        stamp: CpuBufferStamp,
+        bytes: &[u8],
+        cached_handle: Option<GpuBufferHandle>,
+    ) -> bool {
+        if bytes.len() != stamp.size {
+            return false;
+        }
+        let Some(buffer) = self
+            .resources
+            .buffer_by_cpu_id_with_hint(stamp.id, cached_handle)
+        else {
+            return true;
+        };
+        buffer.usage == stamp.usage
+            && buffer.last_uploaded_version <= stamp.version
+            && (buffer.last_uploaded_version != stamp.version || buffer.size >= bytes.len() as u64)
     }
 
     #[inline]
@@ -330,6 +530,8 @@ pub use myth_resources::GpuBufferHandle;
 /// rebuilds.
 pub struct GpuBuffer {
     pub id: u64,
+    /// CPU-side logical owner for exact cached-handle validation.
+    pub(crate) logical_id: u64,
     pub buffer: wgpu::Buffer,
     pub size: u64,
     pub usage: wgpu::BufferUsages,
@@ -343,6 +545,7 @@ impl GpuBuffer {
     #[must_use]
     pub fn new(
         device: &wgpu::Device,
+        logical_id: u64,
         data: &[u8],
         usage: wgpu::BufferUsages,
         label: Option<&str>,
@@ -356,6 +559,7 @@ impl GpuBuffer {
 
         Self {
             id: generate_gpu_resource_id(),
+            logical_id,
             buffer,
             size: data.len() as u64,
             usage,
@@ -368,6 +572,7 @@ impl GpuBuffer {
 
     pub fn with_capacity(
         device: &wgpu::Device,
+        logical_id: u64,
         capacity_bytes: u64,
         usage: wgpu::BufferUsages,
         label: Option<&str>,
@@ -388,6 +593,7 @@ impl GpuBuffer {
 
         Self {
             id: generate_gpu_resource_id(),
+            logical_id,
             buffer,
             size,
             usage,
@@ -451,7 +657,9 @@ impl ResourceManager {
     ) -> (GpuBufferHandle, EnsureResult) {
         // ── Fast path: CpuBuffer already knows its slot ────────────
         if let Some(handle) = cpu_buffer.gpu_handle() {
-            if let Some(gpu_buf) = self.resources.buffer_mut(handle) {
+            if let Some(gpu_buf) = self.resources.buffer_mut(handle)
+                && gpu_buf.logical_id == cpu_buffer.id()
+            {
                 let buffer_ref = cpu_buffer.handle();
                 let mut was_recreated = false;
 

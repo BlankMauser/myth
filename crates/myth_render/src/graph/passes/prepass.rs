@@ -21,6 +21,7 @@ use crate::graph::core::{
     ExecuteContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
 };
 use crate::graph::passes::draw::submit_scene_submission;
+use crate::graph::scene_pipeline_coordinator::resolve_prepared_source_for_frame;
 use crate::graph::scene_pipeline_prepare::PrepassPipelineL1Key;
 use crate::pipeline::{RenderPipelineId, ShaderSource};
 use myth_resources::material::{AlphaMode, Side};
@@ -141,48 +142,24 @@ impl PrepassFeature {
         let shader_source_identity = ctx.shader_manager.source_identity_hash(shader_source);
 
         for (intent_index, intent) in render_lists.opaque.iter().enumerate() {
-            let Some(prepared_source) = prepared_draws.prepared_source_id(intent.source) else {
+            let Some((prepared_source, resolved)) = resolve_prepared_source_for_frame(
+                intent.source,
+                prepared_draws,
+                geometry_frames,
+                material_frames,
+                object_interfaces,
+                render_lists,
+                extracted_scene,
+            ) else {
                 continue;
             };
-            let Some(source) = prepared_draws.source(prepared_source) else {
-                continue;
-            };
-            let Some(extracted_source) = render_lists.extracted_source(intent.source) else {
-                continue;
-            };
-            let Some(extracted_item) = extracted_scene.render_items.get(extracted_source.index())
-            else {
-                continue;
-            };
-            let Some(geometry) = geometry_frames.geometry(source.geometry) else {
-                continue;
-            };
-            let Some(geometry_physical) = geometry_frames.physical(source.geometry) else {
-                continue;
-            };
-            let Some(material) = material_frames.material(source.material) else {
-                continue;
-            };
-            let Some(object_interface) = object_interfaces.interface(source.object_interface)
-            else {
-                continue;
-            };
+            let extracted_item = resolved.item;
+            let geometry = resolved.geometry;
+            let geometry_physical = resolved.geometry_physical;
+            let material = resolved.material;
+            let object_interface = resolved.object_interface;
             if (extracted_item.geometry, extracted_item.material)
                 != (intent.geometry_handle, intent.material_handle)
-                || geometry.key.handle != intent.geometry_handle
-                || material.handle() != intent.material_handle
-                || (geometry.key.asset_version, geometry.key.asset_identity)
-                    != (
-                        extracted_item.geometry_asset_version,
-                        extracted_item.geometry_asset_identity,
-                    )
-                || (material.asset_version(), material.asset_identity())
-                    != (
-                        extracted_item.material_asset_version,
-                        extracted_item.material_asset_identity,
-                    )
-                || !geometry_frames.pipeline_state_is_current(source.geometry)
-                || !material.pipeline_state_is_current()
             {
                 continue;
             }
@@ -217,7 +194,7 @@ impl PrepassFeature {
                 material_asset_identity: material.asset_identity(),
                 material_version: material.material_version(),
                 item_variants: extracted_item.item_variant_flags,
-                item_shader_defines_hash: extracted_item.item_shader_defines_hash,
+                item_shader_features: extracted_item.item_shader_features,
                 shader_source_identity,
                 scene_defines_hash,
                 pipeline_settings_version,
@@ -239,16 +216,10 @@ impl PrepassFeature {
                 needs_velocity: snapshot.needs_velocity,
             };
 
-            if !geometry_frames.pipeline_state_is_current(source.geometry)
-                || !material.pipeline_state_is_current()
-            {
-                continue;
-            }
             let cached = self.local_cache.get(&l1_key).copied();
             ctx.scene_draws.push_prepass_recipe(
                 submission,
                 intent_index,
-                intent.source,
                 prepared_source,
                 l1_key,
                 cached,

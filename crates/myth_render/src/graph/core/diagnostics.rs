@@ -6,6 +6,8 @@
 //! without atomics, locks, logging, or per-event allocation.
 
 use std::cell::Cell;
+#[cfg(feature = "rdg_bench_support")]
+use std::time::Instant;
 
 const FLAG_SURFACE_SUBOPTIMAL: u8 = 1 << 0;
 const FLAG_QUEUE_SUBMITTED: u8 = 1 << 1;
@@ -41,6 +43,10 @@ pub enum RdgAttemptOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RdgResourceMaterializationFailure {
+    /// The render target changed size or format after the CPU graph captured
+    /// its logical external descriptor. The attempt is abandoned before any
+    /// transient allocation, upload, or pass preparation.
+    RenderTargetDescriptorDrift,
     /// A scene buffer changed after graph construction captured its stamp.
     SceneBufferSnapshotDrift,
     /// ResourceManager already contains incompatible or newer physical state
@@ -97,10 +103,10 @@ pub enum RdgFramePhase {
     Extract,
     Maintenance,
     AwaitingRender,
-    AcquireTarget,
     Cull,
     BuildGraph,
     CompileGraph,
+    AcquireTarget,
     MaterializeResources,
     PreparePasses,
     FinalizeDrawPlans,
@@ -109,6 +115,132 @@ pub enum RdgFramePhase {
     Publish,
     Present,
     Complete,
+}
+
+#[cfg(feature = "rdg_bench_support")]
+impl RdgFramePhase {
+    /// Number of stable RDG attempt phases exposed by benchmark diagnostics.
+    pub const COUNT: usize = 16;
+
+    /// Every RDG attempt phase in execution order.
+    ///
+    /// This is benchmark support rather than a shipping profiler contract.
+    /// Consumers can use it with [`RdgFrameDiagnostics::phase_elapsed_ns`]
+    /// without allocating a temporary phase list.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Begin,
+        Self::Extract,
+        Self::Maintenance,
+        Self::AwaitingRender,
+        Self::Cull,
+        Self::BuildGraph,
+        Self::CompileGraph,
+        Self::AcquireTarget,
+        Self::MaterializeResources,
+        Self::PreparePasses,
+        Self::FinalizeDrawPlans,
+        Self::RecordCommands,
+        Self::Submit,
+        Self::Publish,
+        Self::Present,
+        Self::Complete,
+    ];
+
+    const fn timing_index(self) -> usize {
+        match self {
+            Self::Begin => 0,
+            Self::Extract => 1,
+            Self::Maintenance => 2,
+            Self::AwaitingRender => 3,
+            Self::Cull => 4,
+            Self::BuildGraph => 5,
+            Self::CompileGraph => 6,
+            Self::AcquireTarget => 7,
+            Self::MaterializeResources => 8,
+            Self::PreparePasses => 9,
+            Self::FinalizeDrawPlans => 10,
+            Self::RecordCommands => 11,
+            Self::Submit => 12,
+            Self::Publish => 13,
+            Self::Present => 14,
+            Self::Complete => 15,
+        }
+    }
+}
+
+/// Benchmark-only subdivisions of the post-DPE scene preparation pipeline.
+///
+/// Unlike [`RdgFramePhase`], these intervals may be nested inside a macro
+/// phase. They are deliberately absent from shipping builds so the production
+/// hot path carries neither timer reads nor telemetry storage.
+#[cfg(feature = "rdg_bench_support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgDetailPhase {
+    TransientResources,
+    SceneBuffers,
+    GlobalBuffers,
+    PersistentTextures,
+    AssetTexture,
+    GlobalBindGroup,
+    LiveSourceUnion,
+    MaterialPlan,
+    Geometry,
+    SourceGather,
+    SourcePlan,
+    SourceMaterialize,
+    SourceFinalize,
+    PipelineGather,
+    PipelineCoordinate,
+    PipelineFeatureFinalize,
+    PipelineFinalize,
+}
+
+#[cfg(feature = "rdg_bench_support")]
+impl RdgDetailPhase {
+    pub const COUNT: usize = 17;
+
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::TransientResources,
+        Self::SceneBuffers,
+        Self::GlobalBuffers,
+        Self::PersistentTextures,
+        Self::AssetTexture,
+        Self::GlobalBindGroup,
+        Self::LiveSourceUnion,
+        Self::MaterialPlan,
+        Self::Geometry,
+        Self::SourceGather,
+        Self::SourcePlan,
+        Self::SourceMaterialize,
+        Self::SourceFinalize,
+        Self::PipelineGather,
+        Self::PipelineCoordinate,
+        Self::PipelineFeatureFinalize,
+        Self::PipelineFinalize,
+    ];
+
+    const fn timing_index(self) -> usize {
+        match self {
+            Self::TransientResources => 0,
+            Self::SceneBuffers => 1,
+            Self::GlobalBuffers => 2,
+            Self::PersistentTextures => 3,
+            Self::AssetTexture => 4,
+            Self::GlobalBindGroup => 5,
+            Self::LiveSourceUnion => 6,
+            Self::MaterialPlan => 7,
+            Self::Geometry => 8,
+            Self::SourceGather => 9,
+            Self::SourcePlan => 10,
+            Self::SourceMaterialize => 11,
+            Self::SourceFinalize => 12,
+            Self::PipelineGather => 13,
+            Self::PipelineCoordinate => 14,
+            Self::PipelineFeatureFinalize => 15,
+            Self::PipelineFinalize => 16,
+        }
+    }
 }
 
 /// Immutable diagnostics for one Renderer or standalone Render Graph attempt.
@@ -131,6 +263,10 @@ pub struct RdgFrameDiagnostics {
     executed_passes: usize,
     target: Option<RdgRenderTargetKind>,
     flags: u8,
+    #[cfg(feature = "rdg_bench_support")]
+    phase_elapsed_ns: [u64; RdgFramePhase::COUNT],
+    #[cfg(feature = "rdg_bench_support")]
+    detail_elapsed_ns: [u64; RdgDetailPhase::COUNT],
 }
 
 impl RdgFrameDiagnostics {
@@ -147,6 +283,10 @@ impl RdgFrameDiagnostics {
             executed_passes: 0,
             target: None,
             flags: 0,
+            #[cfg(feature = "rdg_bench_support")]
+            phase_elapsed_ns: [0; RdgFramePhase::COUNT],
+            #[cfg(feature = "rdg_bench_support")]
+            detail_elapsed_ns: [0; RdgDetailPhase::COUNT],
         }
     }
 
@@ -229,6 +369,26 @@ impl RdgFrameDiagnostics {
     pub const fn panicked(&self) -> bool {
         self.flags & FLAG_PANICKED != 0
     }
+
+    /// CPU wall-clock nanoseconds attributed to one RDG phase.
+    ///
+    /// Time is accumulated when the attempt crosses a phase boundary. A
+    /// terminal snapshot also seals its last active phase, including RAII
+    /// abandonment and panic paths. An in-progress snapshot therefore reports
+    /// completed phase intervals but not the still-running interval.
+    #[cfg(feature = "rdg_bench_support")]
+    #[must_use]
+    pub const fn phase_elapsed_ns(&self, phase: RdgFramePhase) -> u64 {
+        self.phase_elapsed_ns[phase.timing_index()]
+    }
+
+    /// CPU wall-clock nanoseconds attributed to one benchmark-only scene
+    /// preparation subdivision.
+    #[cfg(feature = "rdg_bench_support")]
+    #[must_use]
+    pub const fn detail_elapsed_ns(&self, phase: RdgDetailPhase) -> u64 {
+        self.detail_elapsed_ns[phase.timing_index()]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +421,12 @@ pub(crate) struct RdgDiagnosticsRecorder {
     target: Cell<Option<RdgRenderTargetKind>>,
     flags: Cell<u8>,
     latest: Cell<Option<RdgFrameDiagnostics>>,
+    #[cfg(feature = "rdg_bench_support")]
+    phase_started_at: Cell<Option<Instant>>,
+    #[cfg(feature = "rdg_bench_support")]
+    phase_elapsed_ns: [Cell<u64>; RdgFramePhase::COUNT],
+    #[cfg(feature = "rdg_bench_support")]
+    detail_elapsed_ns: [Cell<u64>; RdgDetailPhase::COUNT],
 }
 
 impl Default for RdgDiagnosticsRecorder {
@@ -280,6 +446,12 @@ impl Default for RdgDiagnosticsRecorder {
             target: Cell::new(None),
             flags: Cell::new(0),
             latest: Cell::new(None),
+            #[cfg(feature = "rdg_bench_support")]
+            phase_started_at: Cell::new(None),
+            #[cfg(feature = "rdg_bench_support")]
+            phase_elapsed_ns: std::array::from_fn(|_| Cell::new(0)),
+            #[cfg(feature = "rdg_bench_support")]
+            detail_elapsed_ns: std::array::from_fn(|_| Cell::new(0)),
         }
     }
 }
@@ -318,11 +490,23 @@ impl RdgDiagnosticsRecorder {
         self.executed_passes.set(0);
         self.target.set(None);
         self.flags.set(0);
+        #[cfg(feature = "rdg_bench_support")]
+        {
+            for elapsed in &self.phase_elapsed_ns {
+                elapsed.set(0);
+            }
+            for elapsed in &self.detail_elapsed_ns {
+                elapsed.set(0);
+            }
+            self.phase_started_at.set(Some(Instant::now()));
+        }
     }
 
     #[inline]
     pub(crate) fn enter_phase(&self, phase: RdgFramePhase) {
         self.assert_active();
+        #[cfg(feature = "rdg_bench_support")]
+        self.seal_phase_interval(Instant::now(), true);
         self.phase.set(phase);
     }
 
@@ -430,6 +614,9 @@ impl RdgDiagnosticsRecorder {
     pub(crate) fn mark_completed(&self) {
         self.assert_active();
         debug_assert!(self.flag(FLAG_QUEUE_SUBMITTED));
+        #[cfg(feature = "rdg_bench_support")]
+        self.enter_phase(RdgFramePhase::Complete);
+        #[cfg(not(feature = "rdg_bench_support"))]
         self.phase.set(RdgFramePhase::Complete);
         self.request_outcome(RdgAttemptOutcome::Submitted);
     }
@@ -484,6 +671,8 @@ impl RdgDiagnosticsRecorder {
         };
         let outcome = self.requested_outcome.get().unwrap_or(fallback);
         let panicking = std::thread::panicking();
+        #[cfg(feature = "rdg_bench_support")]
+        self.seal_phase_interval(Instant::now(), false);
         let snapshot = self.snapshot(outcome, panicking);
         // Never introduce a second panic from RAII cleanup while unwinding the
         // original frame failure. The preserved snapshot remains inspectable.
@@ -507,7 +696,37 @@ impl RdgDiagnosticsRecorder {
             executed_passes: self.executed_passes.get(),
             target: self.target.get(),
             flags: self.flags.get() | if panicked { FLAG_PANICKED } else { 0 },
+            #[cfg(feature = "rdg_bench_support")]
+            phase_elapsed_ns: std::array::from_fn(|index| self.phase_elapsed_ns[index].get()),
+            #[cfg(feature = "rdg_bench_support")]
+            detail_elapsed_ns: std::array::from_fn(|index| self.detail_elapsed_ns[index].get()),
         }
+    }
+
+    #[cfg(feature = "rdg_bench_support")]
+    pub(crate) fn detail_timer(&self, phase: RdgDetailPhase) -> RdgDetailTimer<'_> {
+        self.assert_active();
+        RdgDetailTimer {
+            recorder: self,
+            phase,
+            started_at: Instant::now(),
+        }
+    }
+
+    #[cfg(feature = "rdg_bench_support")]
+    fn record_detail_elapsed(&self, phase: RdgDetailPhase, elapsed_ns: u64) {
+        let slot = &self.detail_elapsed_ns[phase.timing_index()];
+        slot.set(slot.get().saturating_add(elapsed_ns));
+    }
+
+    #[cfg(feature = "rdg_bench_support")]
+    fn seal_phase_interval(&self, now: Instant, continue_timing: bool) {
+        if let Some(started_at) = self.phase_started_at.get() {
+            let phase_elapsed = duration_ns(now.saturating_duration_since(started_at));
+            let slot = &self.phase_elapsed_ns[self.phase.get().timing_index()];
+            slot.set(slot.get().saturating_add(phase_elapsed));
+        }
+        self.phase_started_at.set(continue_timing.then_some(now));
     }
 
     #[inline]
@@ -529,6 +748,23 @@ impl RdgDiagnosticsRecorder {
         assert!(
             self.active_owner.get().is_some(),
             "RDG diagnostics event recorded without an active attempt"
+        );
+    }
+}
+
+#[cfg(feature = "rdg_bench_support")]
+pub(crate) struct RdgDetailTimer<'a> {
+    recorder: &'a RdgDiagnosticsRecorder,
+    phase: RdgDetailPhase,
+    started_at: Instant,
+}
+
+#[cfg(feature = "rdg_bench_support")]
+impl Drop for RdgDetailTimer<'_> {
+    fn drop(&mut self) {
+        self.recorder.record_detail_elapsed(
+            self.phase,
+            duration_ns(Instant::now().saturating_duration_since(self.started_at)),
         );
     }
 }
@@ -576,6 +812,8 @@ impl RdgStandaloneDiagnosticsStore {
                 RdgFramePhase::BuildGraph,
             ),
             requested_outcome: None,
+            #[cfg(feature = "rdg_bench_support")]
+            phase_started_at: Instant::now(),
         }
     }
 
@@ -593,6 +831,8 @@ impl RdgStandaloneDiagnosticsStore {
 pub(crate) struct RdgStandaloneAttempt {
     snapshot: RdgFrameDiagnostics,
     requested_outcome: Option<RdgAttemptOutcome>,
+    #[cfg(feature = "rdg_bench_support")]
+    phase_started_at: Instant,
 }
 
 impl RdgStandaloneAttempt {
@@ -602,6 +842,8 @@ impl RdgStandaloneAttempt {
     }
 
     pub(crate) fn enter_phase(&mut self, phase: RdgFramePhase) {
+        #[cfg(feature = "rdg_bench_support")]
+        self.seal_phase_interval(Instant::now());
         self.snapshot.phase = phase;
     }
 
@@ -622,11 +864,18 @@ impl RdgStandaloneAttempt {
     }
 
     pub(crate) fn mark_completed_without_submission(&mut self) {
-        self.snapshot.phase = RdgFramePhase::Complete;
+        #[cfg(feature = "rdg_bench_support")]
+        self.enter_phase(RdgFramePhase::Complete);
+        #[cfg(not(feature = "rdg_bench_support"))]
+        {
+            self.snapshot.phase = RdgFramePhase::Complete;
+        }
         self.requested_outcome = Some(RdgAttemptOutcome::CompletedWithoutSubmission);
     }
 
     fn finish(mut self, panicking: bool) -> RdgFrameDiagnostics {
+        #[cfg(feature = "rdg_bench_support")]
+        self.seal_phase_interval(Instant::now());
         self.snapshot.outcome = self
             .requested_outcome
             .unwrap_or(RdgAttemptOutcome::Abandoned);
@@ -637,6 +886,19 @@ impl RdgStandaloneAttempt {
         }
         self.snapshot
     }
+
+    #[cfg(feature = "rdg_bench_support")]
+    fn seal_phase_interval(&mut self, now: Instant) {
+        let elapsed = duration_ns(now.saturating_duration_since(self.phase_started_at));
+        let slot = &mut self.snapshot.phase_elapsed_ns[self.snapshot.phase.timing_index()];
+        *slot = slot.saturating_add(elapsed);
+        self.phase_started_at = now;
+    }
+}
+
+#[cfg(feature = "rdg_bench_support")]
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Covers the pre-Composer Renderer work and hands the active attempt off to
@@ -881,5 +1143,49 @@ mod tests {
         let fourth = RdgComposerAttemptGuard::new(&recorder);
         assert!(!recorder.mark_no_render_target());
         drop(fourth);
+    }
+
+    #[cfg(feature = "rdg_bench_support")]
+    #[test]
+    fn phase_timing_is_sealed_by_renderer_and_standalone_raii() {
+        use std::time::Duration;
+
+        let recorder = RdgDiagnosticsRecorder::default();
+        recorder.start_renderer_attempt(31);
+        let renderer_guard = RdgRendererAttemptGuard::new(&recorder);
+        std::thread::sleep(Duration::from_millis(1));
+        renderer_guard.enter_phase(RdgFramePhase::Extract);
+        let detail_timer = recorder.detail_timer(RdgDetailPhase::SourceGather);
+        std::thread::sleep(Duration::from_millis(1));
+        drop(detail_timer);
+        drop(renderer_guard);
+
+        let renderer_snapshot = recorder.latest().expect("Renderer snapshot missing");
+        assert!(renderer_snapshot.phase_elapsed_ns(RdgFramePhase::Begin) > 0);
+        assert!(renderer_snapshot.phase_elapsed_ns(RdgFramePhase::Extract) > 0);
+        assert_eq!(
+            renderer_snapshot.phase_elapsed_ns(RdgFramePhase::Maintenance),
+            0
+        );
+        assert!(renderer_snapshot.detail_elapsed_ns(RdgDetailPhase::SourceGather) > 0);
+        assert_eq!(
+            renderer_snapshot.detail_elapsed_ns(RdgDetailPhase::PipelineFinalize),
+            0
+        );
+
+        let mut standalone = RdgStandaloneDiagnosticsStore::default();
+        let mut attempt = standalone.begin_attempt();
+        std::thread::sleep(Duration::from_millis(1));
+        attempt.enter_phase(RdgFramePhase::CompileGraph);
+        std::thread::sleep(Duration::from_millis(1));
+        standalone.publish(attempt);
+
+        let standalone_snapshot = standalone.latest().expect("standalone snapshot missing");
+        assert!(standalone_snapshot.phase_elapsed_ns(RdgFramePhase::BuildGraph) > 0);
+        assert!(standalone_snapshot.phase_elapsed_ns(RdgFramePhase::CompileGraph) > 0);
+        assert_eq!(
+            standalone_snapshot.phase_elapsed_ns(RdgFramePhase::RecordCommands),
+            0
+        );
     }
 }

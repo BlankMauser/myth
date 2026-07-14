@@ -28,6 +28,8 @@ pub use context::{
     GraphBinding, PrepareContext, RawBufferBinding, RawSamplerBinding, RawTextureViewBinding,
     ViewResolver, build_screen_bind_group,
 };
+#[cfg(feature = "rdg_bench_support")]
+pub use diagnostics::RdgDetailPhase;
 pub use diagnostics::{
     RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
     RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,

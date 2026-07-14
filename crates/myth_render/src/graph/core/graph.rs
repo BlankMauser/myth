@@ -32,6 +32,8 @@ use crate::graph::scene_source_prepare::SceneSourcePrepareStore;
 
 use super::asset_texture::{AssetTextureImportStore, snapshot_texture_desc};
 use super::builder::PassBuilder;
+#[cfg(feature = "rdg_bench_support")]
+use super::diagnostics::RdgDetailPhase;
 use super::diagnostics::{
     RdgAttemptOwner, RdgDiagnosticsRecorder, RdgFrameDiagnostics, RdgFramePhase,
     RdgStandaloneAttempt, RdgStandaloneDiagnosticsStore,
@@ -316,6 +318,19 @@ impl DenseGenerationScratch {
         }
     }
 
+    /// Extend the active domain without advancing the operation generation.
+    ///
+    /// Streaming graph construction may create a logical resource between
+    /// `begin` and `insert`. Growing in place preserves every first-occurrence
+    /// mark already recorded for the open recipe while retaining the backing
+    /// allocation for later attempts.
+    fn extend_domain(&mut self, domain_len: usize) {
+        self.active_len = self.active_len.max(domain_len);
+        if self.stamps.len() < domain_len {
+            self.stamps.resize(domain_len, 0);
+        }
+    }
+
     #[inline]
     fn insert(&mut self, index: usize) -> bool {
         let stamp = self
@@ -386,6 +401,27 @@ fn append_logical_read(
     resources[resource_index].add_consumer_edge();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameOwnerReleasePhase {
+    Active,
+    PrepareReleased,
+    FrameReleased,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphCompilePhase {
+    Building,
+    TopologyCompiled,
+    PhysicalMaterialized,
+}
+
+impl GraphCompilePhase {
+    #[inline]
+    const fn topology_compiled(self) -> bool {
+        !matches!(self, Self::Building)
+    }
+}
+
 /// Declarative Render Graph — persistent capacity storage.
 ///
 /// Holds the backing `Vec`s whose heap capacity is reused across frames.
@@ -409,6 +445,11 @@ pub struct GraphStorage {
     capacity_governor: CapacityGovernor<GRAPH_CAPACITY_FAMILY_COUNT>,
     capacity_sample: [CapacityUsage; GRAPH_CAPACITY_FAMILY_COUNT],
     capacity_sampled: bool,
+    /// Successful prepare finalization and RenderGraph Drop are two ordered
+    /// owner-release boundaries. The explicit phase prevents repeated clears
+    /// and repeated global attempt-token RMWs while keeping panic paths under
+    /// the same terminal Drop guard.
+    frame_owner_release_phase: FrameOwnerReleasePhase,
     /// All pass records for the current frame.
     pub passes: Vec<PassRecord>,
     /// All resource records for the current frame.
@@ -426,7 +467,12 @@ pub struct GraphStorage {
     /// Compilation derives mutable state in-place (reference counts, physical
     /// dependencies, execution order, and draw-plan liveness), so it is a
     /// deliberately one-shot phase rather than an idempotent query.
-    topology_compiled: bool,
+    /// Logical compilation and post-acquire physical materialization phase.
+    ///
+    /// Keeping this as an explicit state machine prevents a graph from
+    /// materializing twice and lets a failed surface acquisition terminate in
+    /// `TopologyCompiled` without creating or recycling GPU resources.
+    compile_phase: GraphCompilePhase,
 
     /// Per-frame logical import deduplication for persistent textures.
     persistent_texture_lookup: FxHashMap<PersistentTextureId, PersistentTextureImport>,
@@ -537,12 +583,13 @@ impl GraphStorage {
             capacity_governor: CapacityGovernor::default(),
             capacity_sample: [CapacityUsage::default(); GRAPH_CAPACITY_FAMILY_COUNT],
             capacity_sampled: false,
+            frame_owner_release_phase: FrameOwnerReleasePhase::Active,
             passes: Vec::new(),
             resources: Vec::new(),
             execution_queue: Vec::new(),
             logical_reads: Vec::with_capacity(256),
             physical_dependencies: Vec::with_capacity(256),
-            topology_compiled: false,
+            compile_phase: GraphCompilePhase::Building,
             persistent_texture_lookup: FxHashMap::default(),
             asset_texture_imports: AssetTextureImportStore::new(),
             asset_texture_plans: AssetTextureBatch::new(),
@@ -643,8 +690,10 @@ impl GraphStorage {
     }
 
     /// Merge the current point-in-time usage into this attempt's peak sample.
-    /// This is called before early owner release and again from RenderGraph
-    /// Drop, so clear stores cannot make a busy attempt look idle.
+    /// The normal path calls this before early owner release. RenderGraph Drop
+    /// supplies a full sample when an early return skipped that point and a
+    /// mipmap-only tail sample after execute otherwise, so clearing stores
+    /// cannot make a busy attempt look idle.
     pub(crate) fn sample_retained_capacity(&mut self) {
         let snapshot = self.capacity_snapshot();
         for (peak, current) in self.capacity_sample.iter_mut().zip(snapshot) {
@@ -656,7 +705,26 @@ impl GraphStorage {
     }
 
     fn finish_retained_capacity_sample(&mut self) {
-        self.sample_retained_capacity();
+        // The normal submitted path samples immediately before releasing the
+        // destructor-bearing prepare stores.  Re-walking every retained Vec,
+        // map, and coordinator from `RenderGraph::drop` cannot raise that
+        // already-captured peak for the prepare-owned families, and made the
+        // capacity governor a measurable per-frame fixed cost. Execute may
+        // still grow the mipmap coordinator's claim scratch, so retain that
+        // one tail sample. Early-return and panic paths do not take the
+        // explicit sample, so Drop still provides their full RAII fallback.
+        if self.capacity_sampled {
+            let mipmap = vec_footprint(&self.mipmap_batches, 16)
+                + self.mipmap_encode_coordinator.capacity_usage();
+            #[cfg(feature = "3dgs")]
+            let mipmap = mipmap + vec_footprint(&self.gaussian_frame_batches, 16);
+            let peak = &mut self.capacity_sample[GraphCapacityFamily::Mipmap.index()];
+            peak.active_bytes = peak.active_bytes.max(mipmap.active_bytes);
+            peak.retained_bytes = peak.retained_bytes.max(mipmap.retained_bytes);
+            peak.baseline_bytes = peak.baseline_bytes.max(mipmap.baseline_bytes);
+        } else {
+            self.sample_retained_capacity();
+        }
         if self.capacity_sampled {
             self.capacity_governor.observe(self.capacity_sample);
         }
@@ -888,9 +956,11 @@ impl GraphStorage {
     /// governor-selected cold family may be trimmed here after sustained low
     /// utilization or an explicit pressure request.
     pub fn clear(&mut self) {
-        let visible_capacity = self.capacity_snapshot();
-        self.capacity_governor
-            .resolve_requested_trim(visible_capacity);
+        if self.capacity_governor.needs_requested_trim_resolution() {
+            let visible_capacity = self.capacity_snapshot();
+            self.capacity_governor
+                .resolve_requested_trim(visible_capacity);
+        }
         self.passes.clear();
         self.resources.clear();
         self.execution_queue.clear();
@@ -910,7 +980,7 @@ impl GraphStorage {
         self.scene_submission_demands.clear();
         self.scene_submission_raw_demands.clear();
         self.pass_setup_active = false;
-        self.topology_compiled = false;
+        self.compile_phase = GraphCompilePhase::Building;
         self.persistent_texture_lookup.clear();
         self.history_commit_requests.clear();
         self.cache_commit_requests.clear();
@@ -922,6 +992,7 @@ impl GraphStorage {
         self.apply_pending_capacity_trim();
         self.capacity_sample = [CapacityUsage::default(); GRAPH_CAPACITY_FAMILY_COUNT];
         self.capacity_sampled = false;
+        self.frame_owner_release_phase = FrameOwnerReleasePhase::Active;
     }
 
     /// Latest terminal standalone attempt, retained independently from graph
@@ -1138,26 +1209,38 @@ impl GraphStorage {
     /// [`Self::clear`] also lets the engine's frame-attempt guard release
     /// abandoned WGPU and asset owners during unwinding instead of retaining
     /// them until the next graph is constructed.
-    pub(crate) fn release_frame_owners(&mut self) {
-        self.asset_texture_imports.clear();
-        self.asset_texture_plans.clear();
-        self.scene_buffer_imports.clear();
-        self.mipmap_batches.clear();
-        self.mipmap_encode_coordinator.clear();
-        self.prepared_bind_groups.clear();
+    pub(crate) fn release_prepare_owners(&mut self) {
+        if self.frame_owner_release_phase != FrameOwnerReleasePhase::Active {
+            return;
+        }
         self.scene_pipeline_prepare.clear();
         self.scene_source_prepare.clear();
         // Source records address resource slots owned by draw_plans, so drop
-        // those records before resetting the sibling slot tables/token.
+        // those records before resetting the sibling interface/asset tables.
         self.prepared_draws.clear();
         self.object_interfaces.clear();
         self.geometry_frames.clear();
         self.material_plans.clear();
+        self.asset_texture_plans.clear();
+        self.frame_owner_release_phase = FrameOwnerReleasePhase::PrepareReleased;
+    }
+
+    pub(crate) fn release_frame_owners(&mut self) {
+        if self.frame_owner_release_phase == FrameOwnerReleasePhase::FrameReleased {
+            return;
+        }
+        self.asset_texture_imports.clear();
+        self.scene_buffer_imports.clear();
+        self.mipmap_batches.clear();
+        self.mipmap_encode_coordinator.clear();
+        self.prepared_bind_groups.clear();
+        self.release_prepare_owners();
         self.scene_submissions.clear();
         self.draw_plans.clear();
         self.global_state_attempt.clear();
         #[cfg(feature = "3dgs")]
         self.gaussian_frame_batches.clear();
+        self.frame_owner_release_phase = FrameOwnerReleasePhase::FrameReleased;
     }
 
     /// Invalidates arena-backed runtime nodes while retaining pure topology
@@ -1331,7 +1414,7 @@ impl GraphStorage {
         .unwrap();
 
         if compact_asset_inputs && declared_asset_inputs > 0 {
-            if self.topology_compiled {
+            if self.compile_phase.topology_compiled() {
                 writeln!(
                     &mut out,
                     "    ASSET_TEXTURES_IN[\"Asset Textures<br/>declared {declared_asset_inputs} · live {live_asset_inputs}\"]:::external_in"
@@ -1690,7 +1773,7 @@ impl<'a> RenderGraph<'a> {
         debug_assert!(storage.passes.is_empty());
         debug_assert!(storage.resources.is_empty());
         debug_assert!(storage.execution_queue.is_empty());
-        debug_assert!(!storage.topology_compiled);
+        debug_assert_eq!(storage.compile_phase, GraphCompilePhase::Building);
         diagnostics.enter_phase(RdgFramePhase::BuildGraph);
         Self {
             storage,
@@ -1800,7 +1883,7 @@ impl<'a> RenderGraph<'a> {
             "render graph topology is frozen after persistent cache finalization"
         );
         assert!(
-            !self.storage.topology_compiled,
+            self.storage.compile_phase == GraphCompilePhase::Building,
             "render graph topology is frozen after compilation"
         );
     }
@@ -1885,11 +1968,31 @@ impl<'a> RenderGraph<'a> {
 
     /// Bind exact logical Asset Texture aliases to a canonical scene recipe.
     /// Passes that later demand the submission inherit ordinary RDG reads.
+    #[cfg(any(test, feature = "rdg_bench_support"))]
     pub(crate) fn set_scene_submission_texture_dependencies(
         &mut self,
         key: SceneSubmissionKey,
         dependencies: impl IntoIterator<Item = TextureNodeId>,
     ) {
+        self.begin_scene_submission_texture_dependencies(key);
+        let registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for dependency in dependencies {
+                self.push_scene_submission_texture_dependency(dependency);
+            }
+        }));
+        if let Err(payload) = registration {
+            self.storage.draw_plans.abort_texture_dependencies();
+            std::panic::resume_unwind(payload);
+        }
+        self.finish_scene_submission_texture_dependencies(key);
+    }
+
+    /// Begin one retained flat texture-dependency recipe.
+    ///
+    /// Composer uses this streaming form while it imports Material textures,
+    /// avoiding an intermediate variable-length collection before the final
+    /// DrawPlanStore arena.
+    pub(crate) fn begin_scene_submission_texture_dependencies(&mut self, key: SceneSubmissionKey) {
         self.assert_topology_mutable();
         let direct_key = key.cpu_direct_key();
         self.storage
@@ -1898,24 +2001,40 @@ impl<'a> RenderGraph<'a> {
         self.storage
             .draw_texture_dependency_scratch
             .begin(self.storage.resources.len());
-        let mut unique = SmallVec::<[TextureNodeId; 8]>::new();
-        for dependency in dependencies {
-            let resource_index = dependency.index() as usize;
-            assert!(
-                resource_index < self.storage.resources.len(),
-                "scene-submission texture dependency belongs to another graph"
-            );
-            if self
-                .storage
-                .draw_texture_dependency_scratch
-                .insert(resource_index)
-            {
-                unique.push(dependency);
-            }
-        }
         self.storage
             .draw_plans
-            .set_texture_dependencies(direct_key, unique);
+            .begin_texture_dependencies(direct_key);
+    }
+
+    /// Append one first-occurrence dependency to the active flat recipe.
+    pub(crate) fn push_scene_submission_texture_dependency(&mut self, dependency: TextureNodeId) {
+        self.assert_topology_mutable();
+        let resource_index = dependency.index() as usize;
+        assert!(
+            resource_index < self.storage.resources.len(),
+            "scene-submission texture dependency belongs to another graph"
+        );
+        // Importing this dependency may have appended a resource after the
+        // recipe began. Keep the current generation and extend only its
+        // addressable domain so earlier first-occurrence marks remain valid.
+        self.storage
+            .draw_texture_dependency_scratch
+            .extend_domain(self.storage.resources.len());
+        if self
+            .storage
+            .draw_texture_dependency_scratch
+            .insert(resource_index)
+        {
+            self.storage.draw_plans.push_texture_dependency(dependency);
+        }
+    }
+
+    /// Seal the active dependency range before any consumer reserves it.
+    pub(crate) fn finish_scene_submission_texture_dependencies(&mut self, key: SceneSubmissionKey) {
+        self.assert_topology_mutable();
+        self.storage
+            .draw_plans
+            .finish_texture_dependencies(key.cpu_direct_key());
     }
 
     /// Moves Drop-bearing WGPU request owners into persistent GraphStorage and
@@ -2287,7 +2406,7 @@ impl<'a> RenderGraph<'a> {
         registry: &mut HistoryRegistry,
     ) -> bool {
         assert!(
-            self.storage.topology_compiled,
+            self.storage.compile_phase.topology_compiled(),
             "persistent texture materialization requires a compiled graph"
         );
         if let Some(any_cache_member_touched) = self.storage.persistent_cache_finalization {
@@ -2387,7 +2506,7 @@ impl<'a> RenderGraph<'a> {
         resource_manager: &mut ResourceManager,
     ) {
         assert!(
-            self.storage.topology_compiled,
+            self.storage.compile_phase.topology_compiled(),
             "Asset Texture materialization requires a compiled graph"
         );
         let storage = &mut *self.storage;
@@ -2410,7 +2529,7 @@ impl<'a> RenderGraph<'a> {
         uploads: &mut BufferUploadContext<'_>,
     ) -> Result<(), SceneBufferMaterializationFailure> {
         assert!(
-            self.storage.topology_compiled,
+            self.storage.compile_phase.topology_compiled(),
             "Scene Buffer materialization requires a compiled graph"
         );
         self.storage.scene_buffer_imports.materialize_live(
@@ -2429,7 +2548,7 @@ impl<'a> RenderGraph<'a> {
         uploads: &mut BufferUploadContext<'_>,
     ) -> Result<(), GlobalStateMaterializationFailure> {
         assert!(
-            self.storage.topology_compiled,
+            self.storage.compile_phase.topology_compiled(),
             "Global State materialization requires a compiled graph"
         );
         self.storage
@@ -2454,15 +2573,57 @@ impl<'a> RenderGraph<'a> {
         self.storage.global_state_attempt.prepared.resource_ids()
     }
 
-    /// Owned exact BufferRefs in Group 0 binding order: camera, environment,
-    /// directional lights. They remain hidden until the whole captured batch
-    /// has been successfully materialized.
+    /// Exact Copy materialization tokens in Group 0 binding order: camera,
+    /// environment, directional lights. They remain hidden until the whole
+    /// captured batch has been successfully materialized.
     #[inline]
     #[must_use]
-    pub(crate) fn materialized_global_buffer_refs(
+    pub(crate) fn materialized_global_buffer_tokens(
         &self,
-    ) -> Option<[myth_resources::buffer::BufferRef; 3]> {
-        self.storage.global_state_attempt.materialized_buffer_refs()
+    ) -> Option<[crate::core::gpu::MaterializedBufferToken; 3]> {
+        self.storage
+            .global_state_attempt
+            .materialized_buffer_tokens()
+    }
+
+    /// Registers an external output using only its logical descriptor.
+    ///
+    /// The physical view must be supplied with
+    /// [`Self::bind_late_external_texture`] after topology compilation and
+    /// before [`Self::materialize_transient_resources`].  This is primarily
+    /// used for swap-chain images so graph construction and DPE can overlap
+    /// the wait for the previous presentation.
+    pub(crate) fn import_late_external_texture(
+        &mut self,
+        name: &'static str,
+        desc: TextureDesc,
+    ) -> TextureNodeId {
+        ResourceNodeId::from_erased(self.register_resource(
+            name,
+            ResourceKind::unbound_external_texture(desc),
+            true,
+            0,
+        ))
+    }
+
+    /// Attaches the physical view for one compiled external placeholder.
+    pub(crate) fn bind_late_external_texture(
+        &mut self,
+        id: TextureNodeId,
+        view: &Tracked<wgpu::TextureView>,
+    ) {
+        assert!(
+            self.storage.compile_phase == GraphCompilePhase::TopologyCompiled,
+            "late external texture binding requires compiled, non-materialized topology"
+        );
+        let root_idx = self.resolve_alias_root(id.index() as usize);
+        let resource = &mut self.storage.resources[root_idx];
+        assert!(
+            resource.is_external && resource.is_output_root,
+            "late external texture '{}' is not an external output root",
+            resource.name
+        );
+        resource.kind.bind_external_texture(view);
     }
 
     /// Retain the finalized persistent Group 0 bind group for this attempt.
@@ -2714,7 +2875,7 @@ impl<'a> RenderGraph<'a> {
     pub fn compile_topology(&mut self) {
         self.assert_topology_mutable();
         self.enter_diagnostics_phase(RdgFramePhase::CompileGraph);
-        self.storage.topology_compiled = true;
+        self.storage.compile_phase = GraphCompilePhase::TopologyCompiled;
         self.fold_simple_passes();
         self.build_physical_dependencies();
         self.cull_dead_passes();
@@ -2724,6 +2885,7 @@ impl<'a> RenderGraph<'a> {
         self.collect_live_scene_submission_demands();
 
         self.compute_resource_lifetimes();
+        self.compute_alias_group_lifetimes();
         let live_passes = self.storage.execution_queue.len();
         self.record_compiled_live_passes(live_passes);
     }
@@ -2731,7 +2893,38 @@ impl<'a> RenderGraph<'a> {
     pub fn compile(&mut self, pool: &mut TransientPool, device: &Device) {
         self.compile_topology();
 
+        self.materialize_transient_resources(pool, device);
+    }
+
+    /// Allocates the physical transient set selected by the already-compiled
+    /// logical graph.
+    ///
+    /// Renderer attempts call this only after their late external output has
+    /// been acquired and bound. Keeping this barrier separate from
+    /// [`Self::compile_topology`] allows CPU graph work to overlap surface
+    /// availability without performing any speculative GPU allocation.
+    pub(crate) fn materialize_transient_resources(
+        &mut self,
+        pool: &mut TransientPool,
+        device: &Device,
+    ) {
+        assert!(
+            self.storage.compile_phase == GraphCompilePhase::TopologyCompiled,
+            "transient materialization requires compiled, non-materialized topology"
+        );
+        assert!(
+            self.storage
+                .resources
+                .iter()
+                .all(|resource| !resource.is_unbound_external_texture()),
+            "compiled graph still contains an unbound external texture"
+        );
+        self.storage.compile_phase = GraphCompilePhase::PhysicalMaterialized;
         self.enter_diagnostics_phase(RdgFramePhase::MaterializeResources);
+        #[cfg(feature = "rdg_bench_support")]
+        let _timing = self
+            .renderer_diagnostics
+            .map(|diagnostics| diagnostics.detail_timer(RdgDetailPhase::TransientResources));
         self.allocate_physical_resources(pool, device);
     }
 
@@ -3014,6 +3207,9 @@ impl<'a> RenderGraph<'a> {
     /// missing or late derived producer during topology compilation instead of
     /// allowing a resolver panic deep in prepare/execute.
     fn validate_live_asset_texture_dependencies(&self) {
+        if !self.storage.asset_texture_imports.has_imports() {
+            return;
+        }
         for pass_idx in 0..self.storage.passes.len() {
             let pass = &self.storage.passes[pass_idx];
             if pass.reference_count == 0 {
@@ -3327,23 +3523,12 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
-    /// Allocates physical GPU textures for transient resources, with
-    /// alias-aware sharing.
+    /// Unifies alias lifetimes while compilation is still CPU-only.
     ///
-    /// **Phase 1** — Calculate the unified lifetime for each alias group by propagating the
-    /// lifetimes from aliases to their root resources.This ensures that the root resource's lifetime encompasses all of its aliases, preventing premature deallocation of shared physical resources.
-    ///
-    /// **Phase 2** — Propagate the root's unified lifetime back to every alias.\
-    /// This ensures that the execute-phase `StoreOp` deduction sees the correct final lifetime and never discards data prematurely for intermediate versions.
-    ///
-    /// **Phase 3** — Request physical allocations from the pool for root resources.
-    /// Aliases will be skipped since they share the same physical memory.
-    ///
-    /// **Phase 4** — Propagate the root's unified `last_use` back to every alias.\
-    /// This ensures that the execute-phase `LoadOp` deduction sees the correct lifetime and keeps the physical memory alive for the entire duration of all aliases.    
-    fn allocate_physical_resources(&mut self, pool: &mut TransientPool, device: &Device) {
-        pool.begin_frame();
-
+    /// Root lifetimes encompass every SSA alias, and the unified interval is
+    /// then copied back so execute-time load/store deduction observes one
+    /// coherent physical lifetime.
+    fn compute_alias_group_lifetimes(&mut self) {
         for i in 0..self.storage.resources.len() {
             if self.storage.resources[i].alias_of.is_some() {
                 let root_idx = self.resolve_alias_root(i);
@@ -3363,6 +3548,12 @@ impl<'a> RenderGraph<'a> {
                 self.storage.resources[i].last_use = self.storage.resources[root_idx].last_use;
             }
         }
+    }
+
+    /// Allocates physical GPU resources for live transient roots and shares
+    /// each allocation with its precompiled alias group.
+    fn allocate_physical_resources(&mut self, pool: &mut TransientPool, device: &Device) {
+        pool.begin_frame();
 
         for i in 0..self.storage.resources.len() {
             let res = &mut self.storage.resources[i];
@@ -3453,7 +3644,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::core::gpu::snapshot_asset_texture;
+    use crate::core::gpu::{PhysicalImageId, snapshot_asset_texture};
     use crate::core::{ResourceManager, WgpuContext};
     use crate::graph::RdgAttemptOutcome;
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
@@ -3576,6 +3767,66 @@ mod tests {
     }
 
     #[test]
+    fn successful_owner_release_boundaries_are_idempotent_across_the_next_clear() {
+        let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            1,
+            1,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![255; 4]),
+        ));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("early prepare owner"), image));
+        let mut storage = GraphStorage::new();
+        storage.asset_texture_plans.request(texture);
+        storage.asset_texture_plans.capture_requested(&assets);
+
+        storage.release_prepare_owners();
+        assert_eq!(
+            storage.frame_owner_release_phase,
+            FrameOwnerReleasePhase::PrepareReleased
+        );
+        assert!(storage.asset_texture_plans.is_empty());
+
+        let before_full_release = storage.prepared_bind_groups.attempt_token();
+        storage.release_frame_owners();
+        let after_full_release = storage.prepared_bind_groups.attempt_token();
+        assert_ne!(after_full_release, before_full_release);
+        assert_eq!(
+            storage.frame_owner_release_phase,
+            FrameOwnerReleasePhase::FrameReleased
+        );
+
+        storage.release_frame_owners();
+        assert_eq!(
+            storage.prepared_bind_groups.attempt_token(),
+            after_full_release,
+            "the Drop fallback must not advance an already-released attempt twice"
+        );
+
+        storage.clear();
+        assert_eq!(
+            storage.prepared_bind_groups.attempt_token(),
+            after_full_release,
+            "the next maintenance boundary must reuse the token established by Drop"
+        );
+        assert_eq!(
+            storage.frame_owner_release_phase,
+            FrameOwnerReleasePhase::Active
+        );
+
+        storage.release_frame_owners();
+        assert_ne!(
+            storage.prepared_bind_groups.attempt_token(),
+            after_full_release,
+            "the newly opened attempt still needs its own terminal release"
+        );
+    }
+
+    #[test]
     fn cold_capacity_hysteresis_schedules_but_does_not_trim_inside_an_attempt() {
         let mut storage = GraphStorage::new();
         storage.capacity_governor = CapacityGovernor::new(crate::graph::capacity::CapacityPolicy {
@@ -3625,6 +3876,38 @@ mod tests {
     }
 
     #[test]
+    fn drop_capacity_tail_sample_preserves_execute_time_mipmap_growth() {
+        let mut storage = GraphStorage::new();
+        storage.sample_retained_capacity();
+
+        let physical = PhysicalImageId::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001));
+        assert!(
+            storage
+                .mipmap_encode_coordinator
+                .try_claim(PhysicalImageGenerationKey {
+                    physical,
+                    allocation: 7,
+                    generation: 11,
+                })
+        );
+        let execute_tail_active = storage
+            .capacity_snapshot()
+            .iter()
+            .map(|usage| usage.active_bytes)
+            .sum::<usize>();
+
+        storage.finish_retained_capacity_sample();
+
+        assert!(
+            storage
+                .retained_capacity_stats()
+                .last_attempt_active_bytes()
+                >= execute_tail_active,
+            "mipmap claims created after the prepare-time sample must remain visible"
+        );
+    }
+
+    #[test]
     fn release_frame_owners_clears_interned_draw_plan_resources() {
         let wgpu = pollster::block_on(WgpuContext::new_headless(
             &RendererInitConfig::default(),
@@ -3667,24 +3950,27 @@ mod tests {
         assert_eq!(storage.draw_plans.buffer_owner_count(), 1);
         assert_eq!(storage.draw_plans.bind_group_owner_count(), 1);
 
-        storage.prepared_draws.begin_sources(1);
-        let frame_source = crate::graph::frame::FrameSourceId::from_index(1_000_000);
-        let prepared_source = storage.prepared_draws.insert_source(
-            frame_source,
-            crate::graph::frame::PreparedDrawSource {
-                geometry: crate::graph::asset_frame::GeometryFrameId::from_index(0),
-                material: crate::graph::material_plan::MaterialFrameId::from_index(0),
-                object_interface: crate::graph::asset_frame::ObjectInterfaceId::from_index(0),
-                material_bind_group: bind_group_slot,
-                object_bind_group: (bind_group_slot, 0),
-            },
-        );
+        storage.prepared_draws.begin_sources(1, 1);
+        let frame_source = crate::graph::frame::FrameSourceId::from_index(0);
+        let prepared_source =
+            storage
+                .prepared_draws
+                .insert_source(crate::graph::frame::PreparedDrawSource {
+                    frame_source,
+                    extracted_source: crate::graph::frame::ExtractedSourceId::from_index(7),
+                    geometry: crate::graph::asset_frame::GeometryFrameId::from_index(0),
+                    material: crate::graph::material_plan::MaterialFrameId::from_index(0),
+                    object_interface: crate::graph::asset_frame::ObjectInterfaceId::from_index(0),
+                    material_bind_group: bind_group_slot,
+                    object_bind_group: (bind_group_slot, 0),
+                    commits_morph_history: false,
+                });
         assert_eq!(prepared_source.index(), 0);
         assert!(storage.prepared_draws.source(prepared_source).is_some());
         assert_eq!(
             storage.prepared_draws.prepared_source_id(frame_source),
             Some(prepared_source),
-            "a sparse frame ID must occupy one dense prepared slot"
+            "a frame ID must occupy one dense prepared slot"
         );
 
         let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
@@ -3731,7 +4017,7 @@ mod tests {
         assert!(storage.material_plans.is_empty());
         // clear() resets the one-shot initialization barrier for a new graph
         // attempt while retaining capacity.
-        storage.prepared_draws.begin_sources(1);
+        storage.prepared_draws.begin_sources(1, 1);
         assert!(storage.draw_plans.is_empty());
         assert!(storage.global_state_attempt.prepared.is_empty());
         assert!(storage.draw_plans.resolve_plan(plan).is_none());
@@ -3790,6 +4076,61 @@ mod tests {
         storage.clear();
         storage.clear();
         assert_eq!(storage.latest_diagnostics(), Some(submitted));
+    }
+
+    #[test]
+    fn late_external_texture_is_bound_only_after_logical_compilation() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let view = Tracked::with_id(
+            wgpu.headless_texture
+                .as_ref()
+                .expect("headless target missing")
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+            41,
+        );
+        let desc = TextureDesc::new_2d(
+            8,
+            8,
+            wgpu.surface_view_format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut pool = TransientPool::new();
+
+        {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            let output = graph.import_late_external_texture("Late_Output", desc);
+            assert!(graph.storage.resources[output.index() as usize].is_unbound_external_texture());
+
+            graph.compile_topology();
+            assert_eq!(graph.diagnostics().live_passes(), Some(0));
+            assert!(
+                graph.storage.resources[output.index() as usize]
+                    .external_texture_ptr()
+                    .is_none()
+            );
+
+            graph.bind_late_external_texture(output, &view);
+            assert_eq!(
+                graph.storage.resources[output.index() as usize].external_texture_ptr(),
+                Some(std::ptr::from_ref(&view))
+            );
+            graph.materialize_transient_resources(&mut pool, &wgpu.device);
+            graph.finish();
+        }
+
+        assert_eq!(
+            storage.latest_diagnostics().unwrap().outcome(),
+            RdgAttemptOutcome::CompletedWithoutSubmission
+        );
     }
 
     #[test]
@@ -4564,6 +4905,14 @@ mod tests {
         assert_eq!(scratch.stamps.len(), 64, "the dense domain must not shrink");
         assert_eq!(scratch.stamps.capacity(), capacity);
         assert!(scratch.insert(7));
+
+        scratch.extend_domain(96);
+        assert_eq!(scratch.active_len, 96);
+        assert!(scratch.insert(95));
+        assert!(
+            !scratch.insert(7),
+            "extending one open operation must preserve earlier marks"
+        );
 
         scratch.generation = u32::MAX;
         scratch.stamps[7] = 1;
@@ -5372,6 +5721,97 @@ mod tests {
         assert!(
             !resource_manager.asset_snapshot_mipmaps_submitted(live_snapshot),
             "the next graph must retry the unsubmitted logical mip producer"
+        );
+    }
+
+    #[test]
+    fn exact_resident_asset_texture_reuses_generation_after_selected_postflight() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resource_manager = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![19; 8 * 8 * 4]),
+        ));
+        let mut texture_asset = Texture::new_2d(Some("resident graph asset"), image);
+        texture_asset.generate_mipmaps = true;
+        let texture = assets.textures.add(texture_asset);
+        let snapshot = snapshot_asset_texture(&assets, texture).expect("snapshot missing");
+        assert!(
+            resource_manager
+                .materialize_asset_texture_for_graph(&assets, snapshot)
+                .texture
+                .is_some()
+        );
+        let resident_before = resource_manager
+            .exact_asset_texture_residency(snapshot)
+            .expect("initial materialization must be exactly resident");
+        let binding_before = *resource_manager
+            .get_texture_binding(texture)
+            .expect("initial binding missing");
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let owner_plan = graph.storage.asset_texture_plans.request(texture);
+        graph.storage.asset_texture_plans.capture_requested(&assets);
+        let imported = graph.import_planned_asset_texture("Resident_Asset", owner_plan, snapshot);
+        graph.add_pass("Resident_Asset_Consumer", |builder| {
+            builder.read_texture(imported);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+
+        {
+            let storage = &mut *graph.storage;
+            storage.asset_texture_imports.materialize_live_with_hook(
+                &storage.resources,
+                &mut storage.asset_texture_plans,
+                &assets,
+                &mut resource_manager,
+                |resource_manager| {
+                    let binding = resource_manager
+                        .get_texture_binding(texture)
+                        .expect("resident precheck must not remove the binding");
+                    assert_eq!(*binding, binding_before);
+                },
+            );
+        }
+
+        assert_eq!(graph.storage.asset_texture_imports.resident_hit_count(), 1);
+        let import = graph.storage.resources[imported.index() as usize]
+            .asset_texture_import_id()
+            .unwrap();
+        assert!(
+            graph
+                .storage
+                .asset_texture_imports
+                .resolver()
+                .view(import)
+                .is_some()
+        );
+        let resident_after = resource_manager
+            .exact_asset_texture_residency(snapshot)
+            .expect("resident reuse lost the exact logical binding");
+        assert_eq!(resident_after, resident_before);
+        assert_eq!(
+            *resource_manager
+                .get_texture_binding(texture)
+                .expect("resident binding disappeared"),
+            binding_before,
+            "warm reuse must not republish the persistent binding"
         );
     }
 

@@ -840,6 +840,17 @@ fn gen_renderable_trait(def: &MaterialDef) -> TokenStream {
                 visitor(guard.as_bytes());
             }
 
+            fn canonical_binding_stamp(
+                &self,
+            ) -> Option<#cr::material::CanonicalMaterialBindingStamp> {
+                Some(#cr::material::CanonicalMaterialBindingStamp {
+                    topology_epoch: self.version.load(
+                        std::sync::atomic::Ordering::Relaxed,
+                    ),
+                    uniform: self.uniforms.stamp(),
+                })
+            }
+
             fn shader_defines(&self) -> #cr::shader_defines::ShaderDefines {
                 let mut defines = #cr::shader_defines::ShaderDefines::new();
                 #shader_defines_texture_code

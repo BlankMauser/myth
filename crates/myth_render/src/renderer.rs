@@ -1167,27 +1167,92 @@ impl Renderer {
 mod tests {
     use super::*;
 
+    use crate::graph::core::scene_submission::SceneSubmissionPlanId;
     use crate::graph::core::{
         ExecuteContext, GraphBlackboard, HookStage, PassNode, RdgAttemptOutcome, RdgFramePhase,
-        RdgRenderTargetKind, RdgSurfaceAcquireFailure, TextureDesc,
+        RdgRenderTargetKind, RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
+        TextureDesc,
     };
     use glam::{Affine3A, Quat, Vec3, Vec4};
-    use myth_assets::{AssetServer, SceneExt};
-    use myth_core::SkeletonKey;
+    use myth_assets::{AssetServer, MaterialHandle, SceneExt};
+    use myth_core::{NodeHandle, SkeletonKey};
     #[cfg(feature = "3dgs")]
     use myth_resources::gaussian_splat::{GaussianCloud, GaussianSHCoefficients, GaussianSplat};
+    use myth_resources::geometry::{Attribute, Geometry, VertexFormat};
     use myth_resources::image::{ColorSpace, Image, ImageDimension, PixelFormat};
-    use myth_resources::material::PhysicalMaterial;
+    use myth_resources::material::{PhysicalFeatures, PhysicalMaterial};
     use myth_resources::texture::{Texture, TextureSource};
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
     use myth_scene::light::Light;
+    use myth_scene::skeleton::Skeleton;
     use myth_scene::{BindMode, Scene};
 
     struct DepthOnlyTestRoot;
 
     impl PassNode<'_> for DepthOnlyTestRoot {
         fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    struct MaterialEpochGateTestRoot<'a> {
+        drift_material: Option<MaterialHandle>,
+        opaque_submission: SceneSubmissionPlanId,
+        prepass_submission: SceneSubmissionPlanId,
+        opaque_command_count: &'a std::sync::atomic::AtomicUsize,
+        prepass_command_count: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> PassNode<'a> for MaterialEpochGateTestRoot<'a> {
+        fn prepare(&mut self, ctx: &mut crate::graph::core::PrepareContext<'_>) {
+            let Some(material_handle) = self.drift_material else {
+                return;
+            };
+            let material = ctx
+                .assets
+                .materials
+                .get(material_handle)
+                .expect("test material missing during live prepare");
+            let physical = material
+                .as_physical()
+                .expect("epoch-drift test requires a physical material");
+            let previous_epoch = material.as_renderable().version();
+            physical.enable_feature(PhysicalFeatures::CLEARCOAT);
+            assert_ne!(
+                material.as_renderable().version(),
+                previous_epoch,
+                "the test seam must mutate the physical material interior epoch"
+            );
+        }
+
+        fn execute(&self, ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {
+            let opaque_stream = ctx.scene_submissions.stream(self.opaque_submission);
+            let prepass_stream = ctx.scene_submissions.stream(self.prepass_submission);
+            self.opaque_command_count.store(
+                ctx.scene_submissions.commands(opaque_stream).len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.prepass_command_count.store(
+                ctx.scene_submissions.commands(prepass_stream).len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn scene_submission_for_test_pass(
+        graph: &crate::graph::core::RenderGraph<'_>,
+        pass_name: &str,
+    ) -> SceneSubmissionPlanId {
+        let pass_index = graph
+            .storage
+            .passes
+            .iter()
+            .position(|pass| pass.name == pass_name)
+            .unwrap_or_else(|| panic!("{pass_name} missing during graph construction"));
+        *graph
+            .storage
+            .pass_scene_submission_demands(pass_index)
+            .first()
+            .unwrap_or_else(|| panic!("{pass_name} has no scene submission demand"))
     }
 
     fn init_headless_renderer() -> Renderer {
@@ -1215,6 +1280,27 @@ mod tests {
         let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
         camera.update_view_projection(&Affine3A::from_translation(Vec3::new(0.0, 0.0, 5.0)));
         camera.extract_render_camera()
+    }
+
+    fn spawn_test_morph_box(scene: &mut Scene, assets: &AssetServer) -> NodeHandle {
+        let mut geometry = Geometry::new_box(1.0, 1.0, 1.0);
+        let vertex_count = geometry
+            .get_attribute("position")
+            .expect("box position attribute missing")
+            .count as usize;
+        geometry.add_morph_attribute(
+            "position",
+            Attribute::new_planar(&vec![Vec3::ZERO; vertex_count], VertexFormat::Float32x3),
+        );
+        geometry.build_morph_storage_buffers();
+        assert!(geometry.has_morph_targets());
+        let mesh_node = scene.spawn(geometry, PhysicalMaterial::new(Vec4::ONE), assets);
+        scene
+            .meshes
+            .get_mut(mesh_node)
+            .expect("morph mesh missing")
+            .init_morph_targets(1, vertex_count as u32);
+        mesh_node
     }
 
     fn assert_local_light_buffers_unmaterialized(state: &RendererState) {
@@ -1619,8 +1705,52 @@ mod tests {
             RdgAttemptOutcome::SurfaceAcquisitionFailed(RdgSurfaceAcquireFailure::Timeout)
         );
         assert_eq!(diagnostics.phase(), RdgFramePhase::AcquireTarget);
-        assert_eq!(diagnostics.declared_passes(), 0);
-        assert_eq!(diagnostics.live_passes(), None);
+        assert!(diagnostics.declared_passes() > 0);
+        assert!(diagnostics.live_passes().is_some());
+        assert_eq!(diagnostics.prepared_passes(), 0);
+        assert_eq!(diagnostics.executed_passes(), 0);
+        assert_eq!(diagnostics.target(), None);
+        assert!(!diagnostics.queue_submitted());
+    }
+
+    #[test]
+    fn late_headless_target_descriptor_drift_aborts_before_materialization() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        renderer.size.0 += 1;
+
+        renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    frame_count: 32,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("frame composer missing")
+            .render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_global_state_unmaterialized(state, scene.id());
+        assert_local_light_buffers_unmaterialized(state);
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("descriptor-drift diagnostics missing");
+        assert_eq!(
+            diagnostics.outcome(),
+            RdgAttemptOutcome::ResourceMaterializationFailed(
+                RdgResourceMaterializationFailure::RenderTargetDescriptorDrift,
+            )
+        );
+        assert_eq!(diagnostics.phase(), RdgFramePhase::AcquireTarget);
+        assert!(diagnostics.declared_passes() > 0);
+        assert!(diagnostics.live_passes().is_some());
+        assert_eq!(diagnostics.prepared_passes(), 0);
+        assert_eq!(diagnostics.executed_passes(), 0);
+        assert_eq!(diagnostics.target(), None);
         assert!(!diagnostics.queue_submitted());
     }
 
@@ -3780,14 +3910,166 @@ mod tests {
     }
 
     #[test]
+    fn post_prepass_material_epoch_drift_rejects_shared_direct_streams_and_l1() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let material_handle = scene.meshes.get(mesh).expect("test mesh missing").material;
+        let captured_epoch = assets
+            .materials
+            .get(material_handle)
+            .expect("test material missing")
+            .as_renderable()
+            .version();
+        let initial_prepass_l1_count = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .prepass
+            .cached_pipeline_count();
+        let drifted_opaque_command_count = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let drifted_prepass_command_count = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let drifted_opaque_command_count_ref = &drifted_opaque_command_count;
+        let drifted_prepass_command_count_ref = &drifted_prepass_command_count;
+
+        renderer
+            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
+            .expect("frame composer must exist")
+            .add_custom_pass(HookStage::BeforePostProcess, move |graph, blackboard| {
+                let scene_depth = blackboard
+                    .scene_depth
+                    .expect("HighFidelity graph must publish Prepass depth");
+                let opaque_submission = scene_submission_for_test_pass(graph, "Opaque_Pass");
+                let prepass_submission = scene_submission_for_test_pass(graph, "Pre_Pass");
+                graph.add_pass("Material_Epoch_Drift_Test", |builder| {
+                    builder.read_texture(scene_depth);
+                    builder.mark_side_effect();
+                    (
+                        MaterialEpochGateTestRoot {
+                            drift_material: Some(material_handle),
+                            opaque_submission,
+                            prepass_submission,
+                            opaque_command_count: drifted_opaque_command_count_ref,
+                            prepass_command_count: drifted_prepass_command_count_ref,
+                        },
+                        (),
+                    )
+                });
+                blackboard
+            })
+            .render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let execution_names: Vec<_> = state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| state.graph_storage.passes[index].name)
+            .collect();
+        let prepass_position = execution_names
+            .iter()
+            .position(|&name| name == "Pre_Pass")
+            .expect("Prepass must remain DPE-live");
+        let drift_position = execution_names
+            .iter()
+            .position(|&name| name == "Material_Epoch_Drift_Test")
+            .expect("the side-effect epoch-drift pass must remain DPE-live");
+        assert!(
+            prepass_position < drift_position,
+            "the test mutation must occur after Prepass gathered its recipe"
+        );
+        assert!(
+            execution_names.contains(&"Opaque_Pass"),
+            "the shared Opaque plan must remain DPE-live"
+        );
+        assert_ne!(
+            assets
+                .materials
+                .get(material_handle)
+                .expect("test material missing after drift")
+                .as_renderable()
+                .version(),
+            captured_epoch
+        );
+        assert_eq!(
+            state.prepass.cached_pipeline_count(),
+            initial_prepass_l1_count,
+            "a rejected final epoch must not publish the speculative Prepass pipeline into L1"
+        );
+        assert_eq!(
+            drifted_opaque_command_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the final source gate must fail the Opaque stream closed"
+        );
+        assert_eq!(
+            drifted_prepass_command_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the final source gate must fail the already-gathered Prepass stream closed"
+        );
+
+        let recovered_opaque_command_count = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let recovered_prepass_command_count = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let recovered_opaque_command_count_ref = &recovered_opaque_command_count;
+        let recovered_prepass_command_count_ref = &recovered_prepass_command_count;
+        renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    frame_count: 1,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("recovery frame composer must exist")
+            .add_custom_pass(HookStage::BeforePostProcess, move |graph, blackboard| {
+                let scene_depth = blackboard
+                    .scene_depth
+                    .expect("HighFidelity graph must publish Prepass depth");
+                let opaque_submission = scene_submission_for_test_pass(graph, "Opaque_Pass");
+                let prepass_submission = scene_submission_for_test_pass(graph, "Pre_Pass");
+                graph.add_pass("Material_Epoch_Recovery_Probe", |builder| {
+                    builder.read_texture(scene_depth);
+                    builder.mark_side_effect();
+                    (
+                        MaterialEpochGateTestRoot {
+                            drift_material: None,
+                            opaque_submission,
+                            prepass_submission,
+                            opaque_command_count: recovered_opaque_command_count_ref,
+                            prepass_command_count: recovered_prepass_command_count_ref,
+                        },
+                        (),
+                    )
+                });
+                blackboard
+            })
+            .render();
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(
+            state.prepass.cached_pipeline_count() > initial_prepass_l1_count,
+            "the next coherent attempt must publish the recovered Prepass L1"
+        );
+        assert_eq!(
+            recovered_opaque_command_count.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            recovered_prepass_command_count.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn abandoned_composer_does_not_commit_morph_history() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
-        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let mesh_node = spawn_test_morph_box(&mut scene, &assets);
         {
             let mesh = scene.meshes.get_mut(mesh_node).expect("test mesh missing");
-            mesh.init_morph_targets(1, 1);
             mesh.set_morph_target_influence(0, 1.0);
         }
 
@@ -3829,8 +4111,8 @@ mod tests {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
-        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        spawn_test_morph_box(&mut scene, &assets);
+        spawn_test_morph_box(&mut scene, &assets);
         let mut extraction_order = scene.meshes.iter().map(|(node, _)| node);
         let culled_node = extraction_order.next().expect("first test mesh missing");
         let visible_node = extraction_order.next().expect("second test mesh missing");
@@ -3838,7 +4120,6 @@ mod tests {
         scene.node(&culled_node).set_position(1_000_000.0, 0.0, 0.0);
         for (node, influence) in [(culled_node, 0.25), (visible_node, 1.0)] {
             let mesh = scene.meshes.get_mut(node).expect("test mesh missing");
-            mesh.init_morph_targets(1, 1);
             mesh.set_morph_target_influence(0, influence);
         }
         scene.update_matrix_world();
@@ -3903,8 +4184,145 @@ mod tests {
             .expect("render item missing");
         assert!(item.skeleton.is_none());
         assert_eq!(item.item_variant_flags & (1 << 1), 0);
-        assert!(!item.item_shader_defines.contains("HAS_SKINNING"));
+        assert!(!item.item_shader_defines().contains("HAS_SKINNING"));
         assert_eq!(state.render_lists.opaque.len(), 1);
+    }
+
+    #[test]
+    fn distinct_rigid_meshes_share_the_model_only_group2_l0_and_warm_bind_group() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let box_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let material = scene
+            .meshes
+            .get(box_node)
+            .expect("box mesh missing")
+            .material;
+        let sphere_node = scene.spawn_sphere(0.5, material, &assets);
+        scene.node(&box_node).set_position(-0.75, 0.0, 0.0);
+        scene.node(&sphere_node).set_position(0.75, 0.0, 0.0);
+        scene.update_matrix_world();
+        let rigid_morph_buffer_ids = [
+            scene
+                .meshes
+                .get(box_node)
+                .expect("box mesh missing")
+                .morph_uniforms
+                .id(),
+            scene
+                .meshes
+                .get(sphere_node)
+                .expect("sphere mesh missing")
+                .morph_uniforms
+                .id(),
+        ];
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.render_lists.opaque.len(), 2);
+        assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 1);
+        assert_eq!(
+            state.resource_manager.cached_object_bind_group_ids().len(),
+            1
+        );
+        assert!(
+            state.resource_manager.rigid_object_bind_group_l0_hits() > 0,
+            "the second distinct rigid mesh must share the first model-only Group 2"
+        );
+        for morph_buffer_id in rigid_morph_buffer_ids {
+            assert!(
+                state
+                    .resource_manager
+                    .get_gpu_buffer_by_cpu_id(morph_buffer_id)
+                    .is_none(),
+                "a rigid mesh must not materialize its unused empty morph uniform"
+            );
+        }
+        let hits_before = state.resource_manager.rigid_object_bind_group_l0_hits();
+        let uploads_before = state.resource_manager.model_buffer_upload_count();
+        let bind_groups_before = state.resource_manager.cached_object_bind_group_ids();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(
+            state.resource_manager.rigid_object_bind_group_l0_hits() > hits_before,
+            "the stable rigid source must bypass ResourceBuilder on its warm frame"
+        );
+        assert_eq!(
+            state.resource_manager.cached_object_bind_group_ids(),
+            bind_groups_before,
+            "an L0 hit must retain the exact persistent BindGroup owner"
+        );
+        assert_eq!(
+            state.resource_manager.model_buffer_upload_count(),
+            uploads_before,
+            "an identical static model stream must not enqueue a redundant queue write"
+        );
+    }
+
+    #[test]
+    fn morph_object_preserves_its_full_group2_recipe_and_bypasses_rigid_l0() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = spawn_test_morph_box(&mut scene, &assets);
+        let morph_buffer_id = scene
+            .meshes
+            .get(mesh_node)
+            .expect("morph mesh missing")
+            .morph_uniforms
+            .id();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.render_lists.opaque.len(), 1);
+        assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 0);
+        assert!(
+            state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(morph_buffer_id)
+                .is_some(),
+            "a morph draw must retain and materialize its morph uniform binding"
+        );
+    }
+
+    #[test]
+    fn skinned_object_preserves_its_full_group2_recipe_and_bypasses_rigid_l0() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+        let morph_buffer_id = scene
+            .meshes
+            .get(mesh_node)
+            .expect("skinned mesh missing")
+            .morph_uniforms
+            .id();
+        let bone = scene.create_node();
+        let skeleton = Skeleton::new(
+            "Rigid L0 Isolation Skeleton",
+            vec![bone],
+            vec![Affine3A::IDENTITY],
+            0,
+        );
+        let skeleton_key = scene.add_skeleton(skeleton);
+        scene.bind_skeleton(mesh_node, skeleton_key, BindMode::Attached);
+        scene.update_matrix_world();
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert_eq!(state.render_lists.opaque.len(), 1);
+        assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 0);
+        assert!(
+            state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(morph_buffer_id)
+                .is_some(),
+            "the skinned recipe must preserve its existing morph uniform binding"
+        );
     }
 
     #[test]
@@ -3940,6 +4358,12 @@ mod tests {
             .expect("model buffer missing");
         let old_model_physical_id = model_buffer.id;
         let old_model_size = model_buffer.size;
+        let old_upload_count = state.resource_manager.model_buffer_upload_count();
+        assert!(
+            state
+                .resource_manager
+                .rigid_object_bind_group_l0_contains_model(old_model_physical_id)
+        );
 
         for _ in 0..4 {
             scene.add_mesh(template.clone());
@@ -3956,6 +4380,16 @@ mod tests {
             .expect("resized model buffer missing");
         assert!(model_buffer.size > old_model_size);
         assert_ne!(model_buffer.id, old_model_physical_id);
+        assert!(
+            state.resource_manager.model_buffer_upload_count() > old_upload_count,
+            "a resized and expanded model stream must upload the new exact payload"
+        );
+        assert!(
+            !state
+                .resource_manager
+                .rigid_object_bind_group_l0_contains_model(old_model_physical_id),
+            "model-buffer resize must invalidate non-owning L0 entries"
+        );
         for old_object_bind_group_id in &old_object_bind_group_ids {
             assert!(
                 state
@@ -4017,6 +4451,7 @@ mod tests {
                 .is_none(),
             "object cache TTL must release contexts owning stale physical buffers"
         );
+        assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 0);
 
         state.resource_manager.flush_model_buffers();
         let recreated = state

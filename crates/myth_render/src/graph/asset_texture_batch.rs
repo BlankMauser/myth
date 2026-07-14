@@ -14,7 +14,9 @@ use myth_assets::{AssetServer, AssetSnapshot, ImageHandle, TextureHandle};
 use myth_resources::{image::Image, texture::Texture};
 use rustc_hash::FxHashMap;
 
-use crate::core::gpu::{AssetTextureSnapshot, AssetTextureStateSnapshot};
+use crate::core::gpu::{
+    AssetTexturePhysicalBinding, AssetTextureSnapshot, AssetTextureStateSnapshot,
+};
 
 use super::capacity::{
     CapacityUsage, estimated_hash_map_footprint, shrink_hash_map_by_family_ratio,
@@ -126,12 +128,28 @@ impl SelectedImageSparseLookup {
 struct AssetTextureBatchRecord {
     image: Option<AssetImageSnapshotId>,
     state: AssetTextureStateSnapshot,
+    /// Exact graph-attempt physical result published by the canonical lazy
+    /// import. `None` is also the deliberate result for unavailable or
+    /// rejected materialization.
+    physical_binding: Option<AssetTexturePhysicalBinding>,
+    physical_published: bool,
 }
 
 #[derive(Clone, Copy)]
 enum SelectedPostflightState {
     ReadyOnly,
     Complete,
+}
+
+/// Exact mutation epochs surrounding the full retained T -> I -> T capture.
+///
+/// This is only an invalidation token. Once either storage changes, selected
+/// postflights fall back to the complete per-entry validation path; epoch
+/// equality never repairs or replaces a stale retained owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AssetTextureStorageEpochs {
+    textures: u64,
+    images: u64,
 }
 
 /// One graph-attempt table of exact Texture and Image owners.
@@ -167,6 +185,7 @@ pub(crate) struct AssetTextureBatch {
     selected_texture_current_before_images: Vec<bool>,
     selected_image_current: Vec<bool>,
     selected_current: Vec<bool>,
+    stable_storage_epochs: Option<AssetTextureStorageEpochs>,
     initialized: bool,
 }
 
@@ -193,6 +212,7 @@ impl AssetTextureBatch {
             ),
             selected_image_current: Vec::with_capacity(ASSET_TEXTURE_BATCH_BASELINE),
             selected_current: Vec::with_capacity(ASSET_TEXTURE_BATCH_BASELINE),
+            stable_storage_epochs: None,
             initialized: false,
         }
     }
@@ -322,6 +342,8 @@ impl AssetTextureBatch {
     }
 
     fn refresh_current(&mut self, assets: &AssetServer) {
+        let texture_epoch_before = assets.textures.global_version();
+        let image_epoch_before = assets.images.global_version();
         assets.textures.revalidate_batched(
             &self.texture_snapshots,
             &mut self.texture_current_before_images,
@@ -336,6 +358,18 @@ impl AssetTextureBatch {
         for index in 0..self.records.len() {
             self.texture_current[index] = self.record_matches_validation(index);
         }
+
+        // Read in reverse order so both storage epochs bracket the complete
+        // cross-storage validation. A writer announces its mutation before
+        // touching a slot, so equality proves no write started in the window.
+        let image_epoch_after = assets.images.global_version();
+        let texture_epoch_after = assets.textures.global_version();
+        self.stable_storage_epochs = (texture_epoch_before == texture_epoch_after
+            && image_epoch_before == image_epoch_after)
+            .then_some(AssetTextureStorageEpochs {
+                textures: texture_epoch_after,
+                images: image_epoch_after,
+            });
     }
 
     fn derive_record(
@@ -346,6 +380,8 @@ impl AssetTextureBatch {
         let Some(texture) = texture_snapshot.loaded() else {
             return AssetTextureBatchRecord {
                 image: None,
+                physical_binding: None,
+                physical_published: false,
                 state: AssetTextureStateSnapshot {
                     texture_handle,
                     texture_version: None,
@@ -370,6 +406,8 @@ impl AssetTextureBatch {
         let Some(image) = image_snapshot.loaded() else {
             return AssetTextureBatchRecord {
                 image: Some(image_id),
+                physical_binding: None,
+                physical_published: false,
                 state: AssetTextureStateSnapshot {
                     texture_handle,
                     texture_version: Some(texture.version()),
@@ -393,6 +431,8 @@ impl AssetTextureBatch {
         );
         AssetTextureBatchRecord {
             image: Some(image_id),
+            physical_binding: None,
+            physical_published: false,
             state: AssetTextureStateSnapshot {
                 texture_handle,
                 texture_version: Some(texture.version()),
@@ -421,6 +461,47 @@ impl AssetTextureBatch {
             .then_some(self.records.get(id.index())?.state)
     }
 
+    /// Publish the exact physical view/sampler selected by this attempt's
+    /// canonical Asset Texture import.
+    ///
+    /// The logical ready snapshot must match the retained owner record. The
+    /// import phase owns the sole write; later Material preparation reads this
+    /// Copy token instead of reopening ResourceManager residency dictionaries.
+    pub(crate) fn publish_physical_binding(
+        &mut self,
+        id: AssetTextureBatchId,
+        expected: AssetTextureSnapshot,
+        binding: Option<AssetTexturePhysicalBinding>,
+    ) {
+        let record = self
+            .records
+            .get_mut(id.index())
+            .expect("asset texture physical result has an invalid owner plan");
+        assert_eq!(
+            record.state.ready,
+            Some(expected),
+            "asset texture physical result does not match its retained snapshot"
+        );
+        assert!(
+            !record.physical_published,
+            "asset texture physical result was published twice"
+        );
+        record.physical_binding = binding;
+        record.physical_published = true;
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn physical_binding(
+        &self,
+        id: AssetTextureBatchId,
+    ) -> Option<AssetTexturePhysicalBinding> {
+        self.records
+            .get(id.index())
+            .filter(|record| record.physical_published)?
+            .physical_binding
+    }
+
     /// Borrow the exact ready owners retained by this graph attempt.
     ///
     /// This is intentionally narrower than exposing either owner table. A
@@ -444,16 +525,20 @@ impl AssetTextureBatch {
         let texture = texture_snapshot.loaded()?;
         let image_id = self.records.get(index)?.image?;
         let image = self.image_snapshots.get(image_id.index())?.loaded()?;
-        (AssetTextureSnapshot::from_loaded(
-            texture_snapshot.handle(),
-            texture.asset(),
-            texture.version(),
-            texture.identity(),
-            image.asset(),
-            image.version(),
-            image.identity(),
-        ) == Some(expected))
-        .then_some((texture.asset().as_ref(), image.asset().as_ref()))
+        debug_assert_eq!(
+            AssetTextureSnapshot::from_loaded(
+                texture_snapshot.handle(),
+                texture.asset(),
+                texture.version(),
+                texture.identity(),
+                image.asset(),
+                image.version(),
+                image.identity(),
+            ),
+            Some(expected),
+            "accepted Asset Texture record drifted from its retained owners"
+        );
+        Some((texture.asset().as_ref(), image.asset().as_ref()))
     }
 
     /// Revalidate the canonical DPE-live ready subset using one bounded
@@ -473,6 +558,7 @@ impl AssetTextureBatch {
             assets,
             ids,
             SelectedPostflightState::ReadyOnly,
+            true,
             || {},
             || {},
         )
@@ -491,7 +577,14 @@ impl AssetTextureBatch {
         assets: &AssetServer,
         ids: &[AssetTextureBatchId],
     ) -> &[bool] {
-        self.postflight_selected_impl(assets, ids, SelectedPostflightState::Complete, || {}, || {})
+        self.postflight_selected_impl(
+            assets,
+            ids,
+            SelectedPostflightState::Complete,
+            true,
+            || {},
+            || {},
+        )
     }
 
     #[cfg(test)]
@@ -506,6 +599,7 @@ impl AssetTextureBatch {
             assets,
             ids,
             SelectedPostflightState::ReadyOnly,
+            false,
             after_texture_before,
             after_images,
         )
@@ -523,6 +617,7 @@ impl AssetTextureBatch {
             assets,
             ids,
             SelectedPostflightState::Complete,
+            false,
             after_texture_before,
             after_images,
         )
@@ -533,6 +628,7 @@ impl AssetTextureBatch {
         assets: &AssetServer,
         ids: &[AssetTextureBatchId],
         state: SelectedPostflightState,
+        allow_epoch_fast_path: bool,
         after_texture_before: impl FnOnce(),
         after_images: impl FnOnce(),
     ) -> &[bool] {
@@ -545,6 +641,15 @@ impl AssetTextureBatch {
         self.selected_texture_current_before_images.clear();
         self.selected_image_current.clear();
         self.selected_current.clear();
+
+        if allow_epoch_fast_path && self.storage_epochs_are_current(assets) {
+            self.selected_current.reserve(ids.len());
+            for &id in ids {
+                let eligible = self.record_is_eligible(id.index(), state);
+                self.selected_current.push(eligible);
+            }
+            return &self.selected_current;
+        }
 
         self.selected_texture_indices.reserve(ids.len());
         self.selected_texture_image_slots.reserve(ids.len());
@@ -599,10 +704,7 @@ impl AssetTextureBatch {
                 .records
                 .get(id.index())
                 .filter(|_| self.record_is_accepted(id.index()));
-            let state_is_eligible = record.is_some_and(|record| match state {
-                SelectedPostflightState::ReadyOnly => record.state.ready.is_some(),
-                SelectedPostflightState::Complete => true,
-            });
+            let state_is_eligible = self.record_is_eligible(id.index(), state);
             let image_is_current = record.is_some_and(|record| match record.image {
                 Some(_) => {
                     self.selected_texture_image_slots[selected_index]
@@ -666,6 +768,31 @@ impl AssetTextureBatch {
         self.texture_current.get(index).copied() == Some(true)
     }
 
+    #[inline]
+    fn record_is_eligible(&self, index: usize, state: SelectedPostflightState) -> bool {
+        self.records
+            .get(index)
+            .filter(|_| self.record_is_accepted(index))
+            .is_some_and(|record| match state {
+                SelectedPostflightState::ReadyOnly => record.state.ready.is_some(),
+                SelectedPostflightState::Complete => true,
+            })
+    }
+
+    #[inline]
+    fn storage_epochs_are_current(&self, assets: &AssetServer) -> bool {
+        let Some(expected) = self.stable_storage_epochs else {
+            return false;
+        };
+
+        // The first acquire load is the fast-path linearization point. A
+        // writer increments before changing storage, so a later Texture write
+        // is ordered after this validation; an Image write that has already
+        // started is observed by the second load and closes the fast path.
+        assets.textures.global_version() == expected.textures
+            && assets.images.global_version() == expected.images
+    }
+
     fn record_matches_validation(&self, index: usize) -> bool {
         if self.texture_current_before_images.get(index).copied() != Some(true)
             || self.texture_current.get(index).copied() != Some(true)
@@ -718,9 +845,13 @@ impl AssetTextureBatch {
                             && record.state.ready.is_none()
                     }
                     Some(image) => {
-                        record.state.image_version == Some(image.version())
-                            && record.state.image_identity == Some(image.identity())
-                            && AssetTextureSnapshot::from_loaded(
+                        if record.state.image_version != Some(image.version())
+                            || record.state.image_identity != Some(image.identity())
+                        {
+                            return false;
+                        }
+                        debug_assert_eq!(
+                            AssetTextureSnapshot::from_loaded(
                                 texture_snapshot.handle(),
                                 texture.asset(),
                                 texture.version(),
@@ -728,7 +859,11 @@ impl AssetTextureBatch {
                                 image.asset(),
                                 image.version(),
                                 image.identity(),
-                            ) == record.state.ready
+                            ),
+                            record.state.ready,
+                            "retained Asset Texture owners no longer match their derived record"
+                        );
+                        true
                     }
                 }
             }
@@ -754,6 +889,7 @@ impl AssetTextureBatch {
         self.texture_snapshots.clear();
         self.texture_lookup.clear();
         self.texture_handles.clear();
+        self.stable_storage_epochs = None;
         self.initialized = false;
     }
 
@@ -913,6 +1049,7 @@ impl AssetTextureBatch {
             && self.selected_texture_current_before_images.is_empty()
             && self.selected_image_current.is_empty()
             && self.selected_current.is_empty()
+            && self.stable_storage_epochs.is_none()
             && !self.initialized
     }
 
@@ -1196,9 +1333,10 @@ mod tests {
             batch.postflight_states_selected(&assets, &selected),
             [true, true, true]
         );
-        assert_eq!(batch.selected_texture_indices.len(), 3);
-        assert_eq!(batch.selected_image_indices.len(), 2);
-        assert_eq!(batch.selected_image_lookup.slots.len(), 2);
+        assert!(batch.stable_storage_epochs.is_some());
+        assert!(batch.selected_texture_indices.is_empty());
+        assert!(batch.selected_image_indices.is_empty());
+        assert!(batch.selected_image_lookup.is_active_empty());
 
         assert_eq!(
             batch.postflight_selected(&assets, &selected),
@@ -1282,7 +1420,7 @@ mod tests {
         selected.push(batch.request(texture_with_unavailable_image));
         batch.capture_requested(&assets);
 
-        let current = batch.postflight_states_selected(&assets, &selected);
+        let current = batch.postflight_states_selected_with_hooks(&assets, &selected, || {}, || {});
         assert_eq!(current.len(), 65);
         assert!(current.iter().all(|&value| value));
         assert_eq!(batch.selected_texture_indices.len(), 65);
@@ -1308,7 +1446,10 @@ mod tests {
         batch.capture_requested(&assets);
         assert!(batch.postflight_selected(&assets, &[]).is_empty());
         assert!(batch.selected_image_lookup.is_active_empty());
-        assert_eq!(batch.postflight_selected(&assets, &[first_id]), [true]);
+        assert_eq!(
+            batch.postflight_selected_with_hooks(&assets, &[first_id], || {}, || {}),
+            [true]
+        );
         assert_eq!(batch.selected_image_indices, [0]);
         let retained_lookup_capacity = batch.selected_image_lookup.slots.capacity();
         let retained_before_clear = batch.capacity_usage().retained_bytes;
@@ -1324,7 +1465,10 @@ mod tests {
             .add(Texture::new_2d(Some("second attempt"), second_image));
         let second_id = batch.request(second_texture);
         batch.capture_requested(&assets);
-        assert_eq!(batch.postflight_selected(&assets, &[second_id]), [true]);
+        assert_eq!(
+            batch.postflight_selected_with_hooks(&assets, &[second_id], || {}, || {}),
+            [true]
+        );
         assert_eq!(
             batch.selected_image_lookup.slots.capacity(),
             retained_lookup_capacity
@@ -1355,7 +1499,7 @@ mod tests {
         assert!(batch.selected_image_indices.is_empty());
 
         assert_eq!(
-            batch.postflight_selected(&assets, &[last_id.unwrap()]),
+            batch.postflight_selected_with_hooks(&assets, &[last_id.unwrap()], || {}, || {},),
             [true]
         );
         assert_eq!(batch.selected_image_indices, [CAPTURED_IMAGE_COUNT - 1]);
@@ -1364,6 +1508,39 @@ mod tests {
             batch.selected_image_lookup.slots.capacity() < CAPTURED_IMAGE_COUNT / 16,
             "selected Image lookup retained capacity followed the captured domain"
         );
+    }
+
+    #[test]
+    fn stable_epochs_skip_scratch_and_unrelated_writes_restore_the_exact_slow_path() {
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8(1));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("stable epoch"), image));
+        let mut batch = AssetTextureBatch::new();
+        let id = batch.request(texture);
+        batch.capture_requested(&assets);
+
+        assert!(batch.storage_epochs_are_current(&assets));
+        assert_eq!(batch.postflight_selected(&assets, &[id]), [true]);
+        assert!(batch.selected_texture_indices.is_empty());
+        assert!(batch.selected_image_indices.is_empty());
+
+        assets.images.add(image_8x8(2));
+        assert!(!batch.storage_epochs_are_current(&assets));
+        assert_eq!(batch.postflight_selected(&assets, &[id]), [true]);
+        assert_eq!(batch.selected_texture_indices, [id.index()]);
+        assert_eq!(batch.selected_image_indices, [0]);
+        assert!(
+            !batch.storage_epochs_are_current(&assets),
+            "a selected-only slow postflight must not retoken the full batch"
+        );
+
+        batch.revalidate(&assets);
+        assert!(batch.storage_epochs_are_current(&assets));
+        assert_eq!(batch.postflight_selected(&assets, &[id]), [true]);
+        assert!(batch.selected_texture_indices.is_empty());
+        assert!(batch.selected_image_indices.is_empty());
     }
 
     #[test]

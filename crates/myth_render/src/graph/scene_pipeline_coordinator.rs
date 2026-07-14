@@ -32,16 +32,17 @@ use super::{
     },
     extracted::{ExtractedRenderItem, ExtractedScene, SceneFeatures},
     frame::{
-        DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanStore, FrameSourceId, PreparedDrawSource,
-        PreparedDrawStore, PreparedSourceId, RenderIntent, RenderKey, RenderLists,
-        ShadowRenderIntent,
+        DrawCommand, DrawPlanId, DrawPlanKey, DrawPlanStore, PreparedDrawSource, PreparedDrawStore,
+        RenderIntent, RenderKey, RenderLists, ShadowRenderIntent,
     },
     material_plan::{MaterialPlanResolver, PreparedMaterialFrame},
     passes::{
         prepass::{FEATURE_ID_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT},
         shadow::SHADOW_BINDING_WGSL,
     },
-    scene_pipeline_prepare::{ScenePipelinePrepareStore, SceneRecipeOrdinal},
+    scene_pipeline_prepare::{
+        AcceptedPreparedSource, ScenePipelinePrepareStore, SceneRecipeOrdinal,
+    },
 };
 
 /// Gather main-view and shadow recipes for every live CPU-direct plan.
@@ -64,6 +65,11 @@ pub(crate) fn gather_live_pipeline_recipes(
     shader_manager: &ShaderManager,
     camera: &RenderCamera,
 ) {
+    // Attempt invariants are derived at most once per relevant pipeline
+    // family. They are deliberately recomputed at the later coordination
+    // barrier so mutations between Gather and Coordinate still fail closed.
+    let mut scene_defines_hash = None;
+    let mut depth_shader_identity = None;
     for plan_index in 0..draw_plans.plan_count() {
         let meta = draw_plans
             .plan_meta(plan_index)
@@ -98,6 +104,8 @@ pub(crate) fn gather_live_pipeline_recipes(
                     wgpu_ctx,
                     shader_manager,
                     camera,
+                    *scene_defines_hash
+                        .get_or_insert_with(|| extracted_scene.scene_defines.compute_hash()),
                 );
             }
             DrawPlanKey::Prepass { .. } => {}
@@ -124,7 +132,10 @@ pub(crate) fn gather_live_pipeline_recipes(
                     render_lists,
                     extracted_scene,
                     wgpu_ctx,
-                    shader_manager,
+                    *depth_shader_identity.get_or_insert_with(|| {
+                        shader_manager
+                            .source_identity_hash(ShaderSource::File("entry/utility/depth_prepass"))
+                    }),
                 );
             }
         }
@@ -195,8 +206,71 @@ pub(crate) fn coordinate_scene_pipelines(
         shader_manager,
     );
 
+    finalize_source_epoch_gate(
+        store,
+        prepared_draws,
+        geometry_frames,
+        material_frames,
+        object_interfaces,
+        render_lists,
+        extracted_scene,
+    );
+
+    // The gate above is this attempt's source linearization point. Every L1
+    // publication and the later immutable Direct stream must derive only from
+    // its accepted source set.
     store.publish_main_l1(pipeline_cache);
     store.publish_shadow_l1(pipeline_cache);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_source_epoch_gate(
+    store: &mut ScenePipelinePrepareStore,
+    prepared_draws: &PreparedDrawStore,
+    geometry_frames: GeometryFrameResolver<'_>,
+    material_frames: MaterialPlanResolver<'_>,
+    object_interfaces: ObjectInterfaceResolver<'_>,
+    render_lists: &RenderLists,
+    extracted_scene: &ExtractedScene,
+) {
+    #[cfg(not(debug_assertions))]
+    let _ = (object_interfaces, render_lists, extracted_scene);
+
+    for index in 0..store.participating_source_count() {
+        let prepared_source = store.participating_source_at(index);
+        let Some(source) = prepared_draws.source(prepared_source) else {
+            continue;
+        };
+        let Some(material) = material_frames.material(source.material) else {
+            continue;
+        };
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            resolve_prepared_source(
+                source,
+                geometry_frames,
+                material_frames,
+                object_interfaces,
+                render_lists,
+                extracted_scene,
+            )
+            .is_some(),
+            "published prepared-source joins must remain immutable until the epoch gate"
+        );
+        // This is the only live interior-epoch validation after source
+        // publication. Once accepted, the graph attempt owns an immutable
+        // physical stream and must not reopen these epochs in Finalize.
+        if !geometry_frames.pipeline_state_is_current(source.geometry)
+            || !material.pipeline_state_is_current()
+        {
+            continue;
+        }
+        store.accept_source(
+            prepared_source,
+            AcceptedPreparedSource::from_prepared(source, material.interface().bind_group_id),
+        );
+    }
+    store.finish_source_gate();
 }
 
 /// Finalize every live plan from immutable recipe/result tables.
@@ -207,12 +281,7 @@ pub(crate) fn coordinate_scene_pipelines(
 pub(crate) fn finalize_live_draw_plans(
     store: &ScenePipelinePrepareStore,
     draw_plans: &mut DrawPlanStore,
-    prepared_draws: &PreparedDrawStore,
     geometry_frames: GeometryFrameResolver<'_>,
-    material_frames: MaterialPlanResolver<'_>,
-    object_interfaces: ObjectInterfaceResolver<'_>,
-    render_lists: &RenderLists,
-    extracted_scene: &ExtractedScene,
 ) {
     for plan_index in 0..draw_plans.plan_count() {
         let meta = draw_plans
@@ -229,12 +298,7 @@ pub(crate) fn finalize_live_draw_plans(
                 meta.id,
                 matches!(meta.key, DrawPlanKey::Transparent),
                 draw_plans,
-                prepared_draws,
                 geometry_frames,
-                material_frames,
-                object_interfaces,
-                render_lists,
-                extracted_scene,
             ),
             DrawPlanKey::Prepass {
                 needs_normal,
@@ -246,25 +310,11 @@ pub(crate) fn finalize_live_draw_plans(
                 meta.id,
                 (needs_normal, needs_feature_id, needs_velocity),
                 draw_plans,
-                prepared_draws,
                 geometry_frames,
-                material_frames,
-                object_interfaces,
-                render_lists,
-                extracted_scene,
             ),
-            DrawPlanKey::Shadow { .. } => finalize_shadow_plan(
-                store,
-                plan_index,
-                meta.id,
-                draw_plans,
-                prepared_draws,
-                geometry_frames,
-                material_frames,
-                object_interfaces,
-                render_lists,
-                extracted_scene,
-            ),
+            DrawPlanKey::Shadow { .. } => {
+                finalize_shadow_plan(store, plan_index, meta.id, draw_plans, geometry_frames);
+            }
         }
     }
 
@@ -287,16 +337,12 @@ fn gather_main_plan(
     wgpu_ctx: &WgpuContext,
     shader_manager: &ShaderManager,
     camera: &RenderCamera,
+    scene_defines_hash: u64,
 ) {
-    let scene_defines_hash = extracted_scene.scene_defines.compute_hash();
     let taa_enabled = matches!(camera.aa_mode, AntiAliasingMode::TAA { .. });
     for (intent_index, intent) in intents.iter().enumerate() {
-        let Some(prepared_source) = prepared_draws.prepared_source_id(intent.source) else {
-            continue;
-        };
-        let Some(resolved) = resolve_current_source(
+        let Some((prepared_source, resolved)) = resolve_prepared_source_for_frame(
             intent.source,
-            prepared_source,
             prepared_draws,
             geometry_frames,
             material_frames,
@@ -340,7 +386,7 @@ fn gather_main_plan(
             geometry_version: resolved.geometry.key.layout_version,
             vertex_layout_id: resolved.geometry_physical.layout_id,
             instance_variants: resolved.item.item_variant_flags,
-            item_shader_defines_hash: resolved.item.item_shader_defines_hash,
+            item_shader_features: resolved.item.item_shader_features,
             shader_source_identity,
             global_layout_id: gpu_world.layout_id,
             global_binding_interface_id: gpu_world.binding_interface_id,
@@ -355,13 +401,9 @@ fn gather_main_plan(
             #[cfg(feature = "debug_view")]
             debug_view_mode: camera.debug_view.mode,
         };
-        if !source_still_current(resolved, geometry_frames) {
-            continue;
-        }
         store.push_main(
             plan,
             SceneRecipeOrdinal::new(plan.index(), intent_index),
-            intent.source,
             prepared_source,
             key,
             intent.material_index,
@@ -384,18 +426,12 @@ fn gather_shadow_plan(
     render_lists: &RenderLists,
     extracted_scene: &ExtractedScene,
     wgpu_ctx: &WgpuContext,
-    shader_manager: &ShaderManager,
+    shader_source_identity: u64,
 ) {
-    let shader_source = ShaderSource::File("entry/utility/depth_prepass");
-    let shader_source_identity = shader_manager.source_identity_hash(shader_source);
     let shadow_global_layout_id = store.shadow_layout(layout).id();
     for (intent_index, intent) in intents.iter().enumerate() {
-        let Some(prepared_source) = prepared_draws.prepared_source_id(intent.source) else {
-            continue;
-        };
-        let Some(resolved) = resolve_current_source(
+        let Some((prepared_source, resolved)) = resolve_prepared_source_for_frame(
             intent.source,
-            prepared_source,
             prepared_draws,
             geometry_frames,
             material_frames,
@@ -423,7 +459,7 @@ fn gather_shadow_plan(
             geometry_version: resolved.geometry.key.layout_version,
             vertex_layout_id: resolved.geometry_physical.layout_id,
             instance_variants: resolved.item.item_variant_flags,
-            item_shader_defines_hash: resolved.item.item_shader_defines_hash,
+            item_shader_features: resolved.item.item_shader_features,
             shader_source_identity,
             shadow_global_layout_id,
             material_layout_id: material_interface.layout_id,
@@ -432,13 +468,9 @@ fn gather_shadow_plan(
             object_binding_interface_id: resolved.object_interface.binding_interface_id,
             pipeline_settings_version: wgpu_ctx.pipeline_settings_version,
         };
-        if !source_still_current(resolved, geometry_frames) {
-            continue;
-        }
         store.push_shadow(
             plan,
             SceneRecipeOrdinal::new(plan.index(), intent_index),
-            intent.source,
             prepared_source,
             key,
             layout,
@@ -465,15 +497,26 @@ fn coordinate_main_requests(
     let Some(gpu_world) = gpu_world else {
         return;
     };
+    if store.main_request_count() == 0 {
+        return;
+    }
+    let pipeline_settings_version = wgpu_ctx.pipeline_settings_version;
+    let mut scene_defines_hash = None;
     for order_index in 0..store.main_request_count() {
         let request = store.main_request_at(order_index);
         let (fast_key, owner, result) = store.main_request(request);
         debug_assert!(result.is_none());
-        let frame_source = store.main_request_frame_source(request);
-        let Some(resolved) = resolve_current_source(
-            frame_source,
-            owner,
-            prepared_draws,
+        if let Some(pipeline) = pipeline_cache.get_pipeline_fast(fast_key) {
+            store.resolve_main_request(request, pipeline, false);
+            continue;
+        }
+        let scene_defines_hash =
+            *scene_defines_hash.get_or_insert_with(|| extracted_scene.scene_defines.compute_hash());
+        let Some(source) = prepared_draws.source(owner) else {
+            continue;
+        };
+        let Some(resolved) = resolve_prepared_source(
+            source,
             geometry_frames,
             material_frames,
             object_interfaces,
@@ -487,19 +530,13 @@ fn coordinate_main_requests(
             resolved,
             gpu_world,
             extracted_scene,
-            wgpu_ctx,
             shader_manager,
             camera,
+            scene_defines_hash,
+            pipeline_settings_version,
         ) {
             continue;
         }
-        if let Some(pipeline) = pipeline_cache.get_pipeline_fast(fast_key) {
-            if source_still_current(resolved, geometry_frames) {
-                store.resolve_main_request(request, pipeline, false);
-            }
-            continue;
-        }
-
         let material_pipeline = resolved.material.pipeline();
         let material_settings = material_pipeline.settings();
         let is_transparent = matches!(
@@ -515,9 +552,9 @@ fn coordinate_main_requests(
         let mut flags = PipelineFlags::empty();
         let mut options = ShaderCompilationOptions::from_merged(
             material_pipeline.shader_defines(),
-            &resolved.geometry.shader_defines,
+            resolved.geometry.shader_defines(),
             &extracted_scene.scene_defines,
-            &resolved.item.item_shader_defines,
+            resolved.item.item_shader_defines(),
         );
         if use_clustered_shading {
             options.add_define("USE_CLUSTERED_SHADING", "1");
@@ -650,9 +687,7 @@ fn coordinate_main_requests(
             gpu_world,
             screen_layout,
         );
-        if source_still_current(resolved, geometry_frames) {
-            store.resolve_main_request(request, pipeline, true);
-        }
+        store.resolve_main_request(request, pipeline, true);
     }
 }
 
@@ -674,17 +709,26 @@ fn coordinate_prepass_requests(
         return;
     };
     let shader_source = ShaderSource::File("entry/utility/depth_prepass");
+    let mut request_invariants = None;
     for order_index in 0..store.prepass_request_count() {
         let request = store.prepass_request_at(order_index);
-        let (key, owner, cached) = store.prepass_request(request);
-        if cached.is_some() {
+        if store.prepass_result(request).is_some() {
             continue;
         }
-        let frame_source = store.prepass_request_frame_source(request);
-        let Some(resolved) = resolve_current_source(
-            frame_source,
-            owner,
-            prepared_draws,
+        let (key, owner, cached) = store.prepass_request(request);
+        debug_assert!(cached.is_none());
+        let (scene_defines_hash, shader_source_identity) =
+            *request_invariants.get_or_insert_with(|| {
+                (
+                    extracted_scene.scene_defines.compute_hash(),
+                    shader_manager.source_identity_hash(shader_source),
+                )
+            });
+        let Some(source) = prepared_draws.source(owner) else {
+            continue;
+        };
+        let Some(resolved) = resolve_prepared_source(
+            source,
             geometry_frames,
             material_frames,
             object_interfaces,
@@ -697,9 +741,10 @@ fn coordinate_prepass_requests(
             key,
             resolved,
             gpu_world,
-            extracted_scene,
             wgpu_ctx,
-            shader_manager,
+            scene_defines_hash,
+            wgpu_ctx.pipeline_settings_version,
+            shader_source_identity,
         ) {
             continue;
         }
@@ -713,9 +758,9 @@ fn coordinate_prepass_requests(
         }
         let mut options = ShaderCompilationOptions::from_merged(
             material_pipeline.shader_defines(),
-            &resolved.geometry.shader_defines,
+            resolved.geometry.shader_defines(),
             &extracted_scene.scene_defines,
-            &resolved.item.item_shader_defines,
+            resolved.item.item_shader_defines(),
         );
         options.add_define("IS_PREPASS", "1");
         if key.needs_normal {
@@ -811,9 +856,7 @@ fn coordinate_prepass_requests(
             "Prepass Pipeline",
             &vertex_buffers_layout,
         );
-        if source_still_current(resolved, geometry_frames) {
-            store.resolve_prepass_request(request, pipeline, true);
-        }
+        store.resolve_prepass_request(request, pipeline, true);
     }
 }
 
@@ -831,15 +874,26 @@ fn coordinate_shadow_requests(
     shader_manager: &mut ShaderManager,
 ) {
     let shader_source = ShaderSource::File("entry/utility/depth_prepass");
+    if store.shadow_request_count() == 0 {
+        return;
+    }
+    let pipeline_settings_version = wgpu_ctx.pipeline_settings_version;
+    let mut shader_source_identity = None;
     for order_index in 0..store.shadow_request_count() {
         let request = store.shadow_request_at(order_index);
         let (fast_key, owner, layout_id, result) = store.shadow_request(request);
         debug_assert!(result.is_none());
-        let frame_source = store.shadow_request_frame_source(request);
-        let Some(resolved) = resolve_current_source(
-            frame_source,
-            owner,
-            prepared_draws,
+        if let Some(pipeline) = pipeline_cache.get_shadow_pipeline_fast(fast_key) {
+            store.resolve_shadow_request(request, pipeline, false);
+            continue;
+        }
+        let shader_source_identity = *shader_source_identity
+            .get_or_insert_with(|| shader_manager.source_identity_hash(shader_source));
+        let Some(source) = prepared_draws.source(owner) else {
+            continue;
+        };
+        let Some(resolved) = resolve_prepared_source(
+            source,
             geometry_frames,
             material_frames,
             object_interfaces,
@@ -853,26 +907,19 @@ fn coordinate_shadow_requests(
             fast_key,
             resolved,
             shadow_layout.id(),
-            wgpu_ctx,
-            shader_manager,
+            pipeline_settings_version,
+            shader_source_identity,
         ) {
             continue;
         }
         if resolved.material.pipeline().settings().alpha_mode == AlphaMode::Blend {
             continue;
         }
-        if let Some(pipeline) = pipeline_cache.get_shadow_pipeline_fast(fast_key) {
-            if source_still_current(resolved, geometry_frames) {
-                store.resolve_shadow_request(request, pipeline, false);
-            }
-            continue;
-        }
-
         let mut options = ShaderCompilationOptions::from_merged(
             resolved.material.pipeline().shader_defines(),
-            &resolved.geometry.shader_defines,
+            resolved.geometry.shader_defines(),
             &myth_resources::shader_defines::ShaderDefines::new(),
-            &resolved.item.item_shader_defines,
+            resolved.item.item_shader_defines(),
         );
         options.add_define("SHADOW_PASS", "1");
         options.inject_code(
@@ -941,9 +988,7 @@ fn coordinate_shadow_requests(
             "Shadow Pipeline",
             &vertex_buffers_layout,
         );
-        if source_still_current(resolved, geometry_frames) {
-            store.resolve_shadow_request(request, pipeline, true);
-        }
+        store.resolve_shadow_request(request, pipeline, true);
     }
 }
 
@@ -954,12 +999,7 @@ fn finalize_main_plan(
     plan: DrawPlanId,
     transparent: bool,
     draw_plans: &mut DrawPlanStore,
-    prepared_draws: &PreparedDrawStore,
     geometry_frames: GeometryFrameResolver<'_>,
-    material_frames: MaterialPlanResolver<'_>,
-    object_interfaces: ObjectInterfaceResolver<'_>,
-    render_lists: &RenderLists,
-    extracted_scene: &ExtractedScene,
 ) {
     let recipes = store.main_draws(plan_index);
     draw_plans.reserve_commands(recipes.len());
@@ -970,32 +1010,19 @@ fn finalize_main_plan(
         let Some(pipeline) = store.main_result(recipe.pipeline) else {
             continue;
         };
-        let Some(resolved) = resolve_current_source(
-            recipe.frame_source,
-            recipe.prepared_source,
-            prepared_draws,
-            geometry_frames,
-            material_frames,
-            object_interfaces,
-            render_lists,
-            extracted_scene,
-        ) else {
+        let Some(source) = store.accepted_source(recipe.prepared_source) else {
             continue;
         };
+        let geometry = geometry_frames
+            .physical(source.geometry)
+            .expect("accepted main source lost its immutable geometry physical");
         let sort_key = RenderKey::new(
             pipeline,
             recipe.material_index,
             recipe.distance_sq,
             transparent,
         );
-        push_resolved_command(
-            draw_plans,
-            recipe.frame_source,
-            resolved.source,
-            resolved.geometry_physical,
-            pipeline,
-            sort_key.bits(),
-        );
+        push_resolved_command(draw_plans, source, geometry, pipeline, sort_key.bits());
     }
     draw_plans.sort_commands_from(start);
     draw_plans.finish_finalize(plan, start);
@@ -1008,12 +1035,7 @@ fn finalize_prepass_plan(
     plan: DrawPlanId,
     output_mask: (bool, bool, bool),
     draw_plans: &mut DrawPlanStore,
-    prepared_draws: &PreparedDrawStore,
     geometry_frames: GeometryFrameResolver<'_>,
-    material_frames: MaterialPlanResolver<'_>,
-    object_interfaces: ObjectInterfaceResolver<'_>,
-    render_lists: &RenderLists,
-    extracted_scene: &ExtractedScene,
 ) {
     let recipes = store.prepass_draws(plan_index);
     draw_plans.reserve_commands(recipes.len());
@@ -1033,27 +1055,14 @@ fn finalize_prepass_plan(
         let Some(pipeline) = store.prepass_result(recipe.pipeline) else {
             continue;
         };
-        let Some(resolved) = resolve_current_source(
-            recipe.frame_source,
-            recipe.prepared_source,
-            prepared_draws,
-            geometry_frames,
-            material_frames,
-            object_interfaces,
-            render_lists,
-            extracted_scene,
-        ) else {
+        let Some(source) = store.accepted_source(recipe.prepared_source) else {
             continue;
         };
+        let geometry = geometry_frames
+            .physical(source.geometry)
+            .expect("accepted Prepass source lost its immutable geometry physical");
         let sort_key = RenderKey::new(pipeline, recipe.material_index, recipe.distance_sq, false);
-        push_resolved_command(
-            draw_plans,
-            recipe.frame_source,
-            resolved.source,
-            resolved.geometry_physical,
-            pipeline,
-            sort_key.bits(),
-        );
+        push_resolved_command(draw_plans, source, geometry, pipeline, sort_key.bits());
     }
     draw_plans.sort_commands_from(start);
     draw_plans.finish_finalize(plan, start);
@@ -1065,12 +1074,7 @@ fn finalize_shadow_plan(
     plan_index: usize,
     plan: DrawPlanId,
     draw_plans: &mut DrawPlanStore,
-    prepared_draws: &PreparedDrawStore,
     geometry_frames: GeometryFrameResolver<'_>,
-    material_frames: MaterialPlanResolver<'_>,
-    object_interfaces: ObjectInterfaceResolver<'_>,
-    render_lists: &RenderLists,
-    extracted_scene: &ExtractedScene,
 ) {
     let recipes = store.shadow_draws(plan_index);
     draw_plans.reserve_commands(recipes.len());
@@ -1080,28 +1084,14 @@ fn finalize_shadow_plan(
         let Some(pipeline) = store.shadow_result(recipe.pipeline) else {
             continue;
         };
-        let Some(resolved) = resolve_current_source(
-            recipe.frame_source,
-            recipe.prepared_source,
-            prepared_draws,
-            geometry_frames,
-            material_frames,
-            object_interfaces,
-            render_lists,
-            extracted_scene,
-        ) else {
+        let Some(source) = store.accepted_source(recipe.prepared_source) else {
             continue;
         };
-        let sort_key = u64::from(pipeline.0) << 32
-            | (resolved.material.interface().bind_group_id & 0xffff_ffff);
-        push_resolved_command(
-            draw_plans,
-            recipe.frame_source,
-            resolved.source,
-            resolved.geometry_physical,
-            pipeline,
-            sort_key,
-        );
+        let geometry = geometry_frames
+            .physical(source.geometry)
+            .expect("accepted Shadow source lost its immutable geometry physical");
+        let sort_key = u64::from(pipeline.0) << 32 | (source.material_bind_group_id & 0xffff_ffff);
+        push_resolved_command(draw_plans, source, geometry, pipeline, sort_key);
     }
     draw_plans.sort_commands_from(start);
     draw_plans.finish_finalize(plan, start);
@@ -1125,15 +1115,18 @@ fn assert_recipe_plan(
 
 fn push_resolved_command(
     draw_plans: &mut DrawPlanStore,
-    frame_source: FrameSourceId,
-    source: &PreparedDrawSource,
+    source: &AcceptedPreparedSource,
     geometry: &GeometryFramePhysical,
     pipeline_id: RenderPipelineId,
     sort_key: u64,
 ) {
+    if source.commits_morph_history {
+        draw_plans.record_emitted_morph_history_source(source.frame_source);
+    }
     draw_plans.push_command(
         DrawCommand {
-            frame_source,
+            #[cfg(test)]
+            frame_source: source.frame_source,
             sort_key,
             pipeline_id,
             vertex_buffer_range: 0..0,
@@ -1149,32 +1142,32 @@ fn push_resolved_command(
 }
 
 #[derive(Clone, Copy)]
-struct ResolvedPipelineSource<'a> {
-    source: &'a PreparedDrawSource,
-    item: &'a ExtractedRenderItem,
-    geometry: &'a GeometryFrameRecord,
-    geometry_physical: &'a GeometryFramePhysical,
-    material: PreparedMaterialFrame<'a>,
-    object_interface: &'a ObjectInterfaceRecord,
+pub(crate) struct ResolvedPipelineSource<'a> {
+    pub(crate) item: &'a ExtractedRenderItem,
+    pub(crate) geometry: &'a GeometryFrameRecord,
+    pub(crate) geometry_physical: &'a GeometryFramePhysical,
+    pub(crate) material: PreparedMaterialFrame<'a>,
+    pub(crate) object_interface: &'a ObjectInterfaceRecord,
 }
 
+/// Resolve immutable graph-attempt records without reopening live asset
+/// epochs. Scene-source publication already established this exact join; the
+/// one later epoch check belongs exclusively to `finalize_source_epoch_gate`.
 #[allow(clippy::too_many_arguments)]
-fn resolve_current_source<'a>(
-    frame_source: FrameSourceId,
-    prepared_source: PreparedSourceId,
-    prepared_draws: &'a PreparedDrawStore,
+fn resolve_prepared_source<'a>(
+    source: &'a PreparedDrawSource,
     geometry_frames: GeometryFrameResolver<'a>,
     material_frames: MaterialPlanResolver<'a>,
     object_interfaces: ObjectInterfaceResolver<'a>,
     render_lists: &'a RenderLists,
     extracted_scene: &'a ExtractedScene,
 ) -> Option<ResolvedPipelineSource<'a>> {
-    if prepared_draws.prepared_source_id(frame_source) != Some(prepared_source) {
+    if render_lists.extracted_source(source.frame_source) != Some(source.extracted_source) {
         return None;
     }
-    let source = prepared_draws.source(prepared_source)?;
-    let extracted_source = render_lists.extracted_source(frame_source)?;
-    let item = extracted_scene.render_items.get(extracted_source.index())?;
+    let item = extracted_scene
+        .render_items
+        .get(source.extracted_source.index())?;
     let geometry = geometry_frames.geometry(source.geometry)?;
     let geometry_physical = geometry_frames.physical(source.geometry)?;
     let material = material_frames.material(source.material)?;
@@ -1186,13 +1179,10 @@ fn resolve_current_source<'a>(
         || (material.asset_version(), material.asset_identity())
             != (item.material_asset_version, item.material_asset_identity)
         || material.material_version() != item.material_version
-        || !geometry_frames.pipeline_state_is_current(source.geometry)
-        || !material.pipeline_state_is_current()
     {
         return None;
     }
     Some(ResolvedPipelineSource {
-        source,
         item,
         geometry,
         geometry_physical,
@@ -1201,12 +1191,26 @@ fn resolve_current_source<'a>(
     })
 }
 
-fn source_still_current(
-    resolved: ResolvedPipelineSource<'_>,
-    geometry_frames: GeometryFrameResolver<'_>,
-) -> bool {
-    geometry_frames.pipeline_state_is_current(resolved.source.geometry)
-        && resolved.material.pipeline_state_is_current()
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_prepared_source_for_frame<'a>(
+    frame_source: super::frame::FrameSourceId,
+    prepared_draws: &'a PreparedDrawStore,
+    geometry_frames: GeometryFrameResolver<'a>,
+    material_frames: MaterialPlanResolver<'a>,
+    object_interfaces: ObjectInterfaceResolver<'a>,
+    render_lists: &'a RenderLists,
+    extracted_scene: &'a ExtractedScene,
+) -> Option<(super::frame::PreparedSourceId, ResolvedPipelineSource<'a>)> {
+    let (prepared_source, source) = prepared_draws.source_for_frame(frame_source)?;
+    let resolved = resolve_prepared_source(
+        source,
+        geometry_frames,
+        material_frames,
+        object_interfaces,
+        render_lists,
+        extracted_scene,
+    )?;
+    Some((prepared_source, resolved))
 }
 
 fn main_request_matches_source(
@@ -1214,9 +1218,10 @@ fn main_request_matches_source(
     resolved: ResolvedPipelineSource<'_>,
     gpu_world: &GpuGlobalState,
     extracted_scene: &ExtractedScene,
-    wgpu_ctx: &WgpuContext,
     shader_manager: &ShaderManager,
     camera: &RenderCamera,
+    scene_defines_hash: u64,
+    pipeline_settings_version: u64,
 ) -> bool {
     let matches = key.material_handle == resolved.material.handle()
         && key.material_asset_version == resolved.material.asset_version()
@@ -1228,7 +1233,7 @@ fn main_request_matches_source(
         && key.geometry_version == resolved.geometry.key.layout_version
         && key.vertex_layout_id == resolved.geometry_physical.layout_id
         && key.instance_variants == resolved.item.item_variant_flags
-        && key.item_shader_defines_hash == resolved.item.item_shader_defines_hash
+        && key.item_shader_features == resolved.item.item_shader_features
         && key.global_layout_id == gpu_world.layout_id
         && key.global_binding_interface_id == gpu_world.binding_interface_id
         && key.material_layout_id == resolved.material.interface().layout_id
@@ -1236,8 +1241,8 @@ fn main_request_matches_source(
         && key.object_layout_id == resolved.object_interface.layout_id
         && key.object_binding_interface_id == resolved.object_interface.binding_interface_id
         && key.scene_variants == extracted_scene.scene_variants
-        && key.scene_defines_hash == extracted_scene.scene_defines.compute_hash()
-        && key.pipeline_settings_version == wgpu_ctx.pipeline_settings_version
+        && key.scene_defines_hash == scene_defines_hash
+        && key.pipeline_settings_version == pipeline_settings_version
         && key.shader_source_identity
             == shader_manager
                 .source_identity_hash(material_shader_source(resolved.material.pipeline()))
@@ -1251,9 +1256,10 @@ fn prepass_request_matches_source(
     key: super::scene_pipeline_prepare::PrepassPipelineL1Key,
     resolved: ResolvedPipelineSource<'_>,
     gpu_world: &GpuGlobalState,
-    extracted_scene: &ExtractedScene,
     wgpu_ctx: &WgpuContext,
-    shader_manager: &ShaderManager,
+    scene_defines_hash: u64,
+    pipeline_settings_version: u64,
+    shader_source_identity: u64,
 ) -> bool {
     key.geometry_handle == resolved.geometry.key.handle
         && key.geometry_asset_version == resolved.geometry.key.asset_version
@@ -1264,9 +1270,9 @@ fn prepass_request_matches_source(
         && key.material_asset_identity == resolved.material.asset_identity()
         && key.material_version == resolved.material.material_version()
         && key.item_variants == resolved.item.item_variant_flags
-        && key.item_shader_defines_hash == resolved.item.item_shader_defines_hash
-        && key.scene_defines_hash == extracted_scene.scene_defines.compute_hash()
-        && key.pipeline_settings_version == wgpu_ctx.pipeline_settings_version
+        && key.item_shader_features == resolved.item.item_shader_features
+        && key.scene_defines_hash == scene_defines_hash
+        && key.pipeline_settings_version == pipeline_settings_version
         && key.global_binding_interface_id == gpu_world.binding_interface_id
         && key.material_binding_interface_id == resolved.material.interface().binding_interface_id
         && key.object_binding_interface_id == resolved.object_interface.binding_interface_id
@@ -1281,17 +1287,15 @@ fn prepass_request_matches_source(
         && key.topology == resolved.geometry.topology
         && key.cull_mode == side_cull_mode(resolved.material.pipeline().settings().side)
         && key.front_face == item_front_face(resolved.item)
-        && key.shader_source_identity
-            == shader_manager
-                .source_identity_hash(ShaderSource::File("entry/utility/depth_prepass"))
+        && key.shader_source_identity == shader_source_identity
 }
 
 fn shadow_request_matches_source(
     key: FastShadowPipelineKey,
     resolved: ResolvedPipelineSource<'_>,
     shadow_layout_id: u64,
-    wgpu_ctx: &WgpuContext,
-    shader_manager: &ShaderManager,
+    pipeline_settings_version: u64,
+    shader_source_identity: u64,
 ) -> bool {
     key.material_handle == resolved.material.handle()
         && key.material_asset_version == resolved.material.asset_version()
@@ -1303,20 +1307,18 @@ fn shadow_request_matches_source(
         && key.geometry_version == resolved.geometry.key.layout_version
         && key.vertex_layout_id == resolved.geometry_physical.layout_id
         && key.instance_variants == resolved.item.item_variant_flags
-        && key.item_shader_defines_hash == resolved.item.item_shader_defines_hash
+        && key.item_shader_features == resolved.item.item_shader_features
         && key.shadow_global_layout_id == shadow_layout_id
         && key.material_layout_id == resolved.material.interface().layout_id
         && key.material_binding_interface_id == resolved.material.interface().binding_interface_id
         && key.object_layout_id == resolved.object_interface.layout_id
         && key.object_binding_interface_id == resolved.object_interface.binding_interface_id
-        && key.pipeline_settings_version == wgpu_ctx.pipeline_settings_version
-        && key.shader_source_identity
-            == shader_manager
-                .source_identity_hash(ShaderSource::File("entry/utility/depth_prepass"))
+        && key.pipeline_settings_version == pipeline_settings_version
+        && key.shader_source_identity == shader_source_identity
 }
 
 fn material_shader_source(
-    pipeline: &super::material_plan::MaterialPipelineSnapshot,
+    pipeline: &crate::core::gpu::MaterialPipelineSnapshot,
 ) -> ShaderSource<'_> {
     if let Some(template_source) = pipeline.shader_template() {
         ShaderSource::Inline {

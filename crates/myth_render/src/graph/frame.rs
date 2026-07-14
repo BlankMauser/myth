@@ -20,6 +20,7 @@
 
 use glam::Mat4;
 use rustc_hash::FxHashMap;
+#[cfg(test)]
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -223,8 +224,10 @@ pub(crate) struct DrawPlanMeta {
 /// [`scene_pipeline_coordinator::finalize_live_draw_plans`]: super::scene_pipeline_coordinator::finalize_live_draw_plans
 /// [`submit_scene_submission`]: super::passes::draw::submit_scene_submission
 pub(crate) struct DrawCommand {
-    /// Exact frame source used only by the post-submit history commit.
-    /// Execute remains blind to this logical identity.
+    /// Test-only semantic identity used by Direct-stream equivalence checks.
+    /// Production commands need no source identity after morph-history
+    /// candidates have been recorded at finalization.
+    #[cfg(test)]
     pub(crate) frame_source: FrameSourceId,
 
     /// Composite sort key for minimising GPU state switches.
@@ -315,11 +318,24 @@ pub(crate) struct DrawIndexBufferObservation {
 /// sibling attempt stores. This dense record contains only Copy IDs plus the
 /// genuinely per-instance object binding and dynamic offset.
 pub(crate) struct PreparedDrawSource {
+    /// Stable frame-local identity selected by the source Gather transaction.
+    ///
+    /// Keeping the join identity beside the dense prepared record lets every
+    /// later phase address this source through [`PreparedSourceId`] without
+    /// repeating the frame-source hash lookup.
+    pub(crate) frame_source: FrameSourceId,
+    /// Stable index into the immutable extraction snapshot. Later phases still
+    /// validate the RenderLists join before dereferencing this index, but do
+    /// not have to rediscover it from the frame source.
+    pub(crate) extracted_source: ExtractedSourceId,
     pub(crate) geometry: GeometryFrameId,
     pub(crate) material: MaterialFrameId,
     pub(crate) object_interface: ObjectInterfaceId,
     pub(crate) material_bind_group: DrawBindGroupSlot,
     pub(crate) object_bind_group: (DrawBindGroupSlot, u32),
+    /// Whether a submitted command using this source must advance the Mesh's
+    /// CPU morph-history window. Rigid and skin-only sources keep this false.
+    pub(crate) commits_morph_history: bool,
 }
 
 /// Compact graph-attempt source preparation addressed through frame-local IDs.
@@ -331,7 +347,13 @@ pub(crate) struct PreparedDrawSource {
 /// graph attempt.
 pub(crate) struct PreparedDrawStore {
     sources: Vec<PreparedDrawSource>,
-    source_lookup: FxHashMap<FrameSourceId, PreparedSourceId>,
+    /// Dense `FrameSourceId -> PreparedSourceId` join. Slots are valid only
+    /// when their stamp equals `source_join_generation`; warm attempts neither
+    /// clear nor fill the retained high-water arrays.
+    source_join_indices: Vec<u32>,
+    source_join_stamps: Vec<u32>,
+    source_join_generation: u32,
+    source_domain_len: usize,
     sources_initialized: bool,
 }
 
@@ -342,7 +364,10 @@ impl PreparedDrawStore {
     pub(crate) fn new() -> Self {
         Self {
             sources: Vec::with_capacity(PREPARED_DRAW_SOURCE_BASELINE),
-            source_lookup: FxHashMap::default(),
+            source_join_indices: Vec::with_capacity(PREPARED_DRAW_SOURCE_BASELINE),
+            source_join_stamps: Vec::with_capacity(PREPARED_DRAW_SOURCE_BASELINE),
+            source_join_generation: 1,
+            source_domain_len: 0,
             sources_initialized: false,
         }
     }
@@ -351,62 +376,115 @@ impl PreparedDrawStore {
     /// allocations for the next frame.
     pub(crate) fn clear(&mut self) {
         self.sources.clear();
-        self.source_lookup.clear();
+        self.source_domain_len = 0;
         self.sources_initialized = false;
+        self.advance_source_join_generation();
     }
 
     pub(crate) fn capacity_usage(&self) -> CapacityUsage {
+        let join_slot_bytes = std::mem::size_of::<u32>();
+        let join_active_bytes = self
+            .source_domain_len
+            .saturating_mul(join_slot_bytes)
+            .saturating_mul(2);
+        let join_retained_bytes = self
+            .source_join_indices
+            .capacity()
+            .saturating_add(self.source_join_stamps.capacity())
+            .saturating_mul(join_slot_bytes);
+        let join_baseline_bytes = PREPARED_DRAW_SOURCE_BASELINE
+            .saturating_mul(join_slot_bytes)
+            .saturating_mul(2);
         vec_footprint(&self.sources, PREPARED_DRAW_SOURCE_BASELINE)
-            + estimated_hash_map_footprint(&self.source_lookup, PREPARED_DRAW_SOURCE_BASELINE)
+            + CapacityUsage::new(join_active_bytes, join_retained_bytes, join_baseline_bytes)
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
+        assert!(
+            !self.sources_initialized && self.sources.is_empty(),
+            "live prepared-source joins cannot be trimmed"
+        );
         shrink_vec_by_family_ratio(
             &mut self.sources,
             PREPARED_DRAW_SOURCE_BASELINE,
             target_bytes,
             retained_bytes,
         );
-        shrink_hash_map_by_family_ratio(
-            &mut self.source_lookup,
-            PREPARED_DRAW_SOURCE_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
+        let current_slots = self
+            .source_join_indices
+            .len()
+            .max(self.source_join_stamps.len());
+        let target_slots = if retained_bytes == 0 || target_bytes >= retained_bytes {
+            current_slots
+        } else {
+            (((current_slots as u128) * (target_bytes as u128))
+                .div_ceil(retained_bytes as u128)
+                .min(usize::MAX as u128) as usize)
+                .max(PREPARED_DRAW_SOURCE_BASELINE)
+                .min(current_slots)
+        };
+        self.source_join_indices.truncate(target_slots);
+        self.source_join_stamps.truncate(target_slots);
+        self.source_join_indices.shrink_to(target_slots);
+        self.source_join_stamps.shrink_to(target_slots);
     }
 
-    /// Reserve the expected DPE-live source count once for this graph attempt.
-    pub(crate) fn begin_sources(&mut self, expected_live: usize) {
+    /// Reserve the expected DPE-live source count and dense frame-source domain
+    /// once for this graph attempt.
+    pub(crate) fn begin_sources(&mut self, expected_live: usize, source_domain_len: usize) {
         assert!(
             !self.sources_initialized,
             "prepared draw sources may be initialized only once per graph attempt"
         );
         debug_assert!(self.sources.is_empty());
-        debug_assert!(self.source_lookup.is_empty());
         self.sources.reserve(expected_live);
-        self.source_lookup.reserve(expected_live);
+        if expected_live == 0 {
+            // An all-dead graph still completes the attempt transaction, but
+            // has no valid frame-source join. In particular, do not size this
+            // retained scratch to a large pre-DPE frame domain that cannot be
+            // queried successfully in this attempt.
+            self.source_domain_len = 0;
+            self.sources_initialized = true;
+            return;
+        }
+        if self.source_join_indices.len() < source_domain_len {
+            self.source_join_indices.resize(source_domain_len, 0);
+            self.source_join_stamps.resize(source_domain_len, 0);
+        }
+        self.source_domain_len = source_domain_len;
         self.sources_initialized = true;
     }
 
     /// Publish one exact physical source after its resources have been interned
     /// into the sibling [`DrawPlanStore`].
-    pub(crate) fn insert_source(
-        &mut self,
-        frame_source: FrameSourceId,
-        source: PreparedDrawSource,
-    ) -> PreparedSourceId {
+    pub(crate) fn insert_source(&mut self, source: PreparedDrawSource) -> PreparedSourceId {
         assert!(
             self.sources_initialized,
             "prepared draw source table must be initialized before insertion"
         );
-        match self.source_lookup.entry(frame_source) {
-            Entry::Occupied(_) => panic!("prepared draw source was inserted twice"),
-            Entry::Vacant(entry) => {
-                let prepared = PreparedSourceId::from_index(self.sources.len());
-                self.sources.push(source);
-                entry.insert(prepared);
-                prepared
-            }
+        let frame_index = source.frame_source.index();
+        assert!(
+            frame_index < self.source_domain_len,
+            "prepared draw source exceeds the declared frame-source domain"
+        );
+        assert_ne!(
+            self.source_join_stamps[frame_index], self.source_join_generation,
+            "prepared draw source was inserted twice"
+        );
+        let prepared = PreparedSourceId::from_index(self.sources.len());
+        self.sources.push(source);
+        self.source_join_indices[frame_index] = prepared.0;
+        self.source_join_stamps[frame_index] = self.source_join_generation;
+        prepared
+    }
+
+    fn advance_source_join_generation(&mut self) {
+        self.source_join_generation = self.source_join_generation.wrapping_add(1);
+        if self.source_join_generation == 0 {
+            // The only O(high-water) clear occurs once per u32 generation
+            // wrap, preventing an ancient stamp from becoming current again.
+            self.source_join_stamps.fill(0);
+            self.source_join_generation = 1;
         }
     }
 
@@ -416,7 +494,30 @@ impl PreparedDrawStore {
         &self,
         frame_source: FrameSourceId,
     ) -> Option<PreparedSourceId> {
-        self.source_lookup.get(&frame_source).copied()
+        let index = frame_source.index();
+        if index >= self.source_domain_len
+            || self.source_join_stamps.get(index).copied() != Some(self.source_join_generation)
+        {
+            return None;
+        }
+        Some(PreparedSourceId(self.source_join_indices[index]))
+    }
+
+    /// Resolve the only frame-domain join in the scene pipeline transaction.
+    ///
+    /// Gather starts from a [`FrameSourceId`], so it performs this
+    /// generation-stamped dense lookup once and carries the returned
+    /// [`PreparedSourceId`] through Plan, Materialize, and Finalize. All later
+    /// phases directly index `sources`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn source_for_frame(
+        &self,
+        frame_source: FrameSourceId,
+    ) -> Option<(PreparedSourceId, &PreparedDrawSource)> {
+        let prepared = self.prepared_source_id(frame_source)?;
+        let source = self.sources.get(prepared.index())?;
+        (source.frame_source == frame_source).then_some((prepared, source))
     }
 
     #[inline]
@@ -444,12 +545,25 @@ pub(crate) struct DrawPlanStore {
     command_vertex_buffers: Vec<DrawBufferSlot>,
     plans: Vec<DrawPlanRecord>,
     plan_lookup: FxHashMap<DrawPlanKey, DrawPlanId>,
-    texture_dependencies: FxHashMap<DrawPlanKey, SmallVec<[TextureNodeId; 8]>>,
+    /// Flat variable-length logical texture dependencies. The map owns only
+    /// ranges, so clearing a graph retains one shared high-water allocation
+    /// even when a custom material spills past eight textures.
+    texture_dependencies: Vec<TextureNodeId>,
+    texture_dependency_ranges: FxHashMap<DrawPlanKey, std::ops::Range<usize>>,
+    open_texture_dependencies: Option<(DrawPlanKey, usize)>,
     open_plan: Option<(DrawPlanId, u32)>,
     buffers: Vec<Tracked<wgpu::Buffer>>,
     buffer_lookup: FxHashMap<u64, DrawBufferSlot>,
     bind_groups: Vec<Tracked<wgpu::BindGroup>>,
     bind_group_lookup: FxHashMap<u64, DrawBindGroupSlot>,
+    /// Unique sources whose morph payload reached at least one finalized live
+    /// command. A generation-stamped dense membership table removes the old
+    /// per-submit HashSet allocation while keeping main/prepass/shadow aliases
+    /// idempotent.
+    morph_history_sources: Vec<FrameSourceId>,
+    morph_history_source_stamps: Vec<u32>,
+    morph_history_source_generation: u32,
+    morph_history_active_domain_len: usize,
     attempt_token: u64,
 }
 
@@ -473,12 +587,20 @@ impl DrawPlanStore {
             command_vertex_buffers: Vec::with_capacity(DRAW_COMMAND_VERTEX_BUFFER_BASELINE),
             plans: Vec::with_capacity(DRAW_PLAN_BASELINE),
             plan_lookup: FxHashMap::default(),
-            texture_dependencies: FxHashMap::default(),
+            texture_dependencies: Vec::with_capacity(DRAW_PLAN_BASELINE * 8),
+            texture_dependency_ranges: FxHashMap::default(),
+            open_texture_dependencies: None,
             open_plan: None,
             buffers: Vec::with_capacity(DRAW_PHYSICAL_OWNER_BASELINE),
             buffer_lookup: FxHashMap::default(),
             bind_groups: Vec::with_capacity(DRAW_PHYSICAL_OWNER_BASELINE),
             bind_group_lookup: FxHashMap::default(),
+            // Morphing is intentionally cold: a wholly rigid application
+            // should not pay even one allocation for history bookkeeping.
+            morph_history_sources: Vec::new(),
+            morph_history_source_stamps: Vec::new(),
+            morph_history_source_generation: 1,
+            morph_history_active_domain_len: 0,
             attempt_token: next_draw_plan_attempt(),
         }
     }
@@ -490,11 +612,16 @@ impl DrawPlanStore {
         self.plans.clear();
         self.plan_lookup.clear();
         self.texture_dependencies.clear();
+        self.texture_dependency_ranges.clear();
+        self.open_texture_dependencies = None;
         self.open_plan = None;
         self.buffer_lookup.clear();
         self.buffers.clear();
         self.bind_group_lookup.clear();
         self.bind_groups.clear();
+        self.morph_history_sources.clear();
+        self.morph_history_active_domain_len = 0;
+        self.advance_morph_history_generation();
         self.attempt_token = next_draw_plan_attempt();
     }
 
@@ -506,11 +633,21 @@ impl DrawPlanStore {
             )
             + vec_footprint(&self.plans, DRAW_PLAN_BASELINE)
             + estimated_hash_map_footprint(&self.plan_lookup, DRAW_PLAN_BASELINE)
-            + estimated_hash_map_footprint(&self.texture_dependencies, DRAW_PLAN_BASELINE)
+            + vec_footprint(&self.texture_dependencies, DRAW_PLAN_BASELINE * 8)
+            + estimated_hash_map_footprint(&self.texture_dependency_ranges, DRAW_PLAN_BASELINE)
             + vec_footprint(&self.buffers, DRAW_PHYSICAL_OWNER_BASELINE)
             + estimated_hash_map_footprint(&self.buffer_lookup, DRAW_PHYSICAL_OWNER_BASELINE)
             + vec_footprint(&self.bind_groups, DRAW_PHYSICAL_OWNER_BASELINE)
             + estimated_hash_map_footprint(&self.bind_group_lookup, DRAW_PHYSICAL_OWNER_BASELINE)
+            + vec_footprint(&self.morph_history_sources, 0)
+            + CapacityUsage::new(
+                self.morph_history_active_domain_len
+                    .saturating_mul(std::mem::size_of::<u32>()),
+                self.morph_history_source_stamps
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+                0,
+            )
     }
 
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
@@ -538,8 +675,14 @@ impl DrawPlanStore {
             target_bytes,
             retained_bytes,
         );
-        shrink_hash_map_by_family_ratio(
+        shrink_vec_by_family_ratio(
             &mut self.texture_dependencies,
+            DRAW_PLAN_BASELINE * 8,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.texture_dependency_ranges,
             DRAW_PLAN_BASELINE,
             target_bytes,
             retained_bytes,
@@ -568,6 +711,50 @@ impl DrawPlanStore {
             target_bytes,
             retained_bytes,
         );
+        shrink_vec_by_family_ratio(
+            &mut self.morph_history_sources,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        trim_zero_baseline_u32_join(
+            &mut self.morph_history_source_stamps,
+            target_bytes,
+            retained_bytes,
+        );
+    }
+
+    /// Record one source whose morph state is represented by an emitted live
+    /// command. The first occurrence establishes stable commit order; aliases
+    /// in other live plans are O(1) stamped no-ops.
+    #[inline]
+    pub(crate) fn record_emitted_morph_history_source(&mut self, source: FrameSourceId) {
+        let required = source.index() + 1;
+        if self.morph_history_source_stamps.len() < required {
+            self.morph_history_source_stamps.resize(required, 0);
+        }
+        self.morph_history_active_domain_len = self.morph_history_active_domain_len.max(required);
+        if self.morph_history_source_stamps[source.index()] == self.morph_history_source_generation
+        {
+            return;
+        }
+        self.morph_history_source_stamps[source.index()] = self.morph_history_source_generation;
+        self.morph_history_sources.push(source);
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn emitted_morph_history_sources(&self) -> &[FrameSourceId] {
+        &self.morph_history_sources
+    }
+
+    fn advance_morph_history_generation(&mut self) {
+        self.morph_history_source_generation = self.morph_history_source_generation.wrapping_add(1);
+        if self.morph_history_source_generation == 0 {
+            // The only O(high-water) stamp clear occurs once per u32 wrap.
+            self.morph_history_source_stamps.fill(0);
+            self.morph_history_source_generation = 1;
+        }
     }
 
     pub(crate) fn reserve_commands(&mut self, additional: usize) {
@@ -611,28 +798,78 @@ impl DrawPlanStore {
     /// be incomplete and producer ordering could not be recovered later.
     pub(crate) fn assert_texture_dependencies_registerable(&self, key: DrawPlanKey) {
         let key = draw_texture_dependency_key(key);
+        let topology_demanded = |candidate| {
+            self.plan_lookup.get(&candidate).is_some_and(|id| {
+                self.plans
+                    .get(id.index())
+                    .is_some_and(|plan| plan.topology_demanded)
+            })
+        };
+        let dependency_was_demanded = match key {
+            DrawPlanKey::Opaque => OPAQUE_TEXTURE_DEPENDENCY_ALIASES
+                .iter()
+                .copied()
+                .any(topology_demanded),
+            // Normalization above guarantees that Prepass cannot reach this
+            // match. Transparent and Shadow each have one exact canonical key.
+            DrawPlanKey::Transparent | DrawPlanKey::Shadow { .. } => topology_demanded(key),
+            DrawPlanKey::Prepass { .. } => {
+                unreachable!("prepass dependency key was not normalized")
+            }
+        };
         assert!(
-            self.plans.iter().all(|plan| {
-                !plan.topology_demanded || draw_texture_dependency_key(plan.key) != key
-            }),
+            !dependency_was_demanded,
             "scene-submission texture dependencies must be registered before reservation"
         );
     }
 
-    pub(crate) fn set_texture_dependencies(
-        &mut self,
-        key: DrawPlanKey,
-        dependencies: SmallVec<[TextureNodeId; 8]>,
-    ) {
+    pub(crate) fn begin_texture_dependencies(&mut self, key: DrawPlanKey) {
         let key = draw_texture_dependency_key(key);
-        match self.texture_dependencies.entry(key) {
-            Entry::Vacant(entry) => {
-                entry.insert(dependencies);
-            }
-            Entry::Occupied(_) => {
-                panic!("draw-plan texture dependencies registered twice for {key:?}");
-            }
-        }
+        assert!(
+            self.open_texture_dependencies.is_none(),
+            "draw-plan texture dependency registration is already active"
+        );
+        assert!(
+            !self.texture_dependency_ranges.contains_key(&key),
+            "draw-plan texture dependencies registered twice for {key:?}"
+        );
+        self.open_texture_dependencies = Some((key, self.texture_dependencies.len()));
+    }
+
+    #[inline]
+    pub(crate) fn push_texture_dependency(&mut self, dependency: TextureNodeId) {
+        assert!(
+            self.open_texture_dependencies.is_some(),
+            "draw-plan texture dependency registration is not active"
+        );
+        self.texture_dependencies.push(dependency);
+    }
+
+    pub(crate) fn finish_texture_dependencies(&mut self, key: DrawPlanKey) {
+        let key = draw_texture_dependency_key(key);
+        let (open_key, start) = self
+            .open_texture_dependencies
+            .take()
+            .expect("draw-plan texture dependency registration is not active");
+        assert_eq!(
+            open_key, key,
+            "draw-plan texture dependency registration ended with another key"
+        );
+        let previous = self
+            .texture_dependency_ranges
+            .insert(key, start..self.texture_dependencies.len());
+        debug_assert!(previous.is_none());
+    }
+
+    /// Roll back an open flat dependency recipe after graph-construction
+    /// unwinding. No range is published until `finish`, so restoring the
+    /// pre-registration tail and closing the transaction is sufficient.
+    #[cfg(any(test, feature = "rdg_bench_support"))]
+    pub(crate) fn abort_texture_dependencies(&mut self) {
+        let Some((_key, start)) = self.open_texture_dependencies.take() else {
+            return;
+        };
+        self.texture_dependencies.truncate(start);
     }
 
     /// Marks one canonical plan as topology-demanded and returns its normalized
@@ -649,9 +886,9 @@ impl DrawPlanStore {
     /// Borrow the logical texture dependencies registered for a normalized
     /// draw-plan key.
     pub(crate) fn texture_dependencies(&self, normalized_key: DrawPlanKey) -> &[TextureNodeId] {
-        self.texture_dependencies
+        self.texture_dependency_ranges
             .get(&normalized_key)
-            .map_or(&[], SmallVec::as_slice)
+            .map_or(&[], |range| &self.texture_dependencies[range.clone()])
     }
 
     /// Return whether an ID addresses a reserved plan in this graph attempt.
@@ -964,12 +1201,6 @@ impl DrawPlanStore {
         }
     }
 
-    /// Source identities of commands that were actually emitted into at least
-    /// one live plan. The caller deduplicates shared main/prepass/shadow uses.
-    pub(crate) fn emitted_frame_sources(&self) -> impl Iterator<Item = FrameSourceId> + '_ {
-        self.commands.iter().map(|command| command.frame_source)
-    }
-
     fn plan(&self, id: DrawPlanId) -> Option<&DrawPlanRecord> {
         if id.attempt_token != self.attempt_token {
             return None;
@@ -1004,11 +1235,15 @@ impl DrawPlanStore {
             && self.plans.is_empty()
             && self.plan_lookup.is_empty()
             && self.texture_dependencies.is_empty()
+            && self.texture_dependency_ranges.is_empty()
+            && self.open_texture_dependencies.is_none()
             && self.open_plan.is_none()
             && self.buffers.is_empty()
             && self.buffer_lookup.is_empty()
             && self.bind_groups.is_empty()
             && self.bind_group_lookup.is_empty()
+            && self.morph_history_sources.is_empty()
+            && self.morph_history_active_domain_len == 0
     }
 
     #[cfg(test)]
@@ -1024,6 +1259,18 @@ impl DrawPlanStore {
     }
 }
 
+fn trim_zero_baseline_u32_join(stamps: &mut Vec<u32>, target_bytes: usize, retained_bytes: usize) {
+    if retained_bytes == 0 || target_bytes >= retained_bytes {
+        return;
+    }
+    let current_slots = stamps.len();
+    let target_slots = (((current_slots as u128) * (target_bytes as u128))
+        .div_ceil(retained_bytes as u128)
+        .min(usize::MAX as u128)) as usize;
+    stamps.truncate(target_slots);
+    stamps.shrink_to(target_slots);
+}
+
 #[inline]
 fn draw_texture_dependency_key(key: DrawPlanKey) -> DrawPlanKey {
     match key {
@@ -1031,6 +1278,55 @@ fn draw_texture_dependency_key(key: DrawPlanKey) -> DrawPlanKey {
         key => key,
     }
 }
+
+/// Every draw-plan key whose material texture dependencies are owned by the
+/// canonical opaque dependency set. Keeping this finite alias list beside the
+/// normalization function turns registration validation into at most nine
+/// direct retained-map probes instead of scanning every shadow plan already
+/// reserved in the attempt.
+const OPAQUE_TEXTURE_DEPENDENCY_ALIASES: [DrawPlanKey; 9] = [
+    DrawPlanKey::Opaque,
+    DrawPlanKey::Prepass {
+        needs_normal: false,
+        needs_feature_id: false,
+        needs_velocity: false,
+    },
+    DrawPlanKey::Prepass {
+        needs_normal: false,
+        needs_feature_id: false,
+        needs_velocity: true,
+    },
+    DrawPlanKey::Prepass {
+        needs_normal: false,
+        needs_feature_id: true,
+        needs_velocity: false,
+    },
+    DrawPlanKey::Prepass {
+        needs_normal: false,
+        needs_feature_id: true,
+        needs_velocity: true,
+    },
+    DrawPlanKey::Prepass {
+        needs_normal: true,
+        needs_feature_id: false,
+        needs_velocity: false,
+    },
+    DrawPlanKey::Prepass {
+        needs_normal: true,
+        needs_feature_id: false,
+        needs_velocity: true,
+    },
+    DrawPlanKey::Prepass {
+        needs_normal: true,
+        needs_feature_id: true,
+        needs_velocity: false,
+    },
+    DrawPlanKey::Prepass {
+        needs_normal: true,
+        needs_feature_id: true,
+        needs_velocity: true,
+    },
+];
 
 /// Narrow immutable execute-time view over one graph attempt's draw plans.
 #[derive(Clone, Copy)]
@@ -1110,9 +1406,13 @@ pub struct RenderLists {
     pub shadow_queues: FxHashMap<(u64, u32), Vec<ShadowRenderIntent>>,
 
     /// Dense mapping from frame-local source IDs to immutable extraction IDs.
-    /// Both containers retain capacity across frames.
     frame_sources: Vec<ExtractedSourceId>,
-    frame_source_lookup: FxHashMap<ExtractedSourceId, FrameSourceId>,
+    /// Generation-stamped inverse join indexed directly by the dense
+    /// `ExtractedSourceId`. Warm frames never clear the retained high-water
+    /// arrays; only newly observed extraction indices initialize slots.
+    frame_source_indices: Vec<u32>,
+    frame_source_stamps: Vec<u32>,
+    frame_source_generation: u32,
 
     /// All active render views for the current frame.
     ///
@@ -1134,7 +1434,9 @@ impl RenderLists {
             transparent: Vec::with_capacity(128),
             shadow_queues: FxHashMap::default(),
             frame_sources: Vec::with_capacity(512),
-            frame_source_lookup: FxHashMap::default(),
+            frame_source_indices: Vec::with_capacity(512),
+            frame_source_stamps: Vec::with_capacity(512),
+            frame_source_generation: 1,
             active_views: Vec::with_capacity(16),
             use_transmission: false,
         }
@@ -1157,20 +1459,36 @@ impl RenderLists {
         self.transparent.clear();
         self.shadow_queues.clear();
         self.frame_sources.clear();
-        self.frame_source_lookup.clear();
+        self.advance_frame_source_generation();
         self.use_transmission = false;
     }
 
     /// Intern one immutable extraction source into this frame's compact domain.
     pub(crate) fn intern_frame_source(&mut self, extracted: ExtractedSourceId) -> FrameSourceId {
-        match self.frame_source_lookup.entry(extracted) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let source = FrameSourceId::from_index(self.frame_sources.len());
-                self.frame_sources.push(extracted);
-                entry.insert(source);
-                source
-            }
+        let extracted_index = extracted.index();
+        if self.frame_source_indices.len() <= extracted_index {
+            let new_len = extracted_index
+                .checked_add(1)
+                .expect("extracted source join length overflowed");
+            self.frame_source_indices.resize(new_len, 0);
+            self.frame_source_stamps.resize(new_len, 0);
+        }
+        if self.frame_source_stamps[extracted_index] == self.frame_source_generation {
+            return FrameSourceId(self.frame_source_indices[extracted_index]);
+        }
+
+        let source = FrameSourceId::from_index(self.frame_sources.len());
+        self.frame_sources.push(extracted);
+        self.frame_source_indices[extracted_index] = source.0;
+        self.frame_source_stamps[extracted_index] = self.frame_source_generation;
+        source
+    }
+
+    fn advance_frame_source_generation(&mut self) {
+        self.frame_source_generation = self.frame_source_generation.wrapping_add(1);
+        if self.frame_source_generation == 0 {
+            self.frame_source_stamps.fill(0);
+            self.frame_source_generation = 1;
         }
     }
 
@@ -1204,35 +1522,36 @@ impl RenderLists {
         self.transparent.push(intent);
     }
 
-    /// Return the exact sorted and deduplicated frame-source union selected by
-    /// DPE-live draw-plan keys.
-    #[must_use]
-    pub(crate) fn live_frame_sources(
+    /// Visit the frame sources selected by one DPE-live draw-plan key.
+    ///
+    /// The caller owns deduplication scratch. Keeping that scratch in the
+    /// graph-attempt source coordinator avoids allocating and copying one
+    /// temporary `Vec` for every warm frame while still letting several plan
+    /// families share the same source union.
+    pub(crate) fn for_each_source_for_key(
         &self,
-        live_keys: impl IntoIterator<Item = DrawPlanKey>,
-    ) -> Vec<FrameSourceId> {
-        let mut sources = Vec::new();
-        for key in live_keys {
-            self.extend_sources_for_key(key, &mut sources);
-        }
-        sort_and_dedup_sources(&mut sources);
-        sources
-    }
-
-    fn extend_sources_for_key(&self, key: DrawPlanKey, sources: &mut Vec<FrameSourceId>) {
+        key: DrawPlanKey,
+        mut visit: impl FnMut(FrameSourceId),
+    ) {
         match key {
             DrawPlanKey::Opaque | DrawPlanKey::Prepass { .. } => {
-                sources.extend(self.opaque.iter().map(|intent| intent.source));
+                for intent in &self.opaque {
+                    visit(intent.source);
+                }
             }
             DrawPlanKey::Transparent => {
-                sources.extend(self.transparent.iter().map(|intent| intent.source));
+                for intent in &self.transparent {
+                    visit(intent.source);
+                }
             }
             DrawPlanKey::Shadow {
                 light_id,
                 layer_index,
             } => {
                 if let Some(queue) = self.shadow_queues.get(&(light_id, layer_index)) {
-                    sources.extend(queue.iter().map(|intent| intent.source));
+                    for intent in queue {
+                        visit(intent.source);
+                    }
                 }
             }
         }
@@ -1250,12 +1569,6 @@ impl Default for RenderLists {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[inline]
-fn sort_and_dedup_sources(sources: &mut Vec<FrameSourceId>) {
-    sources.sort_unstable();
-    sources.dedup();
 }
 
 // ============================================================================
@@ -1777,6 +2090,81 @@ impl RenderFrame {
 }
 
 #[cfg(test)]
+mod shadow_metadata_tests {
+    use super::*;
+    use glam::{Vec3, Vec4};
+    use myth_resources::{buffer::CpuBuffer, uniforms::GpuLightStorage};
+
+    fn seed_prior_shadow_metadata(buffer: &CpuBuffer<Vec<GpuLightStorage>>) {
+        let mut lights = buffer.write();
+        for light in lights.iter_mut() {
+            light.shadow_layer_index = 7;
+            light.point_shadow_index = 3;
+            light.shadow_bias = 0.125;
+            light.shadow_normal_bias = 0.25;
+            light.cascade_count = 2;
+            light.cascade_splits = Vec4::new(2.0, 8.0, 0.0, 0.0);
+            light.shadow_matrices.0 = [Mat4::from_translation(Vec3::ONE); 4];
+        }
+    }
+
+    fn assert_default_light_payload(buffer: &CpuBuffer<Vec<GpuLightStorage>>) {
+        assert!(
+            buffer
+                .read()
+                .iter()
+                .all(|light| *light == GpuLightStorage::default()),
+            "no-shadow input synchronization must erase prior shadow metadata"
+        );
+    }
+
+    #[test]
+    fn stable_no_shadow_layers_leave_both_light_buffer_stamps_unchanged() {
+        let mut scene = ExtractedScene::new();
+        scene.prepare_gpu_scene_inputs(0.0);
+        let local_before = scene.local_light_storage_buffer.stamp();
+        let directional_before = scene.directional_light_storage_buffer.stamp();
+
+        RenderFrame::update_light_shadow_metadata(&[], &mut scene);
+
+        assert_eq!(scene.local_light_storage_buffer.stamp(), local_before);
+        assert_eq!(
+            scene.directional_light_storage_buffer.stamp(),
+            directional_before
+        );
+    }
+
+    #[test]
+    fn shadow_to_no_shadow_transition_clears_stale_fields_before_early_return() {
+        let mut scene = ExtractedScene::new();
+        seed_prior_shadow_metadata(&scene.local_light_storage_buffer);
+        seed_prior_shadow_metadata(&scene.directional_light_storage_buffer);
+        let stale_local = scene.local_light_storage_buffer.stamp();
+        let stale_directional = scene.directional_light_storage_buffer.stamp();
+
+        // This is the production order: extraction synchronizes the current
+        // light payload before shadow views and their metadata are processed.
+        scene.prepare_gpu_scene_inputs(0.0);
+        assert_default_light_payload(&scene.local_light_storage_buffer);
+        assert_default_light_payload(&scene.directional_light_storage_buffer);
+        let synchronized_local = scene.local_light_storage_buffer.stamp();
+        let synchronized_directional = scene.directional_light_storage_buffer.stamp();
+        assert!(synchronized_local.version > stale_local.version);
+        assert!(synchronized_directional.version > stale_directional.version);
+
+        RenderFrame::update_light_shadow_metadata(&[], &mut scene);
+
+        assert_eq!(scene.local_light_storage_buffer.stamp(), synchronized_local);
+        assert_eq!(
+            scene.directional_light_storage_buffer.stamp(),
+            synchronized_directional
+        );
+        assert_default_light_payload(&scene.local_light_storage_buffer);
+        assert_default_light_payload(&scene.directional_light_storage_buffer);
+    }
+}
+
+#[cfg(test)]
 mod draw_plan_tests {
     use super::*;
     use crate::core::WgpuContext;
@@ -1817,6 +2205,111 @@ mod draw_plan_tests {
     }
 
     #[test]
+    fn prepared_source_join_is_paid_once_and_retains_stable_identities() {
+        let frame_source = FrameSourceId::from_index(37);
+        let extracted_source = ExtractedSourceId::from_index(17);
+        let mut prepared = PreparedDrawStore::new();
+        prepared.begin_sources(1, frame_source.index() + 1);
+        let prepared_source = prepared.insert_source(PreparedDrawSource {
+            frame_source,
+            extracted_source,
+            geometry: GeometryFrameId::from_index(3),
+            material: MaterialFrameId::from_index(5),
+            object_interface: ObjectInterfaceId::from_index(7),
+            material_bind_group: DrawBindGroupSlot(11),
+            object_bind_group: (DrawBindGroupSlot(13), 256),
+            commits_morph_history: false,
+        });
+
+        let (joined_id, joined) = prepared
+            .source_for_frame(frame_source)
+            .expect("inserted frame source must join to its dense prepared record");
+        assert_eq!(joined_id, prepared_source);
+        assert_eq!(joined.frame_source, frame_source);
+        assert_eq!(joined.extracted_source, extracted_source);
+        assert!(
+            std::ptr::eq(
+                joined,
+                prepared
+                    .source(prepared_source)
+                    .expect("dense prepared ID must remain directly addressable"),
+            ),
+            "Gather and later direct-index phases must observe one compact record"
+        );
+        assert!(
+            prepared
+                .source_for_frame(FrameSourceId::from_index(36))
+                .is_none(),
+            "a foreign frame identity must fail closed"
+        );
+
+        let retained_join_len = prepared.source_join_stamps.len();
+        prepared.clear();
+        assert_eq!(prepared.source_join_stamps.len(), retained_join_len);
+        assert_eq!(prepared.prepared_source_id(frame_source), None);
+        prepared.begin_sources(1, frame_source.index() + 1);
+        let next = prepared.insert_source(PreparedDrawSource {
+            frame_source,
+            extracted_source,
+            geometry: GeometryFrameId::from_index(3),
+            material: MaterialFrameId::from_index(5),
+            object_interface: ObjectInterfaceId::from_index(7),
+            material_bind_group: DrawBindGroupSlot(11),
+            object_bind_group: (DrawBindGroupSlot(13), 256),
+            commits_morph_history: false,
+        });
+        assert_eq!(next, PreparedSourceId::from_index(0));
+        assert_eq!(prepared.prepared_source_id(frame_source), Some(next));
+
+        prepared.source_join_stamps.fill(1);
+        prepared.source_join_generation = u32::MAX;
+        prepared.clear();
+        assert_eq!(prepared.source_join_generation, 1);
+        assert!(
+            prepared.source_join_stamps.iter().all(|&stamp| stamp == 0),
+            "generation wrap must erase ancient prepared-source stamps once"
+        );
+    }
+
+    #[test]
+    fn all_dead_prepared_source_attempt_does_not_materialize_frame_domain() {
+        let mut prepared = PreparedDrawStore::new();
+        let retained_before = prepared.capacity_usage().retained_bytes;
+        let indices_len_before = prepared.source_join_indices.len();
+        let stamps_len_before = prepared.source_join_stamps.len();
+
+        prepared.begin_sources(0, 4096);
+        assert!(prepared.sources_initialized);
+        assert_eq!(prepared.source_domain_len, 0);
+        assert_eq!(prepared.source_join_indices.len(), indices_len_before);
+        assert_eq!(prepared.source_join_stamps.len(), stamps_len_before);
+        assert_eq!(prepared.capacity_usage().active_bytes, 0);
+        assert_eq!(prepared.capacity_usage().retained_bytes, retained_before);
+        assert_eq!(
+            prepared.prepared_source_id(FrameSourceId::from_index(0)),
+            None
+        );
+        prepared.clear();
+    }
+
+    #[test]
+    fn prepared_source_dense_join_is_inactive_after_clear_and_trimmable() {
+        let mut prepared = PreparedDrawStore::new();
+        prepared.begin_sources(1, 4096);
+        assert!(prepared.capacity_usage().active_bytes > 0);
+        prepared.clear();
+
+        let before = prepared.capacity_usage();
+        assert_eq!(before.active_bytes, 0);
+        assert!(prepared.source_join_stamps.len() >= 4096);
+        prepared.trim_capacity(0, before.retained_bytes);
+
+        assert!(prepared.source_join_stamps.len() <= PREPARED_DRAW_SOURCE_BASELINE);
+        assert!(prepared.source_join_indices.len() <= PREPARED_DRAW_SOURCE_BASELINE);
+        assert!(prepared.capacity_usage().retained_bytes < before.retained_bytes);
+    }
+
+    #[test]
     fn frame_source_interner_is_dense_deduplicated_and_resettable() {
         let mut lists = RenderLists::new();
         let extracted_9 = ExtractedSourceId::from_index(9);
@@ -1840,6 +2333,35 @@ mod draw_plan_tests {
         lists.begin_intent_collection();
         assert_eq!(lists.frame_source_count(), 0);
         assert_eq!(lists.extracted_source(first), None);
+        assert_eq!(lists.frame_source_stamps.len(), 10);
+        assert_ne!(
+            lists.frame_source_stamps[extracted_9.index()],
+            lists.frame_source_generation,
+            "generation advance invalidates old slots without clearing them"
+        );
+
+        let reinterned = lists.intern_frame_source(extracted_9);
+        assert_eq!(reinterned, FrameSourceId::from_index(0));
+        assert_eq!(lists.extracted_source(reinterned), Some(extracted_9));
+    }
+
+    #[test]
+    fn frame_source_generation_wrap_clears_ancient_stamps_once() {
+        let mut lists = RenderLists::new();
+        let extracted = ExtractedSourceId::from_index(7);
+        lists.frame_source_indices.resize(8, 0);
+        lists.frame_source_stamps.resize(8, 1);
+        lists.frame_source_generation = u32::MAX;
+
+        lists.begin_intent_collection();
+
+        assert_eq!(lists.frame_source_generation, 1);
+        assert!(lists.frame_source_stamps.iter().all(|&stamp| stamp == 0));
+        assert_eq!(
+            lists.intern_frame_source(extracted),
+            FrameSourceId::from_index(0),
+            "a pre-wrap stamp must not alias the new generation"
+        );
     }
 
     #[test]
@@ -1854,6 +2376,61 @@ mod draw_plan_tests {
         store.clear();
         assert!(store.resolve_plan(plan).is_none());
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn rigid_draw_plan_attempts_do_not_materialize_morph_history_storage() {
+        let mut store = DrawPlanStore::new();
+        assert!(store.emitted_morph_history_sources().is_empty());
+        assert_eq!(store.morph_history_sources.capacity(), 0);
+        assert_eq!(store.morph_history_source_stamps.capacity(), 0);
+
+        let plan = store.reserve_plan(DrawPlanKey::Opaque);
+        store.mark_live(plan);
+        let start = store.begin_finalize(plan);
+        store.push_command(test_command(0), &[]);
+        store.finish_finalize(plan, start);
+
+        assert!(store.emitted_morph_history_sources().is_empty());
+        assert_eq!(store.morph_history_sources.capacity(), 0);
+        assert_eq!(store.morph_history_source_stamps.capacity(), 0);
+        store.clear();
+        assert_eq!(store.morph_history_active_domain_len, 0);
+    }
+
+    #[test]
+    fn emitted_morph_history_sources_are_retained_and_generation_deduplicated() {
+        let mut store = DrawPlanStore::new();
+        let source_37 = FrameSourceId::from_index(37);
+        let source_5 = FrameSourceId::from_index(5);
+
+        store.record_emitted_morph_history_source(source_37);
+        store.record_emitted_morph_history_source(source_5);
+        store.record_emitted_morph_history_source(source_37);
+        assert_eq!(
+            store.emitted_morph_history_sources(),
+            &[source_37, source_5],
+            "main/prepass/shadow aliases must commit a source only once"
+        );
+        let retained_stamp_len = store.morph_history_source_stamps.len();
+
+        store.clear();
+        assert!(store.emitted_morph_history_sources().is_empty());
+        assert_eq!(store.morph_history_source_stamps.len(), retained_stamp_len);
+        store.record_emitted_morph_history_source(source_37);
+        assert_eq!(store.emitted_morph_history_sources(), &[source_37]);
+
+        store.morph_history_source_stamps.fill(1);
+        store.morph_history_source_generation = u32::MAX;
+        store.clear();
+        assert_eq!(store.morph_history_source_generation, 1);
+        assert!(
+            store
+                .morph_history_source_stamps
+                .iter()
+                .all(|&stamp| stamp == 0),
+            "generation wrap must erase ancient morph-history stamps once"
+        );
     }
 
     #[test]
@@ -2112,8 +2689,10 @@ mod draw_plan_tests {
 
         assert!(!plans.is_live(dead_transparent));
         assert!(!plans.is_live(dead_shadow));
+        let mut source_prepare = crate::graph::scene_source_prepare::SceneSourcePrepareStore::new();
+        source_prepare.select_live_sources(&lists, plans.live_keys());
         assert_eq!(
-            lists.live_frame_sources(plans.live_keys()),
+            source_prepare.live_sources(),
             vec![
                 FrameSourceId::from_index(1),
                 FrameSourceId::from_index(2),

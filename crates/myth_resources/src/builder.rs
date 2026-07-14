@@ -14,6 +14,7 @@ use crate::buffer::BufferRef;
 use crate::buffer::{CpuBuffer, GpuData};
 use crate::texture::TextureSource;
 use crate::uniforms::WgslStruct;
+use smallvec::SmallVec;
 use std::fmt::Write;
 use wgpu::ShaderStages;
 
@@ -84,7 +85,10 @@ pub struct Binding<'a> {
 /// `wgpu::BindGroupLayoutEntry` arrays and
 /// [`generate_wgsl`](Self::generate_wgsl) for WGSL declarations.
 pub struct ResourceBuilder<'a> {
-    pub bindings: Vec<Binding<'a>>,
+    /// Built-in Physical materials fit inline (one uniform plus all texture
+    /// slots), eliminating one allocator round-trip from every warm material
+    /// validation. Larger custom recipes spill transparently.
+    pub bindings: SmallVec<[Binding<'a>; 24]>,
 }
 
 impl Default for ResourceBuilder<'_> {
@@ -97,7 +101,7 @@ impl<'a> ResourceBuilder<'a> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            bindings: Vec::new(),
+            bindings: SmallVec::new(),
         }
     }
 

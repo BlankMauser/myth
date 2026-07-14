@@ -18,7 +18,7 @@ use super::{GpuResourceStore, MipmapRequest, ResourceManager};
 /// Texture resource mapping
 ///
 /// Maps `TextureHandle` to the corresponding `GpuImage` ID, View ID, and `GpuSampler` ID
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureBinding {
     /// GPU-side image view ID
     pub view_id: u64,
@@ -288,6 +288,29 @@ pub(crate) struct TextureImageLease {
 pub(crate) struct MaterializedAssetTexture {
     pub(crate) view: Tracked<wgpu::TextureView>,
     pub(crate) generation_key: PhysicalImageGenerationKey,
+    pub(crate) sampler_id: usize,
+}
+
+/// Copy physical identity exported by the canonical Asset Texture producer to
+/// later material consumers in the same graph attempt.
+///
+/// The generation key is ABA-safe for the physical allocation/content, while
+/// `sampler_id` identifies the exact sampler slot installed by the producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssetTexturePhysicalBinding {
+    pub(crate) generation_key: PhysicalImageGenerationKey,
+    pub(crate) sampler_id: usize,
+}
+
+impl MaterializedAssetTexture {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn physical_binding(&self) -> AssetTexturePhysicalBinding {
+        AssetTexturePhysicalBinding {
+            generation_key: self.generation_key,
+            sampler_id: self.sampler_id,
+        }
+    }
 }
 
 /// A drift-safe live materialization attempt.
@@ -528,6 +551,7 @@ pub(crate) fn materialize_asset_texture_snapshot(
     frame_index: u64,
     snapshot: AssetTextureSnapshot,
     image: &Image,
+    sampler_id: usize,
 ) -> AssetTextureMaterialization {
     let spec = snapshot.physical_spec();
     resources.materialize_texture_image(
@@ -551,6 +575,7 @@ pub(crate) fn materialize_asset_texture_snapshot(
         generation_key: resources
             .texture_generation_key(snapshot.texture_handle)
             .expect("asset texture missing a physical generation"),
+        sampler_id,
     };
     let mipmap_request = snapshot
         .generate_mipmaps
@@ -568,6 +593,28 @@ pub(crate) fn materialize_asset_texture_snapshot(
 }
 
 impl ResourceManager {
+    /// Observe an exact resident Asset Texture before the graph coordinator's
+    /// selected T -> I -> T postflight.
+    #[must_use]
+    pub(crate) fn exact_asset_texture_residency(
+        &self,
+        snapshot: AssetTextureSnapshot,
+    ) -> Option<super::ExactAssetTextureResidency> {
+        self.resources.exact_asset_texture_residency(snapshot)
+    }
+
+    /// Complete the cache-side CAS for an exact resident Asset Texture after
+    /// AssetStorage postflight. The warm path only touches residency and
+    /// clones graph-attempt owners.
+    pub(crate) fn reuse_exact_asset_texture_for_graph(
+        &mut self,
+        snapshot: AssetTextureSnapshot,
+        expected: super::ExactAssetTextureResidency,
+    ) -> Option<AssetTextureMaterialization> {
+        self.resources
+            .reuse_exact_asset_texture(snapshot, expected, self.frame_index)
+    }
+
     /// Materialize one DPE-live logical Asset Texture and publish the exact
     /// sampler/view binding consumed by graph-planned materials.
     ///
@@ -611,6 +658,7 @@ impl ResourceManager {
             self.frame_index,
             snapshot,
             &image,
+            sampler_id,
         );
 
         // Dynamic images and AssetStorage entries may change while bytes are
@@ -808,6 +856,7 @@ impl ResourceManager {
             self.frame_index,
             snapshot,
             &image_arc,
+            sampler_id,
         );
 
         // Do not publish a binding under a snapshot that drifted while its
@@ -915,6 +964,147 @@ mod tests {
         assert_eq!(second.mip_count, 4);
         assert_eq!(second.format, wgpu::TextureFormat::Rgba8Unorm);
         assert_ne!(first.logical_version, second.logical_version);
+    }
+
+    #[test]
+    fn exact_resident_token_is_fail_closed_across_sampler_and_image_drift() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8());
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("resident token"), image));
+
+        let initial_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("initial snapshot missing");
+        assert!(
+            resources
+                .materialize_asset_texture_for_graph(&assets, initial_snapshot)
+                .texture
+                .is_some()
+        );
+        let initial_token = resources
+            .exact_asset_texture_residency(initial_snapshot)
+            .expect("initial binding must be exactly resident");
+        let initial_generation = resources
+            .resources
+            .texture_generation_key(texture)
+            .expect("initial generation missing");
+        let reused = resources
+            .reuse_exact_asset_texture_for_graph(initial_snapshot, initial_token)
+            .expect("an unchanged exact token must be reusable");
+        assert_eq!(
+            reused
+                .texture
+                .expect("resident reuse lost its physical owner")
+                .generation_key,
+            initial_generation
+        );
+
+        let mut sampler_update = Texture::new_2d(Some("resident token nearest"), image);
+        sampler_update.sampler.mag_filter = wgpu::FilterMode::Nearest;
+        assert_eq!(assets.textures.update(texture, sampler_update), Some(2));
+        let sampler_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("sampler snapshot missing");
+        assert!(
+            resources
+                .materialize_asset_texture_for_graph(&assets, sampler_snapshot)
+                .texture
+                .is_some()
+        );
+        let sampler_token = resources
+            .exact_asset_texture_residency(sampler_snapshot)
+            .expect("sampler update was not published exactly");
+        let sampler_generation = resources
+            .resources
+            .texture_generation_key(texture)
+            .expect("sampler generation missing");
+        assert_eq!(
+            sampler_generation, initial_generation,
+            "sampler-only drift must retain the physical image generation"
+        );
+        assert_ne!(
+            sampler_token, initial_token,
+            "the exact token must still cover the changed sampler slot"
+        );
+        let sampler_binding = *resources
+            .get_texture_binding(texture)
+            .expect("sampler binding missing");
+        assert!(
+            resources
+                .reuse_exact_asset_texture_for_graph(initial_snapshot, initial_token)
+                .is_none(),
+            "an old resident token must not survive sampler/logical drift"
+        );
+        assert_eq!(
+            *resources
+                .get_texture_binding(texture)
+                .expect("failed CAS removed the current binding"),
+            sampler_binding,
+            "a rejected old token must not overwrite the current binding"
+        );
+
+        let replacement = Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![37; 8 * 8 * 4]),
+        );
+        assert_eq!(assets.images.update(image, replacement), Some(2));
+        let image_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("image snapshot missing");
+        assert!(
+            resources
+                .materialize_asset_texture_for_graph(&assets, image_snapshot)
+                .texture
+                .is_some()
+        );
+        let image_token = resources
+            .exact_asset_texture_residency(image_snapshot)
+            .expect("image refresh was not published exactly");
+        let image_generation = resources
+            .resources
+            .texture_generation_key(texture)
+            .expect("image generation missing");
+        assert_eq!(image_generation.allocation, sampler_generation.allocation);
+        assert_ne!(
+            image_generation, sampler_generation,
+            "content drift must advance the physical allocation generation"
+        );
+        assert_ne!(image_token, sampler_token);
+        let image_binding = *resources
+            .get_texture_binding(texture)
+            .expect("refreshed image binding missing");
+        assert!(
+            resources
+                .reuse_exact_asset_texture_for_graph(sampler_snapshot, sampler_token)
+                .is_none(),
+            "an old resident token must not survive image-generation drift"
+        );
+        assert_eq!(
+            *resources
+                .get_texture_binding(texture)
+                .expect("generation CAS failure removed the current binding"),
+            image_binding,
+            "a rejected generation token must leave the exact winner untouched"
+        );
+        assert_eq!(
+            resources
+                .resources
+                .texture_generation_key(texture)
+                .expect("generation CAS failure removed the current image"),
+            image_generation
+        );
     }
 
     #[test]

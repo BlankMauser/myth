@@ -32,7 +32,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::core::gpu::{BindingInterfaceId, GpuGlobalState, Tracked};
-use crate::graph::extracted::SceneFeatures;
+use crate::graph::extracted::{ItemShaderFeatures, SceneFeatures};
 use crate::pipeline::pipeline_id::{ComputePipelineId, RenderPipelineId};
 use crate::pipeline::pipeline_key::{
     ComputePipelineKey, FullscreenPipelineKey, GraphicsPipelineKey, PipelineFlags,
@@ -59,7 +59,7 @@ pub struct FastPipelineKey {
     pub geometry_version: u64,
     pub vertex_layout_id: u64,
     pub instance_variants: u32,
-    pub item_shader_defines_hash: u64,
+    pub item_shader_features: ItemShaderFeatures,
     pub shader_source_identity: u64,
     pub global_layout_id: u64,
     pub global_binding_interface_id: BindingInterfaceId,
@@ -88,7 +88,7 @@ pub struct FastShadowPipelineKey {
     pub geometry_version: u64,
     pub vertex_layout_id: u64,
     pub instance_variants: u32,
-    pub item_shader_defines_hash: u64,
+    pub item_shader_features: ItemShaderFeatures,
     pub shader_source_identity: u64,
     pub shadow_global_layout_id: u64,
     pub material_layout_id: u64,

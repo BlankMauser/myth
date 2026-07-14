@@ -58,6 +58,8 @@ use crate::graph::RdgSurfaceAcquireFailure;
 use crate::graph::RenderState;
 use crate::graph::core::ClusteredScreenBindings;
 use crate::graph::core::GraphStorage;
+#[cfg(feature = "rdg_bench_support")]
+use crate::graph::core::RdgDetailPhase;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::GaussianFrameResolver;
 use crate::graph::core::graph::FrameConfig;
@@ -345,6 +347,60 @@ fn classify_surface_acquisition_failure(
     }
 }
 
+#[derive(Clone, Copy)]
+enum RenderTargetFormatContract {
+    /// Swap-chain textures may expose the configured sRGB view over the
+    /// corresponding linear physical format.
+    SurfaceViewFamily,
+    /// Headless textures declare no alternate view formats, so their physical
+    /// format must exactly match the logical graph descriptor.
+    Exact,
+}
+
+#[inline]
+fn render_target_matches_desc(
+    texture: &wgpu::Texture,
+    desc: TextureDesc,
+    format_contract: RenderTargetFormatContract,
+) -> bool {
+    render_target_metadata_matches_desc(
+        wgpu::Extent3d {
+            width: texture.width(),
+            height: texture.height(),
+            depth_or_array_layers: texture.depth_or_array_layers(),
+        },
+        texture.mip_level_count(),
+        texture.sample_count(),
+        texture.dimension(),
+        texture.format(),
+        desc,
+        format_contract,
+    )
+}
+
+#[inline]
+fn render_target_metadata_matches_desc(
+    size: wgpu::Extent3d,
+    mip_level_count: u32,
+    sample_count: u32,
+    dimension: wgpu::TextureDimension,
+    format: wgpu::TextureFormat,
+    desc: TextureDesc,
+    format_contract: RenderTargetFormatContract,
+) -> bool {
+    let format_matches = match format_contract {
+        RenderTargetFormatContract::SurfaceViewFamily => {
+            format.add_srgb_suffix() == desc.format.add_srgb_suffix()
+        }
+        RenderTargetFormatContract::Exact => format == desc.format,
+    };
+    size == desc.size
+        && mip_level_count == desc.mip_level_count
+        && sample_count == desc.sample_count
+        && dimension == desc.dimension
+        && format_matches
+}
+
 impl<'a> FrameComposer<'a> {
     /// Creates a new frame composer.
     pub(crate) fn new(ctx: ComposerContext<'a>, size: (u32, u32)) -> Self {
@@ -450,108 +506,31 @@ impl<'a> FrameComposer<'a> {
     ///
     /// # Architecture
     ///
-    /// 1. **Acquire Render Target** — swap-chain back buffer or headless texture
-    /// 2. **Build RDG** — register resources, wire passes (compute, shadow,
-    ///    scene, post-processing), invoke user hooks
-    /// 3. **Compile & Execute** — topological sort, allocate transients,
-    ///    prepare, execute, submit
+    /// 1. **Build Logical RDG** — collect CPU draw intents, register resources,
+    ///    wire passes, and run DPE/topological compilation
+    /// 2. **Acquire Render Target** — wait for the swap-chain only after the
+    ///    CPU graph is ready, then late-bind its physical view
+    /// 3. **Materialize & Execute** — allocate transients, prepare, record, and
+    ///    submit only when target acquisition succeeded
     /// 4. **Present** — present swap-chain (windowed only)
     ///
     /// Consumes `self`; the composer cannot be reused after render.
     pub fn render(mut self) {
-        // ━━━ 1. Acquire Render Target ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
         let rdg_diagnostics = self.ctx.rdg_diagnostics;
-        rdg_diagnostics.enter_phase(RdgFramePhase::AcquireTarget);
-
-        #[cfg(test)]
-        if let Some(reason) = self.forced_surface_acquisition_failure {
-            rdg_diagnostics.mark_surface_acquisition_failed(reason);
-            return;
-        }
-
         let view_format = self.ctx.wgpu_ctx.surface_view_format;
 
-        // Acquire either the swap-chain back buffer or the headless texture view.
-        // `surface_output` is `Some` only in windowed mode and holds the
-        // `SurfaceTexture` that must be `.present()`ed after submission.
-        let (surface_view, width, height, surface_output);
-        let mut reconfigure_after_present = false;
-
-        if let Some(surface) = &self.ctx.wgpu_ctx.surface {
-            let output = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(frame) => {
-                    rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Surface, false);
-                    frame
-                }
-                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                    rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Surface, true);
-                    reconfigure_after_present = true;
-                    log::debug!(
-                        "Acquired suboptimal swap-chain surface; reconfiguring after present"
-                    );
-                    frame
-                }
-                failure => {
-                    let reason = classify_surface_acquisition_failure(&failure)
-                        .expect("successful surface acquisition entered the failure branch");
-                    if matches!(reason, RdgSurfaceAcquireFailure::Outdated)
-                        && let Some(config) = &self.ctx.wgpu_ctx.config
-                    {
-                        surface.configure(&self.ctx.wgpu_ctx.device, config);
-                    }
-                    if rdg_diagnostics.mark_surface_acquisition_failed(reason) {
-                        match reason {
-                            RdgSurfaceAcquireFailure::Timeout => {
-                                log::trace!(
-                                    "Skipped frame: timed out acquiring swap-chain surface"
-                                );
-                            }
-                            RdgSurfaceAcquireFailure::Occluded => {
-                                log::debug!("Skipped frame: swap-chain surface is occluded");
-                            }
-                            RdgSurfaceAcquireFailure::Outdated => {
-                                log::debug!(
-                                    "Skipped frame: reconfigured outdated swap-chain surface"
-                                );
-                            }
-                            RdgSurfaceAcquireFailure::Lost => {
-                                log::warn!(
-                                    "Skipped frame: lost swap-chain surface must be recreated by the application"
-                                );
-                            }
-                            RdgSurfaceAcquireFailure::Validation => {
-                                log::error!("Validation error while acquiring swap-chain surface");
-                            }
-                        }
-                    }
-                    return;
-                }
-            };
-
-            surface_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(view_format),
-                ..Default::default()
-            });
-            width = output.texture.width();
-            height = output.texture.height();
-            surface_output = Some(output);
-        } else if let Some(tex) = &self.ctx.wgpu_ctx.headless_texture {
-            rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Headless, false);
-            surface_view = tex.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(view_format),
-                ..Default::default()
-            });
-            width = tex.width();
-            height = tex.height();
-            surface_output = None;
-        } else {
+        // A missing target is known without waiting and should not spend CPU
+        // building a graph. Surface availability itself is intentionally not
+        // queried until logical compilation has completed.
+        if self.ctx.wgpu_ctx.surface.is_none() && self.ctx.wgpu_ctx.headless_texture.is_none() {
+            rdg_diagnostics.enter_phase(RdgFramePhase::AcquireTarget);
             if rdg_diagnostics.mark_no_render_target() {
                 log::error!("No render target available (neither surface nor headless texture)");
             }
             return;
         }
 
+        // ━━━ 1. Build CPU-only Logical RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         rdg_diagnostics.enter_phase(RdgFramePhase::Cull);
 
         // ━━━ 2a. Collect CPU-only central draw intents ━━━━━━━━━━━━━━━━━━
@@ -568,17 +547,10 @@ impl<'a> FrameComposer<'a> {
 
         // ━━━ 2b. Build Unified RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        let surface_desc = TextureDesc::new_2d(
-            width,
-            height,
-            view_format,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-
-        let surface_view_tracked = Tracked::with_id(surface_view, 0);
-
-        // Declared after the tracked external view so reverse drop order keeps
-        // the raw external-view pointer valid for the graph's whole lifetime.
+        // Declared before `graph` so every early-return path drops the graph
+        // (and invalidates its stored raw external-view pointer) before the
+        // physical view. The value is initialized only after acquisition.
+        let surface_view_tracked;
         let mut graph = RenderGraph::from_started_renderer_attempt(
             self.ctx.graph_storage,
             self.ctx.frame_arena,
@@ -611,8 +583,14 @@ impl<'a> FrameComposer<'a> {
             &mut graph.storage.asset_texture_plans,
         );
 
-        let surface_out =
-            graph.import_external_resource("Surface_View", surface_desc, &surface_view_tracked);
+        let surface_desc = TextureDesc::new_2d(
+            self.frame_config.width,
+            self.frame_config.height,
+            view_format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+
+        let surface_out = graph.import_late_external_texture("Surface_View", surface_desc);
 
         let mut graph_ctx = GraphBuilderContext::new(
             &mut graph,
@@ -960,6 +938,11 @@ impl<'a> FrameComposer<'a> {
         // let fxaa_enabled = self.ctx.wgpu_ctx.fxaa_enabled && is_high_fidelity;
         // let taa_enabled = self.ctx.wgpu_ctx.taa_enabled && is_high_fidelity;
 
+        // Assigned at the post-compile acquisition barrier. The presentation
+        // owner remains outside the execution scope and is consumed only after
+        // both the graph and its late-bound view have been explicitly dropped.
+        let surface_output;
+        let mut reconfigure_after_present = false;
         {
             let scene_id = self.ctx.scene.id();
             let scene_gpu_environment = has_active_environment
@@ -1092,9 +1075,11 @@ impl<'a> FrameComposer<'a> {
             // The import store coordinates repeated exact snapshots into one
             // optional Mipmap SSA chain; each canonical submission receives only
             // the roots or aliases sampled by its own source list.
-            for plan in &draw_texture_dependencies {
-                let mut dependencies = Vec::with_capacity(plan.textures.len());
-                for &planned in &plan.textures {
+            for plan in draw_texture_dependencies.iter() {
+                graph_ctx
+                    .graph
+                    .begin_scene_submission_texture_dependencies(plan.key.into());
+                for &planned in draw_texture_dependencies.textures(plan) {
                     let snapshot = planned.snapshot;
                     let imported = graph_ctx.graph.import_planned_asset_texture(
                         "Material_Asset_Texture",
@@ -1122,12 +1107,19 @@ impl<'a> FrameComposer<'a> {
                             .set_planned_asset_texture_ready(planned.owner_plan, ready);
                         ready
                     };
-                    dependencies.push(ready);
+                    graph_ctx
+                        .graph
+                        .push_scene_submission_texture_dependency(ready);
                 }
                 graph_ctx
                     .graph
-                    .set_scene_submission_texture_dependencies(plan.key.into(), dependencies);
+                    .finish_scene_submission_texture_dependencies(plan.key.into());
             }
+            graph_ctx
+                .graph
+                .storage
+                .material_plans
+                .recycle_topology_recipes(draw_texture_dependencies);
 
             if let Some((_, source)) = texture_skybox_plan {
                 texture_skybox_input = Some(match source {
@@ -1885,7 +1877,126 @@ impl<'a> FrameComposer<'a> {
 
             // ━━━ 3. Compile & Execute RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            graph.compile(self.ctx.transient_pool, &self.ctx.wgpu_ctx.device);
+            // Logical topology, DPE, lifetimes, and submission demand are all
+            // CPU-only and intentionally complete before waiting for a
+            // swap-chain image.
+            graph.compile_topology();
+
+            // ━━━ 3a. Acquire and Late-bind Render Target ━━━━━━━━━━━━━━━
+            rdg_diagnostics.enter_phase(RdgFramePhase::AcquireTarget);
+
+            #[cfg(test)]
+            if let Some(reason) = self.forced_surface_acquisition_failure {
+                rdg_diagnostics.mark_surface_acquisition_failed(reason);
+                return;
+            }
+
+            if let Some(surface) = &self.ctx.wgpu_ctx.surface {
+                let (output, suboptimal) = match surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+                    wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+                    failure => {
+                        let reason = classify_surface_acquisition_failure(&failure)
+                            .expect("successful surface acquisition entered the failure branch");
+                        if matches!(reason, RdgSurfaceAcquireFailure::Outdated)
+                            && let Some(config) = &self.ctx.wgpu_ctx.config
+                        {
+                            surface.configure(&self.ctx.wgpu_ctx.device, config);
+                        }
+                        if rdg_diagnostics.mark_surface_acquisition_failed(reason) {
+                            match reason {
+                                RdgSurfaceAcquireFailure::Timeout => {
+                                    log::trace!(
+                                        "Skipped frame: timed out acquiring swap-chain surface"
+                                    );
+                                }
+                                RdgSurfaceAcquireFailure::Occluded => {
+                                    log::debug!("Skipped frame: swap-chain surface is occluded");
+                                }
+                                RdgSurfaceAcquireFailure::Outdated => {
+                                    log::debug!(
+                                        "Skipped frame: reconfigured outdated swap-chain surface"
+                                    );
+                                }
+                                RdgSurfaceAcquireFailure::Lost => {
+                                    log::warn!(
+                                        "Skipped frame: lost swap-chain surface must be recreated by the application"
+                                    );
+                                }
+                                RdgSurfaceAcquireFailure::Validation => {
+                                    log::error!(
+                                        "Validation error while acquiring swap-chain surface"
+                                    );
+                                }
+                            }
+                        }
+                        return;
+                    }
+                };
+
+                if !render_target_matches_desc(
+                    &output.texture,
+                    surface_desc,
+                    RenderTargetFormatContract::SurfaceViewFamily,
+                ) {
+                    drop(output);
+                    if let Some(config) = &self.ctx.wgpu_ctx.config {
+                        surface.configure(&self.ctx.wgpu_ctx.device, config);
+                    }
+                    if rdg_diagnostics
+                        .mark_surface_acquisition_failed(RdgSurfaceAcquireFailure::Outdated)
+                    {
+                        log::warn!(
+                            "Acquired swap-chain target no longer matches the compiled RDG descriptor"
+                        );
+                    }
+                    return;
+                }
+
+                rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Surface, suboptimal);
+                if suboptimal {
+                    reconfigure_after_present = true;
+                    log::debug!(
+                        "Acquired suboptimal swap-chain surface; reconfiguring after present"
+                    );
+                }
+                surface_view_tracked = Tracked::with_id(
+                    output.texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(view_format),
+                        ..Default::default()
+                    }),
+                    0,
+                );
+                surface_output = Some(output);
+            } else if let Some(texture) = &self.ctx.wgpu_ctx.headless_texture {
+                if !render_target_matches_desc(
+                    texture,
+                    surface_desc,
+                    RenderTargetFormatContract::Exact,
+                ) {
+                    rdg_diagnostics.mark_resource_materialization_failed(
+                        RdgResourceMaterializationFailure::RenderTargetDescriptorDrift,
+                    );
+                    return;
+                }
+                rdg_diagnostics.mark_target_acquired(RdgRenderTargetKind::Headless, false);
+                surface_view_tracked = Tracked::with_id(
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(view_format),
+                        ..Default::default()
+                    }),
+                    0,
+                );
+                surface_output = None;
+            } else {
+                unreachable!("render-target presence was checked before graph construction");
+            }
+
+            graph.bind_late_external_texture(surface_out, &surface_view_tracked);
+            graph.materialize_transient_resources(
+                self.ctx.transient_pool,
+                &self.ctx.wgpu_ctx.device,
+            );
             let (scene_buffers, global_buffers) = {
                 let resource_manager = &mut *self.ctx.resource_manager;
                 let mut uploads = BufferUploadContext::new(
@@ -1895,14 +2006,20 @@ impl<'a> FrameComposer<'a> {
                     &mut resource_manager.resources,
                     &resource_manager.internal_textures,
                 );
-                let scene_buffers = graph.materialize_live_scene_buffers(
-                    SceneBufferSources {
-                        light_metadata: &self.ctx.extracted_scene.local_light_metadata_buffer,
-                        light_storage: &self.ctx.extracted_scene.local_light_storage_buffer,
-                    },
-                    &mut uploads,
-                );
+                let scene_buffers = {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::SceneBuffers);
+                    graph.materialize_live_scene_buffers(
+                        SceneBufferSources {
+                            light_metadata: &self.ctx.extracted_scene.local_light_metadata_buffer,
+                            light_storage: &self.ctx.extracted_scene.local_light_storage_buffer,
+                        },
+                        &mut uploads,
+                    )
+                };
                 let global_buffers = if scene_buffers.is_ok() {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::GlobalBuffers);
                     graph.materialize_live_global_state(
                         GlobalStateSources {
                             camera: self.ctx.render_state.uniforms(),
@@ -1949,55 +2066,68 @@ impl<'a> FrameComposer<'a> {
                 rdg_diagnostics.mark_resource_materialization_failed(reason);
                 return;
             }
-            graph.materialize_live_persistent_textures(
-                self.ctx.history_registry,
-                &self.ctx.wgpu_ctx.device,
-            );
-            graph.materialize_live_asset_textures(self.ctx.assets, self.ctx.resource_manager);
+            {
+                #[cfg(feature = "rdg_bench_support")]
+                let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::PersistentTextures);
+                graph.materialize_live_persistent_textures(
+                    self.ctx.history_registry,
+                    &self.ctx.wgpu_ctx.device,
+                );
+            }
+            {
+                #[cfg(feature = "rdg_bench_support")]
+                let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::AssetTexture);
+                graph.materialize_live_asset_textures(self.ctx.assets, self.ctx.resource_manager);
+            }
 
             // Group 0 keeps a stable layout/WGSL interface, but its PMREM
             // physical view is selected only after DPE has decided whether a
             // same-frame cache writer is live and materialized. The graph read
             // edge on `env_dependency_pmrem` orders that writer before every
             // scene pass using this refreshed bind group.
-            let pmrem_override = environment_pmrem.and_then(|(node, texture, valid)| {
-                let live = graph.storage.resources[node.index() as usize].first_use != usize::MAX;
-                if !(valid || live)
-                    || !self
+            {
+                #[cfg(feature = "rdg_bench_support")]
+                let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::GlobalBindGroup);
+                let pmrem_override = environment_pmrem.and_then(|(node, texture, valid)| {
+                    let live =
+                        graph.storage.resources[node.index() as usize].first_use != usize::MAX;
+                    if !(valid || live)
+                        || !self
+                            .ctx
+                            .history_registry
+                            .is_texture_materialized(texture.id)
+                    {
+                        return None;
+                    }
+                    Some(self.ctx.history_registry.get_texture_view(texture.id))
+                });
+                if let Some(key) = graph.global_state_allowed_key() {
+                    let [camera, environment, directional_lights] = graph
+                        .materialized_global_buffer_tokens()
+                        .expect("DPE-live global state lacks its atomic buffer batch");
+                    let finalize_result: Result<u32, GlobalStatePhysicalFailure> =
+                        self.ctx.resource_manager.prepare_global_from_materialized(
+                            key,
+                            &camera,
+                            &environment,
+                            &directional_lights,
+                            pmrem_override,
+                        );
+                    if finalize_result.is_err() {
+                        rdg_diagnostics.mark_resource_materialization_failed(
+                            RdgResourceMaterializationFailure::IncompatibleGlobalStatePhysicalState,
+                        );
+                        return;
+                    }
+                    let bind_group = self
                         .ctx
-                        .history_registry
-                        .is_texture_materialized(texture.id)
-                {
-                    return None;
+                        .resource_manager
+                        .get_global_state(key.render_state_id(), key.scene_id())
+                        .expect("finalized global state was not published")
+                        .bind_group
+                        .clone();
+                    graph.stage_finalized_global_bind_group(key, &bind_group);
                 }
-                Some(self.ctx.history_registry.get_texture_view(texture.id))
-            });
-            if let Some(key) = graph.global_state_allowed_key() {
-                let [camera, environment, directional_lights] = graph
-                    .materialized_global_buffer_refs()
-                    .expect("DPE-live global state lacks its atomic buffer batch");
-                let finalize_result: Result<u32, GlobalStatePhysicalFailure> =
-                    self.ctx.resource_manager.prepare_global_from_materialized(
-                        key,
-                        &camera,
-                        &environment,
-                        &directional_lights,
-                        pmrem_override,
-                    );
-                if finalize_result.is_err() {
-                    rdg_diagnostics.mark_resource_materialization_failed(
-                        RdgResourceMaterializationFailure::IncompatibleGlobalStatePhysicalState,
-                    );
-                    return;
-                }
-                let bind_group = self
-                    .ctx
-                    .resource_manager
-                    .get_global_state(key.render_state_id(), key.scene_id())
-                    .expect("finalized global state was not published")
-                    .bind_group
-                    .clone();
-                graph.stage_finalized_global_bind_group(key, &bind_group);
             }
 
             // ─── 3a. Materialize the DPE-live central source union ───────
@@ -2006,55 +2136,78 @@ impl<'a> FrameComposer<'a> {
             // Prepass, and any number of shadow views share one source slot;
             // dead plan branches never allocate model data, geometry, object
             // bindings, or pipelines.
-            let live_frame_sources = self
-                .ctx
-                .render_lists
-                .live_frame_sources(graph.storage.draw_plans.live_keys());
             {
+                #[cfg(feature = "rdg_bench_support")]
+                let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::LiveSourceUnion);
+                let storage = &mut *graph.storage;
+                storage
+                    .scene_source_prepare
+                    .select_live_sources(self.ctx.render_lists, storage.draw_plans.live_keys());
+            }
+            {
+                #[cfg(feature = "rdg_bench_support")]
+                let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::MaterialPlan);
                 let storage = &mut *graph.storage;
                 storage.material_plans.prepare_live(
                     self.ctx.assets,
                     &mut storage.asset_texture_plans,
                     self.ctx.resource_manager,
-                    &live_frame_sources,
+                    storage.scene_source_prepare.live_sources(),
                 );
             }
-            graph.storage.geometry_frames.capture_live(
-                self.ctx.assets,
-                self.ctx.extracted_scene,
-                self.ctx.render_lists,
-                &live_frame_sources,
-            );
-            graph.storage.geometry_frames.prepare_live(
-                self.ctx.assets,
-                self.ctx.resource_manager,
-                &mut graph.storage.draw_plans,
-            );
+            {
+                #[cfg(feature = "rdg_bench_support")]
+                let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::Geometry);
+                graph.storage.geometry_frames.capture_live(
+                    self.ctx.assets,
+                    self.ctx.extracted_scene,
+                    self.ctx.render_lists,
+                    graph.storage.scene_source_prepare.live_sources(),
+                );
+                graph.storage.geometry_frames.prepare_live(
+                    self.ctx.assets,
+                    self.ctx.resource_manager,
+                    &mut graph.storage.draw_plans,
+                );
+            }
             {
                 let storage = &mut *graph.storage;
-                storage.scene_source_prepare.gather(
-                    self.ctx.extracted_scene,
-                    &live_frame_sources,
-                    self.ctx.render_lists,
-                    storage.geometry_frames.resolver(),
-                    storage.material_plans.resolver(),
-                );
-                storage.scene_source_prepare.plan();
-                storage.scene_source_prepare.materialize(
-                    self.ctx.scene,
-                    self.ctx.resource_manager,
-                    storage.geometry_frames.resolver(),
-                    storage.material_plans.resolver(),
-                );
-                storage.scene_source_prepare.finalize(
-                    self.ctx.scene,
-                    storage.geometry_frames.resolver(),
-                    storage.material_plans.resolver(),
-                    self.ctx.resource_manager,
-                    &mut storage.object_interfaces,
-                    &mut storage.prepared_draws,
-                    &mut storage.draw_plans,
-                );
+                {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::SourceGather);
+                    storage.scene_source_prepare.gather(
+                        self.ctx.extracted_scene,
+                        self.ctx.render_lists,
+                        storage.geometry_frames.resolver(),
+                        storage.material_plans.resolver(),
+                    );
+                }
+                {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::SourcePlan);
+                    storage.scene_source_prepare.plan();
+                }
+                {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::SourceMaterialize);
+                    storage.scene_source_prepare.materialize(
+                        self.ctx.scene,
+                        self.ctx.resource_manager,
+                        storage.geometry_frames.resolver(),
+                        storage.material_plans.resolver(),
+                    );
+                }
+                {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::SourceFinalize);
+                    storage.scene_source_prepare.finalize(
+                        storage.material_plans.resolver(),
+                        self.ctx.resource_manager,
+                        &mut storage.object_interfaces,
+                        &mut storage.prepared_draws,
+                        &mut storage.draw_plans,
+                    );
+                }
             }
 
             rdg_diagnostics.enter_phase(RdgFramePhase::PreparePasses);
@@ -2097,6 +2250,8 @@ impl<'a> FrameComposer<'a> {
                         self.ctx.wgpu_ctx.pipeline_settings_version,
                         &graph.storage.scene_submissions,
                         &mut graph.storage.scene_pipeline_prepare,
+                        #[cfg(feature = "rdg_bench_support")]
+                        rdg_diagnostics,
                     ),
                     mipmap_generator,
                     mipmap_requests: MipmapRequestResolver::new(&graph.storage.mipmap_batches),
@@ -2137,16 +2292,25 @@ impl<'a> FrameComposer<'a> {
                     &self.ctx.camera,
                 );
 
-                for &pass_idx in &graph.storage.execution_queue {
-                    // SAFETY: This is the second serial barrier over the same
-                    // live arena nodes; no competing mutable reference exists.
-                    let pass = unsafe { graph.storage.passes[pass_idx].get_pass_mut() };
-                    pass.finalize_prepare(&mut prepare_ctx);
+                {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing =
+                        rdg_diagnostics.detail_timer(RdgDetailPhase::PipelineFeatureFinalize);
+                    for &pass_idx in &graph.storage.execution_queue {
+                        // SAFETY: This is the second serial barrier over the same
+                        // live arena nodes; no competing mutable reference exists.
+                        let pass = unsafe { graph.storage.passes[pass_idx].get_pass_mut() };
+                        pass.finalize_prepare(&mut prepare_ctx);
+                    }
                 }
 
                 // Execute will consume only these immutable, contiguous
                 // Direct streams. No shader/cache/asset lookup occurs here.
-                prepare_ctx.finalize_scene_draws(&mut graph.storage.draw_plans);
+                {
+                    #[cfg(feature = "rdg_bench_support")]
+                    let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::PipelineFinalize);
+                    prepare_ctx.finalize_scene_draws(&mut graph.storage.draw_plans);
+                }
             }
 
             #[cfg(feature = "3dgs")]
@@ -2158,13 +2322,7 @@ impl<'a> FrameComposer<'a> {
             // asset/interface owners as soon as every live plan is baked;
             // DrawPlanStore continues to own the physical WGPU handles.
             graph.storage.sample_retained_capacity();
-            graph.storage.scene_pipeline_prepare.clear();
-            graph.storage.scene_source_prepare.clear();
-            graph.storage.prepared_draws.clear();
-            graph.storage.object_interfaces.clear();
-            graph.storage.geometry_frames.clear();
-            graph.storage.material_plans.clear();
-            graph.storage.asset_texture_plans.clear();
+            graph.storage.release_prepare_owners();
 
             rdg_diagnostics.enter_phase(RdgFramePhase::RecordCommands);
 
@@ -2273,6 +2431,89 @@ impl<'a> FrameComposer<'a> {
             );
         }
         rdg_diagnostics.mark_completed();
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn late_target_descriptor_enforces_shape_and_backend_format_contract() {
+        let desc = TextureDesc::new_2d(
+            1280,
+            720,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+
+        assert!(render_target_metadata_matches_desc(
+            desc.size,
+            1,
+            1,
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Bgra8Unorm,
+            desc,
+            RenderTargetFormatContract::SurfaceViewFamily,
+        ));
+        assert!(!render_target_metadata_matches_desc(
+            desc.size,
+            1,
+            1,
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Bgra8Unorm,
+            desc,
+            RenderTargetFormatContract::Exact,
+        ));
+        assert!(!render_target_metadata_matches_desc(
+            wgpu::Extent3d {
+                width: 1920,
+                height: 1080,
+                depth_or_array_layers: 1,
+            },
+            1,
+            1,
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Bgra8Unorm,
+            desc,
+            RenderTargetFormatContract::SurfaceViewFamily,
+        ));
+        assert!(!render_target_metadata_matches_desc(
+            desc.size,
+            2,
+            1,
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Bgra8Unorm,
+            desc,
+            RenderTargetFormatContract::SurfaceViewFamily,
+        ));
+        assert!(!render_target_metadata_matches_desc(
+            desc.size,
+            1,
+            4,
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Bgra8Unorm,
+            desc,
+            RenderTargetFormatContract::SurfaceViewFamily,
+        ));
+        assert!(!render_target_metadata_matches_desc(
+            desc.size,
+            1,
+            1,
+            wgpu::TextureDimension::D3,
+            wgpu::TextureFormat::Bgra8Unorm,
+            desc,
+            RenderTargetFormatContract::SurfaceViewFamily,
+        ));
+        assert!(!render_target_metadata_matches_desc(
+            desc.size,
+            1,
+            1,
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Rgba8Unorm,
+            desc,
+            RenderTargetFormatContract::SurfaceViewFamily,
+        ));
     }
 }
 

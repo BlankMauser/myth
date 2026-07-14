@@ -160,10 +160,29 @@ struct ObjectBufferBindingKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ObjectBindGroupKey {
-    // Model + morph uniforms are the common two-binding case and therefore
-    // remain allocation-free on object-cache hits.
+    // Model-only rigid objects and model + morph objects both remain inline
+    // and allocation-free on object-cache hits.
     buffers: SmallVec<[ObjectBufferBindingKey; 2]>,
     layout_id: u64,
+}
+
+/// Allocation-free L0 key for the dominant rigid Object Group 2 shape.
+///
+/// Its binding semantics are fixed to the dynamic `model` uniform alone;
+/// skinned and geometry-morphing sources never enter this table. The mapped
+/// [`ObjectBindGroupKey`] remains the collision-safe owner of the exact layout
+/// and generated binding interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RigidObjectBindGroupL0Key {
+    model_physical_id: u64,
+}
+
+impl RigidObjectBindGroupL0Key {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new(model_physical_id: u64) -> Self {
+        Self { model_physical_id }
+    }
 }
 
 impl ObjectBindGroupKey {
@@ -259,6 +278,11 @@ pub(crate) struct BindGroupStore {
     vertex_layout_cache: FxHashMap<VertexLayoutSignature, u64>,
     binding_interface_cache: FxHashMap<BindingInterfaceKey, BindingInterfaceId>,
     object_bind_group_cache: FxHashMap<ObjectBindGroupKey, CachedObjectBindGroup>,
+    /// Non-owning shortcut into `object_bind_group_cache`. Values keep the
+    /// full collision-safe key but no WGPU owner.
+    rigid_object_bind_group_l0: FxHashMap<RigidObjectBindGroupL0Key, ObjectBindGroupKey>,
+    #[cfg(test)]
+    rigid_object_bind_group_l0_hits: usize,
     bind_group_id_lookup: FxHashMap<u64, BindGroupContext>,
 }
 
@@ -312,6 +336,8 @@ impl BindGroupStore {
         for bind_group_id in stale_object_ids {
             self.bind_group_id_lookup.remove(&bind_group_id);
         }
+        self.rigid_object_bind_group_l0
+            .retain(|_, key| self.object_bind_group_cache.contains_key(key));
     }
 
     pub(super) fn remove_scene_global_states(&mut self, scene_id: u32) -> usize {
@@ -324,7 +350,40 @@ impl BindGroupStore {
     #[inline]
     pub(super) fn clear_object_bind_group_caches(&mut self) {
         self.object_bind_group_cache.clear();
+        self.rigid_object_bind_group_l0.clear();
         self.bind_group_id_lookup.clear();
+    }
+
+    /// Touch a rigid object entry through its model-buffer physical generation.
+    /// A stale non-owning L0 entry is removed and treated as a miss.
+    #[inline]
+    #[must_use]
+    pub(super) fn touch_cached_rigid_object_bind_group(
+        &mut self,
+        key: RigidObjectBindGroupL0Key,
+        frame_index: u64,
+    ) -> Option<u64> {
+        let full_key = self.rigid_object_bind_group_l0.get(&key)?.clone();
+        if let Some(entry) = self.object_bind_group_cache.get_mut(&full_key) {
+            entry.last_used_frame = frame_index;
+            #[cfg(test)]
+            {
+                self.rigid_object_bind_group_l0_hits += 1;
+            }
+            return Some(entry.context.bind_group_id);
+        }
+        self.rigid_object_bind_group_l0.remove(&key);
+        None
+    }
+
+    #[inline]
+    pub(super) fn cache_rigid_object_bind_group_l0(
+        &mut self,
+        key: RigidObjectBindGroupL0Key,
+        full_key: ObjectBindGroupKey,
+    ) {
+        debug_assert!(self.object_bind_group_cache.contains_key(&full_key));
+        self.rigid_object_bind_group_l0.insert(key, full_key);
     }
 
     /// Touch an object cache entry without cloning any WGPU/Arc owner.
@@ -367,6 +426,23 @@ impl BindGroupStore {
     #[cfg(test)]
     pub(super) fn cached_object_bind_group_ids(&self) -> Vec<u64> {
         self.bind_group_id_lookup.keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn rigid_object_bind_group_l0_len(&self) -> usize {
+        self.rigid_object_bind_group_l0.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn rigid_object_bind_group_l0_hits(&self) -> usize {
+        self.rigid_object_bind_group_l0_hits
+    }
+
+    #[cfg(test)]
+    pub(super) fn rigid_object_bind_group_l0_contains_model(&self, physical_id: u64) -> bool {
+        self.rigid_object_bind_group_l0
+            .keys()
+            .any(|key| key.model_physical_id == physical_id)
     }
 
     pub(super) fn get_or_create_layout(
