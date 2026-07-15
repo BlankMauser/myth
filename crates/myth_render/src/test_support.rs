@@ -32,6 +32,7 @@ fn shared_test_gpu() -> &'static SharedTestGpu {
         .expect("shared headless GPU context required");
         let gpu_driven_capabilities = context.gpu_driven_capabilities().clone();
 
+        let gpu_driven_capabilities = context.gpu_driven_capabilities().clone();
         SharedTestGpu {
             device: context.device,
             queue: context.queue,
