@@ -115,8 +115,6 @@ pub enum RdgGpuDrivenFailure {
     ConflictingMaterialEpoch,
     GenerationExhausted,
     DuplicateInstance,
-    #[cfg(test)]
-    MixedFixedState,
     TooManyCandidates,
     UnsupportedShadowDomain,
     PersistentPlanRejected,

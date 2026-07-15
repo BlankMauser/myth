@@ -824,8 +824,6 @@ const fn selection_failure_reason(reason: GpuSceneSelectionRejection) -> RdgGpuD
         }
         GpuSceneSelectionRejection::GenerationExhausted => RdgGpuDrivenFailure::GenerationExhausted,
         GpuSceneSelectionRejection::DuplicateInstance => RdgGpuDrivenFailure::DuplicateInstance,
-        #[cfg(test)]
-        GpuSceneSelectionRejection::MixedFixedState => RdgGpuDrivenFailure::MixedFixedState,
         GpuSceneSelectionRejection::TooManyCandidates => RdgGpuDrivenFailure::TooManyCandidates,
     }
 }

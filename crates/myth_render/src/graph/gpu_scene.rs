@@ -413,15 +413,6 @@ impl GpuSceneRigidBatchKey {
     }
 }
 
-/// Copy-only result of pre-frustum, all-or-nothing opaque selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) struct GpuSceneRigidBatchCandidate {
-    pub(crate) key: GpuSceneRigidBatchKey,
-    pub(crate) representative: FrameSourceId,
-    pub(crate) candidate_count: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GpuSceneMultiBinProjection {
     pub(crate) candidate_count: u32,
@@ -728,8 +719,6 @@ pub(crate) enum GpuSceneSelectionRejection {
     NonFiniteTransform,
     NonInvertibleTransform,
     NonFiniteBounds,
-    #[cfg(test)]
-    MixedFixedState,
     TooManyCandidates,
     DuplicateInstance,
     ConflictingGeometryEpoch,
@@ -830,44 +819,6 @@ fn checked_align_up(value: u64, alignment: u64) -> Option<u64> {
     } else {
         value.checked_add(alignment - remainder)
     }
-}
-
-/// Select the first executable GPU-driven domain without consulting a
-/// frustum or reopening AssetStorage. Transparent/transmission objects remain
-/// on the independent CPU-direct stream and do not participate in the key.
-#[cfg(test)]
-pub(crate) fn select_gpu_scene_rigid_batch(
-    extracted_scene: &ExtractedScene,
-    render_lists: &mut RenderLists,
-) -> Result<Option<GpuSceneRigidBatchCandidate>, GpuSceneSelectionRejection> {
-    let mut selected: Option<(GpuSceneRigidBatchKey, usize)> = None;
-    let mut candidate_count = 0u32;
-
-    for (index, item) in extracted_scene.render_items.iter().enumerate() {
-        let Some(preflight) = preflight_gpu_scene_item(item, false)? else {
-            continue;
-        };
-        let key = preflight.key;
-        match selected {
-            None => selected = Some((key, index)),
-            Some((current, _)) if current == key => {}
-            Some(_) => return Err(GpuSceneSelectionRejection::MixedFixedState),
-        }
-        candidate_count = candidate_count
-            .checked_add(1)
-            .ok_or(GpuSceneSelectionRejection::TooManyCandidates)?;
-    }
-
-    let Some((key, representative_index)) = selected else {
-        return Ok(None);
-    };
-    let representative = render_lists
-        .set_gpu_opaque_representative(ExtractedSourceId::from_index(representative_index));
-    Ok(Some(GpuSceneRigidBatchCandidate {
-        key,
-        representative,
-        candidate_count,
-    }))
 }
 
 impl GpuSceneInstanceInput {
@@ -4257,22 +4208,6 @@ mod tests {
     }
 
     #[test]
-    fn strict_preflight_still_rejects_one_unsupported_opaque_item() {
-        let mut unsupported = rigid_item_with_assets(2, 10, 20);
-        unsupported.geometry_has_morph_targets = true;
-        let scene = extracted_scene([rigid_item_with_assets(1, 10, 20), unsupported]);
-        let mut authority = GpuScene::new();
-
-        assert_eq!(
-            authority.preflight_multi_bin_scene(&scene, 16, 256),
-            Err(GpuSceneMultiBinPreflightFailure::Domain(
-                GpuSceneSelectionRejection::MorphTargets
-            ))
-        );
-        assert_eq!(authority.revision, 0);
-    }
-
-    #[test]
     fn asset_epoch_bump_cascades_batch_and_instance_generation_in_place() {
         let scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
         let mut authority = GpuScene::new();
@@ -4370,23 +4305,85 @@ mod tests {
     }
 
     #[test]
-    fn same_handle_conflicting_epoch_fails_before_any_authority_mutation() {
-        let first = rigid_item_with_assets(1, 10, 20);
-        let mut second = rigid_item_with_assets(2, 10, 20);
-        second.geometry_asset_identity += 1;
-        let scene = extracted_scene([first, second]);
-        let mut authority = GpuScene::new();
-        assert_eq!(
-            authority.preflight_multi_bin_scene(&scene, 16, 256),
-            Err(GpuSceneMultiBinPreflightFailure::Domain(
-                GpuSceneSelectionRejection::ConflictingGeometryEpoch
-            ))
-        );
-        assert_eq!(authority.revision, 0);
-        assert!(authority.records.is_empty());
-        assert!(authority.geometries.records.is_empty());
-        assert!(authority.materials.records.is_empty());
-        assert!(authority.batches.records.is_empty());
+    fn same_handle_stamp_conflicts_fail_before_any_authority_mutation() {
+        let cases: &[(
+            &str,
+            GpuSceneSelectionRejection,
+            fn(&mut ExtractedRenderItem),
+        )] = &[
+            (
+                "geometry asset version",
+                GpuSceneSelectionRejection::ConflictingGeometryEpoch,
+                |item| item.geometry_asset_version += 1,
+            ),
+            (
+                "geometry asset identity",
+                GpuSceneSelectionRejection::ConflictingGeometryEpoch,
+                |item| item.geometry_asset_identity += 1,
+            ),
+            (
+                "geometry structure version",
+                GpuSceneSelectionRejection::ConflictingGeometryEpoch,
+                |item| item.geometry_structure_version += 1,
+            ),
+            (
+                "geometry layout version",
+                GpuSceneSelectionRejection::ConflictingGeometryEpoch,
+                |item| item.geometry_layout_version += 1,
+            ),
+            (
+                "index format",
+                GpuSceneSelectionRejection::ConflictingGeometryEpoch,
+                |item| item.geometry_index_format = Some(wgpu::IndexFormat::Uint16),
+            ),
+            (
+                "index count",
+                GpuSceneSelectionRejection::ConflictingGeometryEpoch,
+                |item| item.geometry_index_count += 3,
+            ),
+            (
+                "material asset version",
+                GpuSceneSelectionRejection::ConflictingMaterialEpoch,
+                |item| item.material_asset_version += 1,
+            ),
+            (
+                "material asset identity",
+                GpuSceneSelectionRejection::ConflictingMaterialEpoch,
+                |item| item.material_asset_identity += 1,
+            ),
+            (
+                "material version",
+                GpuSceneSelectionRejection::ConflictingMaterialEpoch,
+                |item| item.material_version += 1,
+            ),
+            (
+                "material index",
+                GpuSceneSelectionRejection::ConflictingMaterialEpoch,
+                |item| item.material_index += 1,
+            ),
+        ];
+
+        for &(label, expected, mutate) in cases {
+            let first = rigid_item_with_assets(1, 10, 20);
+            let mut second = rigid_item_with_assets(2, 10, 20);
+            mutate(&mut second);
+            let scene = extracted_scene([first, second]);
+            let mut authority = GpuScene::new();
+
+            assert_eq!(
+                authority.preflight_multi_bin_scene(&scene, 16, 256),
+                Err(GpuSceneMultiBinPreflightFailure::Domain(expected)),
+                "same-handle stamp conflict was misclassified: {label}"
+            );
+            assert_eq!(authority.revision, 0, "{label}");
+            assert_eq!(authority.slot_span(), 0, "{label}");
+            assert!(authority.records.is_empty(), "{label}");
+            assert!(authority.geometries.records.is_empty(), "{label}");
+            assert!(authority.materials.records.is_empty(), "{label}");
+            assert!(authority.batches.records.is_empty(), "{label}");
+            assert!(authority.multi_bin_committed.is_empty(), "{label}");
+            assert!(authority.active_batch_descriptors.is_empty(), "{label}");
+        }
     }
 
     #[test]
@@ -4596,32 +4593,6 @@ mod tests {
     }
 
     #[test]
-    fn rigid_batch_selects_all_same_key_candidates_and_one_representative() {
-        let scene = extracted_scene([rigid_item(1, -4.0), rigid_item(2, 9.0)]);
-        let mut lists = RenderLists::new();
-
-        let selected = select_gpu_scene_rigid_batch(&scene, &mut lists)
-            .expect("same-key rigid batch should be eligible")
-            .expect("non-empty opaque domain should select a batch");
-
-        assert_eq!(selected.candidate_count, 2);
-        assert_eq!(
-            selected.key,
-            GpuSceneRigidBatchKey::from_item(&scene.render_items[0]).unwrap()
-        );
-        assert_eq!(
-            lists.gpu_opaque_representative(),
-            Some(selected.representative)
-        );
-        assert_eq!(
-            lists.extracted_source(selected.representative),
-            Some(ExtractedSourceId::from_index(0))
-        );
-        assert_eq!(lists.frame_source_count(), 1);
-        assert!(lists.opaque.is_empty());
-    }
-
-    #[test]
     fn multi_bin_preflight_groups_exact_keys_in_first_occurrence_order() {
         let scene = extracted_scene([
             rigid_item_with_assets(1, 10, 20),
@@ -4676,6 +4647,53 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn supported_batch_identity_drift_partitions_into_distinct_bins() {
+        let cases: &[(&str, u32, u32, fn(&mut ExtractedRenderItem))] = &[
+            ("geometry handle", 2, 1, |item| item.geometry = geometry(11)),
+            ("material handle", 1, 2, |item| item.material = material(21)),
+            ("item variant flags", 1, 1, |item| {
+                item.item_variant_flags ^= 1
+            }),
+            ("item shader features", 1, 1, |item| {
+                item.item_shader_features = ItemShaderFeatures::empty()
+            }),
+        ];
+
+        for &(label, geometry_count, material_count, mutate) in cases {
+            let first = rigid_item_with_assets(1, 10, 20);
+            let mut second = rigid_item_with_assets(2, 10, 20);
+            mutate(&mut second);
+            let scene = extracted_scene([first, second]);
+            let mut authority = GpuScene::new();
+
+            let projection = authority
+                .preflight_multi_bin_scene(&scene, 16, 256)
+                .unwrap_or_else(|error| panic!("supported drift was rejected ({label}): {error:?}"))
+                .expect("two supported candidates must produce a projection")
+                .projection;
+            assert_eq!(projection.candidate_count, 2, "{label}");
+            assert_eq!(projection.bin_count, 2, "{label}");
+            assert_eq!(projection.unique_geometry_count, geometry_count, "{label}");
+            assert_eq!(projection.unique_material_count, material_count, "{label}");
+            assert_eq!(
+                authority
+                    .multi_bin_preflight
+                    .iter()
+                    .map(|bin| bin.representative.index())
+                    .collect::<Vec<_>>(),
+                [0, 1],
+                "{label}"
+            );
+            assert_eq!(authority.revision, 0, "{label}");
+            assert_eq!(authority.slot_span(), 0, "{label}");
+            assert!(authority.records.is_empty(), "{label}");
+            assert!(authority.geometries.records.is_empty(), "{label}");
+            assert!(authority.materials.records.is_empty(), "{label}");
+            assert!(authority.batches.records.is_empty(), "{label}");
+        }
     }
 
     #[test]
@@ -4869,7 +4887,6 @@ mod tests {
             invalid,
         ]);
         let mut authority = GpuScene::new();
-        let lists = RenderLists::new();
 
         assert_eq!(
             authority.preflight_multi_bin_scene(&scene, 16, 256),
@@ -4879,8 +4896,12 @@ mod tests {
         );
         assert_eq!(authority.revision, 0);
         assert_eq!(authority.slot_span(), 0);
-        assert_eq!(lists.frame_source_count(), 0);
-        assert!(lists.gpu_opaque_representatives().next().is_none());
+        assert!(authority.records.is_empty());
+        assert!(authority.geometries.records.is_empty());
+        assert!(authority.materials.records.is_empty());
+        assert!(authority.batches.records.is_empty());
+        assert!(authority.multi_bin_committed.is_empty());
+        assert!(authority.active_batch_descriptors.is_empty());
     }
 
     #[test]
@@ -4932,57 +4953,7 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_fixed_state_key_drift_rejects_the_complete_batch() {
-        let cases: &[(&str, fn(&mut ExtractedRenderItem))] = &[
-            ("geometry handle", |item| item.geometry = geometry(102)),
-            ("geometry asset version", |item| {
-                item.geometry_asset_version += 1
-            }),
-            ("geometry asset identity", |item| {
-                item.geometry_asset_identity += 1
-            }),
-            ("geometry structure version", |item| {
-                item.geometry_structure_version += 1;
-            }),
-            ("geometry layout version", |item| {
-                item.geometry_layout_version += 1
-            }),
-            ("index format", |item| {
-                item.geometry_index_format = Some(wgpu::IndexFormat::Uint16);
-            }),
-            ("index count", |item| item.geometry_index_count += 3),
-            ("material handle", |item| item.material = material(202)),
-            ("material asset version", |item| {
-                item.material_asset_version += 1
-            }),
-            ("material asset identity", |item| {
-                item.material_asset_identity += 1
-            }),
-            ("material version", |item| item.material_version += 1),
-            ("item variant flags", |item| item.item_variant_flags ^= 1),
-            ("item shader features", |item| {
-                item.item_shader_features = ItemShaderFeatures::empty();
-            }),
-        ];
-
-        for &(label, mutate) in cases {
-            let mut second = rigid_item(2, 2.0);
-            mutate(&mut second);
-            let scene = extracted_scene([rigid_item(1, 0.0), second]);
-            let mut lists = RenderLists::new();
-
-            assert_eq!(
-                select_gpu_scene_rigid_batch(&scene, &mut lists),
-                Err(GpuSceneSelectionRejection::MixedFixedState),
-                "fixed-state drift was not rejected: {label}"
-            );
-            assert!(lists.gpu_opaque_representative().is_none(), "{label}");
-            assert_eq!(lists.frame_source_count(), 0, "{label}");
-        }
-    }
-
-    #[test]
-    fn rigid_batch_rejects_every_unsupported_instance_or_resource_shape() {
+    fn strict_multi_bin_preflight_rejects_every_unsupported_shape_before_publication() {
         let cases: &[(
             &str,
             GpuSceneSelectionRejection,
@@ -5070,23 +5041,27 @@ mod tests {
         ];
 
         for &(label, expected, mutate) in cases {
-            let mut item = rigid_item(1, 0.0);
-            mutate(&mut item);
-            let scene = extracted_scene([item]);
-            let mut lists = RenderLists::new();
+            let mut unsupported = rigid_item_with_assets(2, 11, 21);
+            mutate(&mut unsupported);
+            let scene = extracted_scene([rigid_item_with_assets(1, 10, 20), unsupported]);
+            let mut authority = GpuScene::new();
 
             assert_eq!(
-                select_gpu_scene_rigid_batch(&scene, &mut lists),
-                Err(expected),
+                authority.preflight_multi_bin_scene(&scene, 16, 256),
+                Err(GpuSceneMultiBinPreflightFailure::Domain(expected)),
                 "unsupported shape produced the wrong rejection: {label}"
             );
-            assert!(lists.gpu_opaque_representative().is_none(), "{label}");
-            assert_eq!(lists.frame_source_count(), 0, "{label}");
+            assert_eq!(authority.revision, 0, "{label}");
+            assert_eq!(authority.slot_span(), 0, "{label}");
+            assert!(authority.records.is_empty(), "{label}");
+            assert!(authority.geometries.records.is_empty(), "{label}");
+            assert!(authority.materials.records.is_empty(), "{label}");
+            assert!(authority.batches.records.is_empty(), "{label}");
         }
     }
 
     #[test]
-    fn prefrustum_domain_is_independent_of_cpu_visible_opaque_intents() {
+    fn multi_bin_preflight_selects_the_complete_prefrustum_opaque_domain() {
         let mut transparent = rigid_item(3, 30.0);
         transparent
             .material_classification
@@ -5101,31 +5076,26 @@ mod tests {
             transparent,
             transmission,
         ]);
-        let mut lists = RenderLists::new();
+        let mut authority = GpuScene::new();
 
-        // Model a CPU frustum result containing only the second opaque item.
-        // Selection must still observe both pre-frustum opaque candidates.
-        let visible = lists.intern_frame_source(ExtractedSourceId::from_index(1));
-        let visible_item = &scene.render_items[1];
-        lists.insert_opaque(crate::graph::frame::RenderIntent {
-            source: visible,
-            geometry_handle: visible_item.geometry,
-            material_handle: visible_item.material,
-            material_index: visible_item.material_index,
-            distance_sq: 1_000_000.0,
-        });
-
-        let selected = select_gpu_scene_rigid_batch(&scene, &mut lists)
-            .expect("pre-frustum rigid domain should remain eligible")
-            .expect("opaque domain should not be empty");
-        assert_eq!(selected.candidate_count, 2);
-        assert_eq!(lists.opaque.len(), 1);
-        assert_eq!(lists.frame_source_count(), 2);
+        let projection = authority
+            .preflight_multi_bin_scene(&scene, 16, 256)
+            .unwrap()
+            .expect("the opaque pre-frustum domain must not be empty")
+            .projection;
+        assert_eq!(projection.candidate_count, 2);
+        assert_eq!(projection.bin_count, 1);
+        assert_eq!(authority.multi_bin_preflight[0].member_count, 2);
         assert_eq!(
-            lists.extracted_source(selected.representative),
-            Some(ExtractedSourceId::from_index(0))
+            authority
+                .multi_bin_members
+                .iter()
+                .map(|member| member.item)
+                .collect::<Vec<_>>(),
+            [0, 1]
         );
-        assert_ne!(selected.representative, visible);
+        assert_eq!(authority.revision, 0);
+        assert_eq!(authority.slot_span(), 0);
     }
 
     #[test]
@@ -5165,27 +5135,6 @@ mod tests {
             .unwrap()
             .projection;
         assert!(projection.covers_complete_shadow_domain);
-    }
-
-    #[test]
-    fn failed_selection_does_not_intern_or_publish_a_representative() {
-        let mut drifted = rigid_item(2, 2.0);
-        drifted.material_version += 1;
-        let scene = extracted_scene([rigid_item(1, 0.0), drifted]);
-        let mut lists = RenderLists::new();
-        let existing = lists.intern_frame_source(ExtractedSourceId::from_index(1));
-        let source_count_before = lists.frame_source_count();
-
-        assert_eq!(
-            select_gpu_scene_rigid_batch(&scene, &mut lists),
-            Err(GpuSceneSelectionRejection::MixedFixedState)
-        );
-        assert_eq!(lists.frame_source_count(), source_count_before);
-        assert_eq!(
-            lists.extracted_source(existing),
-            Some(ExtractedSourceId::from_index(1))
-        );
-        assert!(lists.gpu_opaque_representative().is_none());
     }
 
     #[test]

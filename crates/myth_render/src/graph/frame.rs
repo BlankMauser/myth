@@ -1724,31 +1724,12 @@ impl RenderLists {
         source
     }
 
-    /// Compatibility facade for the original single-bin selector. M7.4 bin
-    /// selection should call [`Self::append_gpu_opaque_representative`] for
-    /// every unique bin.
-    #[cfg(test)]
-    pub(crate) fn set_gpu_opaque_representative(
-        &mut self,
-        extracted: ExtractedSourceId,
-    ) -> FrameSourceId {
-        self.append_gpu_opaque_representative(extracted)
-    }
-
     /// Iterate retained GPU-bin representatives in deterministic insertion
     /// order.
     pub(crate) fn gpu_opaque_representatives(
         &self,
     ) -> impl ExactSizeIterator<Item = FrameSourceId> + '_ {
         self.gpu_opaque_representatives.iter().copied()
-    }
-
-    /// Compatibility accessor for the original single-bin tests and selector.
-    #[cfg(test)]
-    #[inline]
-    #[must_use]
-    pub(crate) fn gpu_opaque_representative(&self) -> Option<FrameSourceId> {
-        self.gpu_opaque_representatives.first().copied()
     }
 
     /// Inserts an opaque render intent.
@@ -2669,7 +2650,7 @@ mod draw_plan_tests {
         let repeated = lists.append_gpu_opaque_representative(extracted_9);
 
         assert_eq!(repeated, first);
-        assert_eq!(lists.gpu_opaque_representative(), Some(first));
+        assert_eq!(lists.gpu_opaque_representatives().next(), Some(first));
         assert_eq!(
             lists.gpu_opaque_representatives().collect::<Vec<_>>(),
             [first, second]
@@ -2682,7 +2663,6 @@ mod draw_plan_tests {
 
         lists.begin_intent_collection();
         assert!(lists.gpu_opaque_representatives().next().is_none());
-        assert_eq!(lists.gpu_opaque_representative(), None);
         assert_eq!(
             lists.gpu_opaque_representative_stamps, stamps_before_reset,
             "ordinary warm reset must not fill retained representative stamps"

@@ -1184,15 +1184,11 @@ struct GpuSceneMultiBinCullNode<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PreparedGpuSceneCull {
-    #[allow(dead_code, reason = "legacy single-bin test path")]
-    Empty,
-    Dispatch {
-        pipeline: ComputePipelineId,
-        bind_group: PreparedBindGroupId,
-        workgroups_x: u32,
-        workgroups_y: u32,
-    },
+struct PreparedGpuSceneCull {
+    pipeline: ComputePipelineId,
+    bind_group: PreparedBindGroupId,
+    workgroups_x: u32,
+    workgroups_y: u32,
 }
 
 #[cfg(test)]
@@ -1203,14 +1199,11 @@ impl<'a> PassNode<'a> for GpuSceneCullNode<'a> {
             "GpuScene Cull was prepared more than once"
         );
 
-        // An empty table still has a live indirect-output contract. Execute
-        // clears the argument record, but no shader, pipeline, BG, or upload is
-        // required to prove the resulting zero-instance draw.
         let slot_span = self.params[0].domain[1];
-        if slot_span == 0 {
-            self.prepared = Some(PreparedGpuSceneCull::Empty);
-            return;
-        }
+        assert_ne!(
+            slot_span, 0,
+            "the legacy single-bin test node cannot prepare an empty table"
+        );
 
         let workgroups_x = slot_span.div_ceil(GPU_SCENE_CULL_WORKGROUP_SIZE);
         let workgroups_y = self.mode.view_count();
@@ -1233,7 +1226,7 @@ impl<'a> PassNode<'a> for GpuSceneCullNode<'a> {
             .bind_buffer(2, self.indirect_arguments)
             .bind_buffer(3, self.params_buffer)
             .build();
-        self.prepared = Some(PreparedGpuSceneCull::Dispatch {
+        self.prepared = Some(PreparedGpuSceneCull {
             pipeline: resources.pipeline,
             bind_group,
             workgroups_x,
@@ -1255,15 +1248,12 @@ impl<'a> PassNode<'a> for GpuSceneCullNode<'a> {
             Some(self.argument_size),
         );
 
-        let PreparedGpuSceneCull::Dispatch {
+        let PreparedGpuSceneCull {
             pipeline,
             bind_group,
             workgroups_x,
             workgroups_y,
-        } = prepared
-        else {
-            return;
-        };
+        } = prepared;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("GpuScene Cull"),
             timestamp_writes: None,
@@ -1329,7 +1319,7 @@ impl<'a> PassNode<'a> for GpuSceneMultiBinCullNode<'a> {
                 self.parameter_layout.domain.binding_size(),
             )
             .build();
-        self.prepared = Some(PreparedGpuSceneCull::Dispatch {
+        self.prepared = Some(PreparedGpuSceneCull {
             pipeline: resources.pipeline,
             bind_group,
             workgroups_x,
@@ -1338,17 +1328,14 @@ impl<'a> PassNode<'a> for GpuSceneMultiBinCullNode<'a> {
     }
 
     fn execute(&self, ctx: &ExecuteContext, encoder: &mut wgpu::CommandEncoder) {
-        let PreparedGpuSceneCull::Dispatch {
+        let PreparedGpuSceneCull {
             pipeline,
             bind_group,
             workgroups_x,
             workgroups_y,
         } = self
             .prepared
-            .expect("live GPU Scene multi-bin Cull reached execute without preparation")
-        else {
-            unreachable!("multi-bin Cull never uses the empty legacy state")
-        };
+            .expect("live GPU Scene multi-bin Cull reached execute without preparation");
 
         // One clear plus one dispatch for the complete family. Static argument
         // fields and bounded instance counts are populated by disjoint shader
