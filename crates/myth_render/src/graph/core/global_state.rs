@@ -332,6 +332,7 @@ mod tests {
         ExecuteContext, FrameArena, GraphStorage, PassNode, PrepareContext, RenderGraph,
     };
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext;
     use myth_resources::buffer::BufferRef;
 
     struct EmptyNode;
@@ -379,7 +380,7 @@ mod tests {
     }
 
     fn gpu() -> WgpuContext {
-        pollster::block_on(WgpuContext::new_headless(
+        pollster::block_on(SharedTestContext::new_headless(
             &RendererInitConfig::default(),
             &RendererSettings::default(),
             8,

@@ -1173,6 +1173,7 @@ mod tests {
         RdgRenderTargetKind, RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
         TextureDesc,
     };
+    use crate::test_support::SharedTestContext;
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::{AssetServer, MaterialHandle, SceneExt};
     use myth_core::{NodeHandle, SkeletonKey};
@@ -1255,11 +1256,41 @@ mod tests {
             .unwrap_or_else(|| panic!("{pass_name} has no scene submission demand"))
     }
 
+    fn init_shared_headless_renderer(
+        renderer: &mut Renderer,
+        width: u32,
+        height: u32,
+        format: Option<PixelFormat>,
+    ) {
+        if renderer.context.is_some() {
+            return;
+        }
+
+        renderer.size = (width, height);
+        let target_format = format.map(|format| format.to_wgpu(ColorSpace::Srgb));
+        let wgpu_ctx = pollster::block_on(SharedTestContext::new_headless(
+            &renderer.init_config,
+            &renderer.settings,
+            width,
+            height,
+            target_format,
+        ))
+        .expect("headless renderer init failed");
+        renderer.assemble_state(wgpu_ctx);
+    }
+
     fn init_headless_renderer() -> Renderer {
         let mut renderer =
             Renderer::new(RendererInitConfig::default(), RendererSettings::default());
+        init_shared_headless_renderer(&mut renderer, 128, 128, None);
+        renderer
+    }
+
+    fn init_production_headless_renderer() -> Renderer {
+        let mut renderer =
+            Renderer::new(RendererInitConfig::default(), RendererSettings::default());
         pollster::block_on(renderer.init_headless(128, 128, None))
-            .expect("headless renderer init failed");
+            .expect("production headless renderer init failed");
         renderer
     }
 
@@ -1558,7 +1589,10 @@ mod tests {
 
     #[test]
     fn headless_renderer_publishes_pass_conservation_diagnostics() {
-        let mut renderer = init_headless_renderer();
+        // Keep one smoke path through the public constructor; the remaining
+        // contract tests share only Device/Queue to avoid repeated adapter and
+        // device requests.
+        let mut renderer = init_production_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
 
@@ -1806,8 +1840,7 @@ mod tests {
                 ..RendererSettings::default()
             },
         );
-        pollster::block_on(renderer.init_headless(128, 128, None))
-            .expect("headless renderer init failed");
+        init_shared_headless_renderer(&mut renderer, 128, 128, None);
         let assets = AssetServer::new();
         let mut scene = Scene::new();
 
@@ -1827,8 +1860,7 @@ mod tests {
                 ..RendererSettings::default()
             },
         );
-        pollster::block_on(renderer.init_headless(128, 128, None))
-            .expect("headless renderer init failed");
+        init_shared_headless_renderer(&mut renderer, 128, 128, None);
         let assets = AssetServer::new();
         let mut scene = Scene::new();
         let mut lights = (0..4)
@@ -2062,8 +2094,7 @@ mod tests {
                 ..RendererSettings::default()
             },
         );
-        pollster::block_on(renderer.init_headless(128, 128, None))
-            .expect("headless renderer init failed");
+        init_shared_headless_renderer(&mut renderer, 128, 128, None);
         let assets = AssetServer::new();
         let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
         let mut scene = Scene::new();
@@ -4470,8 +4501,7 @@ mod tests {
                 ..RendererSettings::default()
             },
         );
-        pollster::block_on(renderer.init_headless(128, 128, None))
-            .expect("headless renderer init failed");
+        init_shared_headless_renderer(&mut renderer, 128, 128, None);
         let assets = AssetServer::new();
         let image_handle = assets.images.add(Image::new(
             8,
@@ -4527,8 +4557,7 @@ mod tests {
                 ..RendererSettings::default()
             },
         );
-        pollster::block_on(renderer.init_headless(128, 128, None))
-            .expect("headless renderer init failed");
+        init_shared_headless_renderer(&mut renderer, 128, 128, None);
         let assets = AssetServer::new();
         let opaque_image = assets.images.add(Image::new(
             4,

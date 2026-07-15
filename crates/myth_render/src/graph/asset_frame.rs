@@ -1079,8 +1079,8 @@ impl<'a> ObjectInterfaceResolver<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::WgpuContext;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use glam::Mat4;
     use myth_assets::{GeometryHandle, MaterialHandle};
     use myth_resources::{BoundingBox, geometry::Geometry};

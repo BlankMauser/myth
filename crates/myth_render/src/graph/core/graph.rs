@@ -3644,13 +3644,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::core::ResourceManager;
     use crate::core::gpu::{PhysicalImageId, snapshot_asset_texture};
-    use crate::core::{ResourceManager, WgpuContext};
     use crate::graph::RdgAttemptOutcome;
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
     use crate::graph::{composer::GraphBuilderContext, core::context::ExecuteContext};
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use myth_assets::AssetServer;
     use myth_resources::image::{Image, ImageDimension, PixelFormat};
     use myth_resources::texture::Texture;

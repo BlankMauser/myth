@@ -2167,8 +2167,8 @@ mod shadow_metadata_tests {
 #[cfg(test)]
 mod draw_plan_tests {
     use super::*;
-    use crate::core::WgpuContext;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use slotmap::Key;
 
     fn test_command(sort_key: u64) -> DrawCommand {

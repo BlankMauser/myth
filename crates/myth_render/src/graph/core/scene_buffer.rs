@@ -513,11 +513,12 @@ impl<'a> SceneBufferResolver<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ResourceManager;
     use crate::core::gpu::Tracked;
-    use crate::core::{ResourceManager, WgpuContext};
     use crate::graph::core::graph::RenderGraph;
     use crate::graph::core::{ExecuteContext, FrameArena, GraphStorage, PassNode, PrepareContext};
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
 
     struct ConsumerNode;
 

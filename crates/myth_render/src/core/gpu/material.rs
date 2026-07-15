@@ -1180,8 +1180,8 @@ fn binding_recipe_matches_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::WgpuContext;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use slotmap::KeyData;
 
     fn test_resource_manager() -> ResourceManager {

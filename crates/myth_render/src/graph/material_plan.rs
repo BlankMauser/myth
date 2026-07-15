@@ -1719,9 +1719,9 @@ fn material_record_content_is_current(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::WgpuContext;
     use crate::graph::extracted::{ItemShaderFeatures, MaterialClassification};
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use myth_assets::GeometryHandle;
     use myth_resources::BoundingBox;
     use myth_resources::geometry::Geometry;

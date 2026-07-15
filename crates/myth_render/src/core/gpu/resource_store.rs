@@ -1701,9 +1701,9 @@ impl ResourceManager {
 #[cfg(test)]
 mod candidate_tests {
     use super::*;
-    use crate::core::WgpuContext;
     use crate::core::gpu::texture::snapshot_asset_texture;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use myth_assets::AssetServer;
     use myth_resources::image::{ImageDimension, PixelFormat};
 

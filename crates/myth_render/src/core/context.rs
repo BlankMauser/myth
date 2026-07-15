@@ -252,6 +252,44 @@ impl WgpuContext {
         })
     }
 
+    /// Builds an isolated headless context around a process-shared test
+    /// device. Each caller still owns its target texture and all higher-level
+    /// renderer state; only the immutable wgpu device/queue handles are shared.
+    #[cfg(test)]
+    pub(crate) fn from_shared_test_device(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        init_config: &RendererInitConfig,
+        settings: &RendererSettings,
+        width: u32,
+        height: u32,
+        target_format: Option<wgpu::TextureFormat>,
+    ) -> Self {
+        assert!(
+            device.features().contains(init_config.required_features),
+            "shared test device does not satisfy the requested feature set"
+        );
+
+        let view_format = target_format.unwrap_or(wgpu::TextureFormat::Rgba8UnormSrgb);
+        let headless_texture = Self::create_headless_texture(&device, width, height, view_format);
+
+        Self {
+            device,
+            queue,
+            surface: None,
+            config: None,
+            headless_texture: Some(headless_texture),
+            target_width: width,
+            target_height: height,
+            depth_format: init_config.depth_format,
+            surface_view_format: view_format,
+            msaa_samples: 1,
+            anisotropy_clamp: settings.anisotropy_clamp,
+            render_path: settings.path,
+            pipeline_settings_version: 0,
+        }
+    }
+
     /// Creates the offscreen render target texture for headless mode.
     fn create_headless_texture(
         device: &wgpu::Device,

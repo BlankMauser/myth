@@ -924,8 +924,8 @@ impl ResourceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::WgpuContext;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use myth_resources::image::{ColorSpace, ImageDimension, PixelFormat};
 
     fn image_8x8() -> Image {

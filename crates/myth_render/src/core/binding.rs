@@ -394,8 +394,8 @@ impl BindGroupKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::WgpuContext;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
 
     fn empty_bind_group(device: &wgpu::Device, label: &'static str) -> wgpu::BindGroup {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

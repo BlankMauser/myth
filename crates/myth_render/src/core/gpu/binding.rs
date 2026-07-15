@@ -1026,9 +1026,10 @@ mod tests {
         GlobalStateBufferSlot, GlobalStatePhysicalFailure, assert_object_bindings_are_buffer_only,
         global_resource_ids,
     };
+    use crate::core::ResourceManager;
     use crate::core::gpu::{GlobalStateKey, GlobalStateResolver, MaterializedBufferToken, Tracked};
-    use crate::core::{ResourceManager, WgpuContext};
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
     use myth_assets::TextureHandle;
     use myth_resources::buffer::CpuBuffer;
     use myth_resources::texture::TextureSource;
