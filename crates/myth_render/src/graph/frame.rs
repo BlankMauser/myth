@@ -1433,13 +1433,25 @@ pub struct RenderLists {
     frame_source_stamps: Vec<u32>,
     frame_source_generation: u32,
 
-    /// Exact GPU ownership selected for each immutable extraction source.
-    /// Masks are generation-stamped, so an ordinary frame reset is O(1) and
-    /// never zero-fills the retained high-water arrays. CPU intent collection
-    /// consults this table to retain only the cohorts not owned by GPU Scene.
+    /// Debug-only exact GPU ownership proof for each immutable extraction
+    /// source. Masks are generation-stamped, so an ordinary debug frame reset
+    /// remains O(1). Release collection consumes the dense complements below
+    /// and carries no scene-width mask/stamp storage or publication scan.
+    #[cfg(any(debug_assertions, test))]
     gpu_family_ownership_masks: Vec<GpuDrivenFamilyMask>,
+    #[cfg(any(debug_assertions, test))]
     gpu_family_ownership_stamps: Vec<u32>,
+    #[cfg(any(debug_assertions, test))]
     gpu_family_ownership_generation: u32,
+
+    /// Dense CPU complement of the current committed GPU Main/Prepass recipe.
+    /// This is published only after the authority transaction succeeds, so
+    /// Hybrid intent collection never has to rescan GPU-owned sources.
+    gpu_cpu_main_complement: Vec<ExtractedSourceId>,
+    /// Dense CPU caster complement shared by selected Shadow2D/ShadowCube
+    /// families. Unselected families still consume the complete scene domain.
+    gpu_cpu_shadow_complement: Vec<ExtractedSourceId>,
+    gpu_cpu_complement_families: GpuDrivenFamilyMask,
 
     /// All active render views for the current frame.
     ///
@@ -1469,9 +1481,15 @@ impl RenderLists {
             frame_source_generation: 1,
             // GPU ownership is cold when the default mode is Off. Let the
             // first Auto/Required selection own this allocation.
+            #[cfg(any(debug_assertions, test))]
             gpu_family_ownership_masks: Vec::new(),
+            #[cfg(any(debug_assertions, test))]
             gpu_family_ownership_stamps: Vec::new(),
+            #[cfg(any(debug_assertions, test))]
             gpu_family_ownership_generation: 1,
+            gpu_cpu_main_complement: Vec::new(),
+            gpu_cpu_shadow_complement: Vec::new(),
+            gpu_cpu_complement_families: GpuDrivenFamilyMask::empty(),
             active_views: Vec::with_capacity(16),
             use_transmission: false,
         }
@@ -1497,6 +1515,7 @@ impl RenderLists {
         self.gpu_opaque_representatives.clear();
         self.advance_gpu_opaque_representative_generation();
         self.advance_frame_source_generation();
+        #[cfg(any(debug_assertions, test))]
         self.advance_gpu_family_ownership_generation();
         self.use_transmission = false;
     }
@@ -1530,6 +1549,7 @@ impl RenderLists {
         }
     }
 
+    #[cfg(any(debug_assertions, test))]
     fn advance_gpu_family_ownership_generation(&mut self) {
         self.gpu_family_ownership_generation = self.gpu_family_ownership_generation.wrapping_add(1);
         if self.gpu_family_ownership_generation == 0 {
@@ -1541,6 +1561,7 @@ impl RenderLists {
     /// Assign one or more disjoint scene-submission families to GPU Scene for
     /// an exact extracted source. Repeating an already-owned family is a
     /// construction bug: it would make two GPU submissions render one cohort.
+    #[cfg(any(debug_assertions, test))]
     pub(crate) fn claim_gpu_family_ownership(
         &mut self,
         extracted: ExtractedSourceId,
@@ -1577,6 +1598,7 @@ impl RenderLists {
     /// source. A stale generation or unseen high index is CPU-owned.
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn gpu_family_ownership(&self, extracted: ExtractedSourceId) -> GpuDrivenFamilyMask {
         let index = extracted.index();
         if self.gpu_family_ownership_stamps.get(index).copied()
@@ -1586,6 +1608,71 @@ impl RenderLists {
         } else {
             GpuDrivenFamilyMask::empty()
         }
+    }
+
+    /// Begin publishing the exact CPU complement of one successfully committed
+    /// GPU Scene recipe. The default Off route never calls this method and does
+    /// not touch the retained vectors.
+    pub(crate) fn begin_gpu_cpu_complement(&mut self, selected_families: GpuDrivenFamilyMask) {
+        assert!(!selected_families.is_empty());
+        self.gpu_cpu_main_complement.clear();
+        self.gpu_cpu_shadow_complement.clear();
+        self.gpu_cpu_complement_families = selected_families;
+    }
+
+    /// Append one extraction source which is not part of the retained GPU
+    /// recipe. Callers scan extraction order, preserving deterministic CPU draw
+    /// and shadow ordering without a sort or hash table.
+    pub(crate) fn append_gpu_cpu_complement(
+        &mut self,
+        extracted: ExtractedSourceId,
+        cast_shadows: bool,
+        incomplete_families: GpuDrivenFamilyMask,
+    ) {
+        debug_assert!(
+            incomplete_families
+                .difference(self.gpu_cpu_complement_families)
+                .is_empty()
+        );
+        if incomplete_families.contains(GpuDrivenFamilyMask::MAIN_PREPASS) {
+            self.gpu_cpu_main_complement.push(extracted);
+        }
+        if cast_shadows
+            && incomplete_families
+                .intersects(GpuDrivenFamilyMask::SHADOW_2D | GpuDrivenFamilyMask::SHADOW_CUBE)
+        {
+            self.gpu_cpu_shadow_complement.push(extracted);
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn gpu_cpu_main_complement_len(&self) -> usize {
+        self.gpu_cpu_main_complement.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn gpu_cpu_main_complement(&self, index: usize) -> ExtractedSourceId {
+        self.gpu_cpu_main_complement[index]
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn gpu_cpu_shadow_complement_len(&self) -> usize {
+        self.gpu_cpu_shadow_complement.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn gpu_cpu_shadow_complement(&self, index: usize) -> ExtractedSourceId {
+        self.gpu_cpu_shadow_complement[index]
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn gpu_cpu_complement_families(&self) -> GpuDrivenFamilyMask {
+        self.gpu_cpu_complement_families
     }
 
     fn advance_gpu_opaque_representative_generation(&mut self) {

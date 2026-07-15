@@ -479,6 +479,9 @@ impl RdgFramePhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RdgDetailPhase {
+    GpuBackendSelection,
+    GpuSceneCommit,
+    CpuIntentCollection,
     TransientResources,
     SceneBuffers,
     GlobalBuffers,
@@ -501,9 +504,12 @@ pub enum RdgDetailPhase {
 
 #[cfg(feature = "rdg_bench_support")]
 impl RdgDetailPhase {
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 21;
 
     pub const ALL: [Self; Self::COUNT] = [
+        Self::GpuBackendSelection,
+        Self::GpuSceneCommit,
+        Self::CpuIntentCollection,
         Self::TransientResources,
         Self::SceneBuffers,
         Self::GlobalBuffers,
@@ -526,24 +532,27 @@ impl RdgDetailPhase {
 
     const fn timing_index(self) -> usize {
         match self {
-            Self::TransientResources => 0,
-            Self::SceneBuffers => 1,
-            Self::GlobalBuffers => 2,
-            Self::PersistentTextures => 3,
-            Self::PersistentBuffers => 4,
-            Self::AssetTexture => 5,
-            Self::GlobalBindGroup => 6,
-            Self::LiveSourceUnion => 7,
-            Self::MaterialPlan => 8,
-            Self::Geometry => 9,
-            Self::SourceGather => 10,
-            Self::SourcePlan => 11,
-            Self::SourceMaterialize => 12,
-            Self::SourceFinalize => 13,
-            Self::PipelineGather => 14,
-            Self::PipelineCoordinate => 15,
-            Self::PipelineFeatureFinalize => 16,
-            Self::PipelineFinalize => 17,
+            Self::GpuBackendSelection => 0,
+            Self::GpuSceneCommit => 1,
+            Self::CpuIntentCollection => 2,
+            Self::TransientResources => 3,
+            Self::SceneBuffers => 4,
+            Self::GlobalBuffers => 5,
+            Self::PersistentTextures => 6,
+            Self::PersistentBuffers => 7,
+            Self::AssetTexture => 8,
+            Self::GlobalBindGroup => 9,
+            Self::LiveSourceUnion => 10,
+            Self::MaterialPlan => 11,
+            Self::Geometry => 12,
+            Self::SourceGather => 13,
+            Self::SourcePlan => 14,
+            Self::SourceMaterialize => 15,
+            Self::SourceFinalize => 16,
+            Self::PipelineGather => 17,
+            Self::PipelineCoordinate => 18,
+            Self::PipelineFeatureFinalize => 19,
+            Self::PipelineFinalize => 20,
         }
     }
 }

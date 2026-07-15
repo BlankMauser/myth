@@ -2112,7 +2112,10 @@ mod tests {
         );
 
         for (range, source) in [
-            (layout.active_batches, bytemuck::cast_slice::<_, u8>(&active_batches)),
+            (
+                layout.active_batches,
+                bytemuck::cast_slice::<_, u8>(&active_batches),
+            ),
             (layout.views, bytemuck::cast_slice(&views)),
             (layout.domain, bytemuck::cast_slice(&domain)),
         ] {

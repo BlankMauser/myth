@@ -235,6 +235,27 @@ pub struct WgpuContext {
 }
 
 impl WgpuContext {
+    fn requested_device_features(
+        init_config: &RendererInitConfig,
+        #[cfg_attr(not(feature = "rdg_bench_support"), allow(unused_variables))]
+        adapter: &wgpu::Adapter,
+    ) -> wgpu::Features {
+        #[cfg(feature = "rdg_bench_support")]
+        {
+            let mut features = init_config.required_features;
+            let timestamps =
+                wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            if adapter.features().contains(timestamps) {
+                features |= timestamps;
+            }
+            features
+        }
+        #[cfg(not(feature = "rdg_bench_support"))]
+        {
+            init_config.required_features
+        }
+    }
+
     pub async fn new<W>(
         window: W,
         init_config: &RendererInitConfig,
@@ -295,7 +316,7 @@ impl WgpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: init_config.required_features,
+                required_features: Self::requested_device_features(init_config, &adapter),
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
@@ -393,7 +414,7 @@ impl WgpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Headless Device"),
-                required_features: init_config.required_features,
+                required_features: Self::requested_device_features(init_config, &adapter),
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()

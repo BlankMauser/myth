@@ -2351,9 +2351,51 @@ impl GpuScene {
             self.revision = next_revision;
         }
 
+        // Publish a dense CPU complement with one ordered linear merge. The
+        // retained members preserve extraction order, so Hybrid collection can
+        // consume O(CpuComplement) sources instead of rescanning O(Scene) once
+        // for Main and again for every shadow view.
+        render_lists.begin_gpu_cpu_complement(selected_families);
+        let mut incomplete_families = GpuDrivenFamilyMask::empty();
+        if selected_families.contains(GpuDrivenFamilyMask::MAIN_PREPASS)
+            && preflight.projection.candidate_count as usize != extracted_scene.render_items.len()
+        {
+            incomplete_families.insert(GpuDrivenFamilyMask::MAIN_PREPASS);
+        }
+        if !preflight.projection.covers_complete_shadow_domain {
+            incomplete_families |= selected_families
+                & (GpuDrivenFamilyMask::SHADOW_2D | GpuDrivenFamilyMask::SHADOW_CUBE);
+        }
+        if !incomplete_families.is_empty() {
+            let mut retained_index = 0usize;
+            for item_index in 0..extracted_scene.render_items.len() {
+                let retained = self
+                    .multi_bin_members
+                    .get(retained_index)
+                    .is_some_and(|member| member.item as usize == item_index);
+                if retained {
+                    retained_index += 1;
+                } else {
+                    let item = &extracted_scene.render_items[item_index];
+                    render_lists.append_gpu_cpu_complement(
+                        ExtractedSourceId::from_index(item_index),
+                        item.cast_shadows,
+                        incomplete_families,
+                    );
+                }
+            }
+            debug_assert_eq!(
+                retained_index,
+                self.multi_bin_members.len(),
+                "retained GPU Scene members must remain extraction-order sorted"
+            );
+        }
+
         // Publish ownership only after the persistent authority transaction
         // has no remaining fallible boundary. These attempt-local claims are
-        // the CPU xor GPU proof consumed by intent collection.
+        // a debug-only CPU xor GPU proof. Release collection consumes the
+        // dense complement directly and performs no scene-width stamp writes.
+        #[cfg(any(debug_assertions, test))]
         for member in &self.multi_bin_members {
             render_lists.claim_gpu_family_ownership(
                 ExtractedSourceId::from_index(member.item as usize),
@@ -3671,7 +3713,7 @@ mod tests {
     use super::*;
     use crate::core::{RenderView, WgpuContext};
     use crate::graph::core::PersistentBufferCommitRequest;
-    use crate::graph::culling::collect_draw_intents_with_family_ownership;
+    use crate::graph::culling::collect_draw_intents_with_gpu_complement;
     use crate::graph::extracted::ExtractedLight;
     use crate::settings::{RendererInitConfig, RendererSettings};
     use glam::{Affine3A, Vec3};
@@ -4001,7 +4043,14 @@ mod tests {
             )
             .unwrap();
 
-        collect_draw_intents_with_family_ownership(&scene, &mut lists, &test_render_camera());
+        collect_draw_intents_with_gpu_complement(
+            &scene,
+            &mut lists,
+            &test_render_camera(),
+            GpuDrivenFamilyMask::MAIN_PREPASS,
+            GpuDrivenFamilyMask::empty(),
+            false,
+        );
 
         let cpu_sources = lists
             .opaque
@@ -4097,7 +4146,14 @@ mod tests {
                 &mut lists,
             )
             .unwrap();
-        collect_draw_intents_with_family_ownership(&scene, &mut lists, &test_render_camera());
+        collect_draw_intents_with_gpu_complement(
+            &scene,
+            &mut lists,
+            &test_render_camera(),
+            GpuDrivenFamilyMask::SHADOW_2D,
+            GpuDrivenFamilyMask::empty(),
+            false,
+        );
         assert_eq!(shadow_queue_sources(&lists, (101, 0)), [2]);
         assert_eq!(shadow_queue_sources(&lists, (202, 0)), [0, 1, 2]);
         let first = authority.instance_id(scene.scene_id, node(1)).unwrap();
@@ -4120,7 +4176,14 @@ mod tests {
                 &mut lists,
             )
             .unwrap();
-        collect_draw_intents_with_family_ownership(&scene, &mut lists, &test_render_camera());
+        collect_draw_intents_with_gpu_complement(
+            &scene,
+            &mut lists,
+            &test_render_camera(),
+            GpuDrivenFamilyMask::SHADOW_CUBE,
+            GpuDrivenFamilyMask::empty(),
+            false,
+        );
         assert_eq!(shadow_queue_sources(&lists, (101, 0)), [0, 1, 2]);
         assert_eq!(shadow_queue_sources(&lists, (202, 0)), [2]);
         let second = authority.instance_id(scene.scene_id, node(1)).unwrap();
@@ -4128,6 +4191,69 @@ mod tests {
             authority.record(second).unwrap().metadata[3],
             GPU_SCENE_INSTANCE_CASTS_SHADOW | GPU_SCENE_INSTANCE_SHADOW_CUBE
         );
+    }
+
+    #[test]
+    fn complete_gpu_families_publish_empty_cpu_domains_and_keep_shadow_topology() {
+        let mut first = rigid_item_with_assets(1, 10, 20);
+        let mut second = rigid_item_with_assets(2, 10, 20);
+        for item in [&mut first, &mut second] {
+            item.world_matrix = Mat4::IDENTITY;
+            item.prev_world_matrix = Mat4::IDENTITY;
+            item.world_aabb = BoundingBox {
+                min: -Vec3::ONE,
+                max: Vec3::ONE,
+            };
+        }
+        let mut scene = extracted_scene([first, second]);
+        scene.lights.push(shadow_light(
+            101,
+            LightKind::Spot(SpotLight {
+                range: 20.0,
+                inner_cone: 0.4,
+                outer_cone: 0.8,
+            }),
+        ));
+
+        let shadow_frustum = myth_scene::camera::Frustum::from_matrix_standard_z(Mat4::IDENTITY);
+        let mut lists = RenderLists::new();
+        lists.active_views.push(RenderView::new_shadow(
+            101,
+            0,
+            0,
+            "Shadow2D".into(),
+            Mat4::IDENTITY,
+            shadow_frustum,
+            (64, 64),
+            None,
+        ));
+
+        let selected = GpuDrivenFamilyMask::MAIN_PREPASS | GpuDrivenFamilyMask::SHADOW_2D;
+        let mut authority = GpuScene::new();
+        let preflight = authority
+            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .unwrap()
+            .unwrap();
+        assert!(preflight.projection.covers_complete_shadow_domain);
+        authority
+            .commit_multi_bin_selection_with_families(&scene, preflight, selected, 0.0, &mut lists)
+            .unwrap();
+
+        assert_eq!(lists.gpu_cpu_main_complement_len(), 0);
+        assert_eq!(lists.gpu_cpu_shadow_complement_len(), 0);
+        collect_draw_intents_with_gpu_complement(
+            &scene,
+            &mut lists,
+            &test_render_camera(),
+            selected,
+            selected,
+            true,
+        );
+
+        assert!(lists.opaque.is_empty());
+        assert!(lists.transparent.is_empty());
+        assert!(lists.shadow_queues.contains_key(&(101, 0)));
+        assert!(lists.shadow_queues[&(101, 0)].is_empty());
     }
 
     #[test]

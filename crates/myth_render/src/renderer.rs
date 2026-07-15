@@ -16,6 +16,8 @@ use crate::graph::core::{
     HistoryRegistry, PersistentBufferRegistry, RdgDiagnosticsRecorder, RdgFrameDiagnostics,
     RdgFramePhase, RdgRendererAttemptGuard,
 };
+#[cfg(feature = "rdg_bench_support")]
+use crate::graph::core::{RdgGpuFrameTimings, RdgGpuTimingRecorder};
 use crate::graph::frame::{RenderFrameFeatureConfig, RenderLists};
 use crate::graph::gpu_driven_policy::GpuDrivenAutoPolicy;
 use crate::graph::gpu_scene::GpuScene;
@@ -120,6 +122,8 @@ struct RendererState {
     /// retain a shared, non-atomic guard while RenderGraph exclusively borrows
     /// topology storage for the frame lifetime.
     pub(crate) rdg_diagnostics: RdgDiagnosticsRecorder,
+    #[cfg(feature = "rdg_bench_support")]
+    pub(crate) rdg_gpu_timings: RdgGpuTimingRecorder,
     pub(crate) graph_storage: GraphStorage,
     // pub(crate) sampler_registry: SamplerRegistry,
     pub(crate) transient_pool: TransientPool,
@@ -303,6 +307,8 @@ impl Renderer {
         let equirect_to_cube_pass = EquirectToCubeFeature::new();
         let ibl_pass = IblComputeFeature::new();
         let mipmap_pass = MipmapFeature::new(&wgpu_ctx.device);
+        #[cfg(feature = "rdg_bench_support")]
+        let rdg_gpu_timings = RdgGpuTimingRecorder::new(&wgpu_ctx.device, &wgpu_ctx.queue);
 
         self.context = Some(RendererState {
             wgpu_ctx,
@@ -315,6 +321,8 @@ impl Renderer {
             global_bind_group_cache,
 
             rdg_diagnostics: RdgDiagnosticsRecorder::default(),
+            #[cfg(feature = "rdg_bench_support")]
+            rdg_gpu_timings,
             graph_storage: GraphStorage::new(),
             transient_pool: TransientPool::new(),
             history_registry: HistoryRegistry::new(),
@@ -413,6 +421,10 @@ impl Renderer {
         }
 
         let state = self.context.as_mut()?;
+        #[cfg(feature = "rdg_bench_support")]
+        state
+            .rdg_gpu_timings
+            .poll(&state.wgpu_ctx.device, frame_time.frame_count);
 
         // ── Frame Arena Lifecycle ───────────────────────────────────────
         // Invalidate every raw NodeSlot before resetting the arena that owns
@@ -540,6 +552,8 @@ impl Renderer {
 
             graph_storage: &mut state.graph_storage,
             rdg_diagnostics: &state.rdg_diagnostics,
+            #[cfg(feature = "rdg_bench_support")]
+            rdg_gpu_timings: &mut state.rdg_gpu_timings,
             transient_pool: &mut state.transient_pool,
             history_registry: &mut state.history_registry,
             persistent_buffer_registry: &mut state.persistent_buffer_registry,
@@ -854,6 +868,39 @@ impl Renderer {
         self.context
             .as_ref()
             .and_then(|state| state.rdg_diagnostics.latest())
+    }
+
+    /// Returns the latest asynchronously completed RDG GPU timestamp sample.
+    ///
+    /// The sample normally trails the current renderer frame by several frames;
+    /// [`RdgGpuFrameTimings::sample_lag`] exposes that delay explicitly.
+    #[cfg(feature = "rdg_bench_support")]
+    #[must_use]
+    pub fn latest_rdg_gpu_timings(&self) -> Option<&RdgGpuFrameTimings> {
+        self.context
+            .as_ref()
+            .and_then(|state| state.rdg_gpu_timings.latest())
+    }
+
+    /// Changes the non-blocking GPU timestamp sampling cadence. Zero disables
+    /// sampling, which is also the default. Returns false before renderer
+    /// initialization.
+    #[cfg(feature = "rdg_bench_support")]
+    pub fn set_rdg_gpu_timing_sample_interval(&mut self, interval: u64) -> bool {
+        let Some(state) = self.context.as_mut() else {
+            return false;
+        };
+        state.rdg_gpu_timings.set_sample_interval(interval);
+        true
+    }
+
+    /// Whether the active adapter/device enabled the optional timestamp tier.
+    #[cfg(feature = "rdg_bench_support")]
+    #[must_use]
+    pub fn rdg_gpu_timings_supported(&self) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|state| state.rdg_gpu_timings.supported())
     }
 
     /// Returns the accounted CPU backing capacity retained by the RDG between

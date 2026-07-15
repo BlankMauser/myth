@@ -159,6 +159,8 @@ pub struct ComposerContext<'a> {
 
     pub graph_storage: &'a mut GraphStorage,
     pub(crate) rdg_diagnostics: &'a RdgDiagnosticsRecorder,
+    #[cfg(feature = "rdg_bench_support")]
+    pub(crate) rdg_gpu_timings: &'a mut crate::graph::core::RdgGpuTimingRecorder,
     pub transient_pool: &'a mut TransientPool,
     pub history_registry: &'a mut HistoryRegistry,
     pub(crate) persistent_buffer_registry: &'a mut PersistentBufferRegistry,
@@ -720,6 +722,31 @@ fn selected_family_backend(
     }
 }
 
+/// Families whose complete semantic CPU domain is represented by the exact
+/// retained GPU recipe. This is stronger than merely selecting a family: Auto
+/// may retain only high-reuse cohorts and must keep the complement on CPU.
+#[inline]
+fn complete_gpu_family_ownership(
+    selected_families: GpuDrivenFamilyMask,
+    projection: Option<GpuSceneMultiBinProjection>,
+    synopsis: crate::graph::gpu_driven_policy::GpuDrivenWorkloadSynopsis,
+) -> GpuDrivenFamilyMask {
+    let Some(projection) = projection else {
+        return GpuDrivenFamilyMask::empty();
+    };
+    let mut complete = GpuDrivenFamilyMask::empty();
+    if selected_families.contains(GpuDrivenFamilyMask::MAIN_PREPASS)
+        && projection.candidate_count == synopsis.opaque_item_count
+    {
+        complete.insert(GpuDrivenFamilyMask::MAIN_PREPASS);
+    }
+    if projection.covers_complete_shadow_domain {
+        complete |=
+            selected_families & (GpuDrivenFamilyMask::SHADOW_2D | GpuDrivenFamilyMask::SHADOW_CUBE);
+    }
+    complete
+}
+
 fn gpu_scene_capability_families(
     capabilities: &GpuDrivenCapabilities,
     projection: GpuSceneMultiBinProjection,
@@ -1016,6 +1043,9 @@ impl<'a> FrameComposer<'a> {
         let mut policy_minimum_cohort_members = 0;
         let mut policy_exact_evaluated = false;
 
+        #[cfg(feature = "rdg_bench_support")]
+        let backend_selection_timing =
+            rdg_diagnostics.detail_timer(RdgDetailPhase::GpuBackendSelection);
         match mode {
             // No capability query, shadow scan, policy lookup, preflight, or
             // GPU Scene state access is allowed in the CpuDirect baseline.
@@ -1255,12 +1285,16 @@ impl<'a> FrameComposer<'a> {
                 }
             }
         }
+        #[cfg(feature = "rdg_bench_support")]
+        drop(backend_selection_timing);
 
         // This is the first persistent GPU Scene mutation. Main and Shadow
         // capability gates have already passed, and the retained preflight is
         // consumed exactly once into the shared four-table revision.
         let gpu_scene_projection = gpu_scene_preflight.map(|preflight| preflight.projection);
         let gpu_scene_selected = if let Some(preflight) = gpu_scene_preflight {
+            #[cfg(feature = "rdg_bench_support")]
+            let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::GpuSceneCommit);
             if let Err(reason) = self.ctx.gpu_scene.commit_multi_bin_selection_with_families(
                 self.ctx.extracted_scene,
                 preflight,
@@ -1275,8 +1309,14 @@ impl<'a> FrameComposer<'a> {
         } else {
             false
         };
+        let selected_candidate_count =
+            selection_projection.map_or(0, |projection| projection.candidate_count);
+        let selected_shadow_candidate_count =
+            selection_projection.map_or(0, |projection| projection.shadow_candidate_count);
 
-        if mode == GpuDrivenMode::Off {
+        #[cfg(feature = "rdg_bench_support")]
+        let cpu_intent_timing = rdg_diagnostics.detail_timer(RdgDetailPhase::CpuIntentCollection);
+        if mode == GpuDrivenMode::Off || selected_families.is_empty() {
             crate::graph::culling::collect_draw_intents(
                 self.ctx.extracted_scene,
                 self.ctx.render_lists,
@@ -1285,17 +1325,23 @@ impl<'a> FrameComposer<'a> {
                 false,
             );
         } else {
-            crate::graph::culling::collect_draw_intents_with_family_ownership(
+            let complete_families =
+                complete_gpu_family_ownership(selected_families, selection_projection, synopsis);
+            let complete_main_item_domain = complete_families
+                .contains(GpuDrivenFamilyMask::MAIN_PREPASS)
+                && selected_candidate_count == synopsis.extracted_item_count;
+            crate::graph::culling::collect_draw_intents_with_gpu_complement(
                 self.ctx.extracted_scene,
                 self.ctx.render_lists,
                 &self.ctx.camera,
+                selected_families,
+                complete_families,
+                complete_main_item_domain,
             );
         }
+        #[cfg(feature = "rdg_bench_support")]
+        drop(cpu_intent_timing);
 
-        let selected_candidate_count =
-            selection_projection.map_or(0, |projection| projection.candidate_count);
-        let selected_shadow_candidate_count =
-            selection_projection.map_or(0, |projection| projection.shadow_candidate_count);
         rdg_diagnostics.record_gpu_driven_policy(RdgGpuDrivenPolicySnapshot {
             extracted_item_count: synopsis.extracted_item_count,
             supported_opaque_count: synopsis.supported_opaque_count,
@@ -3474,6 +3520,15 @@ impl<'a> FrameComposer<'a> {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("Unified Encoder"),
                     });
+            #[cfg(feature = "rdg_bench_support")]
+            let mut gpu_timing_sample = self.ctx.rdg_gpu_timings.begin_sample(
+                self.ctx.frame_time.frame_count,
+                graph.storage.execution_queue.len(),
+            );
+            #[cfg(feature = "rdg_bench_support")]
+            if let Some(sample) = gpu_timing_sample.as_mut() {
+                sample.write_start(&mut encoder);
+            }
 
             {
                 // Pass storage is frozen from topology compilation through
@@ -3522,9 +3577,17 @@ impl<'a> FrameComposer<'a> {
                     // execute phase and each queue entry is visited serially.
                     unsafe { pass.get_pass_mut() }.execute(&execute_ctx, &mut encoder);
                     rdg_diagnostics.record_executed_pass();
+                    #[cfg(feature = "rdg_bench_support")]
+                    if let Some(sample) = gpu_timing_sample.as_mut() {
+                        sample.write_pass_end(&mut encoder, pass.name);
+                    }
                     #[cfg(debug_assertions)]
                     encoder.pop_debug_group();
                 }
+            }
+            #[cfg(feature = "rdg_bench_support")]
+            if let Some(sample) = gpu_timing_sample.as_ref() {
+                sample.encode_resolve(&mut encoder);
             }
 
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3539,6 +3602,10 @@ impl<'a> FrameComposer<'a> {
                 return;
             };
             rdg_diagnostics.mark_queue_submitted();
+            #[cfg(feature = "rdg_bench_support")]
+            if let Some(sample) = gpu_timing_sample.take() {
+                sample.map_after_submit();
+            }
             if let Some(token) = gpu_policy_submission_token {
                 let committed = self.ctx.gpu_driven_policy.commit_submitted(token);
                 debug_assert!(

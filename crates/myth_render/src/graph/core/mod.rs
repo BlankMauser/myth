@@ -8,6 +8,8 @@ mod diagnostics;
 #[cfg(feature = "3dgs")]
 pub(crate) mod gaussian;
 mod global_state;
+#[cfg(feature = "rdg_bench_support")]
+mod gpu_timing;
 pub mod graph;
 pub mod node;
 pub mod persistent;
@@ -42,6 +44,10 @@ pub(crate) use diagnostics::{
     RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgRendererAttemptGuard,
 };
 pub(crate) use global_state::{GlobalStateMaterializationFailure, GlobalStateSources};
+#[cfg(feature = "rdg_bench_support")]
+pub(crate) use gpu_timing::RdgGpuTimingRecorder;
+#[cfg(feature = "rdg_bench_support")]
+pub use gpu_timing::{RdgGpuFrameTimings, RdgGpuPassTiming};
 pub use graph::{GraphStorage, MermaidDumpMode, RdgRetainedCapacityStats, RenderGraph};
 pub use node::PassNode;
 pub use persistent::{

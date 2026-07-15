@@ -32,8 +32,6 @@ pub(crate) mod scene_source_prepare;
 pub mod shadow_utils;
 
 pub use composer::FrameComposer;
-#[cfg(feature = "rdg_bench_support")]
-pub use core::RdgDetailPhase;
 pub use core::{
     MermaidDumpMode, RdgAttemptOutcome, RdgCommandEncodingFailure, RdgFrameDiagnostics,
     RdgFramePhase, RdgGpuDrivenFailure, RdgGpuDrivenPolicySnapshot,
@@ -41,6 +39,8 @@ pub use core::{
     RdgRetainedCapacityStats, RdgSceneSubmissionBackend, RdgSceneSubmissionFamily,
     RdgSceneSubmissionFamilySnapshot, RdgSceneSubmissionSelectionReason, RdgSurfaceAcquireFailure,
 };
+#[cfg(feature = "rdg_bench_support")]
+pub use core::{RdgDetailPhase, RdgGpuFrameTimings, RdgGpuPassTiming};
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton, ItemShaderFeatures};
 pub use frame::{RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent};
 #[cfg(feature = "debug_view")]
