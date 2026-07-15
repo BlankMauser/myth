@@ -2338,6 +2338,17 @@ impl<'a> RenderGraph<'a> {
         dependency_key: DrawPlanKey,
     ) -> SceneSubmissionPlanId {
         self.assert_topology_mutable();
+        self.validate_gpu_indirect_scene_submission_descriptor(descriptor);
+        let dependencies = self.storage.draw_plans.texture_dependencies(dependency_key);
+        self.storage
+            .scene_submissions
+            .reserve_gpu_indirect_with_textures(descriptor, dependencies)
+    }
+
+    fn validate_gpu_indirect_scene_submission_descriptor(
+        &self,
+        descriptor: GpuIndirectPlanDescriptor,
+    ) {
         for dependency in descriptor.referenced_resources() {
             assert!(
                 (dependency.index() as usize) < self.storage.resources.len(),
@@ -2402,10 +2413,6 @@ impl<'a> RenderGraph<'a> {
             arguments.usage.contains(wgpu::BufferUsages::COPY_DST),
             "GPU-indirect argument buffer must include COPY_DST for deterministic pre-dispatch clearing"
         );
-        let dependencies = self.storage.draw_plans.texture_dependencies(dependency_key);
-        self.storage
-            .scene_submissions
-            .reserve_gpu_indirect_with_textures(descriptor, dependencies)
     }
 
     /// Production reservation for one backend-neutral multi-bin GPU Scene
@@ -2441,6 +2448,48 @@ impl<'a> RenderGraph<'a> {
         self.reserve_gpu_indirect_scene_submission_with_dependencies(
             descriptor,
             DrawPlanKey::Opaque,
+        )
+    }
+
+    /// Production reservation for one atomic CPU-direct + GPU-indirect
+    /// multi-bin submission. The CPU and GPU cohorts share one semantic key,
+    /// one DPE demand, and one execute-time finalization barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_hybrid_gpu_scene_multi_bin_submission(
+        &mut self,
+        key: SceneSubmissionKey,
+        representative: FrameSourceId,
+        instance_table: BufferNodeId,
+        candidate_instances: BufferNodeId,
+        visible_instances: BufferNodeId,
+        indirect_arguments: BufferNodeId,
+        first_active_indirect_offset: u64,
+        indirect_window_start: u64,
+        indirect_span: u64,
+    ) -> SceneSubmissionPlanId {
+        self.assert_topology_mutable();
+        let descriptor = GpuIndirectPlanDescriptor::new_multi_bin(
+            key,
+            representative,
+            instance_table,
+            candidate_instances,
+            visible_instances,
+            indirect_arguments,
+            first_active_indirect_offset,
+            indirect_window_start,
+            indirect_span,
+        );
+        self.validate_gpu_indirect_scene_submission_descriptor(descriptor);
+
+        let draw_plans = &mut self.storage.draw_plans;
+        let draw_plan = draw_plans.reserve_plan(key.cpu_direct_key());
+        let dependency_key = draw_plans.mark_topology_demanded(draw_plan);
+        let dependencies = draw_plans.texture_dependencies(dependency_key);
+        self.storage.scene_submissions.reserve_hybrid_with_textures(
+            draw_plans,
+            draw_plan,
+            descriptor,
+            dependencies,
         )
     }
 
@@ -5693,6 +5742,167 @@ mod tests {
         assert_eq!(counts.live_cpu_direct, 0);
         assert_eq!(counts.live_gpu_indirect, 0);
         assert_eq!(graph.storage.draw_plans.live_keys().count(), 0);
+    }
+
+    #[test]
+    fn hybrid_submission_is_one_dpe_unit_and_dead_work_roots_neither_backend() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.add_pass("Dead_Hybrid_Texture", |builder| {
+            let texture = builder.create_texture("Dead_Hybrid_Texture_Out", dummy_desc());
+            (MockExec, texture)
+        });
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
+        let instances = graph.add_pass("Dead_Hybrid_Instances", |builder| {
+            let buffer = builder.create_buffer(
+                "Dead_Hybrid_Instance_Buffer",
+                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            );
+            (MockExec, buffer)
+        });
+        let (visible, arguments) = graph.add_pass("Dead_Hybrid_Cull", |builder| {
+            builder.read_buffer(instances);
+            let visible = builder.create_buffer(
+                "Dead_Hybrid_Visible",
+                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            );
+            let arguments = builder.create_buffer(
+                "Dead_Hybrid_Arguments",
+                BufferDesc::new(
+                    GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                    wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                ),
+            );
+            (MockExec, (visible, arguments))
+        });
+        let hybrid = graph.reserve_hybrid_gpu_scene_multi_bin_submission(
+            SceneSubmissionKey::Opaque,
+            FrameSourceId::from_index(0),
+            instances,
+            instances,
+            visible,
+            arguments,
+            0,
+            0,
+            GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+        );
+        graph.add_pass("Dead_Hybrid_Consumer", |builder| {
+            builder.demand_scene_submission(hybrid);
+            (MockExec, ())
+        });
+
+        graph.compile_topology();
+
+        assert!(graph.storage.execution_queue.is_empty());
+        assert!(!graph.storage.scene_submissions.is_live(hybrid));
+        assert!(!graph.storage.scene_submissions.has_live_gpu_plan());
+        assert!(
+            graph
+                .storage
+                .scene_submissions
+                .live_cpu_direct_plans()
+                .next()
+                .is_none()
+        );
+        assert!(
+            graph
+                .storage
+                .scene_submissions
+                .live_gpu_indirect_plans()
+                .next()
+                .is_none()
+        );
+        let counts = graph.storage.scene_submissions.backend_counts();
+        assert_eq!(counts.reserved_hybrid, 1);
+        assert_eq!(counts.live_hybrid, 0);
+        assert_eq!(graph.storage.draw_plans.live_keys().count(), 0);
+    }
+
+    #[test]
+    fn live_hybrid_submission_unions_dependencies_and_projects_both_backends() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.register_texture("Hybrid_Texture", dummy_desc(), false);
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
+        let instances = graph.register_buffer(
+            "Hybrid_Instances",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let visible = graph.register_buffer(
+            "Hybrid_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let arguments = graph.register_buffer(
+            "Hybrid_Arguments",
+            BufferDesc::new(
+                GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+        let hybrid = graph.reserve_hybrid_gpu_scene_multi_bin_submission(
+            SceneSubmissionKey::Opaque,
+            FrameSourceId::from_index(0),
+            instances,
+            instances,
+            visible,
+            arguments,
+            0,
+            0,
+            GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+        );
+        let consumer = graph.storage.passes.len();
+        graph.add_pass("Live_Hybrid_Consumer", |builder| {
+            builder.demand_scene_submission(hybrid);
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+
+        assert_eq!(
+            graph.storage.pass_reads(consumer),
+            &[
+                instances.erase(),
+                visible.erase(),
+                arguments.erase(),
+                texture.erase(),
+            ]
+        );
+        graph.compile_topology();
+
+        assert!(graph.storage.scene_submissions.is_live(hybrid));
+        assert!(graph.storage.scene_submissions.has_live_gpu_plan());
+        assert_eq!(
+            graph
+                .storage
+                .scene_submissions
+                .live_cpu_direct_plans()
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph
+                .storage
+                .scene_submissions
+                .live_gpu_indirect_plans()
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph.storage.draw_plans.live_keys().collect::<Vec<_>>(),
+            vec![DrawPlanKey::Opaque]
+        );
+        let counts = graph.storage.scene_submissions.backend_counts();
+        assert_eq!(counts.live_hybrid, 1);
+        assert_eq!(counts.live_cpu_direct, 0);
+        assert_eq!(counts.live_gpu_indirect, 0);
     }
 
     #[test]

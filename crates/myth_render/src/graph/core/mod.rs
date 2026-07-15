@@ -33,8 +33,10 @@ pub use context::{
 pub use diagnostics::RdgDetailPhase;
 pub use diagnostics::{
     RdgAttemptOutcome, RdgCommandEncodingFailure, RdgFrameDiagnostics, RdgFramePhase,
-    RdgGpuDrivenFailure, RdgPostSubmitPublicationFailure, RdgRenderTargetKind,
-    RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
+    RdgGpuDrivenFailure, RdgGpuDrivenPolicySnapshot, RdgPostSubmitPublicationFailure,
+    RdgRenderTargetKind, RdgResourceMaterializationFailure, RdgSceneSubmissionBackend,
+    RdgSceneSubmissionFamily, RdgSceneSubmissionFamilySnapshot, RdgSceneSubmissionSelectionReason,
+    RdgSurfaceAcquireFailure,
 };
 pub(crate) use diagnostics::{
     RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgRendererAttemptGuard,

@@ -384,6 +384,37 @@ impl GpuIndirectPlanDescriptor {
 enum SceneSubmissionBackend {
     CpuDirect(DrawPlanId),
     GpuIndirect(GpuIndirectPlanId),
+    /// One semantic submission whose disjoint cohorts are materialized by
+    /// both physical backends. The pair is one liveness/finalization unit:
+    /// execute may observe it only after both streams have been published.
+    Hybrid {
+        cpu_direct: DrawPlanId,
+        gpu_indirect: GpuIndirectPlanId,
+    },
+}
+
+impl SceneSubmissionBackend {
+    #[inline]
+    const fn cpu_direct(self) -> Option<DrawPlanId> {
+        match self {
+            Self::CpuDirect(plan)
+            | Self::Hybrid {
+                cpu_direct: plan, ..
+            } => Some(plan),
+            Self::GpuIndirect(_) => None,
+        }
+    }
+
+    #[inline]
+    const fn gpu_indirect(self) -> Option<GpuIndirectPlanId> {
+        match self {
+            Self::GpuIndirect(plan)
+            | Self::Hybrid {
+                gpu_indirect: plan, ..
+            } => Some(plan),
+            Self::CpuDirect(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -397,6 +428,10 @@ struct SceneSubmissionRecord {
 #[derive(Debug, Clone, Copy)]
 struct GpuIndirectPlanRecord {
     descriptor: GpuIndirectPlanDescriptor,
+    /// Exactly one semantic submission backend may own a GPU plan. Without
+    /// this claim, separately reserving pure-GPU and Hybrid wrappers for the
+    /// same key could execute the identical indirect stream twice.
+    owner_backend: Option<SceneSubmissionBackend>,
     finalized_stream: Option<GpuIndexedIndirectStreamRange>,
 }
 
@@ -496,6 +531,13 @@ impl<'a> GpuIndexedIndirectStream<'a> {
 pub(crate) enum ResolvedSceneSubmission<'a> {
     CpuDirect(&'a [DrawCommand]),
     GpuIndexedIndirect(GpuIndexedIndirectStream<'a>),
+    /// Two disjoint cohorts sharing one semantic render-pass contract.
+    /// Keeping both borrowed streams in one resolved value preserves the
+    /// zero-copy execute path while preventing partial hybrid execution.
+    Hybrid {
+        cpu_direct: &'a [DrawCommand],
+        gpu_indirect: GpuIndexedIndirectStream<'a>,
+    },
 }
 
 /// Core-only projection of one live CPU-direct plan.
@@ -527,8 +569,10 @@ pub(crate) struct LiveGpuIndirectPlan {
 pub(crate) struct SceneSubmissionBackendCounts {
     pub(crate) reserved_cpu_direct: u32,
     pub(crate) reserved_gpu_indirect: u32,
+    pub(crate) reserved_hybrid: u32,
     pub(crate) live_cpu_direct: u32,
     pub(crate) live_gpu_indirect: u32,
+    pub(crate) live_hybrid: u32,
 }
 
 /// Capacity-retaining plan registry for one GraphStorage attempt.
@@ -536,6 +580,10 @@ pub(crate) struct SceneSubmissionStore {
     attempt_token: u64,
     plans: Vec<SceneSubmissionRecord>,
     lookup: FxHashMap<SceneSubmissionBackend, SceneSubmissionPlanId>,
+    /// Dense one-owner claim for each attempt-local DrawPlanId. This keeps a
+    /// CpuDirect stream from being wrapped once as pure CPU and again as one
+    /// side of a Hybrid submission.
+    cpu_direct_owners: Vec<Option<SceneSubmissionBackend>>,
     dependencies: Vec<ErasedResourceNodeId>,
     gpu_indirect_plans: Vec<GpuIndirectPlanRecord>,
     gpu_indirect_lookup: FxHashMap<SceneSubmissionKey, GpuIndirectPlanId>,
@@ -556,6 +604,7 @@ impl SceneSubmissionStore {
             attempt_token: next_attempt_token(),
             plans: Vec::with_capacity(16),
             lookup: FxHashMap::default(),
+            cpu_direct_owners: Vec::with_capacity(16),
             dependencies: Vec::with_capacity(64),
             // Keep the default CpuDirect path allocation-neutral. The first
             // GPU reservation owns the cold growth of this retained table.
@@ -570,6 +619,7 @@ impl SceneSubmissionStore {
     pub(crate) fn capacity_usage(&self) -> CapacityUsage {
         vec_footprint(&self.plans, 16)
             + estimated_hash_map_footprint(&self.lookup, 16)
+            + vec_footprint(&self.cpu_direct_owners, 16)
             + vec_footprint(&self.dependencies, 64)
             + vec_footprint(&self.gpu_indirect_plans, 4)
             + estimated_hash_map_footprint(&self.gpu_indirect_lookup, 4)
@@ -580,6 +630,12 @@ impl SceneSubmissionStore {
     pub(crate) fn trim_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
         shrink_vec_by_family_ratio(&mut self.plans, 16, target_bytes, retained_bytes);
         shrink_hash_map_by_family_ratio(&mut self.lookup, 16, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(
+            &mut self.cpu_direct_owners,
+            16,
+            target_bytes,
+            retained_bytes,
+        );
         shrink_vec_by_family_ratio(&mut self.dependencies, 64, target_bytes, retained_bytes);
         shrink_vec_by_family_ratio(
             &mut self.gpu_indirect_plans,
@@ -611,6 +667,7 @@ impl SceneSubmissionStore {
     pub(super) fn clear(&mut self) {
         self.plans.clear();
         self.lookup.clear();
+        self.cpu_direct_owners.clear();
         self.dependencies.clear();
         self.gpu_indirect_plans.clear();
         self.gpu_indirect_lookup.clear();
@@ -631,10 +688,9 @@ impl SceneSubmissionStore {
             draw_plans.validate_reserved(draw_plan),
             "scene submission cannot wrap a stale or foreign DrawPlanId"
         );
-        self.reserve_backend(
-            SceneSubmissionBackend::CpuDirect(draw_plan),
-            dependencies.as_slice().iter().copied(),
-        )
+        let backend = SceneSubmissionBackend::CpuDirect(draw_plan);
+        self.claim_cpu_direct_backend(draw_plan, backend);
+        self.reserve_backend(backend, dependencies.as_slice().iter().copied())
     }
 
     /// Zero-temporary-allocation adapter for the current CpuDirect backend.
@@ -650,8 +706,10 @@ impl SceneSubmissionStore {
             draw_plans.validate_reserved(draw_plan),
             "scene submission cannot wrap a stale or foreign DrawPlanId"
         );
+        let backend = SceneSubmissionBackend::CpuDirect(draw_plan);
+        self.claim_cpu_direct_backend(draw_plan, backend);
         self.reserve_backend(
-            SceneSubmissionBackend::CpuDirect(draw_plan),
+            backend,
             dependencies.iter().map(|dependency| dependency.erase()),
         )
     }
@@ -674,6 +732,9 @@ impl SceneSubmissionStore {
         descriptor: GpuIndirectPlanDescriptor,
         material_dependencies: &[TextureNodeId],
     ) -> SceneSubmissionPlanId {
+        let plan = self.reserve_gpu_indirect_plan(descriptor);
+        let backend = SceneSubmissionBackend::GpuIndirect(plan);
+        self.claim_gpu_indirect_backend(plan, backend);
         let dependencies = || {
             descriptor.dependencies().chain(
                 material_dependencies
@@ -681,6 +742,46 @@ impl SceneSubmissionStore {
                     .map(|dependency| dependency.erase()),
             )
         };
+        self.reserve_backend(backend, dependencies())
+    }
+
+    /// Reserve one atomic CpuDirect + GPU-indirect semantic submission.
+    ///
+    /// The material dependency slice is shared by both disjoint cohorts. GPU
+    /// buffer dependencies are appended exactly once, and the returned plan
+    /// becomes live/finalized only as one unit. This is the core ownership
+    /// primitive used by Auto-mode hybrid bin selection; Feature code still
+    /// receives only the backend-neutral [`SceneSubmissionPlanId`].
+    pub(super) fn reserve_hybrid_with_textures(
+        &mut self,
+        draw_plans: &DrawPlanStore,
+        draw_plan: DrawPlanId,
+        descriptor: GpuIndirectPlanDescriptor,
+        material_dependencies: &[TextureNodeId],
+    ) -> SceneSubmissionPlanId {
+        assert!(
+            draw_plans.validate_reserved(draw_plan),
+            "hybrid scene submission cannot wrap a stale or foreign DrawPlanId"
+        );
+        let gpu_plan = self.reserve_gpu_indirect_plan(descriptor);
+        let backend = SceneSubmissionBackend::Hybrid {
+            cpu_direct: draw_plan,
+            gpu_indirect: gpu_plan,
+        };
+        self.claim_cpu_direct_backend(draw_plan, backend);
+        self.claim_gpu_indirect_backend(gpu_plan, backend);
+        let dependencies = descriptor.dependencies().chain(
+            material_dependencies
+                .iter()
+                .map(|dependency| dependency.erase()),
+        );
+        self.reserve_backend(backend, dependencies)
+    }
+
+    fn reserve_gpu_indirect_plan(
+        &mut self,
+        descriptor: GpuIndirectPlanDescriptor,
+    ) -> GpuIndirectPlanId {
         if let Some(&plan) = self.gpu_indirect_lookup.get(&descriptor.key) {
             assert!(
                 self.validate_gpu_indirect_plan(plan),
@@ -693,7 +794,7 @@ impl SceneSubmissionStore {
                 descriptor,
                 "one semantic GPU-indirect plan was registered with a conflicting descriptor"
             );
-            return self.reserve_backend(SceneSubmissionBackend::GpuIndirect(plan), dependencies());
+            return plan;
         }
 
         let index = u32::try_from(self.gpu_indirect_plans.len())
@@ -704,6 +805,7 @@ impl SceneSubmissionStore {
         };
         self.gpu_indirect_plans.push(GpuIndirectPlanRecord {
             descriptor,
+            owner_backend: None,
             finalized_stream: None,
         });
         assert!(
@@ -711,7 +813,45 @@ impl SceneSubmissionStore {
                 .insert(descriptor.key, plan)
                 .is_none()
         );
-        self.reserve_backend(SceneSubmissionBackend::GpuIndirect(plan), dependencies())
+        plan
+    }
+
+    fn claim_gpu_indirect_backend(
+        &mut self,
+        plan: GpuIndirectPlanId,
+        backend: SceneSubmissionBackend,
+    ) {
+        let record = self
+            .validate_gpu_indirect_plan(plan)
+            .then(|| &mut self.gpu_indirect_plans[plan.index as usize])
+            .expect("GPU-indirect backend claim retained a stale plan identity");
+        if let Some(current) = record.owner_backend {
+            assert_eq!(
+                current, backend,
+                "one semantic GPU-indirect plan cannot be wrapped by two submission backends"
+            );
+        } else {
+            record.owner_backend = Some(backend);
+        }
+    }
+
+    fn claim_cpu_direct_backend(&mut self, plan: DrawPlanId, backend: SceneSubmissionBackend) {
+        let required = plan
+            .index()
+            .checked_add(1)
+            .expect("CpuDirect owner index overflowed");
+        if self.cpu_direct_owners.len() < required {
+            self.cpu_direct_owners.resize(required, None);
+        }
+        let owner = &mut self.cpu_direct_owners[plan.index()];
+        if let Some(current) = *owner {
+            assert_eq!(
+                current, backend,
+                "one CpuDirect plan cannot be wrapped by two submission backends"
+            );
+        } else {
+            *owner = Some(backend);
+        }
     }
 
     fn reserve_backend<I>(
@@ -795,6 +935,20 @@ impl SceneSubmissionStore {
             .live
     }
 
+    /// Allocation-free diagnostics projection for one known semantic plan.
+    /// Dead plans report no live backend; stale IDs remain distinguishable.
+    #[must_use]
+    pub(crate) fn live_backend_presence(&self, id: SceneSubmissionPlanId) -> Option<(bool, bool)> {
+        let record = self.record(id)?;
+        if !record.live {
+            return Some((false, false));
+        }
+        Some((
+            record.backend.cpu_direct().is_some(),
+            record.backend.gpu_indirect().is_some(),
+        ))
+    }
+
     /// Project only the current production backend to the private finalizer.
     pub(super) fn live_cpu_direct_plans(&self) -> impl Iterator<Item = LiveCpuDirectPlan> + '_ {
         let attempt_token = self.attempt_token;
@@ -805,16 +959,16 @@ impl SceneSubmissionStore {
                 if !record.live {
                     return None;
                 }
-                match record.backend {
-                    SceneSubmissionBackend::CpuDirect(draw_plan) => Some(LiveCpuDirectPlan {
+                record
+                    .backend
+                    .cpu_direct()
+                    .map(|draw_plan| LiveCpuDirectPlan {
                         submission: SceneSubmissionPlanId {
                             attempt_token,
                             index: u32::try_from(index).expect("validated plan index exceeds u32"),
                         },
                         draw_plan,
-                    }),
-                    SceneSubmissionBackend::GpuIndirect(_) => None,
-                }
+                    })
             })
     }
 
@@ -832,9 +986,7 @@ impl SceneSubmissionStore {
                 if !record.live {
                     return None;
                 }
-                let SceneSubmissionBackend::GpuIndirect(plan) = record.backend else {
-                    return None;
-                };
+                let plan = record.backend.gpu_indirect()?;
                 let descriptor = self
                     .gpu_indirect_record(plan)
                     .expect("live scene submission retained a stale GPU-indirect plan")
@@ -857,9 +1009,9 @@ impl SceneSubmissionStore {
     /// copied into per-view or per-bin submission metadata.
     #[must_use]
     pub(crate) fn has_live_gpu_plan(&self) -> bool {
-        self.plans.iter().any(|record| {
-            record.live && matches!(record.backend, SceneSubmissionBackend::GpuIndirect(_))
-        })
+        self.plans
+            .iter()
+            .any(|record| record.live && record.backend.gpu_indirect().is_some())
     }
 
     /// Publish one compact immutable physical batch stream transactionally.
@@ -886,9 +1038,9 @@ impl SceneSubmissionStore {
     {
         let inputs = inputs.into_iter();
         if !self.validate_gpu_indirect_plan(plan)
-            || !self.record(submission).is_some_and(|record| {
-                record.live && record.backend == SceneSubmissionBackend::GpuIndirect(plan)
-            })
+            || !self
+                .record(submission)
+                .is_some_and(|record| record.live && record.backend.gpu_indirect() == Some(plan))
             || inputs.len() == 0
             || self.gpu_indirect_record(plan)?.finalized_stream.is_some()
         {
@@ -985,9 +1137,7 @@ impl SceneSubmissionStore {
         if !record.live {
             return None;
         }
-        let SceneSubmissionBackend::GpuIndirect(plan) = record.backend else {
-            return None;
-        };
+        let plan = record.backend.gpu_indirect()?;
         Some(LiveGpuIndirectPlan {
             submission,
             plan,
@@ -1000,15 +1150,17 @@ impl SceneSubmissionStore {
             if !record.live {
                 continue;
             }
-            let finalized = match record.backend {
-                SceneSubmissionBackend::CpuDirect(plan) => draw_plans.resolve_plan(plan).is_some(),
-                SceneSubmissionBackend::GpuIndirect(plan) => self
-                    .gpu_indirect_record(plan)
+            let cpu_finalized = record
+                .backend
+                .cpu_direct()
+                .is_none_or(|plan| draw_plans.resolve_plan(plan).is_some());
+            let gpu_finalized = record.backend.gpu_indirect().is_none_or(|plan| {
+                self.gpu_indirect_record(plan)
                     .and_then(|record| record.finalized_stream)
-                    .is_some_and(|stream| self.validate_gpu_indirect_stream(stream)),
-            };
+                    .is_some_and(|stream| self.validate_gpu_indirect_stream(stream))
+            });
             assert!(
-                finalized,
+                cpu_finalized && gpu_finalized,
                 "live scene submission was not finalized before execute"
             );
         }
@@ -1028,6 +1180,10 @@ impl SceneSubmissionStore {
                     counts.reserved_gpu_indirect += 1;
                     counts.live_gpu_indirect += u32::from(record.live);
                 }
+                SceneSubmissionBackend::Hybrid { .. } => {
+                    counts.reserved_hybrid += 1;
+                    counts.live_hybrid += u32::from(record.live);
+                }
             }
         }
         counts
@@ -1044,15 +1200,16 @@ impl SceneSubmissionStore {
         if !record.live {
             return None;
         }
-        let finalized = match record.backend {
-            SceneSubmissionBackend::CpuDirect(draw_plan) => {
-                draw_plans.resolve_plan(draw_plan).is_some()
-            }
-            SceneSubmissionBackend::GpuIndirect(plan) => self
-                .gpu_indirect_record(plan)
+        let cpu_finalized = record
+            .backend
+            .cpu_direct()
+            .is_none_or(|draw_plan| draw_plans.resolve_plan(draw_plan).is_some());
+        let gpu_finalized = record.backend.gpu_indirect().is_none_or(|plan| {
+            self.gpu_indirect_record(plan)
                 .and_then(|record| record.finalized_stream)
-                .is_some_and(|stream| self.validate_gpu_indirect_stream(stream)),
-        };
+                .is_some_and(|stream| self.validate_gpu_indirect_stream(stream))
+        });
+        let finalized = cpu_finalized && gpu_finalized;
         finalized.then_some(DrawStreamId {
             attempt_token: self.attempt_token,
             index: id.index,
@@ -1074,20 +1231,14 @@ impl SceneSubmissionStore {
         if !self.validate_stream(stream) {
             return None;
         }
-        match self.plans[stream.index as usize].backend {
-            SceneSubmissionBackend::CpuDirect(draw_plan) => Some(draw_plan),
-            SceneSubmissionBackend::GpuIndirect(_) => None,
-        }
+        self.plans[stream.index as usize].backend.cpu_direct()
     }
 
     fn gpu_indirect_stream(&self, stream: DrawStreamId) -> Option<GpuIndexedIndirectStreamRange> {
         if !self.validate_stream(stream) {
             return None;
         }
-        let SceneSubmissionBackend::GpuIndirect(plan) = self.plans[stream.index as usize].backend
-        else {
-            return None;
-        };
+        let plan = self.plans[stream.index as usize].backend.gpu_indirect()?;
         let range = self.gpu_indirect_record(plan)?.finalized_stream?;
         self.validate_gpu_indirect_stream(range).then_some(range)
     }
@@ -1095,10 +1246,7 @@ impl SceneSubmissionStore {
     /// Resolve a plan to its private CpuDirect reservation without exposing
     /// the backend tag to Feature code.
     pub(super) fn cpu_direct_plan(&self, plan: SceneSubmissionPlanId) -> Option<DrawPlanId> {
-        match self.record(plan)?.backend {
-            SceneSubmissionBackend::CpuDirect(draw_plan) => Some(draw_plan),
-            SceneSubmissionBackend::GpuIndirect(_) => None,
-        }
+        self.record(plan)?.backend.cpu_direct()
     }
 
     fn record(&self, id: SceneSubmissionPlanId) -> Option<&SceneSubmissionRecord> {
@@ -1147,6 +1295,7 @@ impl SceneSubmissionStore {
     fn is_empty(&self) -> bool {
         self.plans.is_empty()
             && self.lookup.is_empty()
+            && self.cpu_direct_owners.is_empty()
             && self.dependencies.is_empty()
             && self.gpu_indirect_plans.is_empty()
             && self.gpu_indirect_lookup.is_empty()
@@ -1203,20 +1352,27 @@ impl<'a> SceneSubmissionResolver<'a> {
     #[must_use]
     pub(crate) fn resolve(self, plan: SceneSubmissionPlanId) -> ResolvedSceneSubmission<'a> {
         let stream = self.stream(plan);
-        if let Some(draw_plan) = self.submissions.cpu_direct_stream(stream) {
-            return ResolvedSceneSubmission::CpuDirect(self.draw_plans.commands(draw_plan));
-        }
-
-        let range = self
+        let cpu_direct = self
             .submissions
-            .gpu_indirect_stream(stream)
-            .expect("scene-submission stream has no finalized backend");
-        let batches =
-            &self.submissions.gpu_indirect_batches[range.start as usize..range.end as usize];
-        ResolvedSceneSubmission::GpuIndexedIndirect(GpuIndexedIndirectStream {
-            batches,
-            vertex_buffers: &self.submissions.gpu_indirect_vertex_buffers,
-        })
+            .cpu_direct_stream(stream)
+            .map(|draw_plan| self.draw_plans.commands(draw_plan));
+        let gpu_indirect =
+            self.submissions
+                .gpu_indirect_stream(stream)
+                .map(|range| GpuIndexedIndirectStream {
+                    batches: &self.submissions.gpu_indirect_batches
+                        [range.start as usize..range.end as usize],
+                    vertex_buffers: &self.submissions.gpu_indirect_vertex_buffers,
+                });
+        match (cpu_direct, gpu_indirect) {
+            (Some(commands), None) => ResolvedSceneSubmission::CpuDirect(commands),
+            (None, Some(stream)) => ResolvedSceneSubmission::GpuIndexedIndirect(stream),
+            (Some(cpu_direct), Some(gpu_indirect)) => ResolvedSceneSubmission::Hybrid {
+                cpu_direct,
+                gpu_indirect,
+            },
+            (None, None) => unreachable!("finalized scene submission has no physical backend"),
+        }
     }
 
     #[inline]
@@ -1322,7 +1478,19 @@ mod tests {
     fn live_gpu_plan(
         store: &mut SceneSubmissionStore,
     ) -> (SceneSubmissionPlanId, GpuIndirectPlanId) {
-        let descriptor = GpuIndirectPlanDescriptor::new_multi_bin(
+        let descriptor = test_gpu_descriptor();
+        let submission = store.reserve_gpu_indirect(descriptor);
+        store.mark_live(submission);
+        let plan = store
+            .live_gpu_indirect_plans()
+            .next()
+            .expect("live GPU-indirect projection missing")
+            .plan;
+        (submission, plan)
+    }
+
+    fn test_gpu_descriptor() -> GpuIndirectPlanDescriptor {
+        GpuIndirectPlanDescriptor::new_multi_bin(
             SceneSubmissionKey::Opaque,
             FrameSourceId::from_index(0),
             BufferNodeId::new(3, 0),
@@ -1332,15 +1500,7 @@ mod tests {
             0,
             0,
             4 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-        );
-        let submission = store.reserve_gpu_indirect(descriptor);
-        store.mark_live(submission);
-        let plan = store
-            .live_gpu_indirect_plans()
-            .next()
-            .expect("live GPU-indirect projection missing")
-            .plan;
-        (submission, plan)
+        )
     }
 
     #[test]
@@ -1460,6 +1620,163 @@ mod tests {
         assert!(store.has_live_gpu_plan());
         store.reset_live();
         assert!(!store.has_live_gpu_plan());
+    }
+
+    #[test]
+    fn hybrid_reservation_projects_both_backends_from_one_live_semantic_plan() {
+        let mut draw_plans = DrawPlanStore::new();
+        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        let descriptor = test_gpu_descriptor();
+        let texture = TextureNodeId::new(19, 0);
+        let mut store = SceneSubmissionStore::new();
+        let hybrid =
+            store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[texture]);
+
+        assert_eq!(
+            store.dependencies(hybrid),
+            Some(
+                &[
+                    descriptor.instance_table().erase(),
+                    descriptor.visible_instances().erase(),
+                    descriptor.indirect_arguments().erase(),
+                    texture.erase(),
+                ][..]
+            )
+        );
+        assert!(!store.has_live_gpu_plan());
+        assert!(store.live_cpu_direct_plans().next().is_none());
+        assert!(store.live_gpu_indirect_plans().next().is_none());
+
+        store.mark_live(hybrid);
+        assert!(store.has_live_gpu_plan());
+        assert_eq!(
+            store.live_cpu_direct_plans().collect::<Vec<_>>(),
+            vec![LiveCpuDirectPlan {
+                submission: hybrid,
+                draw_plan: direct,
+            }]
+        );
+        let gpu = store
+            .live_gpu_indirect_plans()
+            .next()
+            .expect("live hybrid lost its GPU projection");
+        assert_eq!(gpu.submission, hybrid);
+        assert_eq!(gpu.descriptor, descriptor);
+        let counts = store.backend_counts();
+        assert_eq!(counts.reserved_hybrid, 1);
+        assert_eq!(counts.live_hybrid, 1);
+        assert_eq!(counts.reserved_cpu_direct, 0);
+        assert_eq!(counts.reserved_gpu_indirect, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be wrapped by two submission backends")]
+    fn one_gpu_plan_rejects_pure_and_hybrid_double_wrapping() {
+        let mut draw_plans = DrawPlanStore::new();
+        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        let descriptor = test_gpu_descriptor();
+        let mut store = SceneSubmissionStore::new();
+        store.reserve_gpu_indirect(descriptor);
+        store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be wrapped by two submission backends")]
+    fn one_cpu_plan_rejects_pure_and_hybrid_double_wrapping() {
+        let mut draw_plans = DrawPlanStore::new();
+        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        let descriptor = test_gpu_descriptor();
+        let mut store = SceneSubmissionStore::new();
+        store.reserve_cpu_direct(&draw_plans, direct, &SceneSubmissionDependencies::new());
+        store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
+    }
+
+    #[test]
+    fn hybrid_stream_is_fail_closed_until_both_sides_finalize_then_resolves_zero_copy() {
+        let mut draw_plans = DrawPlanStore::new();
+        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        let descriptor = test_gpu_descriptor();
+        let mut store = SceneSubmissionStore::new();
+        let hybrid = store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
+        store.mark_live(hybrid);
+        draw_plans.mark_live(direct);
+
+        let gpu = store
+            .live_gpu_plan_for_submission(hybrid)
+            .expect("live hybrid lost its GPU plan");
+        let vertices = [test_buffer_slot()];
+        store
+            .publish_gpu_indexed_indirect_stream(
+                hybrid,
+                gpu.plan,
+                std::iter::once(gpu_batch_input(7, 0, &vertices)),
+            )
+            .expect("hybrid GPU stream publication failed");
+        assert!(
+            store.resolve_stream(hybrid, &draw_plans).is_none(),
+            "a hybrid GPU prefix must not become executable before CpuDirect finalization"
+        );
+
+        let start = draw_plans.begin_finalize(direct);
+        draw_plans.push_test_command(91);
+        draw_plans.finish_finalize(direct, start);
+        let direct_commands = draw_plans.resolve_plan(direct).unwrap();
+        let direct_ptr = direct_commands.as_ptr();
+        let stream = store
+            .resolve_stream(hybrid, &draw_plans)
+            .expect("fully finalized hybrid stream did not resolve");
+        assert!(store.validate_stream(stream));
+
+        let resolver = SceneSubmissionResolver::new(&store, &draw_plans);
+        let ResolvedSceneSubmission::Hybrid {
+            cpu_direct,
+            gpu_indirect,
+        } = resolver.resolve(hybrid)
+        else {
+            panic!("hybrid semantic plan resolved as one physical backend");
+        };
+        assert_eq!(cpu_direct.as_ptr(), direct_ptr);
+        assert_eq!(cpu_direct.len(), 1);
+        assert_eq!(cpu_direct[0].sort_key, 91);
+        assert_eq!(gpu_indirect.len(), 1);
+        assert_eq!(
+            gpu_indirect.batches().next().unwrap().pipeline,
+            RenderPipelineId(7)
+        );
+    }
+
+    #[test]
+    fn hybrid_stream_rejects_gpu_publication_while_dead_and_cpu_only_finalization() {
+        let mut draw_plans = DrawPlanStore::new();
+        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        let descriptor = test_gpu_descriptor();
+        let mut store = SceneSubmissionStore::new();
+        let hybrid = store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
+        let gpu_plan = store
+            .record(hybrid)
+            .and_then(|record| record.backend.gpu_indirect())
+            .expect("hybrid lost its private GPU plan");
+        let vertices = [test_buffer_slot()];
+        let input = [gpu_batch_input(3, 0, &vertices)];
+
+        assert!(
+            store
+                .publish_gpu_indexed_indirect_stream(hybrid, gpu_plan, input.into_iter())
+                .is_none(),
+            "DPE-dead hybrid GPU work must reject publication"
+        );
+        assert!(store.gpu_indirect_batches.is_empty());
+        assert!(store.live_cpu_direct_plans().next().is_none());
+        assert!(store.live_gpu_indirect_plans().next().is_none());
+
+        store.mark_live(hybrid);
+        draw_plans.mark_live(direct);
+        let start = draw_plans.begin_finalize(direct);
+        draw_plans.finish_finalize(direct, start);
+        assert!(
+            store.resolve_stream(hybrid, &draw_plans).is_none(),
+            "a finalized CPU prefix must not make an unfinalized hybrid executable"
+        );
     }
 
     #[test]

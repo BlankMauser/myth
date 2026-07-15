@@ -16,6 +16,7 @@ use std::sync::LazyLock;
 use glam::{Mat4, Vec3};
 
 use crate::graph::frame::{DrawPlanStore, RenderLists};
+use crate::graph::gpu_driven_policy::{GpuDrivenWorkloadSynopsis, mix64};
 use bitflags::{Flags, bitflags};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::buffer::CpuBuffer;
@@ -224,6 +225,11 @@ pub struct ExtractedScene {
     /// All active render items (NOT frustum-culled).
     /// Each `RenderView` in the Cull phase filters and culls from this list.
     pub render_items: Vec<ExtractedRenderItem>,
+    /// Whether the current snapshot carries the extra coherent topology and
+    /// resource facts needed by GPU-driven preflight. The default CpuDirect
+    /// path deliberately leaves these fields inert.
+    gpu_driven_facts_captured: bool,
+    gpu_driven_synopsis: GpuDrivenWorkloadSynopsis,
     /// Scene's shader macro definitions
     pub scene_id: u32,
     pub scene_variants: SceneFeatures,
@@ -253,6 +259,8 @@ impl ExtractedScene {
     pub fn new() -> Self {
         Self {
             render_items: Vec::new(),
+            gpu_driven_facts_captured: false,
+            gpu_driven_synopsis: GpuDrivenWorkloadSynopsis::default(),
             scene_id: 0,
             scene_variants: SceneFeatures::empty(),
             scene_defines: ShaderDefines::new(),
@@ -292,6 +300,8 @@ impl ExtractedScene {
     pub fn with_capacity(item_capacity: usize) -> Self {
         Self {
             render_items: Vec::with_capacity(item_capacity),
+            gpu_driven_facts_captured: false,
+            gpu_driven_synopsis: GpuDrivenWorkloadSynopsis::default(),
             scene_id: 0,
             scene_variants: SceneFeatures::empty(),
             scene_defines: ShaderDefines::new(),
@@ -329,6 +339,8 @@ impl ExtractedScene {
     /// Clear data for reuse
     pub fn clear(&mut self) {
         self.render_items.clear();
+        self.gpu_driven_facts_captured = false;
+        self.gpu_driven_synopsis = GpuDrivenWorkloadSynopsis::default();
         self.scene_defines.clear();
         self.scene_id = 0;
         self.lights.clear();
@@ -366,8 +378,10 @@ impl ExtractedScene {
         camera: &RenderCamera,
         assets: &AssetServer,
         max_light_count: usize,
+        capture_gpu_driven_facts: bool,
     ) {
         self.clear();
+        self.gpu_driven_facts_captured = capture_gpu_driven_facts;
         self.extract_lights(scene, camera, max_light_count);
         self.extract_render_items(scene, camera, assets);
         self.extract_environment(scene);
@@ -553,6 +567,18 @@ impl ExtractedScene {
         self.scene_variants.contains(SceneFeatures::HAS_SHADOWS)
     }
 
+    #[inline]
+    #[must_use]
+    pub(crate) const fn gpu_driven_facts_captured(&self) -> bool {
+        self.gpu_driven_facts_captured
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn gpu_driven_workload_synopsis(&self) -> GpuDrivenWorkloadSynopsis {
+        self.gpu_driven_synopsis
+    }
+
     /// Extract all active render items (no frustum culling).
     ///
     /// Only performs lightweight validity checks:
@@ -606,7 +632,8 @@ impl ExtractedScene {
                     .filter(|key| scene.skeleton_pool.get(*key).is_some());
 
                 // 3. calculate Flags (pure math calculation)
-                let has_negative_scale = world_matrix.determinant() < 0.0;
+                let world_determinant = world_matrix.determinant();
+                let has_negative_scale = world_determinant < 0.0;
                 let has_negative_scale_flag = u32::from(has_negative_scale);
                 let has_skeleton_flag = u32::from(skeleton_key.is_some()) << 1;
                 let item_variant_flags = has_negative_scale_flag | has_skeleton_flag;
@@ -653,6 +680,116 @@ impl ExtractedScene {
                     item_shader_features.insert(ItemShaderFeatures::RECEIVE_SHADOWS);
                 }
 
+                // These coherent facts are consumed only by GPU Scene
+                // preflight. Keep the default CpuDirect path byte-for-byte
+                // snapshot-compatible without paying additional geometry
+                // map walks or version reads.
+                let (
+                    geometry_structure_version,
+                    geometry_layout_version,
+                    geometry_topology,
+                    geometry_index_format,
+                    geometry_index_count,
+                    geometry_has_morph_targets,
+                    geometry_has_vertex_attributes,
+                    geometry_has_instanced_attributes,
+                    material_gpu_scene_compatible,
+                ) = if self.gpu_driven_facts_captured {
+                    let index_attribute = geometry.index_attribute();
+                    (
+                        geometry.structure_version(),
+                        geometry.layout_version(),
+                        geometry.topology,
+                        index_attribute.map(|indices| indices.format),
+                        index_attribute.map_or(0, |indices| indices.count),
+                        geometry.has_morph_targets(),
+                        !geometry.attributes().is_empty(),
+                        geometry
+                            .attributes()
+                            .values()
+                            .any(|attribute| attribute.step_mode == wgpu::VertexStepMode::Instance),
+                        !matches!(&material.data, MaterialType::Custom(_)),
+                    )
+                } else {
+                    (
+                        0,
+                        0,
+                        wgpu::PrimitiveTopology::TriangleList,
+                        None,
+                        0,
+                        false,
+                        false,
+                        false,
+                        false,
+                    )
+                };
+
+                if self.gpu_driven_facts_captured {
+                    let synopsis = &mut self.gpu_driven_synopsis;
+                    synopsis.extracted_item_count = synopsis.extracted_item_count.saturating_add(1);
+                    synopsis.transform_changed_count = synopsis
+                        .transform_changed_count
+                        .saturating_add(u32::from(world_matrix != prev_world_matrix));
+                    synopsis.shadow_caster_count = synopsis
+                        .shadow_caster_count
+                        .saturating_add(u32::from(cast_shadows));
+
+                    let opaque = !material_classification.intersects(
+                        MaterialClassification::TRANSPARENT
+                            | MaterialClassification::USES_TRANSMISSION,
+                    );
+                    synopsis.opaque_item_count =
+                        synopsis.opaque_item_count.saturating_add(u32::from(opaque));
+                    let supported = opaque
+                        && skeleton_key.is_none()
+                        && !geometry_has_morph_targets
+                        && !geometry_has_instanced_attributes
+                        && material_gpu_scene_compatible
+                        && geometry_index_format.is_some()
+                        && geometry_index_count != 0
+                        && geometry_has_vertex_attributes
+                        && geometry_topology == wgpu::PrimitiveTopology::TriangleList
+                        && world_matrix.is_finite()
+                        && prev_world_matrix.is_finite()
+                        && world_determinant.is_finite()
+                        && world_determinant.abs() > f32::EPSILON
+                        && world_aabb.is_finite()
+                        && world_aabb.min.cmple(world_aabb.max).all();
+                    synopsis.supported_opaque_count = synopsis
+                        .supported_opaque_count
+                        .saturating_add(u32::from(supported));
+                    synopsis.supported_shadow_caster_count = synopsis
+                        .supported_shadow_caster_count
+                        .saturating_add(u32::from(supported && cast_shadows));
+                    if supported {
+                        synopsis.indexed_primitive_count = synopsis
+                            .indexed_primitive_count
+                            .saturating_add(u64::from(geometry_index_count / 3));
+                    }
+
+                    let mut fingerprint = synopsis.topology_fingerprint;
+                    for value in [
+                        node_handle.data().as_ffi(),
+                        mesh.geometry.data().as_ffi(),
+                        mesh.material.data().as_ffi(),
+                        geometry.identity,
+                        u64::from(geometry.version),
+                        geometry_structure_version,
+                        geometry_layout_version,
+                        material.identity,
+                        u64::from(material.version),
+                        material_version,
+                        u64::from(geometry_index_count),
+                        u64::from(material_index),
+                        u64::from(item_variant_flags),
+                        u64::from(material_classification.bits()),
+                        u64::from(cast_shadows),
+                    ] {
+                        fingerprint = mix64(fingerprint, value);
+                    }
+                    synopsis.topology_fingerprint = fingerprint;
+                }
+
                 self.render_items.push(ExtractedRenderItem {
                     node_handle,
                     world_matrix,
@@ -661,26 +798,18 @@ impl ExtractedScene {
                     material: mesh.material,
                     geometry_asset_version: geometry.version,
                     geometry_asset_identity: geometry.identity,
-                    geometry_structure_version: geometry.structure_version(),
-                    geometry_layout_version: geometry.layout_version(),
-                    geometry_topology: geometry.topology,
-                    geometry_index_format: geometry.index_attribute().map(|indices| indices.format),
-                    geometry_index_count: geometry
-                        .index_attribute()
-                        .map_or(0, |indices| indices.count),
-                    geometry_has_morph_targets: geometry.has_morph_targets(),
-                    geometry_has_vertex_attributes: !geometry.attributes().is_empty(),
-                    geometry_has_instanced_attributes: geometry
-                        .attributes()
-                        .values()
-                        .any(|attribute| attribute.step_mode == wgpu::VertexStepMode::Instance),
+                    geometry_structure_version,
+                    geometry_layout_version,
+                    geometry_topology,
+                    geometry_index_format,
+                    geometry_index_count,
+                    geometry_has_morph_targets,
+                    geometry_has_vertex_attributes,
+                    geometry_has_instanced_attributes,
                     material_asset_version: material.version,
                     material_asset_identity: material.identity,
                     material_version,
-                    material_gpu_scene_compatible: !matches!(
-                        &material.data,
-                        MaterialType::Custom(_)
-                    ),
+                    material_gpu_scene_compatible,
                     material_index,
                     material_classification,
                     skeleton: skeleton_key,

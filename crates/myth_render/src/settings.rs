@@ -190,19 +190,26 @@ impl Default for ClusteredShadingMode {
 /// [`Off`](Self::Off) remains the default so applications opt in explicitly.
 /// [`Auto`](Self::Auto) and [`Required`](Self::Required) are evaluated before
 /// GPU Scene synchronization or RDG topology emission, preserving a clean
-/// CPU-direct fallback boundary.
+/// CPU-direct fallback boundary. `Auto` is performance-adaptive rather than
+/// an alias for `Required`: it may keep tiny or highly fragmented cohorts on
+/// the CPU, select GPU-driven submission independently for Main/Prepass and
+/// the two shadow families, and combine CPU/GPU cohorts in one logical RDG
+/// submission. Its cross-frame decision changes only after a successful queue
+/// submission and uses hysteresis to avoid backend oscillation.
 #[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GpuDrivenMode {
     /// Always use the CPU-direct submission backend.
     #[default]
     Off,
-    /// Request GPU-driven submission when the active device and workload
-    /// support it, otherwise fall back to CPU-direct submission.
+    /// Select the estimated fastest backend per submission family and retained
+    /// reuse cohort. Unsupported, tiny, or low-reuse cohorts remain CPU-direct;
+    /// profitable cohorts may use GPU-driven submission in the same frame.
     Auto,
-    /// Require GPU-driven submission. An unsupported device, workload, or
-    /// scene domain fails the frame with a typed diagnostic instead of
-    /// silently selecting CPU-direct submission.
+    /// Require strict, complete-domain GPU-driven submission. This is also the
+    /// deterministic GPU comparison/oracle mode for benchmarking. An
+    /// unsupported device, workload, or scene domain fails the frame with a
+    /// typed diagnostic instead of silently selecting CPU-direct submission.
     Required,
 }
 

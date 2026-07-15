@@ -16,6 +16,7 @@
 //! ```powershell
 //! $env:MYTH_HELMET_PROBE_WARMUP_FRAMES='10000'
 //! $env:MYTH_HELMET_PROBE_MEASURE_FRAMES='200000'
+//! $env:MYTH_HELMET_PROBE_GPU_DRIVEN='auto' # off | auto | required
 //! cargo run --release --example helmet_gltf_fixed_probe
 //! ```
 
@@ -24,7 +25,8 @@ use std::time::Instant;
 
 use myth::prelude::*;
 #[cfg(feature = "rdg_bench_support")]
-use myth::renderer::graph::{RdgDetailPhase, RdgFrameDiagnostics, RdgFramePhase};
+use myth::renderer::graph::{RdgDetailPhase, RdgFramePhase};
+use myth::renderer::graph::{RdgFrameDiagnostics, RdgSceneSubmissionFamily};
 use myth_dev_utils::FpsCounter;
 
 const ASSET_PATH: &str = match option_env!("MYTH_ASSET_PATH") {
@@ -37,6 +39,7 @@ const MEASURE_FRAMES_ENV: &str = "MYTH_HELMET_PROBE_MEASURE_FRAMES";
 const DISABLE_ENV_ENV: &str = "MYTH_HELMET_PROBE_DISABLE_ENV";
 const UNTEXTURED_ENV: &str = "MYTH_HELMET_PROBE_UNTEXTURED";
 const NO_DRAW_ENV: &str = "MYTH_HELMET_PROBE_NO_DRAW";
+const GPU_DRIVEN_ENV: &str = "MYTH_HELMET_PROBE_GPU_DRIVEN";
 const DEFAULT_WARMUP_FRAMES: usize = 10_000;
 const DEFAULT_MEASURE_FRAMES: usize = 200_000;
 
@@ -53,8 +56,13 @@ struct ProbeResult {
     environment_enabled: bool,
     textured: bool,
     draw_model: bool,
+    gpu_driven: GpuDrivenMode,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent probe axes and one-shot lifecycle flags are clearer as named booleans"
+)]
 struct HelmetGltfFixedProbe {
     camera: NodeHandle,
     controls: OrbitControls,
@@ -64,6 +72,7 @@ struct HelmetGltfFixedProbe {
     replacement_material: Option<MaterialHandle>,
     environment_enabled: bool,
     draw_model: bool,
+    gpu_driven: GpuDrivenMode,
     warmup_frames: usize,
     warmup_remaining: usize,
     measure_frames: usize,
@@ -103,6 +112,7 @@ impl HelmetGltfFixedProbe {
                 self.environment_enabled,
                 self.replacement_material.is_none(),
                 self.draw_model,
+                self.gpu_driven,
             ));
         }
 
@@ -130,6 +140,7 @@ impl AppHandler for HelmetGltfFixedProbe {
         let environment_enabled = !read_bool(DISABLE_ENV_ENV);
         let untextured = read_bool(UNTEXTURED_ENV);
         let draw_model = !read_bool(NO_DRAW_ENV);
+        let gpu_driven = read_gpu_driven_mode();
 
         let env_texture_handle = environment_enabled.then(|| {
             let map_path = format!("{ASSET_PATH}envs/royal_esplanade_2k.hdr.jpg");
@@ -168,6 +179,7 @@ impl AppHandler for HelmetGltfFixedProbe {
             replacement_material,
             environment_enabled,
             draw_model,
+            gpu_driven,
             warmup_frames,
             warmup_remaining: warmup_frames,
             measure_frames,
@@ -207,12 +219,13 @@ impl AppHandler for HelmetGltfFixedProbe {
                     }
                 }
                 println!(
-                    "Helmet ready: root={root:?}, warmup={}, measure={}, environment={}, textured={}, draw_model={}",
+                    "Helmet ready: root={root:?}, warmup={}, measure={}, environment={}, textured={}, draw_model={}, gpu_driven={:?}",
                     self.warmup_frames,
                     self.measure_frames,
                     self.environment_enabled,
                     self.replacement_material.is_none(),
-                    self.draw_model
+                    self.draw_model,
+                    self.gpu_driven
                 );
                 self.helmet_loaded = true;
                 // Establish the baseline after prefab instantiation, so loading and
@@ -260,6 +273,9 @@ impl AppHandler for HelmetGltfFixedProbe {
 
         if !self.exit_requested {
             print_result(result);
+            if let Some(diagnostics) = engine.renderer.latest_rdg_diagnostics() {
+                print_scene_submission_diagnostics(&diagnostics);
+            }
             #[cfg(feature = "rdg_bench_support")]
             print_phase_timings(
                 &self.phase_elapsed_ns,
@@ -298,12 +314,25 @@ fn read_bool(name: &str) -> bool {
     })
 }
 
+fn read_gpu_driven_mode() -> GpuDrivenMode {
+    let Ok(value) = std::env::var(GPU_DRIVEN_ENV) else {
+        return GpuDrivenMode::Off;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "off" => GpuDrivenMode::Off,
+        "auto" => GpuDrivenMode::Auto,
+        "required" => GpuDrivenMode::Required,
+        _ => panic!("{GPU_DRIVEN_ENV} must be off, auto, or required; got {value:?}"),
+    }
+}
+
 fn summarize(
     intervals_ns: &mut [u64],
     warmup_frames: usize,
     environment_enabled: bool,
     textured: bool,
     draw_model: bool,
+    gpu_driven: GpuDrivenMode,
 ) -> ProbeResult {
     let measured_frames = intervals_ns.len();
     assert!(
@@ -342,6 +371,7 @@ fn summarize(
         environment_enabled,
         textured,
         draw_model,
+        gpu_driven,
     }
 }
 
@@ -361,15 +391,55 @@ fn print_result(result: ProbeResult) {
     let mut output = stdout.lock();
     writeln!(
         output,
-        "HELMET_FIXED_PROBE warmup={} frames={} environment={} textured={} draw_model={} total_ms={total_ms:.3} mean_us={mean_us:.3} median_us={median_us:.3} p95_us={p95_us:.3} p99_us={p99_us:.3} max_us={max_us:.3} mean_fps={mean_fps:.2} median_fps={median_fps:.2} p95_fps={p95_fps:.2} p99_fps={p99_fps:.2}",
+        "HELMET_FIXED_PROBE warmup={} frames={} environment={} textured={} draw_model={} gpu_driven={:?} total_ms={total_ms:.3} mean_us={mean_us:.3} median_us={median_us:.3} p95_us={p95_us:.3} p99_us={p99_us:.3} max_us={max_us:.3} mean_fps={mean_fps:.2} median_fps={median_fps:.2} p95_fps={p95_fps:.2} p99_fps={p99_fps:.2}",
         result.warmup_frames,
         result.measured_frames,
         result.environment_enabled,
         result.textured,
-        result.draw_model
+        result.draw_model,
+        result.gpu_driven
     )
     .expect("failed to write helmet probe result");
     output.flush().expect("failed to flush helmet probe result");
+}
+
+fn print_scene_submission_diagnostics(diagnostics: &RdgFrameDiagnostics) {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let policy = diagnostics.gpu_driven_policy();
+    writeln!(
+        output,
+        "HELMET_FIXED_PROBE_POLICY extracted={} supported={} retained={} bins={} dirty={} shadow_d2_views={} shadow_cube_views={} instance_span={} batch_span={} cohort_min={} indexed_primitives={} exact={}",
+        policy.extracted_item_count(),
+        policy.supported_opaque_count(),
+        policy.retained_candidate_count(),
+        policy.retained_bin_count(),
+        policy.dirty_candidate_count(),
+        policy.shadow_2d_view_count(),
+        policy.shadow_cube_view_count(),
+        policy.instance_slot_span(),
+        policy.batch_slot_span(),
+        policy.minimum_cohort_members(),
+        policy.indexed_primitive_count(),
+        policy.exact_evaluated(),
+    )
+    .expect("failed to write helmet probe policy diagnostics");
+    for family in RdgSceneSubmissionFamily::ALL {
+        let snapshot = diagnostics.scene_submission_family(family);
+        writeln!(
+            output,
+            "HELMET_FIXED_PROBE_SUBMISSION family={family:?} selected={:?} reason={:?} live={:?} live_cpu={} live_gpu={}",
+            snapshot.selected_backend(),
+            snapshot.selection_reason(),
+            snapshot.live_backend(),
+            snapshot.live_cpu_submissions(),
+            snapshot.live_gpu_submissions(),
+        )
+        .expect("failed to write helmet probe submission diagnostics");
+    }
+    output
+        .flush()
+        .expect("failed to flush helmet probe submission diagnostics");
 }
 
 #[cfg(feature = "rdg_bench_support")]
@@ -457,11 +527,13 @@ fn request_graceful_exit(_window: &dyn Window) -> bool {
 
 #[myth::main]
 fn main() -> myth::Result<()> {
+    let gpu_driven = read_gpu_driven_mode();
     App::new()
         .with_title("Myth Helmet Fixed Probe")
         .with_settings(RendererSettings {
             path: RenderPath::BasicForward,
             vsync: false,
+            gpu_driven,
             ..Default::default()
         })
         .run::<HelmetGltfFixedProbe>()

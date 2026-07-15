@@ -150,7 +150,7 @@ impl<'a> SceneDrawPrepareContext<'a> {
         let draw_plan = self
             .scene_submissions
             .cpu_direct_plan(submission)
-            .expect("Prepass recipe requires the CpuDirect backend");
+            .expect("Prepass recipe requires a CpuDirect cohort");
         self.scene_pipeline_prepare.push_prepass_compact(
             draw_plan,
             SceneRecipeOrdinal::new(draw_plan.index(), intent_index),
@@ -171,9 +171,10 @@ impl<'a> SceneDrawPrepareContext<'a> {
         self.scene_pipeline_prepare.intern_shadow_layout(layout)
     }
 
-    /// Whether this live backend still needs the legacy per-source recipe
-    /// gather. GPU-indirect plans are finalized by their typed coordinator
-    /// after the common prepare barrier and must not enter CpuDirect stores.
+    /// Whether this live semantic submission contains a CpuDirect cohort and
+    /// therefore still needs the per-source recipe gather. A pure
+    /// GPU-indirect plan is finalized by its typed coordinator after the
+    /// common prepare barrier; Hybrid plans intentionally participate in both.
     #[inline]
     #[must_use]
     pub(crate) fn submission_is_cpu_direct(&self, submission: SceneSubmissionPlanId) -> bool {

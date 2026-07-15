@@ -7,10 +7,7 @@
 //! dispatch. This makes zero-visible and zero-slot domains valid no-op draws
 //! without a CPU readback or a cross-workgroup initialization race.
 
-use std::{
-    mem::{size_of, size_of_val},
-    sync::OnceLock,
-};
+use std::{mem::size_of, num::NonZeroU64, sync::OnceLock};
 
 use bytemuck::{Pod, Zeroable};
 #[cfg(test)]
@@ -189,6 +186,207 @@ struct GpuSceneMultiBinCullActiveBatch {
 const _: () = assert!(size_of::<GpuSceneMultiBinCullDomain>() == 32);
 const _: () = assert!(size_of::<GpuSceneMultiBinCullView>() == 96);
 const _: () = assert!(size_of::<GpuSceneMultiBinCullActiveBatch>() == 16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GpuSceneCullParameterRange {
+    offset: u64,
+    size: u64,
+}
+
+impl GpuSceneCullParameterRange {
+    #[inline]
+    fn end(self) -> Option<u64> {
+        self.offset.checked_add(self.size)
+    }
+
+    #[inline]
+    fn binding_size(self) -> wgpu::BufferSize {
+        wgpu::BufferSize::new(self.size).expect("GPU Scene Cull parameter range is empty")
+    }
+}
+
+/// Packed layout for the three immutable, DPE-live Cull parameter arrays.
+///
+/// Active batches and views are storage bindings, while the fixed domain is a
+/// uniform binding. One transient Buffer carries the union usage; exact ranges
+/// preserve the existing shader ABI without three independent Queue writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GpuSceneMultiBinCullParameterLayout {
+    active_batches: GpuSceneCullParameterRange,
+    views: GpuSceneCullParameterRange,
+    domain: GpuSceneCullParameterRange,
+    total_size: u64,
+}
+
+#[inline]
+fn checked_align_up(value: u64, alignment: u64) -> Option<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    let mask = alignment - 1;
+    value.checked_add(mask).map(|aligned| aligned & !mask)
+}
+
+fn gpu_scene_multi_bin_cull_parameter_layout(
+    active_batch_count: usize,
+    view_count: usize,
+    storage_alignment: u64,
+    uniform_alignment: u64,
+) -> Option<GpuSceneMultiBinCullParameterLayout> {
+    if active_batch_count == 0
+        || view_count == 0
+        || storage_alignment == 0
+        || uniform_alignment == 0
+        || !storage_alignment.is_power_of_two()
+        || !uniform_alignment.is_power_of_two()
+    {
+        return None;
+    }
+    let active_size = u64::try_from(active_batch_count)
+        .ok()?
+        .checked_mul(size_of::<GpuSceneMultiBinCullActiveBatch>() as u64)?;
+    let view_size = u64::try_from(view_count)
+        .ok()?
+        .checked_mul(size_of::<GpuSceneMultiBinCullView>() as u64)?;
+    let active_batches = GpuSceneCullParameterRange {
+        offset: 0,
+        size: active_size,
+    };
+    let views = GpuSceneCullParameterRange {
+        offset: checked_align_up(active_batches.end()?, storage_alignment)?,
+        size: view_size,
+    };
+    let domain = GpuSceneCullParameterRange {
+        offset: checked_align_up(views.end()?, uniform_alignment)?,
+        size: size_of::<GpuSceneMultiBinCullDomain>() as u64,
+    };
+    let total_size = domain.end()?;
+    debug_assert_eq!(active_batches.offset % storage_alignment, 0);
+    debug_assert_eq!(views.offset % storage_alignment, 0);
+    debug_assert_eq!(domain.offset % uniform_alignment, 0);
+    debug_assert_eq!(total_size % wgpu::COPY_BUFFER_ALIGNMENT, 0);
+    Some(GpuSceneMultiBinCullParameterLayout {
+        active_batches,
+        views,
+        domain,
+        total_size,
+    })
+}
+
+#[inline]
+fn portable_uniform_offset_alignment() -> u64 {
+    u64::from(wgpu::Limits::default().min_uniform_buffer_offset_alignment)
+}
+
+fn validate_gpu_scene_multi_bin_cull_parameter_layout(
+    layout: GpuSceneMultiBinCullParameterLayout,
+    limits: &wgpu::Limits,
+) {
+    let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment);
+    let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment);
+    assert_ne!(
+        storage_alignment, 0,
+        "device reported zero storage alignment"
+    );
+    assert_ne!(
+        uniform_alignment, 0,
+        "device reported zero uniform alignment"
+    );
+    assert_eq!(
+        layout.active_batches.offset % storage_alignment,
+        0,
+        "GPU Scene Cull active-batch range is not device storage-aligned"
+    );
+    assert_eq!(
+        layout.views.offset % storage_alignment,
+        0,
+        "GPU Scene Cull view range is not device storage-aligned"
+    );
+    assert_eq!(
+        layout.domain.offset % uniform_alignment,
+        0,
+        "GPU Scene Cull domain range is not device uniform-aligned"
+    );
+    assert!(
+        layout.active_batches.size <= limits.max_storage_buffer_binding_size,
+        "GPU Scene Cull active-batch range exceeds max_storage_buffer_binding_size"
+    );
+    assert!(
+        layout.views.size <= limits.max_storage_buffer_binding_size,
+        "GPU Scene Cull view range exceeds max_storage_buffer_binding_size"
+    );
+    assert!(
+        layout.domain.size <= limits.max_uniform_buffer_binding_size,
+        "GPU Scene Cull domain range exceeds max_uniform_buffer_binding_size"
+    );
+    assert!(
+        layout.total_size <= limits.max_buffer_size,
+        "GPU Scene Cull packed parameters exceed max_buffer_size"
+    );
+    for range in [layout.active_batches, layout.views, layout.domain] {
+        assert!(
+            range.end().is_some_and(|end| end <= layout.total_size),
+            "GPU Scene Cull parameter range exceeds its packed buffer"
+        );
+    }
+}
+
+fn fill_gpu_scene_multi_bin_cull_parameters(
+    mut destination: wgpu::WriteOnly<'_, [u8]>,
+    layout: GpuSceneMultiBinCullParameterLayout,
+    active_batches: &[GpuSceneMultiBinCullActiveBatch],
+    views: &[GpuSceneMultiBinCullView],
+    domain: &[GpuSceneMultiBinCullDomain],
+) {
+    assert_eq!(domain.len(), 1, "GPU Scene Cull requires one domain");
+    assert_eq!(
+        destination.len(),
+        usize::try_from(layout.total_size).expect("GPU Scene Cull upload exceeds usize"),
+        "GPU Scene Cull upload size drifted from its packed layout"
+    );
+    let sources = [
+        (layout.active_batches, bytemuck::cast_slice(active_batches)),
+        (layout.views, bytemuck::cast_slice(views)),
+        (layout.domain, bytemuck::cast_slice(domain)),
+    ];
+    destination.fill(0);
+    for (range, source) in sources {
+        assert_eq!(
+            source.len(),
+            usize::try_from(range.size).expect("GPU Scene Cull range exceeds usize"),
+            "GPU Scene Cull parameter source size drifted"
+        );
+        let start = usize::try_from(range.offset).expect("GPU Scene Cull offset exceeds usize");
+        let end = usize::try_from(range.end().expect("GPU Scene Cull range overflowed"))
+            .expect("GPU Scene Cull range end exceeds usize");
+        destination.slice(start..end).copy_from_slice(source);
+    }
+}
+
+fn upload_gpu_scene_multi_bin_cull_parameters(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    layout: GpuSceneMultiBinCullParameterLayout,
+    active_batches: &[GpuSceneMultiBinCullActiveBatch],
+    views: &[GpuSceneMultiBinCullView],
+    domain: &[GpuSceneMultiBinCullDomain],
+) {
+    let size = NonZeroU64::new(layout.total_size)
+        .expect("GPU Scene Cull packed parameter upload is empty");
+    let Some(mut upload) = queue.write_buffer_with(buffer, 0, size) else {
+        panic!(
+            "GPU Scene Cull could not stage its {}-byte packed parameter upload",
+            layout.total_size
+        );
+    };
+    fill_gpu_scene_multi_bin_cull_parameters(
+        upload.slice(..),
+        layout,
+        active_batches,
+        views,
+        domain,
+    );
+}
 
 /// Copy-only graph-build recipe for one constrained rigid indexed batch.
 #[cfg(test)]
@@ -529,6 +727,13 @@ impl GpuSceneCullFeature {
                 id: [bin.id.slot(), bin.id.generation(), 0, 0],
             }
         });
+        let parameter_layout = gpu_scene_multi_bin_cull_parameter_layout(
+            active_batches.len(),
+            views.len(),
+            descriptor.storage_alignment,
+            portable_uniform_offset_alignment(),
+        )
+        .expect("GPU Scene Cull packed parameter layout overflowed");
 
         let visible_size = u64::from(view_count)
             .checked_mul(descriptor.visible_view_stride)
@@ -556,27 +761,13 @@ impl GpuSceneCullFeature {
                         | wgpu::BufferUsages::COPY_DST,
                 ),
             );
-            let active_batch_buffer = builder.create_buffer(
-                "GpuScene_MultiBin_Active_Batches",
+            let parameter_buffer = builder.create_buffer(
+                "GpuScene_MultiBin_Cull_Parameters",
                 BufferDesc::new(
-                    u64::try_from(size_of_val(active_batches))
-                        .expect("GPU Scene active-batch bytes exceed u64"),
-                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                ),
-            );
-            let view_buffer = builder.create_buffer(
-                "GpuScene_MultiBin_Cull_Views",
-                BufferDesc::new(
-                    u64::try_from(size_of_val(views))
-                        .expect("GPU Scene Cull view bytes exceed u64"),
-                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                ),
-            );
-            let domain_buffer = builder.create_buffer(
-                "GpuScene_MultiBin_Cull_Domain",
-                BufferDesc::new(
-                    size_of::<GpuSceneMultiBinCullDomain>() as u64,
-                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    parameter_layout.total_size,
+                    wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::UNIFORM
+                        | wgpu::BufferUsages::COPY_DST,
                 ),
             );
 
@@ -585,11 +776,10 @@ impl GpuSceneCullFeature {
                     feature: self,
                     instances,
                     batches,
-                    active_batch_buffer,
+                    parameter_buffer,
+                    parameter_layout,
                     visible_instances,
                     indirect_arguments,
-                    view_buffer,
-                    domain_buffer,
                     active_batches,
                     views,
                     domain,
@@ -980,11 +1170,10 @@ struct GpuSceneMultiBinCullNode<'a> {
     feature: &'a GpuSceneCullFeature,
     instances: BufferNodeId,
     batches: BufferNodeId,
-    active_batch_buffer: BufferNodeId,
+    parameter_buffer: BufferNodeId,
+    parameter_layout: GpuSceneMultiBinCullParameterLayout,
     visible_instances: BufferNodeId,
     indirect_arguments: BufferNodeId,
-    view_buffer: BufferNodeId,
-    domain_buffer: BufferNodeId,
     active_batches: &'a [GpuSceneMultiBinCullActiveBatch],
     views: &'a [GpuSceneMultiBinCullView],
     domain: &'a [GpuSceneMultiBinCullDomain],
@@ -1100,20 +1289,17 @@ impl<'a> PassNode<'a> for GpuSceneMultiBinCullNode<'a> {
         );
 
         let resources = self.feature.multi_bin_resources(ctx);
-        ctx.queue.write_buffer(
-            ctx.views.get_buffer(self.active_batch_buffer),
-            0,
-            bytemuck::cast_slice(self.active_batches),
+        validate_gpu_scene_multi_bin_cull_parameter_layout(
+            self.parameter_layout,
+            &ctx.device.limits(),
         );
-        ctx.queue.write_buffer(
-            ctx.views.get_buffer(self.view_buffer),
-            0,
-            bytemuck::cast_slice(self.views),
-        );
-        ctx.queue.write_buffer(
-            ctx.views.get_buffer(self.domain_buffer),
-            0,
-            bytemuck::cast_slice(self.domain),
+        upload_gpu_scene_multi_bin_cull_parameters(
+            ctx.queue,
+            ctx.views.get_buffer(self.parameter_buffer),
+            self.parameter_layout,
+            self.active_batches,
+            self.views,
+            self.domain,
         );
         let bind_group = ctx
             .build_bind_group(
@@ -1122,11 +1308,26 @@ impl<'a> PassNode<'a> for GpuSceneMultiBinCullNode<'a> {
             )
             .bind_buffer(0, self.instances)
             .bind_buffer(1, self.batches)
-            .bind_buffer(2, self.active_batch_buffer)
+            .bind_buffer_range(
+                2,
+                self.parameter_buffer,
+                self.parameter_layout.active_batches.offset,
+                self.parameter_layout.active_batches.binding_size(),
+            )
             .bind_buffer(3, self.visible_instances)
             .bind_buffer(4, self.indirect_arguments)
-            .bind_buffer(5, self.view_buffer)
-            .bind_buffer(6, self.domain_buffer)
+            .bind_buffer_range(
+                5,
+                self.parameter_buffer,
+                self.parameter_layout.views.offset,
+                self.parameter_layout.views.binding_size(),
+            )
+            .bind_buffer_range(
+                6,
+                self.parameter_buffer,
+                self.parameter_layout.domain.offset,
+                self.parameter_layout.domain.binding_size(),
+            )
             .build();
         self.prepared = Some(PreparedGpuSceneCull::Dispatch {
             pipeline: resources.pipeline,
@@ -1650,6 +1851,23 @@ mod tests {
                 id: [bin.id.slot(), bin.id.generation(), 0, 0],
             })
             .collect::<Vec<_>>();
+        let domain = [domain];
+        let parameter_layout = gpu_scene_multi_bin_cull_parameter_layout(
+            active.len(),
+            views.len(),
+            descriptor.storage_alignment,
+            portable_uniform_offset_alignment(),
+        )
+        .expect("GPU Scene multi-bin test parameter layout overflowed");
+        validate_gpu_scene_multi_bin_cull_parameter_layout(parameter_layout, &gpu.device.limits());
+        let mut parameter_bytes = vec![0; parameter_layout.total_size as usize];
+        fill_gpu_scene_multi_bin_cull_parameters(
+            wgpu::WriteOnly::from_mut(parameter_bytes.as_mut_slice()),
+            parameter_layout,
+            &active,
+            &views,
+            &domain,
+        );
 
         let instances = gpu
             .device
@@ -1665,26 +1883,14 @@ mod tests {
                 contents: bytemuck::cast_slice(batches),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        let active = gpu
+        let parameters = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("GpuScene multi-bin test active batches"),
-                contents: bytemuck::cast_slice(&active),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let views = gpu
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("GpuScene multi-bin test views"),
-                contents: bytemuck::cast_slice(&views),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let domain_buffer = gpu
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("GpuScene multi-bin test domain"),
-                contents: bytemuck::bytes_of(&domain),
-                usage: wgpu::BufferUsages::UNIFORM,
+                label: Some("GpuScene multi-bin test packed parameters"),
+                contents: &parameter_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::UNIFORM
+                    | wgpu::BufferUsages::COPY_DST,
             });
         let visible_size = u64::from(view_count) * descriptor.visible_view_stride;
         let visible = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1746,7 +1952,11 @@ mod tests {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: active.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &parameters,
+                        offset: parameter_layout.active_batches.offset,
+                        size: Some(parameter_layout.active_batches.binding_size()),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -1758,11 +1968,19 @@ mod tests {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: views.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &parameters,
+                        offset: parameter_layout.views.offset,
+                        size: Some(parameter_layout.views.binding_size()),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: domain_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &parameters,
+                        offset: parameter_layout.domain.offset,
+                        size: Some(parameter_layout.domain.binding_size()),
+                    }),
                 },
             ],
         });
@@ -1787,7 +2005,7 @@ mod tests {
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(
-                domain.layout[3].div_ceil(GPU_SCENE_CULL_WORKGROUP_SIZE),
+                domain[0].layout[3].div_ceil(GPU_SCENE_CULL_WORKGROUP_SIZE),
                 view_count,
                 1,
             );
@@ -1830,6 +2048,90 @@ mod tests {
         assert_eq!(std::mem::align_of::<GpuSceneCullParams>(), 16);
         assert_eq!(size_of::<GpuSceneVisibleInstance>(), 8);
         assert_eq!(GPU_SCENE_INDEXED_ARGUMENT_SIZE, 20);
+    }
+
+    #[test]
+    fn multi_bin_parameter_layout_aligns_each_exact_binding_range() {
+        let layout = gpu_scene_multi_bin_cull_parameter_layout(3, 2, 64, 256).unwrap();
+        assert_eq!(
+            layout,
+            GpuSceneMultiBinCullParameterLayout {
+                active_batches: GpuSceneCullParameterRange {
+                    offset: 0,
+                    size: 48,
+                },
+                views: GpuSceneCullParameterRange {
+                    offset: 64,
+                    size: 192,
+                },
+                domain: GpuSceneCullParameterRange {
+                    offset: 256,
+                    size: 32,
+                },
+                total_size: 288,
+            }
+        );
+
+        let wider_storage = gpu_scene_multi_bin_cull_parameter_layout(1, 1, 256, 64).unwrap();
+        assert_eq!(wider_storage.active_batches.offset, 0);
+        assert_eq!(wider_storage.active_batches.size, 16);
+        assert_eq!(wider_storage.views.offset, 256);
+        assert_eq!(wider_storage.views.size, 96);
+        assert_eq!(wider_storage.domain.offset, 384);
+        assert_eq!(wider_storage.domain.size, 32);
+        assert_eq!(wider_storage.total_size, 416);
+
+        assert!(gpu_scene_multi_bin_cull_parameter_layout(0, 1, 64, 256).is_none());
+        assert!(gpu_scene_multi_bin_cull_parameter_layout(1, 0, 64, 256).is_none());
+        assert!(gpu_scene_multi_bin_cull_parameter_layout(1, 1, 48, 256).is_none());
+        assert!(checked_align_up(u64::MAX, 256).is_none());
+    }
+
+    #[test]
+    fn multi_bin_parameter_upload_is_one_zero_padded_contiguous_payload() {
+        let active_batches = [
+            GpuSceneMultiBinCullActiveBatch { id: [1, 2, 3, 4] },
+            GpuSceneMultiBinCullActiveBatch { id: [5, 6, 7, 8] },
+        ];
+        let views = [GpuSceneMultiBinCullView {
+            frustum_planes: [[9.0, 10.0, 11.0, 12.0]; 6],
+        }];
+        let domain = [GpuSceneMultiBinCullDomain {
+            domain: [13, 14, 15, 16],
+            layout: [17, 18, 19, 20],
+        }];
+        let layout = gpu_scene_multi_bin_cull_parameter_layout(2, 1, 64, 256).unwrap();
+        let mut bytes = vec![0xA5; layout.total_size as usize];
+
+        fill_gpu_scene_multi_bin_cull_parameters(
+            wgpu::WriteOnly::from_mut(bytes.as_mut_slice()),
+            layout,
+            &active_batches,
+            &views,
+            &domain,
+        );
+
+        for (range, source) in [
+            (layout.active_batches, bytemuck::cast_slice::<_, u8>(&active_batches)),
+            (layout.views, bytemuck::cast_slice(&views)),
+            (layout.domain, bytemuck::cast_slice(&domain)),
+        ] {
+            let start = range.offset as usize;
+            let end = range.end().unwrap() as usize;
+            assert_eq!(&bytes[start..end], source);
+        }
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            let index = index as u64;
+            let belongs_to_parameter = [layout.active_batches, layout.views, layout.domain]
+                .into_iter()
+                .any(|range| index >= range.offset && index < range.end().unwrap());
+            if !belongs_to_parameter {
+                assert_eq!(
+                    byte, 0,
+                    "packed upload padding at byte {index} was not zero"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2151,6 +2453,32 @@ mod tests {
         assert_eq!(view1_batch1.first_instance, 0);
         assert!(output.view_batch(2, 0).is_none());
         assert!(output.view_batch(0, 2).is_none());
+
+        let parameter_resources = graph
+            .storage
+            .resources
+            .iter()
+            .filter(|resource| resource.name == "GpuScene_MultiBin_Cull_Parameters")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parameter_resources.len(),
+            1,
+            "one multi-bin Cull must declare exactly one packed parameter buffer"
+        );
+        let parameter_desc = parameter_resources[0].buffer_desc();
+        assert_eq!(parameter_desc.logical_size, 544);
+        assert_eq!(
+            parameter_desc.usage,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+        );
+        assert!(graph.storage.resources.iter().all(|resource| !matches!(
+            resource.name,
+            "GpuScene_MultiBin_Active_Batches"
+                | "GpuScene_MultiBin_Cull_Views"
+                | "GpuScene_MultiBin_Cull_Domain"
+        )));
 
         graph.add_pass("GpuScene_MultiBin_Test_Consumer", |builder| {
             builder.read_buffer(output.visible_instances);

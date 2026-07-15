@@ -17,6 +17,7 @@ use crate::graph::core::{
     RdgFramePhase, RdgRendererAttemptGuard,
 };
 use crate::graph::frame::{RenderFrameFeatureConfig, RenderLists};
+use crate::graph::gpu_driven_policy::GpuDrivenAutoPolicy;
 use crate::graph::gpu_scene::GpuScene;
 use crate::graph::gpu_scene_capacity::GpuSceneCapacityLedger;
 use crate::graph::gpu_scene_submission::GpuSceneRenderFeature;
@@ -130,6 +131,8 @@ struct RendererState {
     pub(crate) gpu_scene: GpuScene,
     pub(crate) gpu_scene_cull: GpuSceneCullFeature,
     pub(crate) gpu_scene_render: GpuSceneRenderFeature,
+    /// Fixed-capacity, submission-transactional Auto backend policy.
+    pub(crate) gpu_driven_policy: GpuDrivenAutoPolicy,
     pub(crate) frame_arena: FrameArena,
 
     // Post-processing passes
@@ -320,6 +323,7 @@ impl Renderer {
             gpu_scene: GpuScene::new(),
             gpu_scene_cull: GpuSceneCullFeature::new(),
             gpu_scene_render: GpuSceneRenderFeature::new(),
+            gpu_driven_policy: GpuDrivenAutoPolicy::new(),
             frame_arena: FrameArena::new(),
             fxaa_pass: FxaaFeature::new(),
             taa_pass: TaaFeature::new(),
@@ -421,9 +425,11 @@ impl Renderer {
         // Invalidate every arena node before GPU Scene maintenance can clear
         // or shrink slices borrowed by the previous graph's pass payloads.
         state.graph_storage.clear();
-        state
-            .gpu_scene_capacity
-            .maintain(&mut state.gpu_scene, &mut state.gpu_scene_render);
+        if self.settings.gpu_driven != GpuDrivenMode::Off {
+            state
+                .gpu_scene_capacity
+                .maintain(&mut state.gpu_scene, &mut state.gpu_scene_render);
+        }
         // Reset the arena in O(1) — all previous PassNodes are trivially
         // forgotten (no Drop needed).
         state.frame_arena.reset();
@@ -445,6 +451,7 @@ impl Renderer {
 
         let feature_config = RenderFrameFeatureConfig {
             clustered_shading: self.settings.clustered_shading,
+            gpu_driven: self.settings.gpu_driven,
             render_path: state.wgpu_ctx.render_path,
             msaa_samples: state.wgpu_ctx.msaa_samples,
         };
@@ -539,6 +546,7 @@ impl Renderer {
             gpu_scene: &mut state.gpu_scene,
             gpu_scene_cull: &mut state.gpu_scene_cull,
             gpu_scene_render: &mut state.gpu_scene_render,
+            gpu_driven_policy: &mut state.gpu_driven_policy,
             // sampler_registry: &mut state.sampler_registry,
             frame_arena: &state.frame_arena,
             fxaa_pass: &mut state.fxaa_pass,
@@ -676,6 +684,7 @@ impl Renderer {
             if old.path != self.settings.path {
                 state.wgpu_ctx.render_path = self.settings.path;
                 state.wgpu_ctx.pipeline_settings_version += 1;
+                state.gpu_driven_policy.bump_epoch();
                 log::info!("RenderPath changed to {:?}", self.settings.path);
             }
 
@@ -699,6 +708,14 @@ impl Renderer {
             }
 
             if old.gpu_driven != self.settings.gpu_driven {
+                state.gpu_driven_policy.bump_epoch();
+                if self.settings.gpu_driven == GpuDrivenMode::Off {
+                    // Runtime disable is the one transition that drains the
+                    // previous GPU attempt scratch. Subsequent Off frames do
+                    // not touch the GPU Scene capacity ledger at all.
+                    state.gpu_scene.clear_frame_scratch();
+                    state.gpu_scene_render.clear_finalization_scratch();
+                }
                 log::info!(
                     "GPU-driven scene-submission policy changed to {:?}",
                     self.settings.gpu_driven
@@ -1235,7 +1252,8 @@ mod tests {
     use crate::graph::core::scene_submission::SceneSubmissionPlanId;
     use crate::graph::core::{
         ExecuteContext, GraphBlackboard, HookStage, PassNode, RdgAttemptOutcome, RdgFramePhase,
-        RdgGpuDrivenFailure, RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
+        RdgGpuDrivenFailure, RdgResourceMaterializationFailure, RdgSceneSubmissionBackend,
+        RdgSceneSubmissionFamily, RdgSceneSubmissionSelectionReason, RdgSurfaceAcquireFailure,
         TextureDesc,
     };
     use crate::test_support::SharedTestContext;
@@ -3621,8 +3639,140 @@ mod tests {
     }
 
     #[test]
-    fn gpu_driven_basic_forward_closes_patch_cull_indirect_and_warm_publication() {
+    fn gpu_driven_policy_matrix_selects_cpu_or_reports_typed_required_failures() {
+        // Auto keeps a tiny compatible workload on CpuDirect without paying
+        // the exact-retention or GPU Scene topology cost.
         let mut renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            UnlitMaterial::new(Vec4::new(0.7, 0.2, 0.1, 1.0)),
+            &assets,
+        );
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(!graph_contains_pass(state, "GpuScene_Patch"));
+        assert!(!graph_contains_pass(state, "GpuScene_Cull"));
+        assert!(execution_contains_pass(state, "SimpleForward_Pass"));
+        let main = renderer
+            .latest_rdg_diagnostics()
+            .expect("RDG diagnostics missing")
+            .scene_submission_family(RdgSceneSubmissionFamily::MainPrepass);
+        assert_eq!(
+            main.selected_backend(),
+            RdgSceneSubmissionBackend::CpuDirect
+        );
+        assert_eq!(
+            main.selection_reason(),
+            RdgSceneSubmissionSelectionReason::AutoSmallWorkload
+        );
+        assert_eq!(main.live_backend(), RdgSceneSubmissionBackend::CpuDirect);
+        let policy = renderer
+            .latest_rdg_diagnostics()
+            .expect("RDG diagnostics missing")
+            .gpu_driven_policy();
+        assert_eq!(policy.extracted_item_count(), 1);
+        assert_eq!(policy.supported_opaque_count(), 1);
+        assert_eq!(policy.retained_candidate_count(), 0);
+        assert!(!policy.exact_evaluated());
+
+        // Off bypasses even the GPU compatibility snapshot and reports the
+        // frozen policy decision as CpuDirect.
+        let mut off_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Off);
+        let off_assets = AssetServer::new();
+        let mut off_scene = Scene::new();
+        off_scene.spawn_box(1.0, 1.0, 1.0, UnlitMaterial::new(Vec4::ONE), &off_assets);
+
+        render_frame(
+            &mut off_renderer,
+            &mut off_scene,
+            make_camera(),
+            &off_assets,
+            0,
+        );
+
+        let off_state = off_renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing");
+        assert!(
+            !off_state
+                .render_frame
+                .extracted_scene
+                .gpu_driven_facts_captured()
+        );
+        assert!(!graph_contains_pass(off_state, "GpuScene_Patch"));
+        assert!(!graph_contains_pass(off_state, "GpuScene_Cull"));
+        let off_diagnostics = off_renderer
+            .latest_rdg_diagnostics()
+            .expect("RDG diagnostics missing");
+        assert_eq!(off_diagnostics.gpu_driven_policy(), Default::default());
+        let off_main =
+            off_diagnostics.scene_submission_family(RdgSceneSubmissionFamily::MainPrepass);
+        assert_eq!(
+            off_main.selected_backend(),
+            RdgSceneSubmissionBackend::CpuDirect
+        );
+        assert_eq!(
+            off_main.selection_reason(),
+            RdgSceneSubmissionSelectionReason::ModeOff
+        );
+        assert_eq!(
+            off_main.live_backend(),
+            RdgSceneSubmissionBackend::CpuDirect
+        );
+
+        // An unsupported morph source falls back before adding GPU topology
+        // in Auto, while Required fails with a stable typed reason.
+        let auto_assets = AssetServer::new();
+        let mut auto_scene = Scene::new();
+        spawn_test_morph_box(&mut auto_scene, &auto_assets);
+        let mut auto = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        render_frame(&mut auto, &mut auto_scene, make_camera(), &auto_assets, 0);
+        let auto_state = auto.context.as_ref().expect("renderer state missing");
+        assert!(!graph_contains_pass(auto_state, "GpuScene_Patch"));
+        assert!(!graph_contains_pass(auto_state, "GpuScene_Cull"));
+        assert_eq!(
+            auto.latest_rdg_diagnostics().unwrap().outcome(),
+            RdgAttemptOutcome::Submitted
+        );
+
+        let required_assets = AssetServer::new();
+        let mut required_scene = Scene::new();
+        spawn_test_morph_box(&mut required_scene, &required_assets);
+        let mut required = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Required);
+        render_frame(
+            &mut required,
+            &mut required_scene,
+            make_camera(),
+            &required_assets,
+            0,
+        );
+        let outcome = required.latest_rdg_diagnostics().unwrap().outcome();
+        if required
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            assert_eq!(
+                outcome,
+                RdgAttemptOutcome::GpuDrivenFailed(RdgGpuDrivenFailure::MorphTargets)
+            );
+        } else {
+            assert_eq!(
+                outcome,
+                RdgAttemptOutcome::GpuDrivenFailed(RdgGpuDrivenFailure::UnsupportedDevice)
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_driven_required_basic_forward_closes_patch_cull_indirect_and_warm_publication() {
+        let mut renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Required);
         if !renderer
             .gpu_driven_capabilities()
             .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
@@ -3644,6 +3794,28 @@ mod tests {
             assert!(execution_contains_pass(state, "GpuScene_Patch"));
             assert!(execution_contains_pass(state, "GpuScene_Cull"));
             assert!(execution_contains_pass(state, "SimpleForward_Pass"));
+            let main = renderer
+                .latest_rdg_diagnostics()
+                .expect("RDG diagnostics missing")
+                .scene_submission_family(RdgSceneSubmissionFamily::MainPrepass);
+            assert_eq!(
+                main.selected_backend(),
+                RdgSceneSubmissionBackend::GpuDriven
+            );
+            assert_eq!(
+                main.selection_reason(),
+                RdgSceneSubmissionSelectionReason::Required
+            );
+            assert_eq!(main.live_backend(), RdgSceneSubmissionBackend::GpuDriven);
+            let policy = renderer
+                .latest_rdg_diagnostics()
+                .expect("RDG diagnostics missing")
+                .gpu_driven_policy();
+            assert_eq!(policy.extracted_item_count(), 1);
+            assert_eq!(policy.retained_candidate_count(), 1);
+            assert_eq!(policy.retained_bin_count(), 1);
+            assert_eq!(policy.minimum_cohort_members(), 1);
+            assert!(policy.exact_evaluated());
         }
 
         // The exact submitted table revision is acknowledged in the same
@@ -3680,7 +3852,7 @@ mod tests {
     #[test]
     fn gpu_driven_high_fidelity_prepass_and_opaque_share_visibility_and_match_cpu() {
         let mut gpu_renderer =
-            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Auto);
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Required);
         if !gpu_renderer
             .gpu_driven_capabilities()
             .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
@@ -3736,7 +3908,7 @@ mod tests {
         // The portable tier binds each visible partition as an exact Group 2
         // range and keeps every indirect `first_instance` at zero.
         let mut gpu_renderer =
-            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Auto);
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Required);
         if !gpu_renderer
             .gpu_driven_capabilities()
             .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
@@ -3857,7 +4029,7 @@ mod tests {
         );
         gpu_scene.node(&right).set_position(0.7, 0.0, 0.0);
 
-        let mut gpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        let mut gpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Required);
         if !gpu_renderer
             .gpu_driven_capabilities()
             .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
@@ -3933,7 +4105,7 @@ mod tests {
 
     #[test]
     fn gpu_driven_multi_bin_textures_retain_all_producers_and_match_cpu() {
-        let mut gpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        let mut gpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Required);
         if !gpu_renderer
             .gpu_driven_capabilities()
             .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
@@ -4020,48 +4192,5 @@ mod tests {
             .readback_pixels()
             .expect("textured multi-bin CpuDirect readback failed");
         assert_eq!(gpu_pixels, cpu_pixels);
-    }
-
-    #[test]
-    fn gpu_driven_auto_falls_back_before_topology_and_required_is_typed() {
-        let auto_assets = AssetServer::new();
-        let mut auto_scene = Scene::new();
-        spawn_test_morph_box(&mut auto_scene, &auto_assets);
-        let mut auto = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
-        render_frame(&mut auto, &mut auto_scene, make_camera(), &auto_assets, 0);
-        let auto_state = auto.context.as_ref().expect("renderer state missing");
-        assert!(!graph_contains_pass(auto_state, "GpuScene_Patch"));
-        assert!(!graph_contains_pass(auto_state, "GpuScene_Cull"));
-        assert_eq!(
-            auto.latest_rdg_diagnostics().unwrap().outcome(),
-            RdgAttemptOutcome::Submitted
-        );
-
-        let required_assets = AssetServer::new();
-        let mut required_scene = Scene::new();
-        spawn_test_morph_box(&mut required_scene, &required_assets);
-        let mut required = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Required);
-        render_frame(
-            &mut required,
-            &mut required_scene,
-            make_camera(),
-            &required_assets,
-            0,
-        );
-        let outcome = required.latest_rdg_diagnostics().unwrap().outcome();
-        if required
-            .gpu_driven_capabilities()
-            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
-        {
-            assert_eq!(
-                outcome,
-                RdgAttemptOutcome::GpuDrivenFailed(RdgGpuDrivenFailure::MorphTargets)
-            );
-        } else {
-            assert_eq!(
-                outcome,
-                RdgAttemptOutcome::GpuDrivenFailed(RdgGpuDrivenFailure::UnsupportedDevice)
-            );
-        }
     }
 }

@@ -32,6 +32,7 @@ use super::extracted::{
     ExtractedRenderItem, ExtractedScene, ItemShaderFeatures, MaterialClassification,
 };
 use super::frame::{ExtractedSourceId, FrameSourceId, RenderLists};
+use super::gpu_driven_policy::GpuDrivenFamilyMask;
 
 const GPU_SCENE_INSTANCE_SCHEMA_ID: u64 = u64::from_be_bytes(*b"MYTHINST");
 const GPU_SCENE_GEOMETRY_SCHEMA_ID: u64 = u64::from_be_bytes(*b"MYTHGEOM");
@@ -55,6 +56,27 @@ const GPU_SCENE_SCRATCH_BASELINE: usize = 16;
 /// Cull scan the persistent table without rebuilding per-view CPU candidate
 /// buffers.
 pub(crate) const GPU_SCENE_INSTANCE_CASTS_SHADOW: u32 = 1 << 0;
+/// Instance belongs to the GPU-owned Main + Prepass cohort.
+pub(crate) const GPU_SCENE_INSTANCE_MAIN_PREPASS: u32 = 1 << 1;
+/// Instance belongs to the GPU-owned directional/spot Shadow2D cohort.
+pub(crate) const GPU_SCENE_INSTANCE_SHADOW_2D: u32 = 1 << 2;
+/// Instance belongs to the GPU-owned point-light ShadowCube cohort.
+pub(crate) const GPU_SCENE_INSTANCE_SHADOW_CUBE: u32 = 1 << 3;
+
+#[inline]
+fn gpu_scene_instance_family_flags(families: GpuDrivenFamilyMask) -> u32 {
+    let mut flags = 0;
+    if families.contains(GpuDrivenFamilyMask::MAIN_PREPASS) {
+        flags |= GPU_SCENE_INSTANCE_MAIN_PREPASS;
+    }
+    if families.contains(GpuDrivenFamilyMask::SHADOW_2D) {
+        flags |= GPU_SCENE_INSTANCE_SHADOW_2D;
+    }
+    if families.contains(GpuDrivenFamilyMask::SHADOW_CUBE) {
+        flags |= GPU_SCENE_INSTANCE_SHADOW_CUBE;
+    }
+    flags
+}
 const EMPTY_GPU_SCENE_INSTANCE_RECORD: GpuSceneInstanceRecord = GpuSceneInstanceRecord {
     world_matrix: [[0.0; 4]; 4],
     world_matrix_inverse: [[0.0; 4]; 4],
@@ -406,6 +428,10 @@ pub(crate) struct GpuSceneMultiBinProjection {
     pub(crate) bin_count: u32,
     pub(crate) unique_geometry_count: u32,
     pub(crate) unique_material_count: u32,
+    /// Selected candidates which may contribute to a shadow family. This is
+    /// distinct from the complete scene caster count when Auto retains only
+    /// high-reuse cohorts and leaves the rest on the CPU backend.
+    pub(crate) shadow_candidate_count: u32,
     /// True when every shadow caster belongs to the same complete opaque
     /// domain represented by this recipe. This is accumulated during the
     /// mandatory preflight scan so Shadow ownership never rescans the scene.
@@ -537,6 +563,40 @@ pub(crate) enum GpuSceneMultiBinPreflightFailure {
     InvalidVisibleStride,
     InvalidStorageAlignment,
     LayoutOverflow,
+}
+
+/// Mutation-free selection contract used while constructing a retained
+/// multi-bin recipe. `CompleteDomain` preserves the strict `Required` oracle:
+/// one unsupported opaque item rejects the entire GPU backend. `Cohorts`
+/// keeps unsupported and low-reuse bins CPU-owned while retaining only bins
+/// large enough to amortize an indirect submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuSceneMultiBinSelectionPolicy {
+    CompleteDomain,
+    Cohorts { minimum_member_count: u32 },
+}
+
+impl GpuSceneMultiBinSelectionPolicy {
+    #[inline]
+    const fn rejects_unsupported(self) -> bool {
+        matches!(self, Self::CompleteDomain)
+    }
+
+    #[inline]
+    const fn minimum_member_count(self) -> u32 {
+        match self {
+            Self::CompleteDomain => 1,
+            Self::Cohorts {
+                minimum_member_count,
+            } => {
+                if minimum_member_count == 0 {
+                    1
+                } else {
+                    minimum_member_count
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1412,6 +1472,9 @@ pub(crate) struct GpuScene {
     multi_bin_has_shadow_casters: bool,
     multi_bin_preflight: Vec<GpuScenePreflightBin>,
     multi_bin_members: Vec<GpuScenePreflightMember>,
+    /// Old-bin -> retained-bin remap used to compact Auto cohorts in place.
+    /// A retained high-water vector avoids an allocation in warm preflight.
+    multi_bin_bin_remap: Vec<u32>,
     /// Sparse matrix inverses for new or transform-dirty members. Stable
     /// members reuse the inverse already stored in their persistent record.
     multi_bin_inverse_updates: Vec<[[f32; 4]; 4]>,
@@ -1519,6 +1582,7 @@ impl GpuScene {
             )
             + vec_footprint(&self.multi_bin_preflight, GPU_SCENE_SCRATCH_BASELINE)
             + vec_footprint(&self.multi_bin_members, GPU_SCENE_SCRATCH_BASELINE)
+            + vec_footprint(&self.multi_bin_bin_remap, GPU_SCENE_SCRATCH_BASELINE)
             + vec_footprint(&self.multi_bin_inverse_updates, GPU_SCENE_SCRATCH_BASELINE)
             + vec_footprint(&self.multi_bin_resolved, GPU_SCENE_SCRATCH_BASELINE)
             + vec_footprint(&self.multi_bin_committed, GPU_SCENE_SCRATCH_BASELINE)
@@ -1539,6 +1603,7 @@ impl GpuScene {
         self.multi_bin_has_shadow_casters = false;
         self.multi_bin_preflight.clear();
         self.multi_bin_members.clear();
+        self.multi_bin_bin_remap.clear();
         self.multi_bin_inverse_updates.clear();
         self.multi_bin_resolved.clear();
         self.multi_bin_committed.clear();
@@ -1592,6 +1657,12 @@ impl GpuScene {
             retained_bytes,
         );
         shrink_vec_by_family_ratio(
+            &mut self.multi_bin_bin_remap,
+            GPU_SCENE_SCRATCH_BASELINE,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
             &mut self.multi_bin_inverse_updates,
             GPU_SCENE_SCRATCH_BASELINE,
             target_bytes,
@@ -1633,6 +1704,7 @@ impl GpuScene {
     pub(crate) fn reserve_capacity_probe(&mut self, scratch_slots: usize, authority_slots: usize) {
         self.multi_bin_preflight.reserve(scratch_slots);
         self.multi_bin_members.reserve(scratch_slots);
+        self.multi_bin_bin_remap.reserve(scratch_slots);
         self.multi_bin_committed.reserve(scratch_slots);
         self.slots.reserve(authority_slots);
         self.records.reserve(authority_slots);
@@ -1720,6 +1792,41 @@ impl GpuScene {
         visible_stride: u64,
         storage_alignment: u64,
     ) -> Result<Option<GpuSceneMultiBinPreflight>, GpuSceneMultiBinPreflightFailure> {
+        self.preflight_multi_bin_scene_with_policy(
+            extracted_scene,
+            visible_stride,
+            storage_alignment,
+            GpuSceneMultiBinSelectionPolicy::CompleteDomain,
+        )
+    }
+
+    /// Build the permissive Auto recipe. Unsupported opaque objects and bins
+    /// below `minimum_member_count` remain CPU-owned; stable authority is not
+    /// touched until the returned token is explicitly committed.
+    pub(crate) fn preflight_multi_bin_cohorts(
+        &mut self,
+        extracted_scene: &ExtractedScene,
+        visible_stride: u64,
+        storage_alignment: u64,
+        minimum_member_count: u32,
+    ) -> Result<Option<GpuSceneMultiBinPreflight>, GpuSceneMultiBinPreflightFailure> {
+        self.preflight_multi_bin_scene_with_policy(
+            extracted_scene,
+            visible_stride,
+            storage_alignment,
+            GpuSceneMultiBinSelectionPolicy::Cohorts {
+                minimum_member_count,
+            },
+        )
+    }
+
+    fn preflight_multi_bin_scene_with_policy(
+        &mut self,
+        extracted_scene: &ExtractedScene,
+        visible_stride: u64,
+        storage_alignment: u64,
+        selection: GpuSceneMultiBinSelectionPolicy,
+    ) -> Result<Option<GpuSceneMultiBinPreflight>, GpuSceneMultiBinPreflightFailure> {
         if self.generation_exhausted {
             return Err(GpuSceneMultiBinPreflightFailure::Domain(
                 GpuSceneSelectionRejection::GenerationExhausted,
@@ -1745,32 +1852,44 @@ impl GpuScene {
         self.multi_bin_has_shadow_casters = false;
         self.multi_bin_preflight.clear();
         self.multi_bin_members.clear();
+        self.multi_bin_bin_remap.clear();
         self.multi_bin_inverse_updates.clear();
         self.multi_bin_committed.clear();
         self.active_batch_descriptors.clear();
-        let mut candidate_count = 0u32;
-        let mut covers_complete_shadow_domain = true;
+        let mut total_shadow_caster_count = 0u32;
 
         for (item_index, item) in extracted_scene.render_items.iter().enumerate() {
             self.multi_bin_has_shadow_casters |= item.cast_shadows;
-            if item.cast_shadows && !is_gpu_scene_prefrustum_opaque(item) {
-                covers_complete_shadow_domain = false;
+            if item.cast_shadows {
+                total_shadow_caster_count = total_shadow_caster_count.checked_add(1).ok_or(
+                    GpuSceneMultiBinPreflightFailure::Domain(
+                        GpuSceneSelectionRejection::TooManyCandidates,
+                    ),
+                )?;
             }
             let world_matrix_is_current =
                 self.instance_world_matrix_is_current(extracted_scene.scene_id, item);
-            let Some(item_preflight) = preflight_gpu_scene_item(item, world_matrix_is_current)
-                .map_err(GpuSceneMultiBinPreflightFailure::Domain)?
-            else {
+            let item_preflight = preflight_gpu_scene_item(item, world_matrix_is_current);
+            if let Err(reason) = item_preflight
+                && selection.rejects_unsupported()
+            {
+                return Err(GpuSceneMultiBinPreflightFailure::Domain(reason));
+            }
+            // Auto is deliberately permissive: transparent, unsupported, and
+            // later low-reuse items remain under the CPU cohort authority.
+            let Some(item_preflight) = item_preflight.ok().flatten() else {
                 continue;
             };
             let key = item_preflight.key;
-            candidate_count =
-                candidate_count
-                    .checked_add(1)
-                    .ok_or(GpuSceneMultiBinPreflightFailure::Domain(
-                        GpuSceneSelectionRejection::TooManyCandidates,
-                    ))?;
+            if self.multi_bin_members.len() == u32::MAX as usize {
+                return Err(GpuSceneMultiBinPreflightFailure::Domain(
+                    GpuSceneSelectionRejection::TooManyCandidates,
+                ));
+            }
             if !self.multi_bin_instance_uniques.insert(item.node_handle) {
+                // Duplicate live identities cannot be split safely between
+                // CPU and GPU ownership; keep this a typed whole-attempt
+                // rejection in both modes.
                 return Err(GpuSceneMultiBinPreflightFailure::Domain(
                     GpuSceneSelectionRejection::DuplicateInstance,
                 ));
@@ -1843,9 +1962,78 @@ impl GpuScene {
             });
         }
 
+        let minimum_member_count = selection.minimum_member_count();
+        if minimum_member_count > 1 && !self.multi_bin_preflight.is_empty() {
+            self.multi_bin_bin_remap
+                .resize(self.multi_bin_preflight.len(), u32::MAX);
+            let mut retained_len = 0usize;
+            for read_index in 0..self.multi_bin_preflight.len() {
+                let bin = self.multi_bin_preflight[read_index];
+                if bin.member_count < minimum_member_count {
+                    continue;
+                }
+                let retained_index = u32::try_from(retained_len).map_err(|_| {
+                    GpuSceneMultiBinPreflightFailure::Domain(
+                        GpuSceneSelectionRejection::TooManyCandidates,
+                    )
+                })?;
+                self.multi_bin_bin_remap[read_index] = retained_index;
+                if retained_len != read_index {
+                    self.multi_bin_preflight[retained_len] = bin;
+                }
+                retained_len += 1;
+            }
+            self.multi_bin_preflight.truncate(retained_len);
+            let bin_remap = &self.multi_bin_bin_remap;
+            self.multi_bin_members.retain_mut(|member| {
+                let retained = bin_remap[member.bin as usize];
+                if retained == u32::MAX {
+                    false
+                } else {
+                    member.bin = retained;
+                    true
+                }
+            });
+
+            // Projection facts must describe only retained cohorts. The maps
+            // are scratch lookup tables, so rebuilding them is mutation-free
+            // with respect to the persistent four-table authority.
+            self.multi_bin_geometry_uniques.clear();
+            self.multi_bin_material_uniques.clear();
+            self.multi_bin_instance_uniques.clear();
+            for member in &self.multi_bin_members {
+                self.multi_bin_instance_uniques
+                    .insert(extracted_scene.render_items[member.item as usize].node_handle);
+            }
+            for bin in &self.multi_bin_preflight {
+                self.multi_bin_geometry_uniques
+                    .insert(bin.key.geometry, GpuSceneGeometryStamp::from_key(bin.key));
+                self.multi_bin_material_uniques
+                    .insert(bin.key.material, GpuSceneMaterialStamp::from_key(bin.key));
+            }
+        }
+
         if self.multi_bin_preflight.is_empty() {
             return Ok(None);
         }
+
+        let candidate_count = u32::try_from(self.multi_bin_members.len()).map_err(|_| {
+            GpuSceneMultiBinPreflightFailure::Domain(GpuSceneSelectionRejection::TooManyCandidates)
+        })?;
+        let shadow_candidate_count = self
+            .multi_bin_members
+            .iter()
+            .try_fold(0u32, |count, member| {
+                if extracted_scene.render_items[member.item as usize].cast_shadows {
+                    count.checked_add(1)
+                } else {
+                    Some(count)
+                }
+            })
+            .ok_or(GpuSceneMultiBinPreflightFailure::Domain(
+                GpuSceneSelectionRejection::TooManyCandidates,
+            ))?;
+        let covers_complete_shadow_domain = shadow_candidate_count == total_shadow_caster_count;
 
         let mut partition_end = 0u64;
         for bin in &mut self.multi_bin_preflight {
@@ -1890,6 +2078,7 @@ impl GpuScene {
                 bin_count,
                 unique_geometry_count,
                 unique_material_count,
+                shadow_candidate_count,
                 covers_complete_shadow_domain,
                 visible_stride,
                 storage_alignment,
@@ -1911,6 +2100,7 @@ impl GpuScene {
     /// publish frame-local representatives. No fallible capability check is
     /// performed after this boundary: callers must validate `preflight`'s
     /// mutation-free projection first.
+    #[cfg(test)]
     pub(crate) fn commit_multi_bin_selection(
         &mut self,
         extracted_scene: &ExtractedScene,
@@ -1918,6 +2108,32 @@ impl GpuScene {
         elapsed_seconds: f64,
         render_lists: &mut RenderLists,
     ) -> Result<&[GpuSceneMultiBinCandidate], GpuSceneMultiBinCommitFailure> {
+        self.commit_multi_bin_selection_with_families(
+            extracted_scene,
+            preflight,
+            GpuDrivenFamilyMask::MAIN_PREPASS,
+            elapsed_seconds,
+            render_lists,
+        )
+    }
+
+    /// Commit one retained Auto recipe and atomically assign its exact
+    /// per-source scene-submission families. Families become visible to CPU
+    /// intent collection only after the authority transaction has completed;
+    /// every retained member is therefore owned by exactly one backend for
+    /// each selected family.
+    pub(crate) fn commit_multi_bin_selection_with_families(
+        &mut self,
+        extracted_scene: &ExtractedScene,
+        preflight: GpuSceneMultiBinPreflight,
+        selected_families: GpuDrivenFamilyMask,
+        elapsed_seconds: f64,
+        render_lists: &mut RenderLists,
+    ) -> Result<&[GpuSceneMultiBinCandidate], GpuSceneMultiBinCommitFailure> {
+        assert!(
+            !selected_families.is_empty(),
+            "GPU Scene commit requires at least one selected family"
+        );
         if preflight.serial != self.multi_bin_serial {
             return Err(GpuSceneMultiBinCommitFailure::StalePreflight);
         }
@@ -2025,6 +2241,7 @@ impl GpuScene {
         }
         self.scene_batch_scratch.clear();
 
+        let selected_instance_flags = gpu_scene_instance_family_flags(selected_families);
         let mut inserted_instances = 0u32;
         let mut retired_instances = 0u32;
         for member_index in 0..self.multi_bin_members.len() {
@@ -2037,11 +2254,14 @@ impl GpuScene {
                 item.prev_world_matrix,
                 item.world_aabb,
             )
-            .with_flags(if item.cast_shadows {
-                GPU_SCENE_INSTANCE_CASTS_SHADOW
-            } else {
-                0
-            });
+            .with_flags(
+                selected_instance_flags
+                    | if item.cast_shadows {
+                        GPU_SCENE_INSTANCE_CASTS_SHADOW
+                    } else {
+                        0
+                    },
+            );
             let key = GpuSceneInstanceKey {
                 scene_id: extracted_scene.scene_id,
                 node: item.node_handle,
@@ -2129,6 +2349,16 @@ impl GpuScene {
             .expect("GPU Scene instance alive count drift");
         if changed {
             self.revision = next_revision;
+        }
+
+        // Publish ownership only after the persistent authority transaction
+        // has no remaining fallible boundary. These attempt-local claims are
+        // the CPU xor GPU proof consumed by intent collection.
+        for member in &self.multi_bin_members {
+            render_lists.claim_gpu_family_ownership(
+                ExtractedSourceId::from_index(member.item as usize),
+                selected_families,
+            );
         }
 
         self.multi_bin_committed.clear();
@@ -3439,9 +3669,14 @@ fn acknowledge_submitted_revision_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::WgpuContext;
+    use crate::core::{RenderView, WgpuContext};
     use crate::graph::core::PersistentBufferCommitRequest;
+    use crate::graph::culling::collect_draw_intents_with_family_ownership;
+    use crate::graph::extracted::ExtractedLight;
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use glam::{Affine3A, Vec3};
+    use myth_scene::camera::Camera;
+    use myth_scene::light::{LightKind, PointLight, SpotLight};
     use slotmap::KeyData;
 
     fn gpu() -> WgpuContext {
@@ -3536,6 +3771,38 @@ mod tests {
         scene.scene_id = 17;
         scene.render_items.extend(items);
         scene
+    }
+
+    fn test_render_camera() -> myth_scene::camera::RenderCamera {
+        let mut camera = Camera::new_perspective(60.0, 1.0, 0.1);
+        camera.update_view_projection(&Affine3A::from_translation(Vec3::new(0.0, 0.0, 20.0)));
+        camera.extract_render_camera()
+    }
+
+    fn shadow_light(id: u64, kind: LightKind) -> ExtractedLight {
+        ExtractedLight {
+            id,
+            color: Vec3::ONE,
+            intensity: 1.0,
+            flags: 0,
+            cast_shadows: true,
+            kind,
+            position: Vec3::ZERO,
+            direction: -Vec3::Z,
+            shadow: None,
+        }
+    }
+
+    fn shadow_queue_sources(lists: &RenderLists, key: (u64, u32)) -> Vec<usize> {
+        lists.shadow_queues[&key]
+            .iter()
+            .map(|intent| {
+                lists
+                    .extracted_source(intent.source)
+                    .expect("shadow intent lost its extracted source")
+                    .index()
+            })
+            .collect()
     }
 
     fn preflight_and_commit(
@@ -3672,6 +3939,211 @@ mod tests {
             authority.active_batch_descriptors[0].id,
             authority.multi_bin_committed[0].batch_id
         );
+    }
+
+    #[test]
+    fn auto_cohort_preflight_retains_reuse_and_leaves_singletons_cpu_owned() {
+        let shared = [
+            rigid_item_with_assets(1, 10, 20),
+            rigid_item_with_assets(2, 10, 20),
+            rigid_item_with_assets(3, 10, 20),
+        ];
+        let singleton = rigid_item_with_assets(4, 11, 21);
+        let mut unsupported = rigid_item_with_assets(5, 12, 22);
+        unsupported.geometry_has_morph_targets = true;
+        let scene = extracted_scene(shared.into_iter().chain([singleton, unsupported]));
+        let mut authority = GpuScene::new();
+
+        let preflight = authority
+            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .unwrap()
+            .expect("the shared rigid cohort should remain GPU eligible");
+
+        assert_eq!(preflight.projection.candidate_count, 3);
+        assert_eq!(preflight.projection.bin_count, 1);
+        assert_eq!(preflight.projection.unique_geometry_count, 1);
+        assert_eq!(preflight.projection.unique_material_count, 1);
+        assert_eq!(
+            preflight.projection.table_set.instance_slot_span, 3,
+            "discarded cohorts must not inflate the projected authority span"
+        );
+        assert_eq!(preflight.projection.shadow_candidate_count, 3);
+        assert!(!preflight.projection.covers_complete_shadow_domain);
+        assert_eq!(authority.multi_bin_members.len(), 3);
+        assert_eq!(authority.multi_bin_preflight[0].member_count, 3);
+        assert_eq!(authority.revision, 0, "preflight must remain read-only");
+    }
+
+    #[test]
+    fn auto_commit_and_cpu_collection_partition_main_cohorts_exactly_once() {
+        let shared = [
+            rigid_item_with_assets(1, 10, 20),
+            rigid_item_with_assets(2, 10, 20),
+            rigid_item_with_assets(3, 10, 20),
+        ];
+        let singleton = rigid_item_with_assets(4, 11, 21);
+        let mut unsupported = rigid_item_with_assets(5, 12, 22);
+        unsupported.geometry_has_morph_targets = true;
+        let scene = extracted_scene(shared.into_iter().chain([singleton, unsupported]));
+        let mut authority = GpuScene::new();
+        let mut lists = RenderLists::new();
+        let preflight = authority
+            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .unwrap()
+            .unwrap();
+        authority
+            .commit_multi_bin_selection_with_families(
+                &scene,
+                preflight,
+                GpuDrivenFamilyMask::MAIN_PREPASS,
+                0.0,
+                &mut lists,
+            )
+            .unwrap();
+
+        collect_draw_intents_with_family_ownership(&scene, &mut lists, &test_render_camera());
+
+        let cpu_sources = lists
+            .opaque
+            .iter()
+            .map(|intent| lists.extracted_source(intent.source).unwrap().index())
+            .collect::<Vec<_>>();
+        assert_eq!(cpu_sources, [3, 4]);
+        for index in 0..scene.render_items.len() {
+            let owned = lists
+                .gpu_family_ownership(ExtractedSourceId::from_index(index))
+                .contains(GpuDrivenFamilyMask::MAIN_PREPASS);
+            let cpu = cpu_sources.contains(&index);
+            assert_ne!(
+                owned, cpu,
+                "each main opaque source must be owned by exactly one backend"
+            );
+        }
+        for node_value in 1..=3 {
+            let id = authority
+                .instance_id(scene.scene_id, node(node_value))
+                .unwrap();
+            assert_eq!(
+                authority.record(id).unwrap().metadata[3],
+                GPU_SCENE_INSTANCE_CASTS_SHADOW | GPU_SCENE_INSTANCE_MAIN_PREPASS
+            );
+        }
+        assert!(authority.instance_id(scene.scene_id, node(4)).is_none());
+        assert!(authority.instance_id(scene.scene_id, node(5)).is_none());
+    }
+
+    #[test]
+    fn shadow_2d_and_cube_family_ownership_filter_only_the_selected_family() {
+        let mut supported_a = rigid_item_with_assets(1, 10, 20);
+        let mut supported_b = rigid_item_with_assets(2, 10, 20);
+        let mut unsupported = rigid_item_with_assets(3, 11, 21);
+        unsupported.geometry_has_morph_targets = true;
+        for item in [&mut supported_a, &mut supported_b, &mut unsupported] {
+            item.world_matrix = Mat4::IDENTITY;
+            item.prev_world_matrix = Mat4::IDENTITY;
+            item.world_aabb = BoundingBox {
+                min: -Vec3::ONE,
+                max: Vec3::ONE,
+            };
+        }
+        let mut scene = extracted_scene([supported_a, supported_b, unsupported]);
+        scene.lights.push(shadow_light(
+            101,
+            LightKind::Spot(SpotLight {
+                range: 20.0,
+                inner_cone: 0.4,
+                outer_cone: 0.8,
+            }),
+        ));
+        scene.lights.push(shadow_light(
+            202,
+            LightKind::Point(PointLight { range: 20.0 }),
+        ));
+
+        let shadow_frustum = myth_scene::camera::Frustum::from_matrix_standard_z(Mat4::IDENTITY);
+        let mut lists = RenderLists::new();
+        lists.active_views.push(RenderView::new_shadow(
+            101,
+            0,
+            0,
+            "Shadow2D".into(),
+            Mat4::IDENTITY,
+            shadow_frustum,
+            (64, 64),
+            None,
+        ));
+        lists.active_views.push(RenderView::new_shadow(
+            202,
+            0,
+            1,
+            "ShadowCube".into(),
+            Mat4::IDENTITY,
+            shadow_frustum,
+            (64, 64),
+            None,
+        ));
+
+        let mut authority = GpuScene::new();
+        let d2 = authority
+            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .unwrap()
+            .unwrap();
+        authority
+            .commit_multi_bin_selection_with_families(
+                &scene,
+                d2,
+                GpuDrivenFamilyMask::SHADOW_2D,
+                0.0,
+                &mut lists,
+            )
+            .unwrap();
+        collect_draw_intents_with_family_ownership(&scene, &mut lists, &test_render_camera());
+        assert_eq!(shadow_queue_sources(&lists, (101, 0)), [2]);
+        assert_eq!(shadow_queue_sources(&lists, (202, 0)), [0, 1, 2]);
+        let first = authority.instance_id(scene.scene_id, node(1)).unwrap();
+        assert_eq!(
+            authority.record(first).unwrap().metadata[3],
+            GPU_SCENE_INSTANCE_CASTS_SHADOW | GPU_SCENE_INSTANCE_SHADOW_2D
+        );
+
+        lists.begin_intent_collection();
+        let cube = authority
+            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .unwrap()
+            .unwrap();
+        authority
+            .commit_multi_bin_selection_with_families(
+                &scene,
+                cube,
+                GpuDrivenFamilyMask::SHADOW_CUBE,
+                0.1,
+                &mut lists,
+            )
+            .unwrap();
+        collect_draw_intents_with_family_ownership(&scene, &mut lists, &test_render_camera());
+        assert_eq!(shadow_queue_sources(&lists, (101, 0)), [0, 1, 2]);
+        assert_eq!(shadow_queue_sources(&lists, (202, 0)), [2]);
+        let second = authority.instance_id(scene.scene_id, node(1)).unwrap();
+        assert_eq!(
+            authority.record(second).unwrap().metadata[3],
+            GPU_SCENE_INSTANCE_CASTS_SHADOW | GPU_SCENE_INSTANCE_SHADOW_CUBE
+        );
+    }
+
+    #[test]
+    fn strict_preflight_still_rejects_one_unsupported_opaque_item() {
+        let mut unsupported = rigid_item_with_assets(2, 10, 20);
+        unsupported.geometry_has_morph_targets = true;
+        let scene = extracted_scene([rigid_item_with_assets(1, 10, 20), unsupported]);
+        let mut authority = GpuScene::new();
+
+        assert_eq!(
+            authority.preflight_multi_bin_scene(&scene, 16, 256),
+            Err(GpuSceneMultiBinPreflightFailure::Domain(
+                GpuSceneSelectionRejection::MorphTargets
+            ))
+        );
+        assert_eq!(authority.revision, 0);
     }
 
     #[test]

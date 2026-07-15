@@ -10,8 +10,9 @@ use std::hint::black_box;
 
 use myth_render::graph::bench_support::{
     DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern, DrawDemandRoot,
-    DrawDemandTextureTopology, HighFanOutBenchHarness, HighFanOutBenchSpec, HighFanOutRoot,
-    HighFanOutRunToken, MaterialSceneCpuBenchHarness, MaterialSceneCpuBenchStage,
+    DrawDemandTextureTopology, GpuDrivenMatrixBenchHarness, GpuDrivenMatrixBenchSpec,
+    GpuDrivenMatrixMode, GpuDrivenMatrixRunToken, HighFanOutBenchHarness, HighFanOutBenchSpec,
+    HighFanOutRoot, HighFanOutRunToken, MaterialSceneCpuBenchHarness, MaterialSceneCpuBenchStage,
     MaterialSceneCpuRunToken, MorphHistoryWarmBenchHarness, MorphHistoryWarmBenchSpec,
     MorphHistoryWarmRunToken, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
     RdgRecorderLifecycleToken, ScenePipelineWarmBenchHarness, ScenePipelineWarmBenchSpec,
@@ -247,6 +248,24 @@ fn main() {
     );
     for texture_count in [0, 5, 12] {
         run_material_scene_cpu_scenario(texture_count);
+    }
+
+    println!("gpu_driven_policy_warm");
+    println!(
+        "mode backend reason N B cpu gpu batches family_bits exact alloc zeroed realloc dealloc alloc_bytes realloc_old realloc_new dealloc_bytes"
+    );
+    for spec in [
+        GpuDrivenMatrixBenchSpec::main_only(1, 1),
+        GpuDrivenMatrixBenchSpec::main_only(10_000, 64),
+        GpuDrivenMatrixBenchSpec::main_only(10_000, 10_000),
+    ] {
+        for mode in [
+            GpuDrivenMatrixMode::Off,
+            GpuDrivenMatrixMode::Auto,
+            GpuDrivenMatrixMode::Required,
+        ] {
+            run_gpu_driven_matrix_scenario(spec, mode);
+        }
     }
 }
 
@@ -679,6 +698,59 @@ fn measure_scene_pipeline_warm_plateau(
         token.expect("warm scene-pipeline workload was not sampled"),
         baseline.expect("warm scene-pipeline allocation baseline was not sampled"),
     )
+}
+
+fn run_gpu_driven_matrix_scenario(spec: GpuDrivenMatrixBenchSpec, mode: GpuDrivenMatrixMode) {
+    let mut harness = GpuDrivenMatrixBenchHarness::new(spec, mode);
+    black_box(harness.stabilize());
+    let (token, stats) = measure_gpu_driven_matrix_window(&mut harness);
+
+    assert_eq!(
+        stats,
+        AllocationStats::default(),
+        "warm M7.5 policy/planning window regressed from zero allocation"
+    );
+    assert_eq!(
+        token.cpu_main_source_count + token.gpu_main_source_count,
+        spec.item_count,
+        "M7.5 comparison routes lost or duplicated a source"
+    );
+
+    println!(
+        "{} {} {} {} {} {} {} {} {:#05b} {} {} {} {} {} {} {} {} {}",
+        mode.label(),
+        token.backend.label(),
+        token.selection_reason.label(),
+        spec.item_count,
+        spec.bin_count,
+        token.cpu_main_source_count,
+        token.gpu_main_source_count,
+        token.gpu_batch_count,
+        token.selected_family_bits,
+        token.exact_policy_evaluated,
+        stats.alloc_calls,
+        stats.alloc_zeroed_calls,
+        stats.realloc_calls,
+        stats.dealloc_calls,
+        stats.allocated_bytes,
+        stats.reallocated_old_bytes,
+        stats.reallocated_new_bytes,
+        stats.deallocated_bytes,
+    );
+}
+
+fn measure_gpu_driven_matrix_window(
+    harness: &mut GpuDrivenMatrixBenchHarness,
+) -> (GpuDrivenMatrixRunToken, AllocationStats) {
+    measure(|| {
+        let mut token = harness.run_iteration();
+        // Cross Auto's 30-submission periodic exact-recheck boundary inside a
+        // single counted window so both cheap and exact warm paths are guarded.
+        for _ in 1..64 {
+            token = harness.run_iteration();
+        }
+        black_box(token)
+    })
 }
 
 fn run_morph_history_warm_scenario(morph_source_stride: usize) {

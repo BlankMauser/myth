@@ -19,6 +19,7 @@ pub mod core;
 pub mod culling;
 pub mod extracted;
 pub mod frame;
+pub(crate) mod gpu_driven_policy;
 pub(crate) mod gpu_scene;
 pub(crate) mod gpu_scene_capacity;
 pub(crate) mod gpu_scene_submission;
@@ -35,8 +36,10 @@ pub use composer::FrameComposer;
 pub use core::RdgDetailPhase;
 pub use core::{
     MermaidDumpMode, RdgAttemptOutcome, RdgCommandEncodingFailure, RdgFrameDiagnostics,
-    RdgFramePhase, RdgGpuDrivenFailure, RdgPostSubmitPublicationFailure, RdgRenderTargetKind,
-    RdgResourceMaterializationFailure, RdgRetainedCapacityStats, RdgSurfaceAcquireFailure,
+    RdgFramePhase, RdgGpuDrivenFailure, RdgGpuDrivenPolicySnapshot,
+    RdgPostSubmitPublicationFailure, RdgRenderTargetKind, RdgResourceMaterializationFailure,
+    RdgRetainedCapacityStats, RdgSceneSubmissionBackend, RdgSceneSubmissionFamily,
+    RdgSceneSubmissionFamilySnapshot, RdgSceneSubmissionSelectionReason, RdgSurfaceAcquireFailure,
 };
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton, ItemShaderFeatures};
 pub use frame::{RenderFrame, RenderIntent, RenderKey, RenderLists, ShadowRenderIntent};

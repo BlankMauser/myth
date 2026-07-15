@@ -29,7 +29,7 @@ use crate::core::gpu::Tracked;
 use crate::core::{RenderView, ResourceManager};
 use crate::pipeline::RenderPipelineId;
 use crate::renderer::FrameTime;
-use crate::settings::{ClusteredShadingMode, RenderPath};
+use crate::settings::{ClusteredShadingMode, GpuDrivenMode, RenderPath};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_scene::Scene;
 use myth_scene::camera::{Frustum, RenderCamera};
@@ -41,6 +41,7 @@ use super::capacity::{
 };
 use super::core::TextureNodeId;
 use super::extracted::{ExtractedScene, SceneFeatures};
+use super::gpu_driven_policy::GpuDrivenFamilyMask;
 use super::material_plan::MaterialFrameId;
 use super::render_state::RenderState;
 use super::shadow_utils;
@@ -132,6 +133,10 @@ pub struct ShadowRenderIntent {
 #[derive(Debug, Clone, Copy)]
 pub struct RenderFrameFeatureConfig {
     pub clustered_shading: ClusteredShadingMode,
+    /// Controls whether extraction captures the additional coherent asset
+    /// facts consumed exclusively by GPU-driven preflight. `Off` keeps the
+    /// CpuDirect baseline free of those version/topology queries.
+    pub gpu_driven: GpuDrivenMode,
     pub render_path: RenderPath,
     pub msaa_samples: u32,
 }
@@ -1428,6 +1433,14 @@ pub struct RenderLists {
     frame_source_stamps: Vec<u32>,
     frame_source_generation: u32,
 
+    /// Exact GPU ownership selected for each immutable extraction source.
+    /// Masks are generation-stamped, so an ordinary frame reset is O(1) and
+    /// never zero-fills the retained high-water arrays. CPU intent collection
+    /// consults this table to retain only the cohorts not owned by GPU Scene.
+    gpu_family_ownership_masks: Vec<GpuDrivenFamilyMask>,
+    gpu_family_ownership_stamps: Vec<u32>,
+    gpu_family_ownership_generation: u32,
+
     /// All active render views for the current frame.
     ///
     /// Populated during CPU extraction, consumed by intent collection and
@@ -1454,6 +1467,11 @@ impl RenderLists {
             frame_source_indices: Vec::with_capacity(512),
             frame_source_stamps: Vec::with_capacity(512),
             frame_source_generation: 1,
+            // GPU ownership is cold when the default mode is Off. Let the
+            // first Auto/Required selection own this allocation.
+            gpu_family_ownership_masks: Vec::new(),
+            gpu_family_ownership_stamps: Vec::new(),
+            gpu_family_ownership_generation: 1,
             active_views: Vec::with_capacity(16),
             use_transmission: false,
         }
@@ -1479,6 +1497,7 @@ impl RenderLists {
         self.gpu_opaque_representatives.clear();
         self.advance_gpu_opaque_representative_generation();
         self.advance_frame_source_generation();
+        self.advance_gpu_family_ownership_generation();
         self.use_transmission = false;
     }
 
@@ -1508,6 +1527,64 @@ impl RenderLists {
         if self.frame_source_generation == 0 {
             self.frame_source_stamps.fill(0);
             self.frame_source_generation = 1;
+        }
+    }
+
+    fn advance_gpu_family_ownership_generation(&mut self) {
+        self.gpu_family_ownership_generation = self.gpu_family_ownership_generation.wrapping_add(1);
+        if self.gpu_family_ownership_generation == 0 {
+            self.gpu_family_ownership_stamps.fill(0);
+            self.gpu_family_ownership_generation = 1;
+        }
+    }
+
+    /// Assign one or more disjoint scene-submission families to GPU Scene for
+    /// an exact extracted source. Repeating an already-owned family is a
+    /// construction bug: it would make two GPU submissions render one cohort.
+    pub(crate) fn claim_gpu_family_ownership(
+        &mut self,
+        extracted: ExtractedSourceId,
+        families: GpuDrivenFamilyMask,
+    ) {
+        assert!(
+            !families.is_empty(),
+            "GPU family ownership claim cannot be empty"
+        );
+        let index = extracted.index();
+        if self.gpu_family_ownership_masks.len() <= index {
+            let required = index
+                .checked_add(1)
+                .expect("GPU family ownership length overflowed");
+            self.gpu_family_ownership_masks
+                .resize(required, GpuDrivenFamilyMask::empty());
+            self.gpu_family_ownership_stamps.resize(required, 0);
+        }
+        if self.gpu_family_ownership_stamps[index] != self.gpu_family_ownership_generation {
+            self.gpu_family_ownership_masks[index] = families;
+            self.gpu_family_ownership_stamps[index] = self.gpu_family_ownership_generation;
+            return;
+        }
+
+        let current = &mut self.gpu_family_ownership_masks[index];
+        assert!(
+            !current.intersects(families),
+            "one extracted source family cannot have two GPU owners"
+        );
+        current.insert(families);
+    }
+
+    /// Return the exact current-frame GPU ownership mask for one extraction
+    /// source. A stale generation or unseen high index is CPU-owned.
+    #[inline]
+    #[must_use]
+    pub(crate) fn gpu_family_ownership(&self, extracted: ExtractedSourceId) -> GpuDrivenFamilyMask {
+        let index = extracted.index();
+        if self.gpu_family_ownership_stamps.get(index).copied()
+            == Some(self.gpu_family_ownership_generation)
+        {
+            self.gpu_family_ownership_masks[index]
+        } else {
+            GpuDrivenFamilyMask::empty()
         }
     }
 
@@ -1813,8 +1890,13 @@ impl RenderFrame {
         resource_manager.next_frame();
 
         // ── 1. Extract ─────────────────────────────────────────────────
-        self.extracted_scene
-            .extract_into(scene, camera, assets, max_extracted_lights);
+        self.extracted_scene.extract_into(
+            scene,
+            camera,
+            assets,
+            max_extracted_lights,
+            feature_config.gpu_driven != GpuDrivenMode::Off,
+        );
 
         // ── 2. Resolve frame-dependent shader variants ────────────────
         self.resolve_scene_feature_variants(scene, feature_config);
@@ -2440,6 +2522,52 @@ mod draw_plan_tests {
             FrameSourceId::from_index(0),
             "a pre-wrap stamp must not alias the new generation"
         );
+    }
+
+    #[test]
+    fn gpu_family_ownership_is_exact_generation_stamped_and_composable() {
+        let mut lists = RenderLists::new();
+        let selected = ExtractedSourceId::from_index(37);
+        let cpu_only = ExtractedSourceId::from_index(5);
+
+        lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::MAIN_PREPASS);
+        lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::SHADOW_2D);
+        assert_eq!(
+            lists.gpu_family_ownership(selected),
+            GpuDrivenFamilyMask::MAIN_PREPASS | GpuDrivenFamilyMask::SHADOW_2D
+        );
+        assert!(lists.gpu_family_ownership(cpu_only).is_empty());
+
+        let mask_capacity = lists.gpu_family_ownership_masks.capacity();
+        let stamp_capacity = lists.gpu_family_ownership_stamps.capacity();
+        lists.begin_intent_collection();
+        assert!(
+            lists.gpu_family_ownership(selected).is_empty(),
+            "a prior frame's ownership must fail closed to CpuDirect"
+        );
+        assert_eq!(lists.gpu_family_ownership_masks.capacity(), mask_capacity);
+        assert_eq!(lists.gpu_family_ownership_stamps.capacity(), stamp_capacity);
+
+        lists.gpu_family_ownership_stamps.fill(u32::MAX);
+        lists.gpu_family_ownership_generation = u32::MAX;
+        lists.begin_intent_collection();
+        assert_eq!(lists.gpu_family_ownership_generation, 1);
+        assert!(
+            lists
+                .gpu_family_ownership_stamps
+                .iter()
+                .all(|&stamp| stamp == 0),
+            "only generation wrap may zero-fill the retained ownership table"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot have two GPU owners")]
+    fn gpu_family_ownership_rejects_duplicate_family_claims() {
+        let mut lists = RenderLists::new();
+        let selected = ExtractedSourceId::from_index(3);
+        lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::SHADOW_CUBE);
+        lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::SHADOW_CUBE);
     }
 
     #[test]

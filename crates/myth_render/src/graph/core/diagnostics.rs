@@ -172,6 +172,225 @@ pub enum RdgRenderTargetKind {
     Headless,
 }
 
+/// Stable scene-submission families used by backend-selection diagnostics.
+///
+/// Main color and depth-prepass submission intentionally share one family:
+/// the current GPU Scene policy selects them as one ownership domain and one
+/// main-view Cull result may feed both consumers. Shadow families remain
+/// separate because either family may have no live views or independently
+/// retain CPU ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgSceneSubmissionFamily {
+    MainPrepass,
+    Shadow2D,
+    ShadowCube,
+}
+
+impl RdgSceneSubmissionFamily {
+    pub const COUNT: usize = 3;
+
+    pub const ALL: [Self; Self::COUNT] = [Self::MainPrepass, Self::Shadow2D, Self::ShadowCube];
+
+    #[inline]
+    const fn diagnostics_index(self) -> usize {
+        match self {
+            Self::MainPrepass => 0,
+            Self::Shadow2D => 1,
+            Self::ShadowCube => 2,
+        }
+    }
+}
+
+/// Backend ownership selected or observed for one scene-submission family.
+///
+/// `Inactive` is meaningful rather than an alias for CPU submission. For
+/// example, a family may select GPU ownership before graph compilation and
+/// still be inactive after DPE removes all of its semantic submissions.
+/// `Hybrid` is reserved for a family whose live cohorts are split between
+/// CPU-direct and GPU-driven submission.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgSceneSubmissionBackend {
+    #[default]
+    Inactive,
+    CpuDirect,
+    GpuDriven,
+    Hybrid,
+}
+
+/// Stable, coarse reason for one backend-selection decision.
+///
+/// Policy implementation details such as calibrated thresholds and EWMA
+/// coefficients deliberately do not enter this public contract. They may
+/// evolve without invalidating profiler data, while these reasons continue
+/// to explain whether policy, capability, or lack of work decided the frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgSceneSubmissionSelectionReason {
+    /// Selection did not run for this family in the graph attempt.
+    #[default]
+    NotEvaluated,
+    /// The family had no semantic workload to own.
+    NoWork,
+    /// [`crate::settings::GpuDrivenMode::Off`] forced CPU ownership.
+    ModeOff,
+    /// [`crate::settings::GpuDrivenMode::Required`] forced GPU ownership.
+    Required,
+    /// `Auto` rejected the GPU path at its constant-time tiny-workload gate,
+    /// before paying for exact retained-table preflight.
+    AutoSmallWorkload,
+    /// `Auto` chose the backend indicated by the family diagnostics from its
+    /// deterministic cost model.
+    AutoCostModel,
+    /// `Auto` retained the preceding backend to satisfy confirmation, dwell,
+    /// or enter/exit hysteresis policy.
+    AutoHysteresis,
+    /// `Auto` preferred the safe current backend because its estimate did not
+    /// have enough confidence to justify a switch.
+    AutoLowConfidence,
+    /// GPU submission could not represent the exact device or workload. Auto
+    /// may select CPU; Required exposes the same typed reason as a terminal
+    /// attempt outcome.
+    Unsupported(RdgGpuDrivenFailure),
+}
+
+/// Allocation-free backend facts for one scene-submission family.
+///
+/// `selected_backend` records the pre-DPE policy result. `live_backend()` is
+/// derived from the post-DPE semantic submissions that actually reached the
+/// backend finalizers. Keeping both facts prevents a dead GPU topology from
+/// being reported as executed work and supports a future hybrid cohort split
+/// without a variable-size diagnostics payload.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RdgSceneSubmissionFamilySnapshot {
+    selected_backend: RdgSceneSubmissionBackend,
+    selection_reason: RdgSceneSubmissionSelectionReason,
+    live_cpu_submissions: u32,
+    live_gpu_submissions: u32,
+}
+
+impl RdgSceneSubmissionFamilySnapshot {
+    #[must_use]
+    pub const fn selected_backend(self) -> RdgSceneSubmissionBackend {
+        self.selected_backend
+    }
+
+    #[must_use]
+    pub const fn selection_reason(self) -> RdgSceneSubmissionSelectionReason {
+        self.selection_reason
+    }
+
+    #[must_use]
+    pub const fn live_cpu_submissions(self) -> u32 {
+        self.live_cpu_submissions
+    }
+
+    #[must_use]
+    pub const fn live_gpu_submissions(self) -> u32 {
+        self.live_gpu_submissions
+    }
+
+    /// Backend composition of post-DPE live semantic submissions.
+    #[must_use]
+    pub const fn live_backend(self) -> RdgSceneSubmissionBackend {
+        match (
+            self.live_cpu_submissions != 0,
+            self.live_gpu_submissions != 0,
+        ) {
+            (false, false) => RdgSceneSubmissionBackend::Inactive,
+            (true, false) => RdgSceneSubmissionBackend::CpuDirect,
+            (false, true) => RdgSceneSubmissionBackend::GpuDriven,
+            (true, true) => RdgSceneSubmissionBackend::Hybrid,
+        }
+    }
+}
+
+/// Allocation-free inputs and exact projection used by the GPU-driven backend
+/// policy for one Renderer attempt.
+///
+/// A zero snapshot means the strict [`crate::settings::GpuDrivenMode::Off`]
+/// path did not capture or evaluate GPU-specific facts. `exact_evaluated()`
+/// distinguishes a tiny/coarse Auto decision from an exact preflight whose
+/// retained cohort happened to be empty.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RdgGpuDrivenPolicySnapshot {
+    pub(crate) extracted_item_count: u32,
+    pub(crate) supported_opaque_count: u32,
+    pub(crate) retained_candidate_count: u32,
+    pub(crate) retained_bin_count: u32,
+    pub(crate) dirty_candidate_count: u32,
+    pub(crate) shadow_2d_view_count: u32,
+    pub(crate) shadow_cube_view_count: u32,
+    pub(crate) instance_slot_span: u32,
+    pub(crate) batch_slot_span: u32,
+    pub(crate) minimum_cohort_members: u32,
+    pub(crate) indexed_primitive_count: u64,
+    pub(crate) exact_evaluated: bool,
+}
+
+impl RdgGpuDrivenPolicySnapshot {
+    #[must_use]
+    pub const fn extracted_item_count(self) -> u32 {
+        self.extracted_item_count
+    }
+
+    #[must_use]
+    pub const fn supported_opaque_count(self) -> u32 {
+        self.supported_opaque_count
+    }
+
+    #[must_use]
+    pub const fn retained_candidate_count(self) -> u32 {
+        self.retained_candidate_count
+    }
+
+    #[must_use]
+    pub const fn retained_bin_count(self) -> u32 {
+        self.retained_bin_count
+    }
+
+    #[must_use]
+    pub const fn dirty_candidate_count(self) -> u32 {
+        self.dirty_candidate_count
+    }
+
+    #[must_use]
+    pub const fn shadow_2d_view_count(self) -> u32 {
+        self.shadow_2d_view_count
+    }
+
+    #[must_use]
+    pub const fn shadow_cube_view_count(self) -> u32 {
+        self.shadow_cube_view_count
+    }
+
+    #[must_use]
+    pub const fn instance_slot_span(self) -> u32 {
+        self.instance_slot_span
+    }
+
+    #[must_use]
+    pub const fn batch_slot_span(self) -> u32 {
+        self.batch_slot_span
+    }
+
+    #[must_use]
+    pub const fn minimum_cohort_members(self) -> u32 {
+        self.minimum_cohort_members
+    }
+
+    #[must_use]
+    pub const fn indexed_primitive_count(self) -> u64 {
+        self.indexed_primitive_count
+    }
+
+    #[must_use]
+    pub const fn exact_evaluated(self) -> bool {
+        self.exact_evaluated
+    }
+}
+
 /// Last phase entered by a Render Graph attempt.
 ///
 /// The phase is useful for abandoned attempts: counters from later phases are
@@ -347,6 +566,8 @@ pub struct RdgFrameDiagnostics {
     live_passes: Option<usize>,
     prepared_passes: usize,
     executed_passes: usize,
+    scene_submission_families: [RdgSceneSubmissionFamilySnapshot; RdgSceneSubmissionFamily::COUNT],
+    gpu_driven_policy: RdgGpuDrivenPolicySnapshot,
     target: Option<RdgRenderTargetKind>,
     flags: u8,
     #[cfg(feature = "rdg_bench_support")]
@@ -367,6 +588,9 @@ impl RdgFrameDiagnostics {
             live_passes: None,
             prepared_passes: 0,
             executed_passes: 0,
+            scene_submission_families: [RdgSceneSubmissionFamilySnapshot::default();
+                RdgSceneSubmissionFamily::COUNT],
+            gpu_driven_policy: RdgGpuDrivenPolicySnapshot::default(),
             target: None,
             flags: 0,
             #[cfg(feature = "rdg_bench_support")]
@@ -426,6 +650,22 @@ impl RdgFrameDiagnostics {
     #[must_use]
     pub const fn executed_passes(&self) -> usize {
         self.executed_passes
+    }
+
+    /// Pre-DPE selection and post-DPE live-backend facts for one scene family.
+    #[must_use]
+    pub const fn scene_submission_family(
+        &self,
+        family: RdgSceneSubmissionFamily,
+    ) -> RdgSceneSubmissionFamilySnapshot {
+        self.scene_submission_families[family.diagnostics_index()]
+    }
+
+    /// GPU-driven policy inputs/projection for this attempt. The strict Off
+    /// baseline returns the all-zero default without GPU-specific planning.
+    #[must_use]
+    pub const fn gpu_driven_policy(&self) -> RdgGpuDrivenPolicySnapshot {
+        self.gpu_driven_policy
     }
 
     #[must_use]
@@ -504,6 +744,9 @@ pub(crate) struct RdgDiagnosticsRecorder {
     live_passes: Cell<Option<usize>>,
     prepared_passes: Cell<usize>,
     executed_passes: Cell<usize>,
+    scene_submission_families:
+        [Cell<RdgSceneSubmissionFamilySnapshot>; RdgSceneSubmissionFamily::COUNT],
+    gpu_driven_policy: Cell<RdgGpuDrivenPolicySnapshot>,
     target: Cell<Option<RdgRenderTargetKind>>,
     flags: Cell<u8>,
     latest: Cell<Option<RdgFrameDiagnostics>>,
@@ -529,6 +772,10 @@ impl Default for RdgDiagnosticsRecorder {
             live_passes: Cell::new(None),
             prepared_passes: Cell::new(0),
             executed_passes: Cell::new(0),
+            scene_submission_families: std::array::from_fn(|_| {
+                Cell::new(RdgSceneSubmissionFamilySnapshot::default())
+            }),
+            gpu_driven_policy: Cell::new(RdgGpuDrivenPolicySnapshot::default()),
             target: Cell::new(None),
             flags: Cell::new(0),
             latest: Cell::new(None),
@@ -574,6 +821,11 @@ impl RdgDiagnosticsRecorder {
         self.live_passes.set(None);
         self.prepared_passes.set(0);
         self.executed_passes.set(0);
+        for family in &self.scene_submission_families {
+            family.set(RdgSceneSubmissionFamilySnapshot::default());
+        }
+        self.gpu_driven_policy
+            .set(RdgGpuDrivenPolicySnapshot::default());
         self.target.set(None);
         self.flags.set(0);
         #[cfg(feature = "rdg_bench_support")]
@@ -634,6 +886,73 @@ impl RdgDiagnosticsRecorder {
         let executed = self.executed_passes.get().saturating_add(1);
         self.executed_passes.set(executed);
         debug_assert!(executed <= self.prepared_passes.get());
+    }
+
+    /// Overwrite the pre-DPE policy decision for one fixed scene family.
+    ///
+    /// The caller supplies facts it already computed for backend selection;
+    /// diagnostics never inspect scene items or graph topology. The fixed
+    /// family array makes this operation O(1), allocation-free, and suitable
+    /// for every Renderer attempt.
+    #[inline]
+    pub(crate) fn record_scene_submission_selection(
+        &self,
+        family: RdgSceneSubmissionFamily,
+        backend: RdgSceneSubmissionBackend,
+        reason: RdgSceneSubmissionSelectionReason,
+    ) {
+        self.assert_active();
+        let cell = &self.scene_submission_families[family.diagnostics_index()];
+        let mut snapshot = cell.get();
+        snapshot.selected_backend = backend;
+        snapshot.selection_reason = reason;
+        cell.set(snapshot);
+    }
+
+    /// Publish the already-computed policy facts for observability. This is
+    /// one fixed-size Cell write: no scene scan, allocation, clock read, or
+    /// synchronization is introduced by diagnostics.
+    #[inline]
+    pub(crate) fn record_gpu_driven_policy(&self, snapshot: RdgGpuDrivenPolicySnapshot) {
+        self.assert_active();
+        self.gpu_driven_policy.set(snapshot);
+    }
+
+    /// Add post-DPE semantic submissions that reached one concrete backend.
+    ///
+    /// Calls may arrive from multiple live views or cohorts. Separate CPU and
+    /// GPU counters let [`RdgSceneSubmissionFamilySnapshot::live_backend`]
+    /// derive hybrid ownership without storing a variable-size event stream.
+    #[inline]
+    pub(crate) fn record_live_scene_submissions(
+        &self,
+        family: RdgSceneSubmissionFamily,
+        backend: RdgSceneSubmissionBackend,
+        count: u32,
+    ) {
+        self.assert_active();
+        debug_assert!(
+            matches!(
+                backend,
+                RdgSceneSubmissionBackend::CpuDirect | RdgSceneSubmissionBackend::GpuDriven
+            ),
+            "live scene submissions require one concrete backend"
+        );
+        if count == 0 {
+            return;
+        }
+        let cell = &self.scene_submission_families[family.diagnostics_index()];
+        let mut snapshot = cell.get();
+        match backend {
+            RdgSceneSubmissionBackend::CpuDirect => {
+                snapshot.live_cpu_submissions = snapshot.live_cpu_submissions.saturating_add(count);
+            }
+            RdgSceneSubmissionBackend::GpuDriven => {
+                snapshot.live_gpu_submissions = snapshot.live_gpu_submissions.saturating_add(count);
+            }
+            RdgSceneSubmissionBackend::Inactive | RdgSceneSubmissionBackend::Hybrid => return,
+        }
+        cell.set(snapshot);
     }
 
     pub(crate) fn mark_target_acquired(
@@ -801,6 +1120,10 @@ impl RdgDiagnosticsRecorder {
             live_passes: self.live_passes.get(),
             prepared_passes: self.prepared_passes.get(),
             executed_passes: self.executed_passes.get(),
+            scene_submission_families: std::array::from_fn(|index| {
+                self.scene_submission_families[index].get()
+            }),
+            gpu_driven_policy: self.gpu_driven_policy.get(),
             target: self.target.get(),
             flags: self.flags.get() | if panicked { FLAG_PANICKED } else { 0 },
             #[cfg(feature = "rdg_bench_support")]
@@ -1077,6 +1400,162 @@ impl Drop for RdgComposerAttemptGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_submission_diagnostics_distinguish_selection_dpe_and_hybrid_liveness() {
+        let default_family = RdgSceneSubmissionFamilySnapshot::default();
+        assert_eq!(
+            default_family.selected_backend(),
+            RdgSceneSubmissionBackend::Inactive
+        );
+        assert_eq!(
+            default_family.selection_reason(),
+            RdgSceneSubmissionSelectionReason::NotEvaluated
+        );
+        assert_eq!(
+            default_family.live_backend(),
+            RdgSceneSubmissionBackend::Inactive
+        );
+        assert_eq!(default_family.live_cpu_submissions(), 0);
+        assert_eq!(default_family.live_gpu_submissions(), 0);
+
+        let recorder = RdgDiagnosticsRecorder::default();
+        recorder.start_renderer_attempt(50);
+
+        recorder.record_scene_submission_selection(
+            RdgSceneSubmissionFamily::MainPrepass,
+            RdgSceneSubmissionBackend::Hybrid,
+            RdgSceneSubmissionSelectionReason::AutoCostModel,
+        );
+        recorder.record_live_scene_submissions(
+            RdgSceneSubmissionFamily::MainPrepass,
+            RdgSceneSubmissionBackend::CpuDirect,
+            2,
+        );
+        recorder.record_live_scene_submissions(
+            RdgSceneSubmissionFamily::MainPrepass,
+            RdgSceneSubmissionBackend::GpuDriven,
+            3,
+        );
+
+        // Selection and liveness are intentionally independent: graph DPE may
+        // remove every semantic submission after GPU ownership was selected.
+        recorder.record_scene_submission_selection(
+            RdgSceneSubmissionFamily::Shadow2D,
+            RdgSceneSubmissionBackend::GpuDriven,
+            RdgSceneSubmissionSelectionReason::AutoHysteresis,
+        );
+
+        recorder.record_scene_submission_selection(
+            RdgSceneSubmissionFamily::ShadowCube,
+            RdgSceneSubmissionBackend::CpuDirect,
+            RdgSceneSubmissionSelectionReason::ModeOff,
+        );
+        recorder.record_live_scene_submissions(
+            RdgSceneSubmissionFamily::ShadowCube,
+            RdgSceneSubmissionBackend::CpuDirect,
+            4,
+        );
+
+        recorder.record_compiled_live_passes(0);
+        recorder.mark_queue_submitted();
+        recorder.mark_completed();
+        recorder.finish_renderer_attempt(1);
+
+        let diagnostics = recorder.latest().expect("terminal snapshot missing");
+        let main = diagnostics.scene_submission_family(RdgSceneSubmissionFamily::MainPrepass);
+        assert_eq!(main.selected_backend(), RdgSceneSubmissionBackend::Hybrid);
+        assert_eq!(
+            main.selection_reason(),
+            RdgSceneSubmissionSelectionReason::AutoCostModel
+        );
+        assert_eq!(main.live_cpu_submissions(), 2);
+        assert_eq!(main.live_gpu_submissions(), 3);
+        assert_eq!(main.live_backend(), RdgSceneSubmissionBackend::Hybrid);
+
+        let shadow_2d = diagnostics.scene_submission_family(RdgSceneSubmissionFamily::Shadow2D);
+        assert_eq!(
+            shadow_2d.selected_backend(),
+            RdgSceneSubmissionBackend::GpuDriven
+        );
+        assert_eq!(
+            shadow_2d.live_backend(),
+            RdgSceneSubmissionBackend::Inactive
+        );
+
+        let shadow_cube = diagnostics.scene_submission_family(RdgSceneSubmissionFamily::ShadowCube);
+        assert_eq!(
+            shadow_cube.selected_backend(),
+            RdgSceneSubmissionBackend::CpuDirect
+        );
+        assert_eq!(
+            shadow_cube.live_backend(),
+            RdgSceneSubmissionBackend::CpuDirect
+        );
+        assert_eq!(shadow_cube.live_cpu_submissions(), 4);
+    }
+
+    #[test]
+    fn scene_submission_diagnostics_reset_and_saturate_without_allocation() {
+        let recorder = RdgDiagnosticsRecorder::default();
+        recorder.start_renderer_attempt(60);
+        recorder.record_scene_submission_selection(
+            RdgSceneSubmissionFamily::MainPrepass,
+            RdgSceneSubmissionBackend::GpuDriven,
+            RdgSceneSubmissionSelectionReason::Required,
+        );
+        recorder.record_live_scene_submissions(
+            RdgSceneSubmissionFamily::MainPrepass,
+            RdgSceneSubmissionBackend::GpuDriven,
+            u32::MAX,
+        );
+        recorder.record_live_scene_submissions(
+            RdgSceneSubmissionFamily::MainPrepass,
+            RdgSceneSubmissionBackend::GpuDriven,
+            1,
+        );
+        let policy = RdgGpuDrivenPolicySnapshot {
+            extracted_item_count: 10_000,
+            supported_opaque_count: 9_000,
+            retained_candidate_count: 8_000,
+            retained_bin_count: 64,
+            dirty_candidate_count: 80,
+            shadow_2d_view_count: 4,
+            shadow_cube_view_count: 6,
+            instance_slot_span: 16_000,
+            batch_slot_span: 128,
+            minimum_cohort_members: 4,
+            indexed_primitive_count: 1_000_000,
+            exact_evaluated: true,
+        };
+        recorder.record_gpu_driven_policy(policy);
+        let active = recorder.current().expect("active snapshot missing");
+        assert_eq!(
+            active
+                .scene_submission_family(RdgSceneSubmissionFamily::MainPrepass)
+                .live_gpu_submissions(),
+            u32::MAX
+        );
+        assert_eq!(active.gpu_driven_policy(), policy);
+
+        recorder.start_renderer_attempt(61);
+        assert_eq!(
+            recorder
+                .current()
+                .expect("replacement snapshot missing")
+                .gpu_driven_policy(),
+            RdgGpuDrivenPolicySnapshot::default()
+        );
+        for family in RdgSceneSubmissionFamily::ALL {
+            assert_eq!(
+                recorder
+                    .current()
+                    .expect("replacement snapshot missing")
+                    .scene_submission_family(family),
+                RdgSceneSubmissionFamilySnapshot::default()
+            );
+        }
+    }
 
     #[test]
     fn terminal_outcome_matrix_preserves_compile_and_submission_boundaries() {

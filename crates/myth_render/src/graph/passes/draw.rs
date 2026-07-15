@@ -46,6 +46,21 @@ pub(crate) fn submit_scene_submission<'pass>(
         ResolvedSceneSubmission::GpuIndexedIndirect(stream) => {
             submit_gpu_indexed_indirect(pass, submissions, stream, pipeline_cache);
         }
+        ResolvedSceneSubmission::Hybrid {
+            cpu_direct,
+            gpu_indirect,
+        } => {
+            // The ownership mask established before graph construction proves
+            // these cohorts are disjoint. Keeping both calls in the same
+            // render pass avoids a second attachment transition while each
+            // backend retains its specialized, branch-free inner loop.
+            submit_gpu_indexed_indirect(pass, submissions, gpu_indirect, pipeline_cache);
+            // Submit Direct second so its existing state tracker observes a
+            // clean local baseline and overwrites every dynamic state it may
+            // use (including stencil reference). The current GPU Scene tier
+            // owns no dynamic stencil state, matching a pure-GPU pass start.
+            submit_cpu_direct(pass, submissions, cpu_direct, pipeline_cache);
+        }
     }
 }
 

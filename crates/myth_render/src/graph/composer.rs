@@ -73,15 +73,21 @@ use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GlobalStateMaterializationFailure,
     GlobalStateSources, GraphBlackboard, HistoryRegistry, HookStage, PersistentBufferRegistry,
     PersistentBufferResolver, PrepareContext, RdgCommandEncodingFailure, RdgComposerAttemptGuard,
-    RdgDiagnosticsRecorder, RdgFramePhase, RdgGpuDrivenFailure, RdgPostSubmitPublicationFailure,
-    RdgRenderTargetKind, RdgResourceMaterializationFailure, RenderGraph,
-    SceneBufferMaterializationFailure, SceneBufferSources, SceneDrawPrepareContext, TextureDesc,
-    TransientPool, ViewResolver,
+    RdgDiagnosticsRecorder, RdgFramePhase, RdgGpuDrivenFailure, RdgGpuDrivenPolicySnapshot,
+    RdgPostSubmitPublicationFailure, RdgRenderTargetKind, RdgResourceMaterializationFailure,
+    RdgSceneSubmissionBackend, RdgSceneSubmissionFamily, RdgSceneSubmissionSelectionReason,
+    RenderGraph, SceneBufferMaterializationFailure, SceneBufferSources, SceneDrawPrepareContext,
+    TextureDesc, TransientPool, ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
 use crate::graph::frame::{RenderLists, ShadowLightInstance};
+use crate::graph::gpu_driven_policy::{
+    GpuDrivenAutoDecision, GpuDrivenAutoDecisionReason, GpuDrivenAutoPolicy, GpuDrivenCoarseGate,
+    GpuDrivenExactWorkload, GpuDrivenFamilyMask, GpuDrivenPolicyDomainKey,
+};
 use crate::graph::gpu_scene::{
-    GPU_SCENE_INSTANCE_CASTS_SHADOW, GpuScene, GpuSceneMultiBinCommitFailure,
+    GPU_SCENE_INSTANCE_CASTS_SHADOW, GPU_SCENE_INSTANCE_MAIN_PREPASS, GPU_SCENE_INSTANCE_SHADOW_2D,
+    GPU_SCENE_INSTANCE_SHADOW_CUBE, GpuScene, GpuSceneMultiBinCommitFailure,
     GpuSceneMultiBinPreflightFailure, GpuSceneMultiBinProjection, GpuSceneSelectionRejection,
 };
 use crate::graph::gpu_scene_submission::{
@@ -159,6 +165,7 @@ pub struct ComposerContext<'a> {
     pub(crate) gpu_scene: &'a mut GpuScene,
     pub(crate) gpu_scene_cull: &'a mut GpuSceneCullFeature,
     pub(crate) gpu_scene_render: &'a mut GpuSceneRenderFeature,
+    pub(crate) gpu_driven_policy: &'a mut GpuDrivenAutoPolicy,
     // pub sampler_registry: &'a mut SamplerRegistry,
     pub frame_arena: &'a FrameArena,
 
@@ -437,6 +444,16 @@ fn gpu_scene_binding_sized_buffer_supported(
     size.is_some_and(|size| size != 0 && size <= limits.max_buffer_size && size <= max_binding_size)
 }
 
+#[inline]
+fn checked_align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+}
+
 /// Device-independent workload facts for one M7.4 multi-bin view family.
 ///
 /// The four table sizes are the exact logical images requested from the
@@ -538,6 +555,25 @@ pub(crate) fn gpu_scene_multi_bin_workload_supported(
 
     let max_storage_binding = limits.max_storage_buffer_binding_size;
     let max_uniform_binding = limits.max_uniform_buffer_binding_size;
+    let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment);
+    let Some(view_param_offset) = checked_align_up_u64(active_batch_bytes, storage_alignment)
+    else {
+        return false;
+    };
+    let Some(domain_uniform_offset) = view_param_offset
+        .checked_add(view_param_bytes)
+        .and_then(|end| checked_align_up_u64(end, uniform_alignment))
+    else {
+        return false;
+    };
+    let Some(cull_parameter_bytes) =
+        domain_uniform_offset.checked_add(GPU_SCENE_MULTI_BIN_DOMAIN_UNIFORM_SIZE)
+    else {
+        return false;
+    };
+    if cull_parameter_bytes > limits.max_buffer_size {
+        return false;
+    }
     let persistent_table_bytes = [
         facts.instance_table_bytes,
         facts.geometry_table_bytes,
@@ -647,6 +683,67 @@ fn gpu_scene_shadow_family_workload(
 }
 
 #[inline]
+const fn auto_selection_reason(
+    reason: GpuDrivenAutoDecisionReason,
+) -> RdgSceneSubmissionSelectionReason {
+    match reason {
+        GpuDrivenAutoDecisionReason::SmallWorkload => {
+            RdgSceneSubmissionSelectionReason::AutoSmallWorkload
+        }
+        GpuDrivenAutoDecisionReason::CostModel => RdgSceneSubmissionSelectionReason::AutoCostModel,
+        GpuDrivenAutoDecisionReason::Hysteresis => {
+            RdgSceneSubmissionSelectionReason::AutoHysteresis
+        }
+        GpuDrivenAutoDecisionReason::LowConfidence => {
+            RdgSceneSubmissionSelectionReason::AutoLowConfidence
+        }
+    }
+}
+
+#[inline]
+fn selected_family_backend(
+    selected: bool,
+    selected_members: u32,
+    total_members: u32,
+    has_work: bool,
+) -> RdgSceneSubmissionBackend {
+    if !has_work {
+        return RdgSceneSubmissionBackend::Inactive;
+    }
+    if !selected {
+        return RdgSceneSubmissionBackend::CpuDirect;
+    }
+    if selected_members < total_members {
+        RdgSceneSubmissionBackend::Hybrid
+    } else {
+        RdgSceneSubmissionBackend::GpuDriven
+    }
+}
+
+fn gpu_scene_capability_families(
+    capabilities: &GpuDrivenCapabilities,
+    projection: GpuSceneMultiBinProjection,
+    shadows: GpuSceneShadowFamilyWorkload,
+) -> GpuDrivenFamilyMask {
+    let mut families = GpuDrivenFamilyMask::empty();
+    if gpu_scene_multi_bin_family_supported(capabilities, projection, 1) {
+        families.insert(GpuDrivenFamilyMask::MAIN_PREPASS);
+    }
+    if shadows.d2_view_count != 0
+        && gpu_scene_multi_bin_family_supported(capabilities, projection, shadows.d2_view_count)
+    {
+        families.insert(GpuDrivenFamilyMask::SHADOW_2D);
+    }
+    if shadows.cube_view_count != 0
+        && gpu_scene_multi_bin_family_supported(capabilities, projection, shadows.cube_view_count)
+    {
+        families.insert(GpuDrivenFamilyMask::SHADOW_CUBE);
+    }
+    families
+}
+
+#[inline]
+#[cfg(test)]
 fn resolve_gpu_scene_shadow_ownership(
     mode: GpuDrivenMode,
     has_shadow_work: bool,
@@ -900,125 +997,274 @@ impl<'a> FrameComposer<'a> {
         // transparent and independently-fallback Shadow intents remain CPU-owned.
         self.ctx.render_lists.begin_intent_collection();
 
-        // M7.4 performs a mutation-free, all-or-nothing preflight over the
-        // complete pre-frustum opaque domain. Capability and packed-shadow
-        // decisions are finished before the stable four-table authority is
-        // touched, so `Auto` can still fall back without a dirty journal.
-        let (gpu_scene_preflight, gpu_scene_owns_shadows) =
-            match self.ctx.renderer_settings.gpu_driven {
-                // `Off` is also the CPU baseline contract: it must not scan scene
-                // items, active shadow views, device limits, or GPU Scene state.
-                GpuDrivenMode::Off => (None, false),
-                mode => {
-                    let capabilities = self.ctx.wgpu_ctx.gpu_driven_capabilities();
-                    let (preflight, has_shadow_casters) = if capabilities
-                        .supports_indirect_primitives()
-                    {
-                        let storage_alignment = u64::from(
-                            capabilities
-                                .device_limits()
-                                .min_storage_buffer_offset_alignment,
+        // M7.5 keeps Off as a strict zero-planning baseline, preserves
+        // Required as the all-or-nothing correctness oracle, and makes Auto a
+        // submission-transactional family/cohort policy. Auto's cheap synopsis
+        // may reject tiny/stable CPU workloads before O(N) preflight.
+        let mode = self.ctx.renderer_settings.gpu_driven;
+        let mut synopsis = self.ctx.extracted_scene.gpu_driven_workload_synopsis();
+        let mut gpu_scene_preflight = None;
+        let mut selection_projection = None;
+        let mut selected_families = GpuDrivenFamilyMask::empty();
+        let mut shadow_workload = GpuSceneShadowFamilyWorkload::default();
+        let mut selection_reason = match mode {
+            GpuDrivenMode::Off => RdgSceneSubmissionSelectionReason::ModeOff,
+            GpuDrivenMode::Required => RdgSceneSubmissionSelectionReason::Required,
+            GpuDrivenMode::Auto => RdgSceneSubmissionSelectionReason::NotEvaluated,
+        };
+        let mut gpu_policy_submission_token = None;
+        let mut policy_minimum_cohort_members = 0;
+        let mut policy_exact_evaluated = false;
+
+        match mode {
+            // No capability query, shadow scan, policy lookup, preflight, or
+            // GPU Scene state access is allowed in the CpuDirect baseline.
+            GpuDrivenMode::Off => {}
+            GpuDrivenMode::Required => {
+                debug_assert!(self.ctx.extracted_scene.gpu_driven_facts_captured());
+                policy_minimum_cohort_members = 1;
+                policy_exact_evaluated = true;
+                let capabilities = self.ctx.wgpu_ctx.gpu_driven_capabilities();
+                if !capabilities.supports_indirect_primitives() {
+                    rdg_diagnostics.mark_gpu_driven_failed(RdgGpuDrivenFailure::UnsupportedDevice);
+                    return;
+                }
+                let storage_alignment = u64::from(
+                    capabilities
+                        .device_limits()
+                        .min_storage_buffer_offset_alignment,
+                );
+                let preflight = match self.ctx.gpu_scene.preflight_multi_bin_scene(
+                    self.ctx.extracted_scene,
+                    GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                    storage_alignment,
+                ) {
+                    Ok(preflight) => preflight,
+                    Err(reason) => {
+                        rdg_diagnostics
+                            .mark_gpu_driven_failed(multi_bin_preflight_failure_reason(reason));
+                        return;
+                    }
+                };
+                let has_shadow_casters = self.ctx.gpu_scene.preflight_has_shadow_casters();
+                if has_shadow_casters {
+                    shadow_workload = gpu_scene_shadow_family_workload(
+                        self.ctx.render_lists,
+                        self.ctx.extracted_scene,
+                    );
+                    synopsis.shadow_2d_view_count =
+                        u32::try_from(shadow_workload.d2_view_count).unwrap_or(u32::MAX);
+                    synopsis.shadow_cube_view_count =
+                        u32::try_from(shadow_workload.cube_view_count).unwrap_or(u32::MAX);
+                }
+                let has_shadow_work =
+                    shadow_workload.d2_view_count != 0 || shadow_workload.cube_view_count != 0;
+                if let Some(preflight) = preflight {
+                    let capability_families = gpu_scene_capability_families(
+                        capabilities,
+                        preflight.projection,
+                        shadow_workload,
+                    );
+                    if !capability_families.contains(GpuDrivenFamilyMask::MAIN_PREPASS) {
+                        rdg_diagnostics.mark_gpu_driven_failed(
+                            RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
                         );
-                        match self.ctx.gpu_scene.preflight_multi_bin_scene(
-                            self.ctx.extracted_scene,
-                            GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-                            storage_alignment,
-                        ) {
-                            Ok(None) => (None, self.ctx.gpu_scene.preflight_has_shadow_casters()),
-                            Ok(Some(preflight))
-                                if gpu_scene_multi_bin_family_supported(
-                                    capabilities,
-                                    preflight.projection,
-                                    1,
-                                ) =>
-                            {
-                                (
-                                    Some(preflight),
-                                    self.ctx.gpu_scene.preflight_has_shadow_casters(),
-                                )
-                            }
-                            Ok(Some(_)) => {
-                                if mode == GpuDrivenMode::Required {
-                                    rdg_diagnostics.mark_gpu_driven_failed(
-                                        RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
-                                    );
-                                    return;
-                                }
-                                (None, false)
-                            }
-                            Err(reason) => {
-                                if mode == GpuDrivenMode::Required {
-                                    rdg_diagnostics.mark_gpu_driven_failed(
-                                        multi_bin_preflight_failure_reason(reason),
-                                    );
-                                    return;
-                                }
-                                (None, false)
-                            }
-                        }
-                    } else {
-                        if mode == GpuDrivenMode::Required {
-                            rdg_diagnostics
-                                .mark_gpu_driven_failed(RdgGpuDrivenFailure::UnsupportedDevice);
+                        return;
+                    }
+                    selected_families.insert(GpuDrivenFamilyMask::MAIN_PREPASS);
+                    if has_shadow_work && !preflight.projection.covers_complete_shadow_domain {
+                        rdg_diagnostics
+                            .mark_gpu_driven_failed(RdgGpuDrivenFailure::UnsupportedShadowDomain);
+                        return;
+                    }
+                    if shadow_workload.d2_view_count != 0 {
+                        if !capability_families.contains(GpuDrivenFamilyMask::SHADOW_2D) {
+                            rdg_diagnostics.mark_gpu_driven_failed(
+                                RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
+                            );
                             return;
                         }
-                        (None, false)
-                    };
-
-                    let shadow_workload = if has_shadow_casters {
-                        gpu_scene_shadow_family_workload(
+                        selected_families.insert(GpuDrivenFamilyMask::SHADOW_2D);
+                    }
+                    if shadow_workload.cube_view_count != 0 {
+                        if !capability_families.contains(GpuDrivenFamilyMask::SHADOW_CUBE) {
+                            rdg_diagnostics.mark_gpu_driven_failed(
+                                RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
+                            );
+                            return;
+                        }
+                        selected_families.insert(GpuDrivenFamilyMask::SHADOW_CUBE);
+                    }
+                    selection_projection = Some(preflight.projection);
+                    gpu_scene_preflight = Some(preflight);
+                } else {
+                    if has_shadow_work {
+                        rdg_diagnostics
+                            .mark_gpu_driven_failed(RdgGpuDrivenFailure::UnsupportedShadowDomain);
+                        return;
+                    }
+                    // A transparent-only scene has no opaque semantic domain.
+                    selection_reason = RdgSceneSubmissionSelectionReason::NoWork;
+                }
+            }
+            GpuDrivenMode::Auto => {
+                debug_assert!(self.ctx.extracted_scene.gpu_driven_facts_captured());
+                let capabilities = self.ctx.wgpu_ctx.gpu_driven_capabilities();
+                if capabilities.supports_indirect_primitives() {
+                    if synopsis.shadow_caster_count != 0 {
+                        shadow_workload = gpu_scene_shadow_family_workload(
                             self.ctx.render_lists,
                             self.ctx.extracted_scene,
-                        )
-                    } else {
-                        GpuSceneShadowFamilyWorkload::default()
+                        );
+                        synopsis.shadow_2d_view_count =
+                            u32::try_from(shadow_workload.d2_view_count).unwrap_or(u32::MAX);
+                        synopsis.shadow_cube_view_count =
+                            u32::try_from(shadow_workload.cube_view_count).unwrap_or(u32::MAX);
+                    }
+                    let domain = GpuDrivenPolicyDomainKey {
+                        scene_id: self.ctx.extracted_scene.scene_id,
+                        camera_id: self.ctx.camera.camera_id,
+                        render_path: self.ctx.wgpu_ctx.render_path,
+                        msaa_samples: self.ctx.wgpu_ctx.msaa_samples,
+                        viewport_width: self.frame_config.width,
+                        viewport_height: self.frame_config.height,
+                        pipeline_epoch: self.ctx.wgpu_ctx.pipeline_settings_version,
                     };
-                    let has_shadow_work = has_shadow_casters
-                        && (shadow_workload.d2_view_count != 0
-                            || shadow_workload.cube_view_count != 0);
-                    let (covers_complete_shadow_domain, shadow_workload_supported) =
-                        if has_shadow_work && let Some(preflight) = preflight {
-                            let covers_complete_domain =
-                                preflight.projection.covers_complete_shadow_domain;
-                            let workload_supported = covers_complete_domain
-                                && gpu_scene_multi_bin_family_supported(
-                                    capabilities,
-                                    preflight.projection,
-                                    shadow_workload.d2_view_count,
-                                )
-                                && gpu_scene_multi_bin_family_supported(
-                                    capabilities,
-                                    preflight.projection,
-                                    shadow_workload.cube_view_count,
-                                );
-                            (covers_complete_domain, workload_supported)
-                        } else {
-                            (false, false)
-                        };
-                    let owns_shadows = match resolve_gpu_scene_shadow_ownership(
-                        mode,
-                        has_shadow_work,
-                        covers_complete_shadow_domain,
-                        shadow_workload_supported,
-                    ) {
-                        Ok(owns_shadows) => owns_shadows,
-                        Err(reason) => {
-                            rdg_diagnostics.mark_gpu_driven_failed(reason);
-                            return;
+                    match self.ctx.gpu_driven_policy.coarse_gate(domain, synopsis) {
+                        GpuDrivenCoarseGate::Decide(decision) => {
+                            debug_assert!(decision.families.is_empty());
+                            debug_assert!(decision.minimum_cohort_members >= 1);
+                            selected_families = decision.families;
+                            selection_reason = auto_selection_reason(decision.reason);
+                            gpu_policy_submission_token = Some(decision.token);
+                            policy_minimum_cohort_members = decision.minimum_cohort_members;
                         }
-                    };
-                    (preflight, owns_shadows)
+                        GpuDrivenCoarseGate::EvaluateExact {
+                            minimum_cohort_members,
+                        } => {
+                            policy_exact_evaluated = true;
+                            policy_minimum_cohort_members = minimum_cohort_members;
+                            let storage_alignment = u64::from(
+                                capabilities
+                                    .device_limits()
+                                    .min_storage_buffer_offset_alignment,
+                            );
+                            let (preflight, preflight_failure) =
+                                match self.ctx.gpu_scene.preflight_multi_bin_cohorts(
+                                    self.ctx.extracted_scene,
+                                    GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                                    storage_alignment,
+                                    minimum_cohort_members,
+                                ) {
+                                    Ok(preflight) => (preflight, None),
+                                    Err(reason) => {
+                                        (None, Some(multi_bin_preflight_failure_reason(reason)))
+                                    }
+                                };
+                            let exact = if let Some(preflight) = preflight {
+                                let projection = preflight.projection;
+                                selection_projection = Some(projection);
+                                let capability_families = gpu_scene_capability_families(
+                                    capabilities,
+                                    projection,
+                                    shadow_workload,
+                                );
+                                let selected_index_work = if synopsis.supported_opaque_count == 0 {
+                                    0
+                                } else {
+                                    synopsis
+                                        .indexed_primitive_count
+                                        .saturating_mul(u64::from(projection.candidate_count))
+                                        / u64::from(synopsis.supported_opaque_count)
+                                };
+                                GpuDrivenExactWorkload {
+                                    candidate_count: projection.candidate_count,
+                                    bin_count: projection.bin_count,
+                                    unique_geometry_count: projection.unique_geometry_count,
+                                    unique_material_count: projection.unique_material_count,
+                                    shadow_candidate_count: projection.shadow_candidate_count,
+                                    instance_slot_span: projection.table_set.instance_slot_span,
+                                    batch_slot_span: projection.table_set.batch_slot_span,
+                                    dirty_candidate_count: synopsis
+                                        .transform_changed_count
+                                        .min(projection.candidate_count),
+                                    indexed_primitive_count: selected_index_work,
+                                    main_submission_count: if self
+                                        .ctx
+                                        .wgpu_ctx
+                                        .render_path
+                                        .supports_post_processing()
+                                    {
+                                        2
+                                    } else {
+                                        1
+                                    },
+                                    shadow_2d_view_count: u32::try_from(
+                                        shadow_workload.d2_view_count,
+                                    )
+                                    .unwrap_or(u32::MAX),
+                                    shadow_cube_view_count: u32::try_from(
+                                        shadow_workload.cube_view_count,
+                                    )
+                                    .unwrap_or(u32::MAX),
+                                    viewport_pixels: u64::from(self.frame_config.width)
+                                        .saturating_mul(u64::from(self.frame_config.height)),
+                                    device_tier: if capabilities
+                                        .supports_multi_draw_indirect_count()
+                                    {
+                                        2
+                                    } else {
+                                        1
+                                    },
+                                    capability_families,
+                                }
+                            } else {
+                                // No retained cohort or a typed preflight
+                                // rejection has no safe GPU family. Still
+                                // issue a transactional policy decision so a
+                                // previously selected family is disabled only
+                                // after this CPU fallback frame is submitted.
+                                GpuDrivenExactWorkload::default()
+                            };
+                            let decision: GpuDrivenAutoDecision = self
+                                .ctx
+                                .gpu_driven_policy
+                                .evaluate_exact(domain, synopsis, exact, minimum_cohort_members);
+                            debug_assert_eq!(
+                                decision.minimum_cohort_members,
+                                minimum_cohort_members
+                            );
+                            selected_families = decision.families;
+                            selection_reason = if let Some(reason) = preflight_failure {
+                                debug_assert!(selected_families.is_empty());
+                                RdgSceneSubmissionSelectionReason::Unsupported(reason)
+                            } else {
+                                auto_selection_reason(decision.reason)
+                            };
+                            gpu_policy_submission_token = Some(decision.token);
+                            if !selected_families.is_empty() {
+                                gpu_scene_preflight = preflight;
+                                debug_assert!(gpu_scene_preflight.is_some());
+                            }
+                        }
+                    }
+                } else {
+                    selection_reason = RdgSceneSubmissionSelectionReason::Unsupported(
+                        RdgGpuDrivenFailure::UnsupportedDevice,
+                    );
                 }
-            };
+            }
+        }
 
         // This is the first persistent GPU Scene mutation. Main and Shadow
         // capability gates have already passed, and the retained preflight is
         // consumed exactly once into the shared four-table revision.
         let gpu_scene_projection = gpu_scene_preflight.map(|preflight| preflight.projection);
         let gpu_scene_selected = if let Some(preflight) = gpu_scene_preflight {
-            if let Err(reason) = self.ctx.gpu_scene.commit_multi_bin_selection(
+            if let Err(reason) = self.ctx.gpu_scene.commit_multi_bin_selection_with_families(
                 self.ctx.extracted_scene,
                 preflight,
+                selected_families,
                 f64::from(self.ctx.frame_time.time),
                 self.ctx.render_lists,
             ) {
@@ -1030,13 +1276,84 @@ impl<'a> FrameComposer<'a> {
             false
         };
 
-        crate::graph::culling::collect_draw_intents(
-            self.ctx.extracted_scene,
-            self.ctx.render_lists,
-            &self.ctx.camera,
-            gpu_scene_selected,
-            gpu_scene_owns_shadows,
+        if mode == GpuDrivenMode::Off {
+            crate::graph::culling::collect_draw_intents(
+                self.ctx.extracted_scene,
+                self.ctx.render_lists,
+                &self.ctx.camera,
+                false,
+                false,
+            );
+        } else {
+            crate::graph::culling::collect_draw_intents_with_family_ownership(
+                self.ctx.extracted_scene,
+                self.ctx.render_lists,
+                &self.ctx.camera,
+            );
+        }
+
+        let selected_candidate_count =
+            selection_projection.map_or(0, |projection| projection.candidate_count);
+        let selected_shadow_candidate_count =
+            selection_projection.map_or(0, |projection| projection.shadow_candidate_count);
+        rdg_diagnostics.record_gpu_driven_policy(RdgGpuDrivenPolicySnapshot {
+            extracted_item_count: synopsis.extracted_item_count,
+            supported_opaque_count: synopsis.supported_opaque_count,
+            retained_candidate_count: selected_candidate_count,
+            retained_bin_count: selection_projection.map_or(0, |projection| projection.bin_count),
+            dirty_candidate_count: synopsis
+                .transform_changed_count
+                .min(selected_candidate_count),
+            shadow_2d_view_count: synopsis.shadow_2d_view_count,
+            shadow_cube_view_count: synopsis.shadow_cube_view_count,
+            instance_slot_span: selection_projection
+                .map_or(0, |projection| projection.table_set.instance_slot_span),
+            batch_slot_span: selection_projection
+                .map_or(0, |projection| projection.table_set.batch_slot_span),
+            minimum_cohort_members: policy_minimum_cohort_members,
+            indexed_primitive_count: synopsis.indexed_primitive_count,
+            exact_evaluated: policy_exact_evaluated,
+        });
+        let diagnostic_reason = selection_reason;
+        let main_backend = if mode == GpuDrivenMode::Off {
+            RdgSceneSubmissionBackend::CpuDirect
+        } else {
+            selected_family_backend(
+                selected_families.contains(GpuDrivenFamilyMask::MAIN_PREPASS),
+                selected_candidate_count,
+                synopsis.opaque_item_count,
+                synopsis.opaque_item_count != 0,
+            )
+        };
+        rdg_diagnostics.record_scene_submission_selection(
+            RdgSceneSubmissionFamily::MainPrepass,
+            main_backend,
+            diagnostic_reason,
         );
+        for (family, policy_family, view_count) in [
+            (
+                RdgSceneSubmissionFamily::Shadow2D,
+                GpuDrivenFamilyMask::SHADOW_2D,
+                shadow_workload.d2_view_count,
+            ),
+            (
+                RdgSceneSubmissionFamily::ShadowCube,
+                GpuDrivenFamilyMask::SHADOW_CUBE,
+                shadow_workload.cube_view_count,
+            ),
+        ] {
+            let backend = if mode == GpuDrivenMode::Off {
+                RdgSceneSubmissionBackend::CpuDirect
+            } else {
+                selected_family_backend(
+                    selected_families.contains(policy_family),
+                    selected_shadow_candidate_count,
+                    synopsis.shadow_caster_count,
+                    view_count != 0 && synopsis.shadow_caster_count != 0,
+                )
+            };
+            rdg_diagnostics.record_scene_submission_selection(family, backend, diagnostic_reason);
+        }
 
         rdg_diagnostics.enter_phase(RdgFramePhase::BuildGraph);
 
@@ -1101,25 +1418,32 @@ impl<'a> FrameComposer<'a> {
                 patched.batch_slot_span,
                 projection.table_set.batch_slot_span
             );
-            let frustum_planes =
-                std::array::from_fn(|index| self.ctx.camera.frustum.planes()[index].to_array());
-            let views = graph.alloc_slice(&[GpuSceneCullViewDescriptor::new(frustum_planes)]);
-            let culled = self.ctx.gpu_scene_cull.add_multi_bin_to_graph(
-                &mut graph,
-                patched.instances,
-                patched.batches,
-                "GpuScene_Cull",
-                GpuSceneMultiBinCullDescriptor::new(
-                    self.ctx.extracted_scene.scene_id,
-                    patched.instance_slot_span,
-                    patched.batch_slot_span,
-                    projection.storage_alignment,
-                    projection.table_set.visible_view_stride,
-                    views,
-                    patched.active_batches,
-                ),
-            );
-            Some((patched, culled))
+            let main_culled = selected_families
+                .contains(GpuDrivenFamilyMask::MAIN_PREPASS)
+                .then(|| {
+                    let frustum_planes = std::array::from_fn(|index| {
+                        self.ctx.camera.frustum.planes()[index].to_array()
+                    });
+                    let views =
+                        graph.alloc_slice(&[GpuSceneCullViewDescriptor::new(frustum_planes)]);
+                    self.ctx.gpu_scene_cull.add_multi_bin_to_graph(
+                        &mut graph,
+                        patched.instances,
+                        patched.batches,
+                        "GpuScene_Cull",
+                        GpuSceneMultiBinCullDescriptor::new(
+                            self.ctx.extracted_scene.scene_id,
+                            patched.instance_slot_span,
+                            patched.batch_slot_span,
+                            projection.storage_alignment,
+                            projection.table_set.visible_view_stride,
+                            views,
+                            patched.active_batches,
+                        )
+                        .with_required_instance_flags(GPU_SCENE_INSTANCE_MAIN_PREPASS),
+                    )
+                });
+            Some((patched, main_culled))
         } else {
             None
         };
@@ -1670,36 +1994,46 @@ impl<'a> FrameComposer<'a> {
             // Texture producers are registered before the GPU submission so
             // its logical descriptor inherits the exact normalized Opaque
             // material dependency set, just like the CpuDirect backend.
-            let gpu_opaque_submission = gpu_scene_topology.as_ref().map(|(patched, culled)| {
-                let first = culled
-                    .view_batch(0, 0)
-                    .expect("selected GPU Scene Cull lost its first batch");
-                let indirect_span = u64::from(patched.batch_slot_span)
-                    .checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
-                    .expect("GPU Scene main argument window overflowed");
-                let submission = graph_ctx.graph.reserve_gpu_scene_multi_bin_submission(
-                    SceneSubmissionKey::Opaque,
-                    patched.candidates[0].representative,
-                    patched.instances,
-                    patched.instances,
-                    culled.visible_instances,
-                    culled.indirect_arguments,
-                    first.indirect_offset,
-                    0,
-                    indirect_span,
-                );
-                let submissions = graph_ctx.graph.alloc_slice(&[submission]);
-                gpu_scene_family_prepare_plans.push(GpuSceneMultiBinFamilyPreparePlan {
-                    submissions,
-                    candidates: patched.candidates,
-                    instance_table: patched.instances,
-                    culled: *culled,
-                    target: GpuSceneSubmissionTarget::Main { global_state_key },
+            let mut diagnostic_main_submissions = [None; 2];
+            let gpu_opaque_submission =
+                gpu_scene_topology.as_ref().and_then(|(patched, culled)| {
+                    let culled = culled.as_ref()?;
+                    let first = culled
+                        .view_batch(0, 0)
+                        .expect("selected GPU Scene Cull lost its first batch");
+                    let indirect_span = u64::from(patched.batch_slot_span)
+                        .checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
+                        .expect("GPU Scene main argument window overflowed");
+                    let reserve = if self.ctx.render_lists.opaque.is_empty() {
+                        RenderGraph::reserve_gpu_scene_multi_bin_submission
+                    } else {
+                        RenderGraph::reserve_hybrid_gpu_scene_multi_bin_submission
+                    };
+                    let submission = reserve(
+                        graph_ctx.graph,
+                        SceneSubmissionKey::Opaque,
+                        patched.candidates[0].representative,
+                        patched.instances,
+                        patched.instances,
+                        culled.visible_instances,
+                        culled.indirect_arguments,
+                        first.indirect_offset,
+                        0,
+                        indirect_span,
+                    );
+                    let submissions = graph_ctx.graph.alloc_slice(&[submission]);
+                    gpu_scene_family_prepare_plans.push(GpuSceneMultiBinFamilyPreparePlan {
+                        submissions,
+                        candidates: patched.candidates,
+                        instance_table: patched.instances,
+                        culled: *culled,
+                        target: GpuSceneSubmissionTarget::Main { global_state_key },
+                    });
+                    Some(submission)
                 });
-                submission
-            });
             let gpu_prepass_submission = if is_high_fidelity {
-                gpu_scene_topology.as_ref().map(|(patched, culled)| {
+                gpu_scene_topology.as_ref().and_then(|(patched, culled)| {
+                    let culled = culled.as_ref()?;
                     let key = SceneSubmissionKey::Prepass {
                         needs_normal,
                         needs_feature_id,
@@ -1711,7 +2045,13 @@ impl<'a> FrameComposer<'a> {
                     let indirect_span = u64::from(patched.batch_slot_span)
                         .checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
                         .expect("GPU Scene prepass argument window overflowed");
-                    let submission = graph_ctx.graph.reserve_gpu_scene_multi_bin_submission(
+                    let reserve = if self.ctx.render_lists.opaque.is_empty() {
+                        RenderGraph::reserve_gpu_scene_multi_bin_submission
+                    } else {
+                        RenderGraph::reserve_hybrid_gpu_scene_multi_bin_submission
+                    };
+                    let submission = reserve(
+                        graph_ctx.graph,
                         key,
                         patched.candidates[0].representative,
                         patched.instances,
@@ -1735,7 +2075,7 @@ impl<'a> FrameComposer<'a> {
                             needs_velocity,
                         },
                     });
-                    submission
+                    Some(submission)
                 })
             } else {
                 None
@@ -1863,46 +2203,65 @@ impl<'a> FrameComposer<'a> {
             // without an environment, Raw prepare binds the system black cube.
             let ssgi_pmrem = env_dependency_pmrem;
 
+            let mut diagnostic_shadow_submissions = None;
             let shadow_output = if self.ctx.extracted_scene.has_shadow_casters() {
                 let snapshot = self.ctx.shadow_pass.extract(
                     self.ctx.render_lists,
                     self.ctx.extracted_scene,
                     self.ctx.frame_arena,
                 );
-                let gpu_shadow_submissions = if gpu_scene_owns_shadows {
+                let shadow_submissions = if selected_families
+                    .intersects(GpuDrivenFamilyMask::SHADOW_2D | GpuDrivenFamilyMask::SHADOW_CUBE)
+                {
                     let (patched, _) = gpu_scene_topology
                         .as_ref()
                         .expect("GPU Shadow ownership lost the selected GPU Scene topology");
                     let projection = gpu_scene_projection
                         .expect("GPU Shadow ownership lost its workload projection");
-                    let d2 = add_gpu_scene_shadow_family(
-                        graph_ctx.graph,
-                        self.ctx.gpu_scene_cull,
-                        snapshot.d2_lights,
-                        patched,
-                        projection,
-                        self.ctx.extracted_scene.scene_id,
-                        "GpuScene_Shadow_2D_Cull",
-                        &mut gpu_scene_family_prepare_plans,
-                    );
-                    let cube = add_gpu_scene_shadow_family(
-                        graph_ctx.graph,
-                        self.ctx.gpu_scene_cull,
-                        snapshot.cube_lights,
-                        patched,
-                        projection,
-                        self.ctx.extracted_scene.scene_id,
-                        "GpuScene_Shadow_Cube_Cull",
-                        &mut gpu_scene_family_prepare_plans,
-                    );
-                    Some(ShadowSubmissions { d2, cube })
+                    let d2 = if selected_families.contains(GpuDrivenFamilyMask::SHADOW_2D) {
+                        add_gpu_scene_shadow_family(
+                            graph_ctx.graph,
+                            self.ctx.gpu_scene_cull,
+                            self.ctx.render_lists,
+                            snapshot.d2_lights,
+                            patched,
+                            projection,
+                            self.ctx.extracted_scene.scene_id,
+                            GPU_SCENE_INSTANCE_CASTS_SHADOW | GPU_SCENE_INSTANCE_SHADOW_2D,
+                            "GpuScene_Shadow_2D_Cull",
+                            &mut gpu_scene_family_prepare_plans,
+                        )
+                    } else {
+                        reserve_cpu_shadow_family(graph_ctx.graph, snapshot.d2_lights)
+                    };
+                    let cube = if selected_families.contains(GpuDrivenFamilyMask::SHADOW_CUBE) {
+                        add_gpu_scene_shadow_family(
+                            graph_ctx.graph,
+                            self.ctx.gpu_scene_cull,
+                            self.ctx.render_lists,
+                            snapshot.cube_lights,
+                            patched,
+                            projection,
+                            self.ctx.extracted_scene.scene_id,
+                            GPU_SCENE_INSTANCE_CASTS_SHADOW | GPU_SCENE_INSTANCE_SHADOW_CUBE,
+                            "GpuScene_Shadow_Cube_Cull",
+                            &mut gpu_scene_family_prepare_plans,
+                        )
+                    } else {
+                        reserve_cpu_shadow_family(graph_ctx.graph, snapshot.cube_lights)
+                    };
+                    ShadowSubmissions { d2, cube }
                 } else {
-                    None
+                    ShadowSubmissions {
+                        d2: reserve_cpu_shadow_family(graph_ctx.graph, snapshot.d2_lights),
+                        cube: reserve_cpu_shadow_family(graph_ctx.graph, snapshot.cube_lights),
+                    }
                 };
+                diagnostic_shadow_submissions = Some(shadow_submissions);
                 graph_ctx.with_group("Shadow", |c| {
                     self.ctx
                         .shadow_pass
-                        .add_to_graph(c, snapshot, gpu_shadow_submissions)
+                        .add_to_graph(c, snapshot, Some(shadow_submissions))
                 })
             } else {
                 crate::graph::passes::shadow::ShadowOutput {
@@ -2022,6 +2381,7 @@ impl<'a> FrameComposer<'a> {
                                     needs_velocity,
                                 })
                         });
+                        diagnostic_main_submissions[0] = Some(prepass_submission);
                         let prepass_out = self.ctx.prepass.add_to_graph(
                             c,
                             prepass_submission,
@@ -2061,6 +2421,7 @@ impl<'a> FrameComposer<'a> {
                         let opaque_submission = gpu_opaque_submission.unwrap_or_else(|| {
                             c.graph.reserve_scene_submission(SceneSubmissionKey::Opaque)
                         });
+                        diagnostic_main_submissions[1] = Some(opaque_submission);
                         let opaque_out = self.ctx.opaque_pass.add_to_graph(
                             c,
                             opaque_submission,
@@ -2500,6 +2861,7 @@ impl<'a> FrameComposer<'a> {
                     let opaque_submission = gpu_opaque_submission.unwrap_or_else(|| {
                         c.graph.reserve_scene_submission(SceneSubmissionKey::Opaque)
                     });
+                    diagnostic_main_submissions[0] = Some(opaque_submission);
                     self.ctx.simple_forward_pass.add_to_graph(
                         c,
                         opaque_submission,
@@ -2552,6 +2914,48 @@ impl<'a> FrameComposer<'a> {
             // CPU-only and intentionally complete before waiting for a
             // swap-chain image.
             graph.compile_topology();
+
+            for submission in diagnostic_main_submissions.into_iter().flatten() {
+                let (cpu, gpu) = graph
+                    .storage
+                    .scene_submissions
+                    .live_backend_presence(submission)
+                    .expect("main diagnostics retained a stale scene submission");
+                rdg_diagnostics.record_live_scene_submissions(
+                    RdgSceneSubmissionFamily::MainPrepass,
+                    RdgSceneSubmissionBackend::CpuDirect,
+                    u32::from(cpu),
+                );
+                rdg_diagnostics.record_live_scene_submissions(
+                    RdgSceneSubmissionFamily::MainPrepass,
+                    RdgSceneSubmissionBackend::GpuDriven,
+                    u32::from(gpu),
+                );
+            }
+            if let Some(submissions) = diagnostic_shadow_submissions {
+                for (family, family_submissions) in [
+                    (RdgSceneSubmissionFamily::Shadow2D, submissions.d2),
+                    (RdgSceneSubmissionFamily::ShadowCube, submissions.cube),
+                ] {
+                    for &submission in family_submissions {
+                        let (cpu, gpu) = graph
+                            .storage
+                            .scene_submissions
+                            .live_backend_presence(submission)
+                            .expect("shadow diagnostics retained a stale scene submission");
+                        rdg_diagnostics.record_live_scene_submissions(
+                            family,
+                            RdgSceneSubmissionBackend::CpuDirect,
+                            u32::from(cpu),
+                        );
+                        rdg_diagnostics.record_live_scene_submissions(
+                            family,
+                            RdgSceneSubmissionBackend::GpuDriven,
+                            u32::from(gpu),
+                        );
+                    }
+                }
+            }
 
             // ━━━ 3a. Acquire and Late-bind Render Target ━━━━━━━━━━━━━━━
             rdg_diagnostics.enter_phase(RdgFramePhase::AcquireTarget);
@@ -3135,6 +3539,13 @@ impl<'a> FrameComposer<'a> {
                 return;
             };
             rdg_diagnostics.mark_queue_submitted();
+            if let Some(token) = gpu_policy_submission_token {
+                let committed = self.ctx.gpu_driven_policy.commit_submitted(token);
+                debug_assert!(
+                    committed,
+                    "submitted GPU-driven Auto decision lost its policy epoch/state"
+                );
+            }
             rdg_diagnostics.enter_phase(RdgFramePhase::Publish);
             // Morph history is a submission result, not a begin-frame side
             // effect. Once the queue accepts these commands, advance the
@@ -3217,10 +3628,12 @@ impl<'a> FrameComposer<'a> {
 fn add_gpu_scene_shadow_family<'a>(
     graph: &mut RenderGraph<'a>,
     cull_feature: &'a GpuSceneCullFeature,
+    render_lists: &RenderLists,
     lights: &'a [ShadowLightInstance],
     patched: &GpuSceneTableSetPatchOutput<'a>,
     projection: GpuSceneMultiBinProjection,
     active_scene_id: u32,
+    required_instance_flags: u32,
     pass_name: &'static str,
     prepare_plans: &mut SmallVec<[GpuSceneMultiBinFamilyPreparePlan<'a>; 4]>,
 ) -> &'a [SceneSubmissionPlanId] {
@@ -3248,7 +3661,7 @@ fn add_gpu_scene_shadow_family<'a>(
             views,
             patched.active_batches,
         )
-        .with_required_instance_flags(GPU_SCENE_INSTANCE_CASTS_SHADOW),
+        .with_required_instance_flags(required_instance_flags),
     );
     let indirect_span = u64::from(patched.batch_slot_span)
         .checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
@@ -3268,17 +3681,35 @@ fn add_gpu_scene_shadow_family<'a>(
                 light_id: light.light_id,
                 layer_index: light.view_layer_index,
             };
-            graph.reserve_gpu_scene_multi_bin_submission(
-                key,
-                patched.candidates[0].representative,
-                patched.instances,
-                patched.instances,
-                culled.visible_instances,
-                culled.indirect_arguments,
-                first.indirect_offset,
-                indirect_window_start,
-                indirect_span,
-            )
+            let has_cpu_cohort = render_lists
+                .shadow_queues
+                .get(&(light.light_id, light.view_layer_index))
+                .is_some_and(|queue| !queue.is_empty());
+            if has_cpu_cohort {
+                graph.reserve_hybrid_gpu_scene_multi_bin_submission(
+                    key,
+                    patched.candidates[0].representative,
+                    patched.instances,
+                    patched.instances,
+                    culled.visible_instances,
+                    culled.indirect_arguments,
+                    first.indirect_offset,
+                    indirect_window_start,
+                    indirect_span,
+                )
+            } else {
+                graph.reserve_gpu_scene_multi_bin_submission(
+                    key,
+                    patched.candidates[0].representative,
+                    patched.instances,
+                    patched.instances,
+                    culled.visible_instances,
+                    culled.indirect_arguments,
+                    first.indirect_offset,
+                    indirect_window_start,
+                    indirect_span,
+                )
+            }
         };
 
     // Reserve view zero first, then initialize the exact-size arena slice
@@ -3298,6 +3729,28 @@ fn add_gpu_scene_shadow_family<'a>(
         culled,
         target: GpuSceneSubmissionTarget::Shadow,
     });
+    submissions
+}
+
+fn reserve_cpu_shadow_family<'a>(
+    graph: &mut RenderGraph<'a>,
+    lights: &'a [ShadowLightInstance],
+) -> &'a [SceneSubmissionPlanId] {
+    if lights.is_empty() {
+        return graph.alloc_slice(&[]);
+    }
+    let reserve = |graph: &mut RenderGraph<'a>, index: usize| {
+        let light = &lights[index];
+        graph.reserve_scene_submission(SceneSubmissionKey::Shadow {
+            light_id: light.light_id,
+            layer_index: light.view_layer_index,
+        })
+    };
+    let first = reserve(graph, 0);
+    let submissions = graph.alloc_slice_fill_copy_mut(lights.len(), first);
+    for (index, submission) in submissions.iter_mut().enumerate().skip(1) {
+        *submission = reserve(graph, index);
+    }
     submissions
 }
 

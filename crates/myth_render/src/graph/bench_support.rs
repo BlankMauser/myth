@@ -27,6 +27,10 @@ use crate::graph::frame::{
     DrawPlanId, DrawPlanKey, DrawPlanStore, ExtractedSourceId, FrameSourceId, PreparedSourceId,
     RenderIntent, RenderLists, ShadowRenderIntent,
 };
+use crate::graph::gpu_driven_policy::{
+    GpuDrivenAutoDecisionReason, GpuDrivenAutoPolicy, GpuDrivenCoarseGate, GpuDrivenExactWorkload,
+    GpuDrivenFamilyMask, GpuDrivenPolicyDomainKey, GpuDrivenWorkloadSynopsis, mix64,
+};
 use crate::graph::scene_pipeline_prepare::{
     PrepassPipelineL1Key, ScenePipelinePrepareStore, SceneRecipeOrdinal,
 };
@@ -38,6 +42,7 @@ use crate::graph::{
     material_plan::MaterialPlanStore,
 };
 use crate::pipeline::RenderPipelineId;
+use crate::settings::RenderPath;
 
 const CUBE_LIGHT_ID_BASE: u64 = 1 << 32;
 
@@ -1682,14 +1687,529 @@ struct HighFanOutRunIndices {
     root: Option<usize>,
 }
 
+/// Backend contract exercised by the deterministic M7.5 comparison matrix.
+///
+/// This benchmark-side enum deliberately mirrors the public runtime setting
+/// without making Criterion depend on a non-exhaustive match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDrivenMatrixMode {
+    /// Preserve the CPU-direct path and skip policy/preflight work.
+    Off,
+    /// Run the production adaptive policy, including submitted hysteresis.
+    Auto,
+    /// Force the complete supported cohort through the GPU recipe path.
+    Required,
+}
+
+impl GpuDrivenMatrixMode {
+    /// Stable label used in Criterion IDs and allocation-probe output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// Observable backend selected for one synthetic comparison iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDrivenMatrixBackend {
+    /// Every main source and optional Shadow family remains CPU-direct.
+    CpuDirect,
+    /// Every active family and main source uses a GPU recipe.
+    GpuDriven,
+    /// CPU and GPU recipes own disjoint cohorts or semantic families.
+    Hybrid,
+}
+
+impl GpuDrivenMatrixBackend {
+    /// Stable diagnostic label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CpuDirect => "cpu",
+            Self::GpuDriven => "gpu",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+/// Stable public projection of the production Auto decision reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDrivenMatrixSelectionReason {
+    /// Explicit CPU-direct control arm.
+    Off,
+    /// Explicit GPU-driven comparison arm.
+    Required,
+    /// The workload never crossed the cheap Auto admission threshold.
+    SmallWorkload,
+    /// The exact deterministic cost model chose the current proposal.
+    CostModel,
+    /// Enter/exit confirmation or minimum dwell retained the prior choice.
+    Hysteresis,
+    /// CPU/GPU estimates were inside the policy confidence band.
+    LowConfidence,
+}
+
+impl GpuDrivenMatrixSelectionReason {
+    /// Stable diagnostic label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Required => "required",
+            Self::SmallWorkload => "small",
+            Self::CostModel => "cost",
+            Self::Hysteresis => "hysteresis",
+            Self::LowConfidence => "low_confidence",
+        }
+    }
+}
+
+/// One reproducible CPU-side workload in the M7.5 comparison matrix.
+///
+/// `item_count` is N and `bin_count` is B. Items are distributed round-robin
+/// over B stable pipeline/material bins. `dirty_percent` uses a deterministic
+/// source-index mask; no random generator or wall clock participates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuDrivenMatrixBenchSpec {
+    pub item_count: usize,
+    pub bin_count: usize,
+    pub render_path: RenderPath,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    /// Production capability prior: 1 = portable indirect, 2 = enabled
+    /// indirect-count. Adapter-specific throughput belongs to hardware runs.
+    pub device_tier: u8,
+    /// Retained slot-span pressure relative to the compact live domain.
+    pub slot_span_multiplier: u32,
+    pub shadow_2d_view_count: u32,
+    pub shadow_cube_view_count: u32,
+    pub dirty_percent: u8,
+}
+
+impl GpuDrivenMatrixBenchSpec {
+    /// Main-view-only baseline used by the full N/B/mode matrix.
+    #[must_use]
+    pub const fn main_only(item_count: usize, bin_count: usize) -> Self {
+        Self {
+            item_count,
+            bin_count,
+            render_path: RenderPath::BasicForward,
+            viewport_width: 1920,
+            viewport_height: 1080,
+            device_tier: 2,
+            slot_span_multiplier: 1,
+            shadow_2d_view_count: 0,
+            shadow_cube_view_count: 0,
+            dirty_percent: 0,
+        }
+    }
+}
+
+/// O(1) selection and ownership diagnostics returned by a timed iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuDrivenMatrixRunToken {
+    pub mode: GpuDrivenMatrixMode,
+    pub backend: GpuDrivenMatrixBackend,
+    pub selection_reason: GpuDrivenMatrixSelectionReason,
+    pub item_count: usize,
+    pub requested_bin_count: usize,
+    pub retained_gpu_bin_count: usize,
+    pub cpu_main_source_count: usize,
+    pub gpu_main_source_count: usize,
+    pub gpu_batch_count: usize,
+    /// Bit 0 = Main/Prepass, bit 1 = Shadow2D, bit 2 = ShadowCube.
+    pub selected_family_bits: u8,
+    pub exact_policy_evaluated: bool,
+    pub checksum: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GpuDrivenMatrixBatch {
+    bin: u32,
+    first_instance: u32,
+    instance_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GpuDrivenMatrixPreflight {
+    candidate_len: u32,
+    bin_len: u32,
+    dirty_candidates: u32,
+}
+
+/// Retained, GPU-free M7.5 comparison harness.
+///
+/// The harness measures the production Auto selector plus a deterministic
+/// CPU planning proxy for its selected route. CPU-direct emits one flat command
+/// per owned source. GPU-driven emits a bin-major instance stream and compact
+/// batch headers. Auto applies the same cohort threshold and submitted-only
+/// hysteresis as the renderer; Required keeps every bin. This is intentionally
+/// a CPU policy/planning comparison, not a substitute for adapter-specific GPU
+/// timestamps. It remains runnable on headless CI and reaches a zero-allocation
+/// plateau after construction/warm-up.
+pub struct GpuDrivenMatrixBenchHarness {
+    spec: GpuDrivenMatrixBenchSpec,
+    mode: GpuDrivenMatrixMode,
+    policy: GpuDrivenAutoPolicy,
+    source_bins: Vec<u32>,
+    bin_counts: Vec<u32>,
+    bin_offsets: Vec<u32>,
+    bin_cursors: Vec<u32>,
+    eligible_bins: Vec<bool>,
+    cpu_commands: Vec<u64>,
+    gpu_instances: Vec<u32>,
+    gpu_batches: Vec<GpuDrivenMatrixBatch>,
+}
+
+impl GpuDrivenMatrixBenchHarness {
+    /// Build one deterministic workload. Fixture allocation is intentionally
+    /// outside the measured iteration.
+    #[must_use]
+    pub fn new(spec: GpuDrivenMatrixBenchSpec, mode: GpuDrivenMatrixMode) -> Self {
+        assert!(spec.item_count > 0, "GPU-driven matrix requires N > 0");
+        assert!(spec.bin_count > 0, "GPU-driven matrix requires B > 0");
+        assert!(
+            spec.bin_count <= spec.item_count,
+            "GPU-driven matrix requires B <= N (empty bins are not production bins)"
+        );
+        assert!(
+            u32::try_from(spec.item_count).is_ok() && u32::try_from(spec.bin_count).is_ok(),
+            "GPU-driven matrix domain exceeds u32 production IDs"
+        );
+        assert!(
+            spec.dirty_percent <= 100,
+            "GPU-driven matrix dirty percentage exceeds 100"
+        );
+        assert!(
+            spec.viewport_width > 0 && spec.viewport_height > 0,
+            "GPU-driven matrix viewport must be nonzero"
+        );
+        assert!(
+            spec.device_tier <= 2,
+            "GPU-driven matrix device tier must be 0, 1, or 2"
+        );
+        assert!(
+            spec.slot_span_multiplier > 0,
+            "GPU-driven matrix slot-span multiplier must be nonzero"
+        );
+
+        let source_bins = (0..spec.item_count)
+            .map(|source| {
+                u32::try_from(source % spec.bin_count)
+                    .expect("validated GPU-driven matrix bin exceeds u32")
+            })
+            .collect();
+        Self {
+            spec,
+            mode,
+            policy: GpuDrivenAutoPolicy::new(),
+            source_bins,
+            bin_counts: vec![0; spec.bin_count],
+            bin_offsets: vec![0; spec.bin_count],
+            bin_cursors: vec![0; spec.bin_count],
+            eligible_bins: vec![false; spec.bin_count],
+            cpu_commands: Vec::with_capacity(spec.item_count),
+            gpu_instances: Vec::with_capacity(spec.item_count),
+            gpu_batches: Vec::with_capacity(spec.bin_count),
+        }
+    }
+
+    /// Advance enough successful submissions to leave Auto's enter-confirm and
+    /// minimum-dwell startup region while establishing all retained capacities.
+    #[must_use]
+    pub fn stabilize(&mut self) -> GpuDrivenMatrixRunToken {
+        let mut token = self.run_iteration();
+        for _ in 1..64 {
+            token = self.run_iteration();
+        }
+        token
+    }
+
+    /// Run one deterministic successful frame-equivalent iteration.
+    #[must_use]
+    pub fn run_iteration(&mut self) -> GpuDrivenMatrixRunToken {
+        let mut exact_policy_evaluated = false;
+        let (families, reason, preflight) = match self.mode {
+            GpuDrivenMatrixMode::Off => (
+                GpuDrivenFamilyMask::empty(),
+                GpuDrivenMatrixSelectionReason::Off,
+                GpuDrivenMatrixPreflight::default(),
+            ),
+            GpuDrivenMatrixMode::Required => {
+                let preflight = self.preflight(1);
+                (
+                    active_families(self.spec),
+                    GpuDrivenMatrixSelectionReason::Required,
+                    preflight,
+                )
+            }
+            GpuDrivenMatrixMode::Auto => {
+                let synopsis = self.synopsis();
+                match self.policy.coarse_gate(policy_key(self.spec), synopsis) {
+                    GpuDrivenCoarseGate::Decide(decision) => {
+                        let reason = project_auto_reason(decision.reason);
+                        let families = decision.families;
+                        assert!(
+                            self.policy.commit_submitted(decision.token),
+                            "headless Auto decision token did not commit"
+                        );
+                        (families, reason, GpuDrivenMatrixPreflight::default())
+                    }
+                    GpuDrivenCoarseGate::EvaluateExact {
+                        minimum_cohort_members,
+                    } => {
+                        exact_policy_evaluated = true;
+                        let preflight = self.preflight(minimum_cohort_members);
+                        let decision = self.policy.evaluate_exact(
+                            policy_key(self.spec),
+                            synopsis,
+                            self.exact_workload(preflight),
+                            minimum_cohort_members,
+                        );
+                        let reason = project_auto_reason(decision.reason);
+                        let families = decision.families;
+                        assert!(
+                            self.policy.commit_submitted(decision.token),
+                            "headless exact Auto decision token did not commit"
+                        );
+                        (families, reason, preflight)
+                    }
+                }
+            }
+        };
+
+        self.materialize(families, preflight);
+        let active = active_families(self.spec);
+        let backend = if families.is_empty() {
+            GpuDrivenMatrixBackend::CpuDirect
+        } else if self.cpu_commands.is_empty()
+            && families.contains(active)
+            && active.contains(families)
+        {
+            GpuDrivenMatrixBackend::GpuDriven
+        } else {
+            GpuDrivenMatrixBackend::Hybrid
+        };
+        let checksum = self.checksum();
+
+        GpuDrivenMatrixRunToken {
+            mode: self.mode,
+            backend,
+            selection_reason: reason,
+            item_count: self.spec.item_count,
+            requested_bin_count: self.spec.bin_count,
+            retained_gpu_bin_count: if families.contains(GpuDrivenFamilyMask::MAIN_PREPASS) {
+                preflight.bin_len as usize
+            } else {
+                0
+            },
+            cpu_main_source_count: self.cpu_commands.len(),
+            gpu_main_source_count: self.gpu_instances.len(),
+            gpu_batch_count: self.gpu_batches.len(),
+            selected_family_bits: families.bits(),
+            exact_policy_evaluated,
+            checksum,
+        }
+    }
+
+    fn synopsis(&self) -> GpuDrivenWorkloadSynopsis {
+        let item_count = u32::try_from(self.spec.item_count)
+            .expect("validated GPU-driven matrix item count exceeds u32");
+        let changed = item_count.saturating_mul(u32::from(self.spec.dirty_percent)) / 100;
+        let topology_fingerprint = mix64(
+            mix64(self.spec.item_count as u64, self.spec.bin_count as u64),
+            u64::from(self.spec.shadow_2d_view_count) << 32
+                | u64::from(self.spec.shadow_cube_view_count),
+        );
+        GpuDrivenWorkloadSynopsis {
+            extracted_item_count: item_count,
+            opaque_item_count: item_count,
+            supported_opaque_count: item_count,
+            shadow_caster_count: item_count,
+            supported_shadow_caster_count: item_count,
+            transform_changed_count: changed,
+            indexed_primitive_count: u64::from(item_count).saturating_mul(36),
+            shadow_2d_view_count: self.spec.shadow_2d_view_count,
+            shadow_cube_view_count: self.spec.shadow_cube_view_count,
+            topology_fingerprint,
+        }
+    }
+
+    fn preflight(&mut self, minimum_cohort_members: u32) -> GpuDrivenMatrixPreflight {
+        self.bin_counts.fill(0);
+        for &bin in &self.source_bins {
+            let count = &mut self.bin_counts[bin as usize];
+            *count = count.saturating_add(1);
+        }
+
+        self.eligible_bins.fill(false);
+        self.bin_offsets.fill(0);
+        let mut projection = GpuDrivenMatrixPreflight::default();
+        let mut next_offset = 0_u32;
+        for (bin, &count) in self.bin_counts.iter().enumerate() {
+            if count < minimum_cohort_members {
+                continue;
+            }
+            self.eligible_bins[bin] = true;
+            self.bin_offsets[bin] = next_offset;
+            next_offset = next_offset
+                .checked_add(count)
+                .expect("GPU-driven matrix instance range overflowed");
+            projection.candidate_len = projection.candidate_len.saturating_add(count);
+            projection.bin_len = projection.bin_len.saturating_add(1);
+        }
+
+        if self.spec.dirty_percent != 0 {
+            for (source, &bin) in self.source_bins.iter().enumerate() {
+                if self.eligible_bins[bin as usize]
+                    && source % 100 < self.spec.dirty_percent as usize
+                {
+                    projection.dirty_candidates = projection.dirty_candidates.saturating_add(1);
+                }
+            }
+        }
+        projection
+    }
+
+    fn exact_workload(&self, preflight: GpuDrivenMatrixPreflight) -> GpuDrivenExactWorkload {
+        GpuDrivenExactWorkload {
+            candidate_count: preflight.candidate_len,
+            bin_count: preflight.bin_len,
+            unique_geometry_count: preflight.bin_len,
+            unique_material_count: preflight.bin_len,
+            shadow_candidate_count: preflight.candidate_len,
+            instance_slot_span: preflight
+                .candidate_len
+                .saturating_mul(self.spec.slot_span_multiplier),
+            batch_slot_span: preflight
+                .bin_len
+                .saturating_mul(self.spec.slot_span_multiplier),
+            dirty_candidate_count: preflight.dirty_candidates,
+            indexed_primitive_count: u64::from(preflight.candidate_len).saturating_mul(36),
+            main_submission_count: match self.spec.render_path {
+                RenderPath::BasicForward => 1,
+                RenderPath::HighFidelity => 2,
+            },
+            shadow_2d_view_count: self.spec.shadow_2d_view_count,
+            shadow_cube_view_count: self.spec.shadow_cube_view_count,
+            viewport_pixels: u64::from(self.spec.viewport_width)
+                .saturating_mul(u64::from(self.spec.viewport_height)),
+            device_tier: self.spec.device_tier,
+            capability_families: GpuDrivenFamilyMask::ALL,
+        }
+    }
+
+    fn materialize(&mut self, families: GpuDrivenFamilyMask, preflight: GpuDrivenMatrixPreflight) {
+        self.cpu_commands.clear();
+        self.gpu_instances.clear();
+        self.gpu_batches.clear();
+
+        if !families.contains(GpuDrivenFamilyMask::MAIN_PREPASS) {
+            for (source, &bin) in self.source_bins.iter().enumerate() {
+                self.cpu_commands
+                    .push(encode_cpu_command(source as u32, bin));
+            }
+            return;
+        }
+
+        self.gpu_instances
+            .resize(preflight.candidate_len as usize, 0);
+        self.bin_cursors.fill(0);
+        for (source, &bin) in self.source_bins.iter().enumerate() {
+            let bin_index = bin as usize;
+            if !self.eligible_bins[bin_index] {
+                self.cpu_commands
+                    .push(encode_cpu_command(source as u32, bin));
+                continue;
+            }
+            let cursor = &mut self.bin_cursors[bin_index];
+            let instance = self.bin_offsets[bin_index]
+                .checked_add(*cursor)
+                .expect("GPU-driven matrix bin cursor overflowed");
+            self.gpu_instances[instance as usize] = source as u32;
+            *cursor = cursor.saturating_add(1);
+        }
+
+        for (bin, &count) in self.bin_counts.iter().enumerate() {
+            if self.eligible_bins[bin] {
+                self.gpu_batches.push(GpuDrivenMatrixBatch {
+                    bin: bin as u32,
+                    first_instance: self.bin_offsets[bin],
+                    instance_count: count,
+                });
+            }
+        }
+    }
+
+    fn checksum(&self) -> u64 {
+        let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
+        for &command in &self.cpu_commands {
+            checksum = mix64(checksum, command);
+        }
+        for &source in &self.gpu_instances {
+            checksum = mix64(checksum, u64::from(source) | 1_u64 << 63);
+        }
+        for batch in &self.gpu_batches {
+            checksum = mix64(
+                checksum,
+                u64::from(batch.bin) << 48
+                    ^ u64::from(batch.first_instance) << 24
+                    ^ u64::from(batch.instance_count),
+            );
+        }
+        checksum
+    }
+}
+
+fn policy_key(spec: GpuDrivenMatrixBenchSpec) -> GpuDrivenPolicyDomainKey {
+    GpuDrivenPolicyDomainKey {
+        scene_id: 1,
+        camera_id: 1,
+        render_path: spec.render_path,
+        msaa_samples: 1,
+        viewport_width: spec.viewport_width,
+        viewport_height: spec.viewport_height,
+        pipeline_epoch: 1,
+    }
+}
+
+fn active_families(spec: GpuDrivenMatrixBenchSpec) -> GpuDrivenFamilyMask {
+    let mut families = GpuDrivenFamilyMask::MAIN_PREPASS;
+    if spec.shadow_2d_view_count != 0 {
+        families.insert(GpuDrivenFamilyMask::SHADOW_2D);
+    }
+    if spec.shadow_cube_view_count != 0 {
+        families.insert(GpuDrivenFamilyMask::SHADOW_CUBE);
+    }
+    families
+}
+
+fn project_auto_reason(reason: GpuDrivenAutoDecisionReason) -> GpuDrivenMatrixSelectionReason {
+    match reason {
+        GpuDrivenAutoDecisionReason::SmallWorkload => GpuDrivenMatrixSelectionReason::SmallWorkload,
+        GpuDrivenAutoDecisionReason::CostModel => GpuDrivenMatrixSelectionReason::CostModel,
+        GpuDrivenAutoDecisionReason::Hysteresis => GpuDrivenMatrixSelectionReason::Hysteresis,
+        GpuDrivenAutoDecisionReason::LowConfidence => GpuDrivenMatrixSelectionReason::LowConfidence,
+    }
+}
+
+fn encode_cpu_command(source: u32, bin: u32) -> u64 {
+    u64::from(source) << 32 | u64::from(bin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DrawDemandBenchHarness, DrawDemandBenchSpec, DrawDemandDependencyPattern,
-        DrawDemandPlanKey, DrawDemandRoot, DrawDemandTextureTopology, HighFanOutBenchHarness,
-        HighFanOutBenchSpec, HighFanOutRoot, MaterialSceneCpuBenchHarness,
+        DrawDemandPlanKey, DrawDemandRoot, DrawDemandTextureTopology, GpuDrivenMatrixBackend,
+        GpuDrivenMatrixBenchHarness, GpuDrivenMatrixBenchSpec, GpuDrivenMatrixMode,
+        HighFanOutBenchHarness, HighFanOutBenchSpec, HighFanOutRoot, MaterialSceneCpuBenchHarness,
         MaterialSceneCpuBenchStage, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
-        project_plan_key, shadow_plan_key,
+        RenderPath, project_plan_key, shadow_plan_key,
     };
 
     fn spec(
@@ -2162,5 +2682,76 @@ mod tests {
             assert!(facts.root_physical_dependencies.is_empty());
             assert!(facts.execution_queue.is_empty());
         }
+    }
+
+    #[test]
+    fn gpu_driven_matrix_modes_preserve_disjoint_main_ownership() {
+        let spec = GpuDrivenMatrixBenchSpec::main_only(10_000, 4);
+        for mode in [
+            GpuDrivenMatrixMode::Off,
+            GpuDrivenMatrixMode::Auto,
+            GpuDrivenMatrixMode::Required,
+        ] {
+            let mut harness = GpuDrivenMatrixBenchHarness::new(spec, mode);
+            let token = harness.stabilize();
+            assert_eq!(token.item_count, spec.item_count);
+            assert_eq!(token.requested_bin_count, spec.bin_count);
+            assert_eq!(
+                token.cpu_main_source_count + token.gpu_main_source_count,
+                spec.item_count,
+                "CPU and GPU recipes must own each source exactly once"
+            );
+            assert_ne!(token.checksum, 0);
+        }
+    }
+
+    #[test]
+    fn gpu_driven_matrix_auto_keeps_tiny_and_singleton_bins_cpu_direct() {
+        for spec in [
+            GpuDrivenMatrixBenchSpec::main_only(1, 1),
+            GpuDrivenMatrixBenchSpec::main_only(10_000, 10_000),
+        ] {
+            let mut harness = GpuDrivenMatrixBenchHarness::new(spec, GpuDrivenMatrixMode::Auto);
+            let token = harness.stabilize();
+            assert_eq!(token.backend, GpuDrivenMatrixBackend::CpuDirect);
+            assert_eq!(token.cpu_main_source_count, spec.item_count);
+            assert_eq!(token.gpu_main_source_count, 0);
+        }
+    }
+
+    #[test]
+    fn gpu_driven_matrix_auto_promotes_shared_large_workload() {
+        let spec = GpuDrivenMatrixBenchSpec {
+            item_count: 10_000,
+            bin_count: 4,
+            render_path: RenderPath::HighFidelity,
+            viewport_width: 2560,
+            viewport_height: 1440,
+            device_tier: 2,
+            slot_span_multiplier: 1,
+            shadow_2d_view_count: 4,
+            shadow_cube_view_count: 6,
+            dirty_percent: 10,
+        };
+        let mut harness = GpuDrivenMatrixBenchHarness::new(spec, GpuDrivenMatrixMode::Auto);
+        let token = harness.stabilize();
+        assert_eq!(token.backend, GpuDrivenMatrixBackend::GpuDriven);
+        assert_eq!(token.cpu_main_source_count, 0);
+        assert_eq!(token.gpu_main_source_count, spec.item_count);
+        assert_eq!(token.retained_gpu_bin_count, spec.bin_count);
+        assert_eq!(token.selected_family_bits, 0b111);
+    }
+
+    #[test]
+    fn gpu_driven_matrix_required_is_a_stable_forced_comparison_arm() {
+        let spec = GpuDrivenMatrixBenchSpec::main_only(1_000, 1_000);
+        let mut required = GpuDrivenMatrixBenchHarness::new(spec, GpuDrivenMatrixMode::Required);
+        let first = required.run_iteration();
+        let second = required.run_iteration();
+        assert_eq!(first, second);
+        assert_eq!(first.backend, GpuDrivenMatrixBackend::GpuDriven);
+        assert_eq!(first.gpu_main_source_count, spec.item_count);
+        assert_eq!(first.gpu_batch_count, spec.bin_count);
+        assert!(!first.exact_policy_evaluated);
     }
 }
