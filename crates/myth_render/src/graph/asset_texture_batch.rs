@@ -1071,4 +1071,421 @@ impl Default for AssetTextureBatch {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use std::sync::Arc;
+
+    use myth_resources::{
+        image::{ImageDimension, PixelFormat},
+        texture::Texture,
+    };
+
+    use super::*;
+
+    fn image_8x8(value: u8) -> Image {
+        Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![value; 8 * 8 * 4]),
+        )
+    }
+
+    #[test]
+    fn capture_deduplicates_owners_and_preserves_every_complete_state() {
+        let assets = AssetServer::new();
+        let shared_image = assets.images.add(image_8x8(1));
+        let pending_image = assets.images.reserve();
+        let first = assets
+            .textures
+            .add(Texture::new_2d(Some("first"), shared_image));
+        let second = assets
+            .textures
+            .add(Texture::new_2d(Some("second"), shared_image));
+        let pending_texture = assets.textures.reserve();
+        let texture_with_pending_image = assets
+            .textures
+            .add(Texture::new_2d(Some("pending image"), pending_image));
+
+        let mut batch = AssetTextureBatch::new();
+        let first_id = batch.request(first);
+        assert_eq!(batch.request(first), first_id);
+        let second_id = batch.request(second);
+        let pending_texture_id = batch.request(pending_texture);
+        let pending_image_id = batch.request(texture_with_pending_image);
+        batch.capture_requested(&assets);
+
+        assert_eq!(batch.texture_count(), 4);
+        assert_eq!(batch.image_count(), 2);
+        assert_eq!(
+            batch.texture_handles,
+            [first, second, pending_texture, texture_with_pending_image]
+        );
+        assert!(Arc::ptr_eq(
+            batch.image_owner(first_id).unwrap().asset(),
+            batch.image_owner(second_id).unwrap().asset(),
+        ));
+
+        let pending_texture_state = batch.state(pending_texture_id).unwrap();
+        assert_eq!(pending_texture_state.texture_version, None);
+        assert_eq!(pending_texture_state.image_handle, None);
+        assert_eq!(pending_texture_state.ready, None);
+        let pending_image_state = batch.state(pending_image_id).unwrap();
+        assert!(pending_image_state.texture_version.is_some());
+        assert_eq!(pending_image_state.image_handle, Some(pending_image));
+        assert_eq!(pending_image_state.image_version, None);
+        assert_eq!(pending_image_state.ready, None);
+
+        let selected = [first_id, second_id, pending_texture_id, pending_image_id];
+        assert_eq!(
+            batch.postflight_states_selected(&assets, &selected),
+            [true, true, true, true]
+        );
+        assert_eq!(
+            batch.postflight_selected(&assets, &selected),
+            [true, true, false, false]
+        );
+
+        let expected = batch.state(first_id).unwrap().ready.unwrap();
+        let (texture_owner, image_owner) = batch
+            .ready_owners(first_id, expected)
+            .expect("exact ready owners missing");
+        assert_eq!(texture_owner.image, shared_image);
+        assert_eq!(image_owner.width, 8);
+        assert!(batch.ready_owners(pending_texture_id, expected).is_none());
+        assert_eq!(
+            batch.postflight_selected(
+                &assets,
+                &[
+                    first_id,
+                    pending_texture_id,
+                    AssetTextureBatchId::from_index(1024),
+                ],
+            ),
+            [true, false, false]
+        );
+    }
+
+    #[test]
+    fn capture_bracket_isolates_texture_redirect_and_image_aba() {
+        let assets = AssetServer::new();
+        let redirect_source = assets.images.add(image_8x8(1));
+        let redirect_target = assets.images.add(image_8x8(2));
+        let aba_image = assets.images.add(image_8x8(3));
+        let stable_image = assets.images.add(image_8x8(4));
+        let redirected = assets
+            .textures
+            .add(Texture::new_2d(Some("redirected"), redirect_source));
+        let image_aba = assets
+            .textures
+            .add(Texture::new_2d(Some("image ABA"), aba_image));
+        let stable = assets
+            .textures
+            .add(Texture::new_2d(Some("stable"), stable_image));
+
+        let mut batch = AssetTextureBatch::new();
+        batch.capture_with_hooks(
+            &assets,
+            [redirected, image_aba, stable],
+            || {
+                assets.textures.insert_ready(
+                    redirected,
+                    Texture::new_2d(Some("redirect replacement"), redirect_target),
+                );
+            },
+            || assets.images.insert_ready(aba_image, image_8x8(5)),
+        );
+
+        let redirected_id = batch.id(redirected).unwrap();
+        let image_aba_id = batch.id(image_aba).unwrap();
+        let stable_id = batch.id(stable).unwrap();
+        assert!(batch.state(redirected_id).is_none());
+        assert!(batch.texture_owner(redirected_id).is_none());
+        assert!(batch.state(image_aba_id).is_none());
+        assert!(batch.image_owner(image_aba_id).is_none());
+        assert!(batch.state(stable_id).unwrap().ready.is_some());
+        assert_eq!(
+            batch.postflight_selected(&assets, &[redirected_id, image_aba_id, stable_id]),
+            [false, false, true]
+        );
+        assert!(
+            batch
+                .records
+                .iter()
+                .all(|record| !record.physical_published),
+            "a failed capture must publish no physical result"
+        );
+    }
+
+    #[test]
+    fn revalidation_detects_pending_transitions_and_late_aba_per_record() {
+        let assets = AssetServer::new();
+        let stable_image = assets.images.add(image_8x8(1));
+        let texture_aba_image = assets.images.add(image_8x8(2));
+        let image_aba_image = assets.images.add(image_8x8(3));
+        let pending_image = assets.images.reserve();
+        let pending_texture = assets.textures.reserve();
+        let texture_with_pending_image = assets
+            .textures
+            .add(Texture::new_2d(Some("pending image"), pending_image));
+        let texture_aba = assets
+            .textures
+            .add(Texture::new_2d(Some("texture ABA"), texture_aba_image));
+        let image_aba = assets
+            .textures
+            .add(Texture::new_2d(Some("image ABA"), image_aba_image));
+        let stable = assets
+            .textures
+            .add(Texture::new_2d(Some("stable"), stable_image));
+
+        let mut batch = AssetTextureBatch::new();
+        batch.capture(
+            &assets,
+            [
+                pending_texture,
+                texture_with_pending_image,
+                texture_aba,
+                image_aba,
+                stable,
+            ],
+        );
+        assets.textures.insert_ready(
+            pending_texture,
+            Texture::new_2d(Some("became ready"), stable_image),
+        );
+        assets.images.insert_ready(pending_image, image_8x8(4));
+        assets.textures.insert_ready(
+            texture_aba,
+            Texture::new_2d(Some("same handle replacement"), texture_aba_image),
+        );
+        assets.images.insert_ready(image_aba_image, image_8x8(5));
+        batch.revalidate(&assets);
+
+        for handle in [
+            pending_texture,
+            texture_with_pending_image,
+            texture_aba,
+            image_aba,
+        ] {
+            assert!(
+                batch.state_for_handle(handle).is_none(),
+                "drifting handle {handle:?} remained accepted"
+            );
+        }
+        assert!(batch.state_for_handle(stable).unwrap().ready.is_some());
+    }
+
+    #[test]
+    fn ready_postflight_crosses_batch_width_and_isolates_both_drift_windows() {
+        const STABLE_TEXTURE_COUNT: usize = 63;
+        let assets = AssetServer::new();
+        let shared_image = assets.images.add(image_8x8(1));
+        let drifting_image = assets.images.add(image_8x8(2));
+        let replacement_image = assets.images.add(image_8x8(3));
+        let mut batch = AssetTextureBatch::new();
+        let mut selected = Vec::with_capacity(STABLE_TEXTURE_COUNT + 2);
+
+        for _ in 0..STABLE_TEXTURE_COUNT {
+            let texture = assets
+                .textures
+                .add(Texture::new_2d(Some("shared postflight"), shared_image));
+            selected.push(batch.request(texture));
+        }
+        let drifting_texture = assets
+            .textures
+            .add(Texture::new_2d(Some("image drift"), drifting_image));
+        selected.push(batch.request(drifting_texture));
+        let redirected_texture = assets
+            .textures
+            .add(Texture::new_2d(Some("late redirect"), shared_image));
+        selected.push(batch.request(redirected_texture));
+        batch.capture_requested(&assets);
+
+        assets.images.insert_ready(drifting_image, image_8x8(4));
+        let current = batch
+            .postflight_selected_with_hooks(
+                &assets,
+                &selected,
+                || {},
+                || {
+                    assets.textures.insert_ready(
+                        redirected_texture,
+                        Texture::new_2d(Some("late replacement"), replacement_image),
+                    );
+                },
+            )
+            .to_vec();
+
+        assert_eq!(current.len(), 65);
+        assert!(current[..STABLE_TEXTURE_COUNT].iter().all(|&value| value));
+        assert!(!current[STABLE_TEXTURE_COUNT]);
+        assert!(!current[STABLE_TEXTURE_COUNT + 1]);
+        assert_eq!(batch.selected_texture_indices.len(), 65);
+        assert_eq!(batch.selected_image_indices.len(), 2);
+        assert_eq!(batch.selected_image_lookup.slots.len(), 2);
+    }
+
+    #[test]
+    fn complete_postflight_crosses_batch_width_and_rejects_every_transition() {
+        const READY_TEXTURE_COUNT: usize = 63;
+        let assets = AssetServer::new();
+        let shared_image = assets.images.add(image_8x8(1));
+        let replacement_image = assets.images.add(image_8x8(2));
+        let unavailable_image = assets.images.reserve();
+        let mut batch = AssetTextureBatch::new();
+        let mut selected = Vec::with_capacity(READY_TEXTURE_COUNT + 2);
+        let mut first_ready = None;
+
+        for _ in 0..READY_TEXTURE_COUNT {
+            let texture = assets.textures.add(Texture::new_2d(
+                Some("shared complete-state boundary"),
+                shared_image,
+            ));
+            first_ready.get_or_insert(texture);
+            selected.push(batch.request(texture));
+        }
+        let unavailable_texture = assets.textures.reserve();
+        selected.push(batch.request(unavailable_texture));
+        let texture_with_unavailable_image = assets.textures.add(Texture::new_2d(
+            Some("unavailable-image boundary"),
+            unavailable_image,
+        ));
+        selected.push(batch.request(texture_with_unavailable_image));
+        batch.capture_requested(&assets);
+
+        assert!(
+            batch
+                .postflight_states_selected_with_hooks(&assets, &selected, || {}, || {})
+                .iter()
+                .all(|&value| value)
+        );
+        assert_eq!(batch.selected_texture_indices.len(), 65);
+        assert_eq!(batch.selected_image_indices.len(), 2);
+        assert_eq!(
+            batch.postflight_selected(&assets, &selected),
+            [vec![true; READY_TEXTURE_COUNT], vec![false, false]].concat()
+        );
+
+        assets.textures.insert_ready(
+            unavailable_texture,
+            Texture::new_2d(Some("transitioned texture"), shared_image),
+        );
+        assets.images.insert_ready(unavailable_image, image_8x8(3));
+        let first_ready = first_ready.unwrap();
+        let current = batch
+            .postflight_states_selected_with_hooks(
+                &assets,
+                &selected,
+                || {},
+                || {
+                    assets.textures.insert_ready(
+                        first_ready,
+                        Texture::new_2d(Some("redirected ready"), replacement_image),
+                    );
+                },
+            )
+            .to_vec();
+
+        assert!(!current[0]);
+        assert!(current[1..READY_TEXTURE_COUNT].iter().all(|&value| value));
+        assert!(!current[READY_TEXTURE_COUNT]);
+        assert!(!current[READY_TEXTURE_COUNT + 1]);
+    }
+
+    #[test]
+    fn sparse_scratch_reuses_capacity_and_clear_releases_exact_owners() {
+        const CAPTURED_COUNT: usize = 256;
+        let assets = AssetServer::new();
+        let mut batch = AssetTextureBatch::new();
+        let mut handles = Vec::with_capacity(CAPTURED_COUNT);
+        let mut first_texture = None;
+        let mut first_image = None;
+
+        for index in 0..CAPTURED_COUNT {
+            let image = assets.images.add(image_8x8(index as u8));
+            let texture = assets
+                .textures
+                .add(Texture::new_2d(Some("sparse scratch"), image));
+            first_texture.get_or_insert(texture);
+            first_image.get_or_insert(image);
+            handles.push(texture);
+        }
+        let retained_texture = assets.textures.get(first_texture.unwrap()).unwrap();
+        let retained_image = assets.images.get(first_image.unwrap()).unwrap();
+        batch.capture(&assets, handles);
+
+        let high_id = AssetTextureBatchId::from_index(CAPTURED_COUNT - 1);
+        assert_eq!(
+            batch.postflight_selected_with_hooks(&assets, &[high_id], || {}, || {}),
+            [true]
+        );
+        assert_eq!(batch.selected_image_indices, [CAPTURED_COUNT - 1]);
+        assert_eq!(batch.selected_image_lookup.slots.len(), 1);
+        assert!(batch.selected_image_lookup.slots.capacity() < CAPTURED_COUNT / 16);
+        let retained_lookup_capacity = batch.selected_image_lookup.slots.capacity();
+        assert_eq!(Arc::strong_count(&retained_texture), 3);
+        assert_eq!(Arc::strong_count(&retained_image), 3);
+        let populated = batch.capacity_usage();
+        assert!(populated.active_bytes > populated.baseline_bytes);
+
+        batch.clear();
+        assert_eq!(Arc::strong_count(&retained_texture), 2);
+        assert_eq!(Arc::strong_count(&retained_image), 2);
+        let cleared = batch.capacity_usage();
+        assert_eq!(cleared.active_bytes, 0);
+        assert_eq!(cleared.retained_bytes, populated.retained_bytes);
+
+        let second_image = assets.images.add(image_8x8(7));
+        let second_texture = assets
+            .textures
+            .add(Texture::new_2d(Some("warm scratch"), second_image));
+        let second_id = batch.request(second_texture);
+        batch.capture_requested(&assets);
+        assert_eq!(
+            batch.postflight_selected_with_hooks(&assets, &[second_id], || {}, || {}),
+            [true]
+        );
+        assert_eq!(
+            batch.selected_image_lookup.slots.capacity(),
+            retained_lookup_capacity
+        );
+        assert_eq!(batch.selected_image_indices, [0]);
+
+        batch.clear();
+        let retained = batch.capacity_usage();
+        batch.trim_capacity(retained.baseline_bytes, retained.retained_bytes);
+        assert!(batch.capacity_usage().retained_bytes < retained.retained_bytes);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn stable_epochs_skip_scratch_and_unrelated_writes_restore_the_slow_path() {
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8(1));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("stable epoch"), image));
+        let mut batch = AssetTextureBatch::new();
+        let id = batch.request(texture);
+        batch.capture_requested(&assets);
+
+        assert!(batch.storage_epochs_are_current(&assets));
+        assert_eq!(batch.postflight_selected(&assets, &[id]), [true]);
+        assert!(batch.selected_texture_indices.is_empty());
+        assert!(batch.selected_image_indices.is_empty());
+
+        assets.images.add(image_8x8(2));
+        assert!(!batch.storage_epochs_are_current(&assets));
+        assert_eq!(batch.postflight_selected(&assets, &[id]), [true]);
+        assert_eq!(batch.selected_texture_indices, [id.index()]);
+        assert_eq!(batch.selected_image_indices, [0]);
+        assert!(!batch.storage_epochs_are_current(&assets));
+
+        batch.revalidate(&assets);
+        assert!(batch.storage_epochs_are_current(&assets));
+        assert_eq!(batch.postflight_selected(&assets, &[id]), [true]);
+        assert!(batch.selected_texture_indices.is_empty());
+        assert!(batch.selected_image_indices.is_empty());
+    }
+}

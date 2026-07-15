@@ -501,20 +501,13 @@ mod tests {
     }
 
     #[test]
-    fn dead_tone_mapping_culls_its_input_chain() {
+    fn graph_demand_controls_the_input_chain_without_eager_static_resources() {
         assert!(live_passes(false).is_empty());
-    }
-
-    #[test]
-    fn live_tone_mapping_keeps_only_its_real_input() {
         let live = live_passes(true);
         assert!(live.contains(&"ToneMap_Input"));
         assert!(live.contains(&"ToneMap_Pass"));
         assert!(live.contains(&"ToneMap_Root"));
-    }
 
-    #[test]
-    fn graph_build_does_not_initialize_static_resources() {
         let mut feature = ToneMappingFeature::new();
         {
             let mut storage = GraphStorage::new();

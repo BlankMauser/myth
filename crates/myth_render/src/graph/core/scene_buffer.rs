@@ -511,4 +511,351 @@ impl<'a> SceneBufferResolver<'a> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::core::{ResourceManager, WgpuContext};
+    use crate::graph::core::graph::RenderGraph;
+    use crate::graph::core::{ExecuteContext, FrameArena, GraphStorage, PassNode, PrepareContext};
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext;
+
+    struct ConsumerNode;
+
+    impl PassNode<'_> for ConsumerNode {
+        fn prepare(&mut self, _ctx: &mut PrepareContext<'_>) {}
+
+        fn execute(&self, _ctx: &ExecuteContext<'_>, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    fn gpu() -> WgpuContext {
+        pollster::block_on(SharedTestContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required")
+    }
+
+    fn metadata_buffer() -> CpuBuffer<LightBufferMetadata> {
+        CpuBuffer::new(
+            LightBufferMetadata::default(),
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            Some("scene buffer metadata test"),
+        )
+    }
+
+    fn storage_buffer() -> CpuBuffer<Vec<GpuLightStorage>> {
+        CpuBuffer::new(
+            vec![GpuLightStorage::default()],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            Some("scene buffer storage test"),
+        )
+    }
+
+    fn add_live_consumer(
+        graph: &mut RenderGraph<'_>,
+        metadata: BufferNodeId,
+        lights: BufferNodeId,
+    ) {
+        graph.add_pass("scene buffer consumer", |builder| {
+            builder.read_buffer(metadata);
+            builder.read_buffer(lights);
+            builder.mark_side_effect();
+            (ConsumerNode, ())
+        });
+    }
+
+    fn import_id(graph: &RenderGraph<'_>, node: BufferNodeId) -> SceneBufferImportId {
+        graph.storage.resources[node.index() as usize]
+            .scene_buffer_import_id()
+            .expect("lazy scene-buffer backing missing")
+    }
+
+    #[test]
+    fn dead_imports_do_not_touch_the_real_resource_manager() {
+        let wgpu = gpu();
+        let metadata = metadata_buffer();
+        let lights = storage_buffer();
+        let metadata_id = metadata.id();
+        let lights_id = lights.id();
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        graph.import_scene_light_metadata_buffer("dead metadata", &metadata);
+        graph.import_scene_light_storage_buffer("dead lights", &lights);
+        graph.compile_topology();
+
+        let mut uploads = BufferUploadContext::new(
+            &wgpu.device,
+            &wgpu.queue,
+            resources.frame_index,
+            &mut resources.resources,
+            &resources.internal_textures,
+        );
+        assert_eq!(
+            graph.materialize_live_scene_buffers(
+                SceneBufferSources {
+                    light_metadata: &metadata,
+                    light_storage: &lights,
+                },
+                &mut uploads,
+            ),
+            Ok(()),
+        );
+        assert!(resources.get_gpu_buffer_by_cpu_id(metadata_id).is_none());
+        assert!(resources.get_gpu_buffer_by_cpu_id(lights_id).is_none());
+    }
+
+    #[test]
+    fn live_imports_dedupe_materialize_once_and_resolve() {
+        let wgpu = gpu();
+        let metadata = metadata_buffer();
+        let lights = storage_buffer();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut calls = 0;
+
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        let first = graph.import_scene_light_metadata_buffer("metadata first", &metadata);
+        let duplicate = graph.import_scene_light_metadata_buffer("metadata duplicate", &metadata);
+        let lights = graph.import_scene_light_storage_buffer("lights", &lights);
+        assert_eq!(first, duplicate);
+        assert_eq!(graph.storage.scene_buffer_imports.entries.len(), 2);
+
+        add_live_consumer(&mut graph, first, lights);
+        graph.compile_topology();
+        let ids = [import_id(&graph, first), import_id(&graph, lights)];
+
+        assert_eq!(
+            graph
+                .storage
+                .scene_buffer_imports
+                .materialize_live_for_test(&graph.storage.resources, |recipe, snapshot| {
+                    calls += 1;
+                    let usage = match recipe {
+                        SceneBufferRecipe::LightMetadata => wgpu::BufferUsages::UNIFORM,
+                        SceneBufferRecipe::LightStorage => wgpu::BufferUsages::STORAGE,
+                    };
+                    Some(Tracked::new(wgpu.device.create_buffer(
+                        &wgpu::BufferDescriptor {
+                            label: Some("scene buffer materialization test"),
+                            size: snapshot.stamp.size as u64,
+                            usage,
+                            mapped_at_creation: false,
+                        },
+                    )))
+                }),
+            Ok(()),
+        );
+        assert_eq!(calls, 2);
+
+        assert_eq!(
+            graph
+                .storage
+                .scene_buffer_imports
+                .materialize_live_for_test(&graph.storage.resources, |_, _| {
+                    calls += 1;
+                    None
+                }),
+            Ok(()),
+        );
+        assert_eq!(calls, 2);
+
+        let resolver = graph.storage.scene_buffer_imports.resolver();
+        for id in ids {
+            assert!(resolver.was_materialized(id));
+            assert!(resolver.buffer(id).is_some());
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BatchFailureCase {
+        SnapshotDrift,
+        UndersizedEqualVersion,
+        NewerPhysicalVersion,
+    }
+
+    #[test]
+    fn invalid_live_batches_fail_before_any_companion_upload() {
+        let wgpu = gpu();
+
+        for case in [
+            BatchFailureCase::SnapshotDrift,
+            BatchFailureCase::UndersizedEqualVersion,
+            BatchFailureCase::NewerPhysicalVersion,
+        ] {
+            let metadata = metadata_buffer();
+            let lights = storage_buffer();
+            let metadata_id = metadata.id();
+            let light_stamp = lights.stamp();
+            let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+
+            match case {
+                BatchFailureCase::SnapshotDrift => {}
+                BatchFailureCase::UndersizedEqualVersion => {
+                    assert!(light_stamp.size > 16, "test source must exceed seed buffer");
+                    let seed = BufferRef::with_fixed_id(
+                        light_stamp.id,
+                        16,
+                        light_stamp.usage,
+                        light_stamp.version,
+                        None,
+                    );
+                    resources.ensure_buffer_ref(&seed, &[0; 16]);
+                }
+                BatchFailureCase::NewerPhysicalVersion => {
+                    let newer = BufferRef::with_fixed_id(
+                        light_stamp.id,
+                        light_stamp.size,
+                        light_stamp.usage,
+                        light_stamp.version + 1,
+                        None,
+                    );
+                    resources.ensure_buffer_ref(&newer, lights.read().as_bytes());
+                }
+            }
+
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            let metadata_node = graph.import_scene_light_metadata_buffer("metadata", &metadata);
+            let storage_node = graph.import_scene_light_storage_buffer("lights", &lights);
+            add_live_consumer(&mut graph, metadata_node, storage_node);
+            graph.compile_topology();
+
+            if matches!(case, BatchFailureCase::SnapshotDrift) {
+                drop(metadata.write());
+            }
+
+            let mut uploads = BufferUploadContext::new(
+                &wgpu.device,
+                &wgpu.queue,
+                resources.frame_index,
+                &mut resources.resources,
+                &resources.internal_textures,
+            );
+            let result = graph.materialize_live_scene_buffers(
+                SceneBufferSources {
+                    light_metadata: &metadata,
+                    light_storage: &lights,
+                },
+                &mut uploads,
+            );
+            let expected = match case {
+                BatchFailureCase::SnapshotDrift => SceneBufferMaterializationFailure::SnapshotDrift,
+                BatchFailureCase::UndersizedEqualVersion
+                | BatchFailureCase::NewerPhysicalVersion => {
+                    SceneBufferMaterializationFailure::ConflictingPhysicalState
+                }
+            };
+            assert_eq!(result, Err(expected));
+
+            let resolver = graph.storage.scene_buffer_imports.resolver();
+            for node in [metadata_node, storage_node] {
+                let id = import_id(&graph, node);
+                assert!(resolver.was_materialized(id));
+                assert!(resolver.buffer(id).is_none());
+            }
+            assert!(resources.get_gpu_buffer_by_cpu_id(metadata_id).is_none());
+
+            match case {
+                BatchFailureCase::SnapshotDrift => {
+                    assert!(resources.get_gpu_buffer_by_cpu_id(light_stamp.id).is_none(),);
+                }
+                BatchFailureCase::UndersizedEqualVersion => {
+                    let seeded = resources
+                        .get_gpu_buffer_by_cpu_id(light_stamp.id)
+                        .expect("undersized physical state missing");
+                    assert_eq!(seeded.size, 16);
+                    assert_eq!(seeded.last_uploaded_version, light_stamp.version);
+                }
+                BatchFailureCase::NewerPhysicalVersion => {
+                    assert_eq!(
+                        resources
+                            .get_gpu_buffer_by_cpu_id(light_stamp.id)
+                            .expect("newer physical state missing")
+                            .last_uploaded_version,
+                        light_stamp.version + 1,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_cleared_stale_and_foreign_ids_fail_closed() {
+        let metadata = metadata_buffer();
+        let lights = storage_buffer();
+        let mut first_storage = GraphStorage::new();
+        let first_arena = FrameArena::new();
+
+        let dropped_id = {
+            let mut graph = RenderGraph::new(&mut first_storage, &first_arena);
+            let node = graph.import_scene_light_metadata_buffer("metadata", &metadata);
+            let id = import_id(&graph, node);
+            assert!(!graph.storage.scene_buffer_imports.is_empty());
+            id
+        };
+        assert!(first_storage.scene_buffer_imports.is_empty());
+        assert!(
+            first_storage
+                .scene_buffer_imports
+                .resolver()
+                .buffer(dropped_id)
+                .is_none(),
+        );
+
+        let cleared_id = {
+            let mut graph = RenderGraph::new(&mut first_storage, &first_arena);
+            let node = graph.import_scene_light_metadata_buffer("metadata", &metadata);
+            let id = import_id(&graph, node);
+            graph.storage.clear();
+            assert!(graph.storage.scene_buffer_imports.is_empty());
+            assert!(
+                graph
+                    .storage
+                    .scene_buffer_imports
+                    .resolver()
+                    .buffer(id)
+                    .is_none(),
+            );
+            id
+        };
+
+        let mut first_graph = RenderGraph::new(&mut first_storage, &first_arena);
+        let first_node = first_graph.import_scene_light_metadata_buffer("metadata", &metadata);
+        let first_id = import_id(&first_graph, first_node);
+        let expected = first_graph
+            .storage
+            .scene_buffer_imports
+            .snapshot(first_id)
+            .expect("snapshot missing");
+
+        let mut second_storage = GraphStorage::new();
+        let second_arena = FrameArena::new();
+        let mut second_graph = RenderGraph::new(&mut second_storage, &second_arena);
+        let second_node = second_graph.import_scene_light_storage_buffer("lights", &lights);
+        let foreign_id = import_id(&second_graph, second_node);
+
+        let resolver = first_graph.storage.scene_buffer_imports.resolver();
+        assert!(resolver.buffer(dropped_id).is_none());
+        assert!(resolver.buffer(cleared_id).is_none());
+        assert!(!resolver.record(foreign_id, expected, None));
+        assert!(!resolver.was_materialized(foreign_id));
+
+        let stale = SceneBufferSnapshot {
+            stamp: CpuBufferStamp {
+                version: expected.stamp.version.wrapping_add(1),
+                ..expected.stamp
+            },
+            ..expected
+        };
+        assert!(!resolver.record(first_id, stale, None));
+        assert!(resolver.was_materialized(first_id));
+        assert!(resolver.buffer(first_id).is_none());
+    }
+}

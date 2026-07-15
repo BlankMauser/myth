@@ -72,12 +72,6 @@ impl MipmapRequest {
         self.submitted_generation
             .fetch_max(self.generation_id, Ordering::Release);
     }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn shares_submission_token(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.submitted_generation, &other.submitted_generation)
-    }
 }
 
 /// Copy handle stored by an RDG node instead of borrowing Drop-bearing WGPU

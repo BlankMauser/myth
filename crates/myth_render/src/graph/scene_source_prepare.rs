@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn skeleton_plan_uses_stable_first_semantic_occurrence() {
+    fn skeleton_plan_is_stable_and_capacity_is_explicitly_retained_then_trimmed() {
         let first = skeleton(1);
         let second = skeleton(2);
         let mut store = SceneSourcePrepareStore::new();
@@ -692,11 +692,8 @@ mod tests {
 
         assert_eq!(store.skeleton_plan, [first, second]);
         assert_eq!(store.phase, SceneSourcePreparePhase::Planned);
-    }
 
-    #[test]
-    fn clear_retains_then_trim_releases_excess_capacity() {
-        let mut store = SceneSourcePrepareStore::new();
+        store.clear();
         for index in 1..=(SCENE_SOURCE_RECIPE_BASELINE * 16) {
             store.push_test_recipe(Some(skeleton(index as u64)));
         }

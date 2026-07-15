@@ -1170,13 +1170,12 @@ mod tests {
     use crate::graph::core::scene_submission::SceneSubmissionPlanId;
     use crate::graph::core::{
         ExecuteContext, GraphBlackboard, HookStage, PassNode, RdgAttemptOutcome, RdgFramePhase,
-        RdgRenderTargetKind, RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
-        TextureDesc,
+        RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure, TextureDesc,
     };
     use crate::test_support::SharedTestContext;
     use glam::{Affine3A, Quat, Vec3, Vec4};
     use myth_assets::{AssetServer, MaterialHandle, SceneExt};
-    use myth_core::{NodeHandle, SkeletonKey};
+    use myth_core::NodeHandle;
     #[cfg(feature = "3dgs")]
     use myth_resources::gaussian_splat::{GaussianCloud, GaussianSHCoefficients, GaussianSplat};
     use myth_resources::geometry::{Attribute, Geometry, VertexFormat};
@@ -1185,7 +1184,6 @@ mod tests {
     use myth_resources::texture::{Texture, TextureSource};
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
-    use myth_scene::light::Light;
     use myth_scene::skeleton::Skeleton;
     use myth_scene::{BindMode, Scene};
 
@@ -1286,14 +1284,6 @@ mod tests {
         renderer
     }
 
-    fn init_production_headless_renderer() -> Renderer {
-        let mut renderer =
-            Renderer::new(RendererInitConfig::default(), RendererSettings::default());
-        pollster::block_on(renderer.init_headless(128, 128, None))
-            .expect("production headless renderer init failed");
-        renderer
-    }
-
     fn init_headless_renderer_with_model_capacity(initial_capacity: usize) -> Renderer {
         let mut renderer = init_headless_renderer();
         let anisotropy_clamp = renderer.settings.anisotropy_clamp;
@@ -1360,37 +1350,6 @@ mod tests {
         }
     }
 
-    fn assert_local_light_buffers_materialized(state: &RendererState) {
-        let scene = &state.render_frame.extracted_scene;
-        for (id, handle, stamp) in [
-            (
-                scene.local_light_metadata_buffer.id(),
-                scene.local_light_metadata_buffer.gpu_handle(),
-                scene.local_light_metadata_buffer.stamp(),
-            ),
-            (
-                scene.local_light_storage_buffer.id(),
-                scene.local_light_storage_buffer.gpu_handle(),
-                scene.local_light_storage_buffer.stamp(),
-            ),
-        ] {
-            assert!(
-                handle.is_none(),
-                "exact scene-buffer imports must not publish process-wide cached handles"
-            );
-            let gpu_buffer = state
-                .resource_manager
-                .get_gpu_buffer_by_cpu_id(id)
-                .expect("live scene-light import has no resolvable physical buffer");
-            assert_eq!(gpu_buffer.last_uploaded_version, stamp.version);
-            assert_eq!(gpu_buffer.usage, stamp.usage);
-            assert!(
-                gpu_buffer.size >= stamp.size as u64,
-                "scene-light physical allocation is smaller than the captured snapshot"
-            );
-        }
-    }
-
     fn global_buffer_ids(state: &RendererState) -> [u64; 3] {
         [
             state.render_frame.render_state.uniforms().id(),
@@ -1424,111 +1383,6 @@ mod tests {
                 .is_none(),
             "pre-graph frame exit must not create a persistent Group 0 state"
         );
-    }
-
-    fn assert_global_state_materialized_exact(state: &RendererState, scene_id: u32) {
-        let stamps = [
-            state.render_frame.render_state.uniforms().stamp(),
-            state
-                .render_frame
-                .extracted_scene
-                .environment_uniforms_buffer
-                .stamp(),
-            state
-                .render_frame
-                .extracted_scene
-                .directional_light_storage_buffer
-                .stamp(),
-        ];
-        let global = state
-            .resource_manager
-            .get_global_state(state.render_frame.render_state.id, scene_id)
-            .expect("DPE-live scene passes must finalize Group 0");
-        for (binding, stamp) in stamps.into_iter().enumerate() {
-            let gpu = state
-                .resource_manager
-                .get_gpu_buffer_by_cpu_id(stamp.id)
-                .expect("DPE-live Group 0 buffer missing");
-            assert_eq!(gpu.last_uploaded_version, stamp.version);
-            assert_eq!(gpu.usage, stamp.usage);
-            assert!(gpu.size >= stamp.size as u64);
-            assert_eq!(global.resource_ids.as_slice()[binding], gpu.id);
-        }
-    }
-
-    fn global_gpu_state(
-        state: &RendererState,
-        scene_id: u32,
-    ) -> ([(u64, u64, u64, u64); 3], (u32, u64, u64, Vec<u64>, u64)) {
-        let buffers = global_buffer_ids(state).map(|cpu_id| {
-            let gpu = state
-                .resource_manager
-                .get_gpu_buffer_by_cpu_id(cpu_id)
-                .expect("Group 0 physical buffer missing");
-            (
-                gpu.id,
-                gpu.size,
-                gpu.last_uploaded_version,
-                gpu.last_used_frame,
-            )
-        });
-        let global = state
-            .resource_manager
-            .get_global_state(state.render_frame.render_state.id, scene_id)
-            .expect("persistent Group 0 state missing");
-        (
-            buffers,
-            (
-                global.id,
-                global.bind_group_id,
-                global.layout_id,
-                global.resource_ids.as_slice().to_vec(),
-                global.last_used_frame,
-            ),
-        )
-    }
-
-    fn local_light_gpu_state(state: &RendererState) -> [(u64, u64, u64, u64); 2] {
-        let scene = &state.render_frame.extracted_scene;
-        [
-            scene.local_light_metadata_buffer.id(),
-            scene.local_light_storage_buffer.id(),
-        ]
-        .map(|cpu_id| {
-            let gpu = state
-                .resource_manager
-                .get_gpu_buffer_by_cpu_id(cpu_id)
-                .expect("local-light physical buffer missing");
-            (
-                gpu.id,
-                gpu.size,
-                gpu.last_uploaded_version,
-                gpu.last_used_frame,
-            )
-        })
-    }
-
-    fn local_light_storage_state(state: &RendererState) -> (u64, u64, u64, u64) {
-        let cpu = &state
-            .render_frame
-            .extracted_scene
-            .local_light_storage_buffer;
-        let stamp = cpu.stamp();
-        let gpu = state
-            .resource_manager
-            .get_gpu_buffer_by_cpu_id(stamp.id)
-            .expect("local-light storage physical buffer missing");
-        let logical_size = state
-            .graph_storage
-            .resources
-            .iter()
-            .find(|resource| resource.name == "Scene_Local_Lights")
-            .expect("logical scene-light storage import missing")
-            .buffer_desc()
-            .logical_size;
-        assert_eq!(logical_size, stamp.size as u64);
-        assert_eq!(gpu.last_uploaded_version, stamp.version);
-        (gpu.id, gpu.size, logical_size, stamp.version)
     }
 
     #[cfg(feature = "3dgs")]
@@ -1588,46 +1442,40 @@ mod tests {
     }
 
     #[test]
-    fn headless_renderer_publishes_pass_conservation_diagnostics() {
-        // Keep one smoke path through the public constructor; the remaining
-        // contract tests share only Device/Queue to avoid repeated adapter and
-        // device requests.
-        let mut renderer = init_production_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 17);
-
-        let diagnostics = renderer
-            .latest_rdg_diagnostics()
-            .expect("submitted frame diagnostics missing");
-        let live = diagnostics
-            .live_passes()
-            .expect("submitted graph must have compiled topology");
-        assert_eq!(diagnostics.renderer_frame(), Some(17));
-        assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::Submitted);
-        assert_eq!(diagnostics.phase(), RdgFramePhase::Complete);
-        assert_eq!(diagnostics.target(), Some(RdgRenderTargetKind::Headless));
-        assert!(diagnostics.declared_passes() >= live);
-        assert_eq!(diagnostics.prepared_passes(), live);
-        assert_eq!(diagnostics.executed_passes(), live);
-        assert!(diagnostics.queue_submitted());
-        assert!(!diagnostics.presented());
-        assert!(!diagnostics.panicked());
-        assert_local_light_buffers_materialized(
-            renderer.context.as_ref().expect("renderer state missing"),
-        );
-        assert_global_state_materialized_exact(
-            renderer.context.as_ref().expect("renderer state missing"),
-            scene.id(),
-        );
-    }
-
-    #[test]
-    fn dropped_composer_publishes_an_abandoned_pre_graph_attempt() {
+    fn abandoned_composer_is_transactional_across_diagnostics_assets_and_history() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
+        let image_handle = assets.images.add(Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![192; 8 * 8 * 4]),
+        ));
+        let mut texture = Texture::new_2d(Some("Abandoned Frame Texture"), image_handle);
+        texture.generate_mipmaps = true;
+        let texture_handle = assets.textures.add(texture);
+        let mesh_node = spawn_test_morph_box(&mut scene, &assets);
+        let (geometry_handle, material_handle, morph_buffer_id) = {
+            let mesh = scene.meshes.get_mut(mesh_node).expect("test mesh missing");
+            mesh.set_morph_target_influence(0, 1.0);
+            (mesh.geometry, mesh.material, mesh.morph_uniforms.id())
+        };
+        assets
+            .materials
+            .get(material_handle)
+            .expect("test material missing")
+            .as_physical()
+            .expect("test material must be physical")
+            .set_map(Some(texture_handle));
+        let initial_pipeline_count = renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing")
+            .pipeline_cache
+            .render_pipeline_count();
 
         let composer = renderer
             .begin_frame(
@@ -1660,56 +1508,79 @@ mod tests {
             renderer.context.as_ref().expect("renderer state missing"),
             scene.id(),
         );
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.render_lists.opaque.is_empty());
+        assert!(
+            state
+                .resource_manager
+                .get_geometry(geometry_handle)
+                .is_none()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .is_none()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_texture_image(texture_handle)
+                .is_none()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(morph_buffer_id)
+                .is_none()
+        );
+        assert!(!state.mipmap_pass.generator_initialized());
+        assert_eq!(state.prepass.cached_pipeline_count(), 0);
+        assert_eq!(
+            state.pipeline_cache.render_pipeline_count(),
+            initial_pipeline_count
+        );
+        let unsubmitted = scene
+            .meshes
+            .get(mesh_node)
+            .expect("test mesh missing")
+            .morph_uniforms();
+        assert!(unsubmitted.weights[0].x.abs() <= f32::EPSILON);
+        drop(unsubmitted);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 24);
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(
+            state
+                .resource_manager
+                .get_geometry(geometry_handle)
+                .is_some()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_material(material_handle)
+                .is_some()
+        );
+        assert!(
+            state
+                .resource_manager
+                .get_texture_image(texture_handle)
+                .expect("submitted texture missing")
+                .mipmaps_submitted()
+        );
+        let submitted = scene
+            .meshes
+            .get(mesh_node)
+            .expect("test mesh missing")
+            .morph_uniforms();
+        assert!((submitted.weights[0].x - 1.0).abs() <= f32::EPSILON);
+        assert!(submitted.prev_weights[0].x.abs() <= f32::EPSILON);
     }
 
     #[test]
-    fn missing_headless_target_publishes_no_target_without_building_a_graph() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        renderer
-            .context
-            .as_mut()
-            .expect("renderer state missing")
-            .wgpu_ctx
-            .headless_texture = None;
-
-        renderer
-            .begin_frame(
-                &mut scene,
-                make_camera(),
-                &assets,
-                FrameTime {
-                    frame_count: 29,
-                    ..FrameTime::default()
-                },
-            )
-            .expect("frame composer missing")
-            .render();
-
-        let diagnostics = renderer
-            .latest_rdg_diagnostics()
-            .expect("no-target diagnostics missing");
-        assert_eq!(diagnostics.renderer_frame(), Some(29));
-        assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::NoRenderTarget);
-        assert_eq!(diagnostics.phase(), RdgFramePhase::AcquireTarget);
-        assert_eq!(diagnostics.target(), None);
-        assert_eq!(diagnostics.declared_passes(), 0);
-        assert_eq!(diagnostics.live_passes(), None);
-        assert_eq!(diagnostics.prepared_passes(), 0);
-        assert_eq!(diagnostics.executed_passes(), 0);
-        assert!(!diagnostics.queue_submitted());
-        assert_local_light_buffers_unmaterialized(
-            renderer.context.as_ref().expect("renderer state missing"),
-        );
-        assert_global_state_unmaterialized(
-            renderer.context.as_ref().expect("renderer state missing"),
-            scene.id(),
-        );
-    }
-
-    #[test]
-    fn surface_acquisition_failure_does_not_materialize_global_state() {
+    fn pre_materialization_exits_publish_zero_work_and_preserve_warm_state() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
@@ -1745,15 +1616,10 @@ mod tests {
         assert_eq!(diagnostics.executed_passes(), 0);
         assert_eq!(diagnostics.target(), None);
         assert!(!diagnostics.queue_submitted());
-    }
 
-    #[test]
-    fn late_headless_target_descriptor_drift_aborts_before_materialization() {
         let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
         let mut scene = Scene::new();
         renderer.size.0 += 1;
-
         renderer
             .begin_frame(
                 &mut scene,
@@ -1766,48 +1632,34 @@ mod tests {
             )
             .expect("frame composer missing")
             .render();
-
         let state = renderer.context.as_ref().expect("renderer state missing");
         assert_global_state_unmaterialized(state, scene.id());
         assert_local_light_buffers_unmaterialized(state);
-        let diagnostics = renderer
-            .latest_rdg_diagnostics()
-            .expect("descriptor-drift diagnostics missing");
+        let diagnostics = renderer.latest_rdg_diagnostics().unwrap();
         assert_eq!(
             diagnostics.outcome(),
             RdgAttemptOutcome::ResourceMaterializationFailed(
                 RdgResourceMaterializationFailure::RenderTargetDescriptorDrift,
             )
         );
-        assert_eq!(diagnostics.phase(), RdgFramePhase::AcquireTarget);
-        assert!(diagnostics.declared_passes() > 0);
-        assert!(diagnostics.live_passes().is_some());
         assert_eq!(diagnostics.prepared_passes(), 0);
         assert_eq!(diagnostics.executed_passes(), 0);
-        assert_eq!(diagnostics.target(), None);
         assert!(!diagnostics.queue_submitted());
-    }
 
-    #[test]
-    fn missing_target_does_not_touch_warm_scene_light_buffers() {
         let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
         let mut scene = Scene::new();
         render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let before =
-            local_light_gpu_state(renderer.context.as_ref().expect("renderer state missing"));
-        let global_before = global_gpu_state(
-            renderer.context.as_ref().expect("renderer state missing"),
-            scene.id(),
-        );
-        renderer
-            .context
-            .as_mut()
-            .expect("renderer state missing")
-            .wgpu_ctx
-            .headless_texture = None;
-
+        let before = global_buffer_ids(renderer.context.as_ref().unwrap()).map(|cpu_id| {
+            let gpu = renderer
+                .context
+                .as_ref()
+                .unwrap()
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(cpu_id)
+                .expect("warm global buffer missing");
+            (gpu.id, gpu.last_uploaded_version, gpu.last_used_frame)
+        });
+        renderer.context.as_mut().unwrap().wgpu_ctx.headless_texture = None;
         renderer
             .begin_frame(
                 &mut scene,
@@ -1820,35 +1672,47 @@ mod tests {
             )
             .expect("frame composer missing")
             .render();
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert_eq!(local_light_gpu_state(state), before);
-        assert_eq!(global_gpu_state(state, scene.id()), global_before);
-        let diagnostics = renderer
-            .latest_rdg_diagnostics()
-            .expect("no-target diagnostics missing");
+        let after = global_buffer_ids(renderer.context.as_ref().unwrap()).map(|cpu_id| {
+            let gpu = renderer
+                .context
+                .as_ref()
+                .unwrap()
+                .resource_manager
+                .get_gpu_buffer_by_cpu_id(cpu_id)
+                .expect("warm global buffer missing after no-target attempt");
+            (gpu.id, gpu.last_uploaded_version, gpu.last_used_frame)
+        });
+        assert_eq!(after, before);
+        let diagnostics = renderer.latest_rdg_diagnostics().unwrap();
         assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::NoRenderTarget);
+        assert_eq!(diagnostics.declared_passes(), 0);
+        assert_eq!(diagnostics.live_passes(), None);
+        assert_eq!(diagnostics.prepared_passes(), 0);
+        assert_eq!(diagnostics.executed_passes(), 0);
         assert!(!diagnostics.queue_submitted());
     }
 
-    #[test]
-    fn basic_forward_materializes_live_scene_light_imports() {
-        let mut renderer = Renderer::new(
-            RendererInitConfig::default(),
-            RendererSettings {
-                path: RenderPath::BasicForward,
-                ..RendererSettings::default()
-            },
-        );
-        init_shared_headless_renderer(&mut renderer, 128, 128, None);
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        assert_local_light_buffers_materialized(
-            renderer.context.as_ref().expect("renderer state missing"),
-        );
+    fn local_light_storage_state(state: &RendererState) -> (u64, u64, u64, u64) {
+        let cpu = &state
+            .render_frame
+            .extracted_scene
+            .local_light_storage_buffer;
+        let stamp = cpu.stamp();
+        let gpu = state
+            .resource_manager
+            .get_gpu_buffer_by_cpu_id(stamp.id)
+            .expect("local-light storage physical buffer missing");
+        let logical_size = state
+            .graph_storage
+            .resources
+            .iter()
+            .find(|resource| resource.name == "Scene_Local_Lights")
+            .expect("logical scene-light storage import missing")
+            .buffer_desc()
+            .logical_size;
+        assert_eq!(logical_size, stamp.size as u64);
+        assert_eq!(gpu.last_uploaded_version, stamp.version);
+        (gpu.id, gpu.size, logical_size, stamp.version)
     }
 
     #[test]
@@ -1919,7 +1783,7 @@ mod tests {
 
     #[cfg(feature = "3dgs")]
     #[test]
-    fn gaussian_extract_is_cpu_only_and_keeps_all_gpu_caches_cold() {
+    fn gaussian_extract_and_dead_path_keep_all_gpu_caches_cold() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
@@ -1947,11 +1811,30 @@ mod tests {
             state.gaussian_splatting_pass.cache_is_empty(),
             "extract must not create layouts, pipelines, or cloud GPU buffers"
         );
+        drop(extract);
+
+        let mut basic_forward = Renderer::new(
+            RendererInitConfig::default(),
+            RendererSettings {
+                path: RenderPath::BasicForward,
+                ..RendererSettings::default()
+            },
+        );
+        init_shared_headless_renderer(&mut basic_forward, 128, 128, None);
+        render_frame(&mut basic_forward, &mut scene, camera, &assets, 0);
+        let state = basic_forward
+            .context
+            .as_ref()
+            .expect("renderer state missing");
+        assert!(state.gaussian_splatting_pass.cache_is_empty());
+        assert!(!graph_contains_pass(state, "GS_Compute"));
+        assert!(!graph_contains_pass(state, "GS_Render"));
+        assert!(!graph_contains_pass(state, "GS_Composite"));
     }
 
     #[cfg(feature = "3dgs")]
     #[test]
-    fn live_gaussian_prepare_reuses_static_and_cloud_caches_until_ttl_expires() {
+    fn gaussian_live_cache_reuses_replaces_and_retires_exact_resources() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
@@ -1991,28 +1874,54 @@ mod tests {
 
         render_frame(&mut renderer, &mut scene, camera, &assets, 1);
 
+        let second_last_used = {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert_eq!(
+                state.gaussian_splatting_pass.static_cache_identity(),
+                first_static,
+                "a stable second frame must reuse every Gaussian layout and pipeline"
+            );
+            assert_eq!(
+                state.gaussian_splatting_pass.cloud_cache_identity(cloud),
+                Some(first_cloud),
+                "a stable asset version must reuse both persistent cloud buffers"
+            );
+            state
+                .gaussian_splatting_pass
+                .cloud_last_used_frame(cloud)
+                .expect("second live prepare must touch the cloud")
+        };
+        assert!(second_last_used > first_last_used);
+
+        assets
+            .gaussian_clouds
+            .insert_ready(cloud, tiny_gaussian_cloud());
+        assert_eq!(assets.gaussian_clouds.get_version(cloud), Some(1));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
         let state = renderer.context.as_mut().expect("renderer state missing");
+        let replacement = state
+            .gaussian_splatting_pass
+            .cloud_cache_identity(cloud)
+            .expect("replacement cloud must be uploaded");
         assert_eq!(
             state.gaussian_splatting_pass.static_cache_identity(),
-            first_static,
-            "a stable second frame must reuse every Gaussian layout and pipeline"
+            first_static
         );
-        assert_eq!(
-            state.gaussian_splatting_pass.cloud_cache_identity(cloud),
-            Some(first_cloud),
-            "a stable asset version must reuse both persistent cloud buffers"
+        assert_ne!(
+            (replacement.1, replacement.2),
+            (first_cloud.1, first_cloud.2),
+            "same handle/version with a new exact asset identity must rebuild cloud buffers"
         );
-        let second_last_used = state
+        let replacement_last_used = state
             .gaussian_splatting_pass
             .cloud_last_used_frame(cloud)
-            .expect("second live prepare must touch the cloud");
-        assert!(second_last_used > first_last_used);
+            .expect("replacement cloud must record its frame");
 
         const TEST_TTL: u64 = 3;
         assert_eq!(
             state
                 .gaussian_splatting_pass
-                .garbage_collect(second_last_used + TEST_TTL, TEST_TTL),
+                .garbage_collect(replacement_last_used + TEST_TTL, TEST_TTL),
             0,
             "age == TTL remains live"
         );
@@ -2020,7 +1929,7 @@ mod tests {
         assert_eq!(
             state
                 .gaussian_splatting_pass
-                .garbage_collect(second_last_used + TEST_TTL + 1, TEST_TTL),
+                .garbage_collect(replacement_last_used + TEST_TTL + 1, TEST_TTL),
             1,
             "age == TTL + 1 retires the persistent upload"
         );
@@ -2031,87 +1940,8 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "3dgs")]
     #[test]
-    fn gaussian_same_handle_same_version_replacement_rebuilds_only_cloud_buffers() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
-        let mut scene = Scene::new();
-        scene.add_gaussian_cloud("exact-identity", cloud);
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let (first_static, first_cloud) = {
-            let state = renderer.context.as_ref().expect("renderer state missing");
-            (
-                state.gaussian_splatting_pass.static_cache_identity(),
-                state
-                    .gaussian_splatting_pass
-                    .cloud_cache_identity(cloud)
-                    .expect("first live prepare must upload the cloud"),
-            )
-        };
-        assert_eq!(assets.gaussian_clouds.get_version(cloud), Some(1));
-        assert_eq!(first_cloud.0, 1);
-
-        // `insert_ready` replaces the Arc stored behind an existing handle but
-        // deliberately initializes its numeric version to 1 again. The weak
-        // exact-asset identity must therefore participate in the L1 key.
-        assets
-            .gaussian_clouds
-            .insert_ready(cloud, tiny_gaussian_cloud());
-        assert_eq!(assets.gaussian_clouds.get_version(cloud), Some(1));
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let second_cloud = state
-            .gaussian_splatting_pass
-            .cloud_cache_identity(cloud)
-            .expect("replacement asset must remain resident after prepare");
-        assert_eq!(second_cloud.0, 1);
-        assert_eq!(
-            state.gaussian_splatting_pass.static_cache_identity(),
-            first_static,
-            "an asset-only replacement must preserve static layouts and pipelines"
-        );
-        assert_ne!(
-            (second_cloud.1, second_cloud.2),
-            (first_cloud.1, first_cloud.2),
-            "same handle/version with a new Arc identity must rebuild both raw cloud buffers"
-        );
-    }
-
-    #[cfg(feature = "3dgs")]
-    #[test]
-    fn basic_forward_with_gaussian_scene_does_not_initialize_gaussian_resources() {
-        let mut renderer = Renderer::new(
-            RendererInitConfig::default(),
-            RendererSettings {
-                path: RenderPath::BasicForward,
-                ..RendererSettings::default()
-            },
-        );
-        init_shared_headless_renderer(&mut renderer, 128, 128, None);
-        let assets = AssetServer::new();
-        let cloud = assets.gaussian_clouds.add(tiny_gaussian_cloud());
-        let mut scene = Scene::new();
-        scene.add_gaussian_cloud("basic-forward", cloud);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(state.gaussian_splatting_pass.cache_is_empty());
-        assert!(!graph_contains_pass(state, "GS_Compute"));
-        assert!(!graph_contains_pass(state, "GS_Render"));
-        assert!(!graph_contains_pass(state, "GS_Composite"));
-        assert!(state.graph_storage.gaussian_frame_batches.is_empty());
-    }
-
-    #[test]
-    fn inactive_environment_uses_black_cube_without_allocating_scene_textures() {
+    fn inactive_and_pending_environment_sources_preserve_fallback_or_last_publication() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
@@ -2141,6 +1971,80 @@ mod tests {
         let resource_ids = global_state.resource_ids.as_slice();
         let black_cube_id = state.resource_manager.system_textures.black_cube.id();
         assert_eq!(black_cube_id, resource_ids[3]);
+
+        scene.background.set_mode(BackgroundMode::gradient(
+            Vec4::new(0.1, 0.2, 0.3, 1.0),
+            Vec4::new(0.01, 0.02, 0.03, 1.0),
+        ));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.resource_manager.gpu_environment(scene_id).is_none());
+        assert!(!state.environment_cache.has_scene_state(scene_id));
+        assert!(published_pmrem_view_id(state, scene_id).is_none());
+
+        let background_texture = assets.checkerboard(16, 2);
+        scene
+            .background
+            .set_mode(BackgroundMode::planar(background_texture, 1.0));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(state.resource_manager.gpu_environment(scene_id).is_none());
+        assert!(!state.environment_cache.has_scene_state(scene_id));
+        assert!(published_pmrem_view_id(state, scene_id).is_none());
+
+        scene.environment.set_base_cube_size(16);
+        scene.environment.set_pmrem_size(8);
+        scene
+            .environment
+            .set_env_map(Some(TextureSource::Attachment(
+                u64::MAX,
+                wgpu::TextureViewDimension::D2,
+            )));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 3);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let pending = state
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("configured pending environment metadata missing");
+        assert!(!pending.source_ready);
+        assert!(state.environment_cache.has_scene_state(scene_id));
+        assert!(published_pmrem_view_id(state, scene_id).is_none());
+        let global = state
+            .resource_manager
+            .get_global_state(state.render_frame.render_state.id, scene_id)
+            .expect("global state missing for pending source");
+        assert_eq!(
+            global.resource_ids.as_slice()[3],
+            state.resource_manager.system_textures.black_cube.id()
+        );
+
+        scene.environment.set_env_map(None::<TextureSource>);
+        scene.background.set_mode(BackgroundMode::procedural());
+        render_frame(&mut renderer, &mut scene, camera, &assets, 4);
+        let published = published_pmrem_view_id(
+            renderer.context.as_ref().expect("renderer state missing"),
+            scene_id,
+        )
+        .expect("procedural environment must publish a PMREM");
+        if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
+            params.set_starbox_texture(Some(TextureSource::Attachment(
+                u64::MAX,
+                wgpu::TextureViewDimension::D2,
+            )));
+        }
+        render_frame(&mut renderer, &mut scene, camera, &assets, 5);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(
+            !state
+                .resource_manager
+                .gpu_environment(scene_id)
+                .expect("procedural metadata missing")
+                .source_ready
+        );
+        assert_eq!(published_pmrem_view_id(state, scene_id), Some(published));
+        assert!(graph_contains_pass(state, "Atmosphere_SkyView"));
+        assert!(!graph_contains_pass(state, "Atmosphere_SkyToCube"));
+        assert!(!graph_contains_pass(state, "IBL_Compute"));
     }
 
     #[test]
@@ -2172,190 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn background_only_skybox_modes_do_not_allocate_ibl_textures() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let camera = make_camera();
-
-        scene.background.set_mode(BackgroundMode::gradient(
-            Vec4::new(0.1, 0.2, 0.3, 1.0),
-            Vec4::new(0.01, 0.02, 0.03, 1.0),
-        ));
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-        {
-            let state = renderer.context.as_ref().expect("renderer state missing");
-            assert!(
-                state.resource_manager.gpu_environment(scene.id()).is_none(),
-                "a gradient background must not create IBL metadata"
-            );
-            assert!(!state.environment_cache.has_scene_state(scene.id()));
-            assert!(published_pmrem_view_id(state, scene.id()).is_none());
-        }
-
-        let background_texture = assets.checkerboard(16, 2);
-        scene
-            .background
-            .set_mode(BackgroundMode::planar(background_texture, 1.0));
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(
-            state.resource_manager.gpu_environment(scene.id()).is_none(),
-            "a background-only texture must not create IBL metadata"
-        );
-        assert!(!state.environment_cache.has_scene_state(scene.id()));
-        assert!(published_pmrem_view_id(state, scene.id()).is_none());
-    }
-
-    #[test]
-    fn reenabled_environment_before_ttl_reuses_persistent_views() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        scene.background.set_mode(BackgroundMode::procedural());
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let scene_id = scene.id();
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let initial_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("initial scene environment metadata missing");
-        assert_eq!(16, initial_env.base_cube_size);
-        assert_eq!(8, initial_env.pmrem_size);
-        assert!(initial_env.source_ready);
-        let initial_source_version = initial_env.source_version;
-        let initial_last_used_frame = initial_env.last_used_frame;
-        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
-            .expect("initial persistent PMREM must be published");
-        assert!(state.environment_cache.has_scene_state(scene_id));
-
-        scene
-            .background
-            .set_mode(BackgroundMode::color(0.0, 0.0, 0.0));
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-        scene.background.set_mode(BackgroundMode::procedural());
-        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let reenabled_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("re-enabled scene environment metadata missing");
-        assert_eq!(initial_source_version, reenabled_env.source_version);
-        assert!(reenabled_env.last_used_frame > initial_last_used_frame);
-        assert_eq!(
-            Some(initial_pmrem_id),
-            published_pmrem_view_id(state, scene_id),
-            "re-enabling before TTL expiry should reuse the published PMREM view"
-        );
-    }
-
-    #[test]
-    fn environment_feature_maintenance_prunes_abandoned_scene_domains() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let camera = make_camera();
-
-        let mut source_scene = Scene::new();
-        source_scene.environment.set_base_cube_size(16);
-        source_scene.environment.set_pmrem_size(8);
-        source_scene
-            .environment
-            .set_env_map(Some(assets.checkerboard(16, 2)));
-        render_frame(&mut renderer, &mut source_scene, camera, &assets, 0);
-
-        let source_scene_id = source_scene.id();
-        {
-            let state = renderer.context.as_ref().expect("renderer state missing");
-            assert!(state.environment_cache.has_scene_state(source_scene_id));
-            assert!(published_pmrem_view_id(state, source_scene_id).is_some());
-        }
-
-        let mut procedural_scene = Scene::new();
-        procedural_scene.environment.set_base_cube_size(16);
-        procedural_scene.environment.set_pmrem_size(8);
-        procedural_scene
-            .background
-            .set_mode(BackgroundMode::procedural());
-        render_frame(&mut renderer, &mut procedural_scene, camera, &assets, 1);
-
-        let procedural_scene_id = procedural_scene.id();
-        {
-            let state = renderer.context.as_ref().expect("renderer state missing");
-            assert!(state.environment_cache.has_scene_state(procedural_scene_id));
-            assert!(published_pmrem_view_id(state, procedural_scene_id).is_some());
-            assert!(state.atmosphere_pass.has_scene_state(procedural_scene_id));
-        }
-
-        // Static converter/filter features no longer own scene state. The
-        // logical coordinator retires both persistent domains atomically.
-        let state = renderer.context.as_mut().expect("renderer state missing");
-        let retired = state
-            .environment_cache
-            .maintain(&mut state.history_registry, u64::MAX);
-        state
-            .atmosphere_pass
-            .maintain(&mut state.history_registry, u64::MAX);
-        assert!(retired.contains(&source_scene_id));
-        assert!(retired.contains(&procedural_scene_id));
-        assert!(!state.environment_cache.has_scene_state(source_scene_id));
-        assert!(!state.environment_cache.has_scene_state(procedural_scene_id));
-        assert!(published_pmrem_view_id(state, source_scene_id).is_none());
-        assert!(published_pmrem_view_id(state, procedural_scene_id).is_none());
-        assert!(!state.atmosphere_pass.has_scene_state(procedural_scene_id));
-    }
-
-    #[test]
-    fn missing_environment_attachment_stays_pending_without_graph_panic() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        scene
-            .environment
-            .set_env_map(Some(TextureSource::Attachment(
-                u64::MAX,
-                wgpu::TextureViewDimension::D2,
-            )));
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let gpu_env = state
-            .resource_manager
-            .gpu_environment(scene.id())
-            .expect("configured environment should retain CPU metadata");
-        assert_eq!(16, gpu_env.base_cube_size);
-        assert_eq!(8, gpu_env.pmrem_size);
-        assert!(!gpu_env.source_ready);
-        assert_ne!(0, gpu_env.source_version);
-        assert_eq!(
-            state.resource_manager.frame_index(),
-            gpu_env.last_used_frame
-        );
-        assert!(state.environment_cache.has_scene_state(scene.id()));
-        assert!(published_pmrem_view_id(state, scene.id()).is_none());
-
-        let global_state = state
-            .resource_manager
-            .get_global_state(state.render_frame.render_state.id, scene.id())
-            .expect("global state missing for pending environment");
-        assert_eq!(
-            state.resource_manager.system_textures.black_cube.id(),
-            global_state.resource_ids.as_slice()[3],
-            "a first-time pending source must bind the black cube"
-        );
-    }
-
-    #[test]
-    fn disabling_environment_stops_keepalive_and_allows_ttl_pruning() {
+    fn environment_domain_reuses_before_ttl_then_retires_and_recreates_atomically() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
@@ -2409,6 +2130,21 @@ mod tests {
             "procedural LUTs should remain reusable until their feature TTL expires"
         );
 
+        scene.background.set_mode(BackgroundMode::procedural());
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let reenabled = state
+            .resource_manager
+            .gpu_environment(scene_id)
+            .expect("re-enabled environment metadata missing");
+        assert!(reenabled.last_used_frame > last_active_frame);
+        assert_eq!(published_pmrem_view_id(state, scene_id), Some(pmrem_id));
+
+        scene
+            .background
+            .set_mode(BackgroundMode::color(0.02, 0.03, 0.04));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 3);
+
         let state = renderer.context.as_mut().expect("renderer state missing");
         for _ in 0..121 {
             state.resource_manager.next_frame();
@@ -2428,112 +2164,23 @@ mod tests {
         assert!(!state.atmosphere_pass.has_scene_state(scene_id));
         assert!(published_pmrem_view_id(state, scene_id).is_none());
         assert_ne!(0, active_source_version);
-    }
-
-    #[test]
-    fn reenabled_environment_recreates_using_current_configuration() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        scene.background.set_mode(BackgroundMode::procedural());
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let scene_id = scene.id();
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let initial_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("initial scene environment metadata missing");
-        let initial_last_used_frame = initial_env.last_used_frame;
-        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
-            .expect("initial persistent PMREM must be published");
-
-        scene
-            .background
-            .set_mode(BackgroundMode::color(0.0, 0.0, 0.0));
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-        {
-            let state = renderer.context.as_mut().expect("renderer state missing");
-            let retired = state
-                .environment_cache
-                .maintain(&mut state.history_registry, initial_last_used_frame + 121);
-            assert_eq!(vec![scene_id], retired);
-            state.resource_manager.remove_scene_global_states(scene_id);
-            assert!(!state.environment_cache.has_scene_state(scene_id));
-        }
 
         scene.environment.set_base_cube_size(32);
         scene.environment.set_pmrem_size(16);
         scene.background.set_mode(BackgroundMode::procedural());
-        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
-
+        render_frame(&mut renderer, &mut scene, camera, &assets, 4);
         let state = renderer.context.as_ref().expect("renderer state missing");
-        let recreated_env = state
+        let recreated = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("re-enabled scene environment metadata missing");
-        assert_eq!(32, recreated_env.base_cube_size);
-        assert_eq!(16, recreated_env.pmrem_size);
-        assert!(recreated_env.source_ready);
-        assert!(recreated_env.last_used_frame > initial_last_used_frame);
-        assert_ne!(
-            Some(initial_pmrem_id),
-            published_pmrem_view_id(state, scene_id),
-            "a retired domain must materialize a new PMREM using the current configuration"
-        );
+            .expect("retired environment must be recreated");
+        assert_eq!((recreated.base_cube_size, recreated.pmrem_size), (32, 16));
+        assert!(recreated.source_ready);
+        assert_ne!(published_pmrem_view_id(state, scene_id), Some(pmrem_id));
     }
 
     #[test]
-    fn active_environment_source_switch_reuses_persistent_views() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        let first_source = assets.checkerboard(16, 2);
-        scene.environment.set_env_map(Some(first_source));
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let scene_id = scene.id();
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let initial_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("initial scene environment metadata missing");
-        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
-            .expect("initial persistent PMREM must be published");
-        let initial_source_version = initial_env.source_version;
-        let initial_last_used_frame = initial_env.last_used_frame;
-
-        let second_source = assets.checkerboard(32, 4);
-        scene.environment.set_env_map(Some(second_source));
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let switched_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("switched scene environment metadata missing");
-        assert_eq!(16, switched_env.base_cube_size);
-        assert_eq!(8, switched_env.pmrem_size);
-        assert!(switched_env.source_ready);
-        assert_ne!(initial_source_version, switched_env.source_version);
-        assert!(switched_env.last_used_frame > initial_last_used_frame);
-        assert_eq!(
-            Some(initial_pmrem_id),
-            published_pmrem_view_id(state, scene_id),
-            "a same-spec source switch should reuse the physical PMREM view"
-        );
-    }
-
-    #[test]
-    fn dirty_internal_environment_attachment_republishes_without_reallocating_pmrem() {
+    fn environment_content_changes_reuse_views_while_spec_changes_reallocate() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
@@ -2622,133 +2269,47 @@ mod tests {
             published_pmrem_view_id(state, scene_id),
             "content-only attachment updates should reuse the PMREM allocation"
         );
-    }
 
-    #[test]
-    fn procedural_environment_updates_keep_global_bind_group_stable() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        scene.background.set_mode(BackgroundMode::procedural());
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let scene_id = scene.id();
-        let render_state_id = state.render_frame.render_state.id;
-        let global_state = state
-            .resource_manager
-            .get_global_state(render_state_id, scene_id)
-            .expect("global state missing after first render");
-        let first_bind_group_id = global_state.bind_group_id;
-        let first_env = state
+        let after_dirty_version = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene environment metadata missing after first render");
-        let first_source_version = first_env.source_version;
-        let first_last_used_frame = first_env.last_used_frame;
-        let first_pmrem_id = published_pmrem_view_id(state, scene_id)
-            .expect("first persistent PMREM must be published");
-
-        if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
-            params.set_sun_intensity(25.0);
-        } else {
-            panic!("expected procedural background");
-        }
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-
+            .expect("updated environment metadata missing")
+            .source_version;
+        scene
+            .environment
+            .set_env_map(Some(assets.checkerboard(32, 4)));
+        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
         let state = renderer.context.as_ref().expect("renderer state missing");
-        let global_state = state
-            .resource_manager
-            .get_global_state(render_state_id, scene_id)
-            .expect("global state missing after procedural update");
-        let updated_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("scene environment metadata missing after procedural update");
-
-        assert_eq!(
-            first_bind_group_id, global_state.bind_group_id,
-            "procedural parameter changes should not rebuild the global bind group"
+        assert_ne!(
+            state
+                .resource_manager
+                .gpu_environment(scene_id)
+                .expect("switched environment metadata missing")
+                .source_version,
+            after_dirty_version
         );
-        assert_eq!(16, updated_env.base_cube_size);
-        assert_eq!(8, updated_env.pmrem_size);
-        assert!(updated_env.source_ready);
-        assert_ne!(first_source_version, updated_env.source_version);
-        assert!(updated_env.last_used_frame > first_last_used_frame);
         assert_eq!(
-            Some(first_pmrem_id),
             published_pmrem_view_id(state, scene_id),
-            "procedural parameter changes should keep the persistent PMREM view stable"
+            Some(initial_pmrem_id)
         );
-    }
-
-    #[test]
-    fn resizing_environment_maps_recreates_persistent_views() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        scene.background.set_mode(BackgroundMode::procedural());
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let scene_id = scene.id();
-        let render_state_id = state.render_frame.render_state.id;
-        let global_state = state
-            .resource_manager
-            .get_global_state(render_state_id, scene_id)
-            .expect("global state missing after first render");
-        let first_bind_group_id = global_state.bind_group_id;
-        let first_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("scene environment metadata missing after first render");
-        let first_source_version = first_env.source_version;
-        let first_last_used_frame = first_env.last_used_frame;
-        let first_pmrem_id = published_pmrem_view_id(state, scene_id)
-            .expect("first persistent PMREM must be published");
 
         scene.environment.set_base_cube_size(32);
         scene.environment.set_pmrem_size(16);
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-
+        render_frame(&mut renderer, &mut scene, camera, &assets, 3);
         let state = renderer.context.as_ref().expect("renderer state missing");
-        let global_state = state
-            .resource_manager
-            .get_global_state(render_state_id, scene_id)
-            .expect("global state missing after resize");
-        let resized_env = state
+        let resized = state
             .resource_manager
             .gpu_environment(scene_id)
-            .expect("scene environment metadata missing after resize");
-
+            .expect("resized environment metadata missing");
+        assert_eq!((resized.base_cube_size, resized.pmrem_size), (32, 16));
         assert_ne!(
-            first_bind_group_id, global_state.bind_group_id,
-            "environment map resizing should rebuild the global bind group"
-        );
-        assert_ne!(
-            Some(first_pmrem_id),
             published_pmrem_view_id(state, scene_id),
-            "PMREM resize should recreate the persistent PMREM view"
+            Some(initial_pmrem_id)
         );
-        assert_eq!(32, resized_env.base_cube_size);
-        assert_eq!(16, resized_env.pmrem_size);
-        assert!(resized_env.source_ready);
-        assert_eq!(first_source_version, resized_env.source_version);
-        assert!(resized_env.last_used_frame > first_last_used_frame);
     }
 
     #[test]
-    fn small_day_night_step_does_not_rebake_procedural_environment() {
+    fn procedural_environment_rebake_policy_distinguishes_small_large_and_source_changes() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
@@ -2844,91 +2405,29 @@ mod tests {
                 && graph_contains_pass(state, "IBL_Compute"),
             "moon motion beyond the threshold should rewrite base and PMREM in the same physical views"
         );
-    }
 
-    #[test]
-    fn procedural_starbox_triggers_environment_rebake() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        scene.background.set_mode(BackgroundMode::procedural());
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let scene_id = scene.id();
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let initial_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("scene environment metadata missing after first render");
-        let initial_source_version = initial_env.source_version;
-        let initial_last_used_frame = initial_env.last_used_frame;
-        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
-            .expect("initial persistent PMREM must be published");
-
+        let after_large_source_version = after_large_rotation.source_version;
         let starbox = assets.checkerboard(32, 8);
         if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
             params.set_starbox_texture(Some(starbox.into()));
             params.set_star_intensity(2.0);
         }
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-
+        render_frame(&mut renderer, &mut scene, camera, &assets, 3);
         let state = renderer.context.as_ref().expect("renderer state missing");
-        let updated_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("scene environment metadata missing after starbox update");
-
         assert_ne!(
-            initial_source_version, updated_env.source_version,
-            "adding a procedural starbox should trigger an environment rebake"
+            state
+                .resource_manager
+                .gpu_environment(scene_id)
+                .expect("updated environment metadata missing")
+                .source_version,
+            after_large_source_version
         );
-        assert!(updated_env.last_used_frame > initial_last_used_frame);
         assert_eq!(
-            Some(initial_pmrem_id),
-            published_pmrem_view_id(state, scene_id)
+            published_pmrem_view_id(state, scene_id),
+            Some(initial_pmrem_id)
         );
         assert!(graph_contains_pass(state, "Atmosphere_SkyToCube"));
         assert!(graph_contains_pass(state, "IBL_Compute"));
-    }
-
-    #[test]
-    fn tone_mapping_materializes_ready_3d_lut_only_in_live_prepare() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let image = Image::new(
-            2,
-            2,
-            2,
-            ImageDimension::D3,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![128; 2 * 2 * 2 * 4]),
-        );
-        let image_handle = assets.images.add(image);
-        let mut texture = Texture::new_3d(Some("ToneMap Test LUT"), image_handle);
-        texture.color_space = ColorSpace::Linear;
-        let lut_handle = assets.textures.add(texture);
-        let mut scene = Scene::new();
-        scene.tone_mapping.set_lut_texture(Some(lut_handle));
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(graph_contains_pass(state, "ToneMap_Pass"));
-        assert!(state.tone_map_pass.has_lut_pipeline());
-        assert_eq!(
-            state
-                .resource_manager
-                .get_image(image_handle)
-                .expect("live ToneMap must materialize the LUT image")
-                .default_view_dimension,
-            wgpu::TextureViewDimension::D3,
-        );
     }
 
     #[test]
@@ -2969,74 +2468,6 @@ mod tests {
             state.tone_map_pass.has_base_pipeline(),
             "an invalid replacement LUT must select the current no-LUT mode instead of reusing stale state"
         );
-    }
-
-    #[test]
-    fn live_mixed_shadows_prepare_one_shared_vp_upload() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let caster = scene.spawn_box(
-            1.0,
-            1.0,
-            1.0,
-            PhysicalMaterial::new(Vec4::new(0.7, 0.7, 0.7, 1.0)),
-            &assets,
-        );
-        scene.node(&caster).set_shadows(true, true);
-
-        let mut directional = Light::new_directional(Vec3::ONE, 1.0);
-        directional.cast_shadows = true;
-        if let Some(shadow) = directional.shadow.as_mut() {
-            shadow.map_size = 32;
-        }
-        let directional_node = scene.add_light(directional);
-        scene
-            .node(&directional_node)
-            .set_position(3.0, 4.0, 2.0)
-            .look_at(Vec3::ZERO);
-
-        let mut point = Light::new_point(Vec3::ONE, 1.0, 8.0);
-        point.cast_shadows = true;
-        if let Some(shadow) = point.shadow.as_mut() {
-            shadow.map_size = 32;
-        }
-        let point_node = scene.add_light(point);
-        scene.node(&point_node).set_position(2.0, 2.0, 2.0);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(graph_contains_pass(state, "Shadow_VP_Upload"));
-        assert!(graph_contains_pass(state, "Shadow_2D_Pass"));
-        assert!(graph_contains_pass(state, "Shadow_Cube_Pass"));
-        assert_eq!(
-            state
-                .graph_storage
-                .passes
-                .iter()
-                .filter(|pass| pass.name == "Shadow_VP_Upload")
-                .count(),
-            1,
-        );
-        assert_eq!(
-            state.resource_manager.model_allocator.len(),
-            1,
-            "main, Prepass, directional cascades, and point-light faces must share one model slot for the caster source"
-        );
-    }
-
-    #[test]
-    fn mipmap_generator_stays_uninitialized_without_requests() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(!state.mipmap_pass.generator_initialized());
-        assert!(!graph_contains_pass(state, "Asset_Mipmap_Generation"));
     }
 
     #[test]
@@ -3152,323 +2583,6 @@ mod tests {
                 .id,
             physical_image_id
         );
-    }
-
-    #[test]
-    fn pending_material_texture_enters_logical_chain_only_after_becoming_ready() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let image_handle = assets.images.reserve();
-        let mut texture = Texture::new_2d(Some("Pending Material Texture"), image_handle);
-        texture.generate_mipmaps = true;
-        let texture_handle = assets.textures.add(texture);
-        let material = PhysicalMaterial::new(Vec4::ONE);
-        material.set_map(Some(texture_handle));
-        let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(!execution_contains_pass(state, "Asset_Texture_Upload"));
-        assert!(!graph_contains_pass(state, "Asset_Texture_Upload"));
-        assert!(!graph_contains_pass(
-            state,
-            "Asset_Texture_Mipmap_Generation"
-        ));
-        assert!(
-            state
-                .resource_manager
-                .get_texture_image(texture_handle)
-                .is_none()
-        );
-
-        assets.images.insert_ready(
-            image_handle,
-            Image::new(
-                8,
-                8,
-                1,
-                ImageDimension::D2,
-                PixelFormat::Rgba8Unorm,
-                Some(vec![73; 8 * 8 * 4]),
-            ),
-        );
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let execution_names: Vec<_> = state
-            .graph_storage
-            .execution_queue
-            .iter()
-            .map(|&index| state.graph_storage.passes[index].name)
-            .collect();
-        let mipmap = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
-            .expect("newly ready material mipmap producer missing");
-        let opaque = execution_names
-            .iter()
-            .position(|&name| name == "Opaque_Pass")
-            .expect("opaque consumer missing");
-        assert!(mipmap < opaque);
-        assert!(
-            state
-                .resource_manager
-                .get_texture_image(texture_handle)
-                .expect("newly ready texture missing")
-                .mipmaps_submitted()
-        );
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(!execution_contains_pass(state, "Asset_Texture_Upload"));
-        assert!(!execution_contains_pass(
-            state,
-            "Asset_Texture_Mipmap_Generation"
-        ));
-    }
-
-    #[test]
-    fn same_spec_image_refresh_reopens_logical_mipmap_generation() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let image_handle = assets.images.add(Image::new(
-            8,
-            8,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![21; 8 * 8 * 4]),
-        ));
-        let mut texture = Texture::new_2d(Some("Dynamic Mip Material"), image_handle);
-        texture.generate_mipmaps = true;
-        let texture_handle = assets.textures.add(texture);
-        let material = PhysicalMaterial::new(Vec4::ONE);
-        material.set_map(Some(texture_handle));
-        let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-        let initial_physical_id = renderer
-            .context
-            .as_ref()
-            .and_then(|state| state.resource_manager.get_texture_image(texture_handle))
-            .expect("initial material texture missing")
-            .id;
-
-        assert_eq!(
-            assets.images.update(
-                image_handle,
-                Image::new(
-                    8,
-                    8,
-                    1,
-                    ImageDimension::D2,
-                    PixelFormat::Rgba8Unorm,
-                    Some(vec![219; 8 * 8 * 4]),
-                ),
-            ),
-            Some(2)
-        );
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(execution_contains_pass(
-            state,
-            "Asset_Texture_Mipmap_Generation"
-        ));
-        let refreshed = state
-            .resource_manager
-            .get_texture_image(texture_handle)
-            .expect("refreshed material texture missing");
-        assert_eq!(refreshed.id, initial_physical_id);
-        assert!(refreshed.mipmaps_submitted());
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(!execution_contains_pass(
-            state,
-            "Asset_Texture_Mipmap_Generation"
-        ));
-    }
-
-    #[test]
-    fn abandoned_composer_does_not_materialize_texture_or_publish_mipmaps() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let image = Image::new(
-            8,
-            8,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![192; 8 * 8 * 4]),
-        );
-        let image_handle = assets.images.add(image);
-        let mut texture = Texture::new_2d(Some("Mipmap Submission Test"), image_handle);
-        texture.color_space = ColorSpace::Linear;
-        texture.generate_mipmaps = true;
-        let texture_handle = assets.textures.add(texture);
-        let mut scene = Scene::new();
-        scene
-            .background
-            .set_mode(BackgroundMode::planar(texture_handle, 1.0));
-        let camera = make_camera();
-
-        let composer = renderer
-            .begin_frame(
-                &mut scene,
-                camera,
-                &assets,
-                FrameTime {
-                    time: 0.0,
-                    delta_time: 1.0 / 60.0,
-                    frame_count: 0,
-                },
-            )
-            .expect("frame composer must exist");
-        drop(composer);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(
-            state.resource_manager.get_image(image_handle).is_none(),
-            "dropping Composer before graph build must not materialize the texture"
-        );
-        assert!(!state.mipmap_pass.generator_initialized());
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let gpu_image = state
-            .resource_manager
-            .get_image(image_handle)
-            .expect("submitted texture must remain resident");
-        assert_eq!(gpu_image.mip_level_count, 4);
-        assert!(gpu_image.mipmaps_submitted());
-        assert!(state.mipmap_pass.generator_initialized());
-        assert!(!graph_contains_pass(state, "Asset_Texture_Upload"));
-        assert!(graph_contains_pass(
-            state,
-            "Asset_Texture_Mipmap_Generation"
-        ));
-        let execution_names: Vec<_> = state
-            .graph_storage
-            .execution_queue
-            .iter()
-            .map(|&index| state.graph_storage.passes[index].name)
-            .collect();
-        let mipmap_position = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
-            .expect("mipmap pass missing from execution queue");
-        let skybox_position = execution_names
-            .iter()
-            .position(|&name| name == "Skybox_Pass")
-            .expect("texture skybox pass missing from execution queue");
-        assert!(mipmap_position < skybox_position);
-        assert!(
-            state
-                .graph_storage
-                .mipmap_batches
-                .iter()
-                .all(Option::is_none),
-            "submitted mipmap batches must release their Texture/Arc owners immediately"
-        );
-        assert!(
-            state.graph_storage.asset_texture_imports.is_empty(),
-            "submitted asset imports must release their view/request owners immediately"
-        );
-    }
-
-    #[test]
-    fn prepass_pipelines_are_created_only_by_live_prepare_and_reused() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let mesh_node = scene.spawn_box(
-            1.0,
-            1.0,
-            1.0,
-            PhysicalMaterial::new(Vec4::new(0.7, 0.7, 0.7, 1.0)),
-            &assets,
-        );
-        let (geometry_handle, material_handle) = {
-            let mesh = scene
-                .meshes
-                .get(mesh_node)
-                .expect("spawned test mesh missing");
-            (mesh.geometry, mesh.material)
-        };
-        let camera = make_camera();
-        let initial_pipeline_count = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
-            .pipeline_cache
-            .render_pipeline_count();
-
-        let composer = renderer
-            .begin_frame(
-                &mut scene,
-                camera,
-                &assets,
-                FrameTime {
-                    time: 0.0,
-                    delta_time: 1.0 / 60.0,
-                    frame_count: 0,
-                },
-            )
-            .expect("frame composer must exist");
-        drop(composer);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert_eq!(
-            state.prepass.cached_pipeline_count(),
-            0,
-            "begin_frame must not compile Prepass pipelines"
-        );
-        assert_eq!(
-            state.pipeline_cache.render_pipeline_count(),
-            initial_pipeline_count,
-            "an abandoned Composer must not derive scene render pipelines"
-        );
-        assert!(state.render_lists.opaque.is_empty());
-        assert!(state.render_lists.transparent.is_empty());
-        assert!(state.render_lists.shadow_queues.is_empty());
-        assert!(
-            state
-                .resource_manager
-                .get_geometry(geometry_handle)
-                .is_none()
-        );
-        assert!(
-            state
-                .resource_manager
-                .get_material(material_handle)
-                .is_none()
-        );
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(graph_contains_pass(state, "Pre_Pass"));
-        let live_pipeline_count = state.prepass.cached_pipeline_count();
-        assert!(live_pipeline_count > 0);
-        assert!(state.pipeline_cache.render_pipeline_count() > initial_pipeline_count);
-        assert!(
-            state
-                .resource_manager
-                .get_geometry(geometry_handle)
-                .is_some()
-        );
-        assert!(
-            state
-                .resource_manager
-                .get_material(material_handle)
-                .is_some()
-        );
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 2);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert_eq!(state.prepass.cached_pipeline_count(), live_pipeline_count);
     }
 
     #[test]
@@ -3719,51 +2833,6 @@ mod tests {
     }
 
     #[test]
-    fn material_readiness_is_frozen_by_the_cpu_scene_snapshot() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
-        let pending_material = assets.materials.reserve();
-        scene
-            .meshes
-            .get_mut(mesh_node)
-            .expect("test mesh missing")
-            .material = pending_material;
-
-        let composer = renderer
-            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
-            .expect("frame composer must exist");
-        assets.materials.insert_ready(
-            pending_material,
-            myth_resources::Material::from(PhysicalMaterial::new(Vec4::new(0.3, 0.4, 0.5, 1.0))),
-        );
-        composer.render();
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(state.render_frame.extracted_scene.render_items.is_empty());
-        assert!(state.render_lists.opaque.is_empty());
-        assert!(
-            state
-                .resource_manager
-                .get_material(pending_material)
-                .is_none()
-        );
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert_eq!(state.render_frame.extracted_scene.render_items.len(), 1);
-        assert_eq!(state.render_lists.opaque.len(), 1);
-        assert!(
-            state
-                .resource_manager
-                .get_material(pending_material)
-                .is_some()
-        );
-    }
-
-    #[test]
     fn same_version_asset_replacement_after_extract_fails_the_graph_attempt_closed() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
@@ -3867,77 +2936,6 @@ mod tests {
                 .asset_identity,
             replacement_identity
         );
-    }
-
-    #[test]
-    fn blend_material_snapshot_is_not_shadow_eligible() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.spawn_box(
-            1.0,
-            1.0,
-            1.0,
-            PhysicalMaterial::new(Vec4::ONE)
-                .with_alpha_mode(myth_resources::material::AlphaMode::Blend),
-            &assets,
-        );
-
-        let composer = renderer
-            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
-            .expect("frame composer must exist");
-        drop(composer);
-
-        let item = renderer
-            .context
-            .as_ref()
-            .expect("renderer state missing")
-            .render_frame
-            .extracted_scene
-            .render_items
-            .first()
-            .expect("render item missing");
-        assert!(!item.cast_shadows);
-    }
-
-    #[test]
-    fn material_classification_epoch_drift_fails_the_frame_closed() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let mesh = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
-        let material_handle = scene.meshes.get(mesh).expect("test mesh missing").material;
-
-        let composer = renderer
-            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
-            .expect("frame composer must exist");
-        let material = assets
-            .materials
-            .get(material_handle)
-            .expect("test material missing");
-        let myth_resources::material::MaterialType::Physical(physical) = &material.data else {
-            panic!("test material must be physical");
-        };
-        physical.set_alpha_mode(myth_resources::material::AlphaMode::Blend);
-        composer.render();
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert_eq!(
-            state.render_lists.opaque.len(),
-            1,
-            "culling must consume the coherent extracted classification snapshot"
-        );
-        assert!(state.render_lists.transparent.is_empty());
-        assert_eq!(
-            state.resource_manager.model_allocator.len(),
-            0,
-            "MaterialPlan must reject the drifted material before physical draw preparation"
-        );
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(state.render_lists.opaque.is_empty());
-        assert_eq!(state.render_lists.transparent.len(), 1);
     }
 
     #[test]
@@ -4094,50 +3092,6 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_composer_does_not_commit_morph_history() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let mesh_node = spawn_test_morph_box(&mut scene, &assets);
-        {
-            let mesh = scene.meshes.get_mut(mesh_node).expect("test mesh missing");
-            mesh.set_morph_target_influence(0, 1.0);
-        }
-
-        let composer = renderer
-            .begin_frame(&mut scene, make_camera(), &assets, FrameTime::default())
-            .expect("frame composer must exist");
-        drop(composer);
-
-        let unsubmitted = scene
-            .meshes
-            .get(mesh_node)
-            .expect("test mesh missing")
-            .morph_uniforms();
-        assert!(unsubmitted.weights[0].x.abs() <= f32::EPSILON);
-        drop(unsubmitted);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
-
-        let submitted = scene
-            .meshes
-            .get(mesh_node)
-            .expect("test mesh missing")
-            .morph_uniforms();
-        assert!((submitted.weights[0].x - 1.0).abs() <= f32::EPSILON);
-        assert!(submitted.prev_weights[0].x.abs() <= f32::EPSILON);
-        drop(submitted);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
-        let followup = scene
-            .meshes
-            .get(mesh_node)
-            .expect("test mesh missing")
-            .morph_uniforms();
-        assert!((followup.prev_weights[0].x - 1.0).abs() <= f32::EPSILON);
-    }
-
-    #[test]
     fn compact_frame_source_history_maps_back_to_the_nonzero_extracted_item() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
@@ -4190,37 +3144,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_skeleton_binding_does_not_select_a_skinned_draw_variant() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let mesh_node = scene.spawn_box(
-            1.0,
-            1.0,
-            1.0,
-            PhysicalMaterial::new(Vec4::new(0.4, 0.4, 0.4, 1.0)),
-            &assets,
-        );
-        let stale_skeleton = SkeletonKey::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001));
-        scene.bind_skeleton(mesh_node, stale_skeleton, BindMode::Attached);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let item = state
-            .render_frame
-            .extracted_scene
-            .render_items
-            .first()
-            .expect("render item missing");
-        assert!(item.skeleton.is_none());
-        assert_eq!(item.item_variant_flags & (1 << 1), 0);
-        assert!(!item.item_shader_defines().contains("HAS_SKINNING"));
-        assert_eq!(state.render_lists.opaque.len(), 1);
-    }
-
-    #[test]
-    fn distinct_rigid_meshes_share_the_model_only_group2_l0_and_warm_bind_group() {
+    fn group2_recipe_matrix_shares_rigid_l0_without_erasing_morph_or_skin_bindings() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();
         let mut scene = Scene::new();
@@ -4290,74 +3214,73 @@ mod tests {
             uploads_before,
             "an identical static model stream must not enqueue a redundant queue write"
         );
-    }
 
-    #[test]
-    fn morph_object_preserves_its_full_group2_recipe_and_bypasses_rigid_l0() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let mesh_node = spawn_test_morph_box(&mut scene, &assets);
+        let morph_node = spawn_test_morph_box(&mut scene, &assets);
+        scene.node(&morph_node).set_position(-1.5, 0.0, 0.0);
         let morph_buffer_id = scene
             .meshes
-            .get(mesh_node)
+            .get(morph_node)
             .expect("morph mesh missing")
             .morph_uniforms
             .id();
 
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert_eq!(state.render_lists.opaque.len(), 1);
-        assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 0);
-        assert!(
-            state
-                .resource_manager
-                .get_gpu_buffer_by_cpu_id(morph_buffer_id)
-                .is_some(),
-            "a morph draw must retain and materialize its morph uniform binding"
-        );
-    }
-
-    #[test]
-    fn skinned_object_preserves_its_full_group2_recipe_and_bypasses_rigid_l0() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
-        let morph_buffer_id = scene
+        let skinned_node =
+            scene.spawn_box(0.5, 0.5, 0.5, PhysicalMaterial::new(Vec4::ONE), &assets);
+        scene.node(&skinned_node).set_position(0.0, 0.0, 0.0);
+        let skinned_morph_buffer_id = scene
             .meshes
-            .get(mesh_node)
+            .get(skinned_node)
             .expect("skinned mesh missing")
             .morph_uniforms
             .id();
         let bone = scene.create_node();
         let skeleton = Skeleton::new(
-            "Rigid L0 Isolation Skeleton",
+            "Group2 Recipe Matrix Skeleton",
             vec![bone],
             vec![Affine3A::IDENTITY],
             0,
         );
         let skeleton_key = scene.add_skeleton(skeleton);
-        scene.bind_skeleton(mesh_node, skeleton_key, BindMode::Attached);
+        scene.bind_skeleton(skinned_node, skeleton_key, BindMode::Attached);
+
+        let stale_node = scene.spawn_box(0.5, 0.5, 0.5, PhysicalMaterial::new(Vec4::ONE), &assets);
+        scene.node(&stale_node).set_position(1.5, 0.0, 0.0);
+        let stale_skeleton = scene.add_skeleton(Skeleton::new(
+            "Removed Group2 Recipe Skeleton",
+            vec![bone],
+            vec![Affine3A::IDENTITY],
+            0,
+        ));
+        assert!(scene.skeleton_pool.remove(stale_skeleton).is_some());
+        scene.bind_skeleton(stale_node, stale_skeleton, BindMode::Attached);
         scene.update_matrix_world();
 
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
         let state = renderer.context.as_ref().expect("renderer state missing");
-        assert_eq!(state.render_lists.opaque.len(), 1);
-        assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 0);
-        assert!(
-            state
-                .resource_manager
-                .get_gpu_buffer_by_cpu_id(morph_buffer_id)
-                .is_some(),
-            "the skinned recipe must preserve its existing morph uniform binding"
-        );
+        assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 1);
+        for buffer_id in [morph_buffer_id, skinned_morph_buffer_id] {
+            assert!(
+                state
+                    .resource_manager
+                    .get_gpu_buffer_by_cpu_id(buffer_id)
+                    .is_some(),
+                "non-rigid recipes must preserve their full Group 2 bindings"
+            );
+        }
+        let stale_item = state
+            .render_frame
+            .extracted_scene
+            .render_items
+            .iter()
+            .find(|item| item.node_handle == stale_node)
+            .expect("stale-skeleton item missing");
+        assert!(stale_item.skeleton.is_none());
+        assert_eq!(stale_item.item_variant_flags & (1 << 1), 0);
+        assert!(!stale_item.item_shader_defines().contains("HAS_SKINNING"));
     }
 
     #[test]
-    fn model_buffer_resize_rebinds_objects_before_commands_capture_them() {
+    fn model_buffer_resize_and_ttl_recreation_never_leave_stale_object_bindings() {
         let mut renderer = init_headless_renderer_with_model_capacity(4);
         let assets = AssetServer::new();
         let mut scene = Scene::new();
@@ -4443,44 +3366,24 @@ mod tests {
                 .iter()
                 .all(|id| !old_object_bind_group_ids.contains(id))
         );
-    }
-
-    #[test]
-    fn pruned_model_buffer_is_recreated_before_the_next_draw_prepare() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        let resized_physical_id = model_buffer.id;
+        let resized_bind_group_id = new_object_bind_group_ids[0];
 
         let state = renderer.context.as_mut().expect("renderer state missing");
-        let old_object_bind_group_id = *state
-            .resource_manager
-            .cached_object_bind_group_ids()
-            .first()
-            .expect("submitted draw did not populate the object cache");
         let logical_id = state.resource_manager.model_buffer_id();
-        let initial_physical_id = state
-            .resource_manager
-            .get_gpu_buffer_by_cpu_id(logical_id)
-            .expect("initial model buffer missing")
-            .id;
-
         state.resource_manager.next_frame();
         state.resource_manager.prune(0);
         assert!(
             state
                 .resource_manager
                 .get_gpu_buffer_by_cpu_id(logical_id)
-                .is_none(),
-            "the test must exercise the stale allocator-handle path"
+                .is_none()
         );
         assert!(
             state
                 .resource_manager
-                .get_cached_bind_group(old_object_bind_group_id)
-                .is_none(),
-            "object cache TTL must release contexts owning stale physical buffers"
+                .get_cached_bind_group(resized_bind_group_id)
+                .is_none()
         );
         assert_eq!(state.resource_manager.rigid_object_bind_group_l0_len(), 0);
 
@@ -4488,342 +3391,7 @@ mod tests {
         let recreated = state
             .resource_manager
             .get_gpu_buffer_by_cpu_id(logical_id)
-            .expect("model buffer was not recreated");
-        assert_ne!(recreated.id, initial_physical_id);
-    }
-
-    #[test]
-    fn basic_forward_texture_skybox_consumes_the_live_mip_ready_import() {
-        let mut renderer = Renderer::new(
-            RendererInitConfig::default(),
-            RendererSettings {
-                path: RenderPath::BasicForward,
-                ..RendererSettings::default()
-            },
-        );
-        init_shared_headless_renderer(&mut renderer, 128, 128, None);
-        let assets = AssetServer::new();
-        let image_handle = assets.images.add(Image::new(
-            8,
-            8,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![96; 8 * 8 * 4]),
-        ));
-        let mut texture = Texture::new_2d(Some("BasicForward Skybox"), image_handle);
-        texture.color_space = ColorSpace::Linear;
-        texture.generate_mipmaps = true;
-        let texture_handle = assets.textures.add(texture);
-        let mut scene = Scene::new();
-        scene
-            .background
-            .set_mode(BackgroundMode::planar(texture_handle, 1.0));
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let image = state
-            .resource_manager
-            .get_texture_image(texture_handle)
-            .expect("live BasicForward skybox must materialize its texture");
-        assert_eq!(image.mip_level_count, 4);
-        assert!(image.mipmaps_submitted());
-        assert!(!graph_contains_pass(state, "Skybox_Pass"));
-        let execution_names: Vec<_> = state
-            .graph_storage
-            .execution_queue
-            .iter()
-            .map(|&index| state.graph_storage.passes[index].name)
-            .collect();
-        let mipmap = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
-            .expect("asset mipmap pass missing");
-        let forward = execution_names
-            .iter()
-            .position(|&name| name == "SimpleForward_Pass")
-            .expect("BasicForward pass missing");
-        assert!(mipmap < forward);
-        assert!(state.graph_storage.asset_texture_imports.is_empty());
-    }
-
-    #[test]
-    fn basic_forward_draw_plans_retain_opaque_and_transparent_material_textures() {
-        let mut renderer = Renderer::new(
-            RendererInitConfig::default(),
-            RendererSettings {
-                path: RenderPath::BasicForward,
-                ..RendererSettings::default()
-            },
-        );
-        init_shared_headless_renderer(&mut renderer, 128, 128, None);
-        let assets = AssetServer::new();
-        let opaque_image = assets.images.add(Image::new(
-            4,
-            4,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![64; 4 * 4 * 4]),
-        ));
-        let transparent_image = assets.images.add(Image::new(
-            4,
-            4,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![192; 4 * 4 * 4]),
-        ));
-        let opaque_texture = assets
-            .textures
-            .add(Texture::new_2d(Some("BasicForward Opaque"), opaque_image));
-        let transparent_texture = assets.textures.add(Texture::new_2d(
-            Some("BasicForward Transparent"),
-            transparent_image,
-        ));
-        let opaque = PhysicalMaterial::new(Vec4::ONE);
-        opaque.set_map(Some(opaque_texture));
-        let transparent = PhysicalMaterial::new(Vec4::ONE)
-            .with_alpha_mode(myth_resources::material::AlphaMode::Blend);
-        transparent.set_map(Some(transparent_texture));
-        let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, opaque, &assets);
-        scene.spawn_box(0.5, 0.5, 0.5, transparent, &assets);
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let execution_names: Vec<_> = state
-            .graph_storage
-            .execution_queue
-            .iter()
-            .map(|&index| state.graph_storage.passes[index].name)
-            .collect();
-        assert!(execution_names.contains(&"SimpleForward_Pass"));
-        assert!(!execution_names.contains(&"Asset_Texture_Upload"));
-        assert!(!execution_names.contains(&"Asset_Texture_Mipmap_Generation"));
-        assert!(
-            state
-                .resource_manager
-                .get_texture_image(opaque_texture)
-                .is_some()
-        );
-        assert!(
-            state
-                .resource_manager
-                .get_texture_image(transparent_texture)
-                .is_some()
-        );
-        assert_eq!(state.render_lists.opaque.len(), 1);
-        assert_eq!(state.render_lists.transparent.len(), 1);
-    }
-
-    #[test]
-    fn material_and_texture_skybox_share_one_logical_asset_chain() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let image_handle = assets.images.add(Image::new(
-            8,
-            8,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![160; 8 * 8 * 4]),
-        ));
-        let mut material_texture = Texture::new_2d(Some("Shared Material"), image_handle);
-        material_texture.color_space = ColorSpace::Linear;
-        material_texture.generate_mipmaps = true;
-        let material_texture_handle = assets.textures.add(material_texture);
-        let material = PhysicalMaterial::new(Vec4::ONE);
-        material.set_map(Some(material_texture_handle));
-        let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
-        scene
-            .background
-            .set_mode(BackgroundMode::planar(material_texture_handle, 1.0));
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(
-            !graph_contains_pass(state, "Asset_Mipmap_Generation"),
-            "the shared logical import must not create a legacy mip request"
-        );
-        assert_eq!(
-            state
-                .graph_storage
-                .passes
-                .iter()
-                .filter(|pass| pass.name == "Asset_Texture_Mipmap_Generation")
-                .count(),
-            1
-        );
-        assert_eq!(
-            state
-                .graph_storage
-                .passes
-                .iter()
-                .filter(|pass| pass.name == "Asset_Texture_Upload")
-                .count(),
-            0
-        );
-        let image = state
-            .resource_manager
-            .get_texture_image(material_texture_handle)
-            .expect("shared material/Skybox texture must remain resident");
-        assert!(image.mipmaps_submitted());
-
-        let execution_names: Vec<_> = state
-            .graph_storage
-            .execution_queue
-            .iter()
-            .map(|&index| state.graph_storage.passes[index].name)
-            .collect();
-        let mipmap = execution_names
-            .iter()
-            .position(|&name| name == "Asset_Texture_Mipmap_Generation")
-            .expect("shared logical mipmap producer missing");
-        let opaque = execution_names
-            .iter()
-            .position(|&name| name == "Opaque_Pass")
-            .expect("opaque consumer missing");
-        let skybox = execution_names
-            .iter()
-            .position(|&name| name == "Skybox_Pass")
-            .expect("Skybox consumer missing");
-        assert!(mipmap < opaque && mipmap < skybox);
-    }
-
-    #[test]
-    fn distinct_texture_handles_share_one_physical_mipmap_generation() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let image_handle = assets.images.add(Image::new(
-            8,
-            8,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![160; 8 * 8 * 4]),
-        ));
-        let mut material_texture = Texture::new_2d(Some("Shared Material"), image_handle);
-        material_texture.color_space = ColorSpace::Linear;
-        material_texture.generate_mipmaps = true;
-        let material_texture_handle = assets.textures.add(material_texture);
-        let mut skybox_texture = Texture::new_2d(Some("Shared Skybox"), image_handle);
-        skybox_texture.color_space = ColorSpace::Linear;
-        skybox_texture.generate_mipmaps = true;
-        skybox_texture.sampler.mag_filter = wgpu::FilterMode::Nearest;
-        let skybox_texture_handle = assets.textures.add(skybox_texture);
-        let material = PhysicalMaterial::new(Vec4::ONE);
-        material.set_map(Some(material_texture_handle));
-        let mut scene = Scene::new();
-        scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
-        scene
-            .background
-            .set_mode(BackgroundMode::planar(skybox_texture_handle, 1.0));
-
-        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        assert!(!graph_contains_pass(state, "Asset_Mipmap_Generation"));
-        assert_eq!(
-            state
-                .graph_storage
-                .passes
-                .iter()
-                .filter(|pass| pass.name == "Asset_Texture_Upload")
-                .count(),
-            0,
-            "distinct logical snapshots remain import resources, not proxy passes"
-        );
-        assert_eq!(
-            state
-                .graph_storage
-                .passes
-                .iter()
-                .filter(|pass| pass.name == "Asset_Texture_Mipmap_Generation")
-                .count(),
-            2,
-            "each logical import exposes readiness while physical encoding is coordinated"
-        );
-        let execution_names: Vec<_> = state
-            .graph_storage
-            .execution_queue
-            .iter()
-            .map(|&index| state.graph_storage.passes[index].name)
-            .collect();
-        assert_eq!(
-            execution_names
-                .iter()
-                .filter(|&&name| name == "Asset_Texture_Upload")
-                .count(),
-            0
-        );
-        assert_eq!(
-            execution_names
-                .iter()
-                .filter(|&&name| name == "Asset_Texture_Mipmap_Generation")
-                .count(),
-            2
-        );
-        let material_image = state
-            .resource_manager
-            .get_texture_image(material_texture_handle)
-            .expect("material texture must remain resident");
-        let skybox_image = state
-            .resource_manager
-            .get_texture_image(skybox_texture_handle)
-            .expect("Skybox texture must remain resident");
-        assert_eq!(material_image.id, skybox_image.id);
-        assert!(material_image.mipmaps_submitted());
-        assert!(skybox_image.mipmaps_submitted());
-    }
-
-    #[test]
-    fn pending_procedural_optional_source_keeps_published_environment() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        scene.environment.set_base_cube_size(16);
-        scene.environment.set_pmrem_size(8);
-        scene.background.set_mode(BackgroundMode::procedural());
-        let camera = make_camera();
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let scene_id = scene.id();
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let initial_pmrem_id = published_pmrem_view_id(state, scene_id)
-            .expect("initial persistent PMREM must be published");
-
-        if let BackgroundMode::Procedural(params) = &mut scene.background.mode {
-            params.set_starbox_texture(Some(TextureSource::Attachment(
-                u64::MAX,
-                wgpu::TextureViewDimension::D2,
-            )));
-        }
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 1);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let pending_env = state
-            .resource_manager
-            .gpu_environment(scene_id)
-            .expect("procedural environment metadata missing");
-
-        assert!(!pending_env.source_ready);
-        assert_eq!(
-            Some(initial_pmrem_id),
-            published_pmrem_view_id(state, scene_id),
-            "a pending optional source must not overwrite the last published PMREM"
-        );
-        assert!(
-            graph_contains_pass(state, "Atmosphere_SkyView"),
-            "the visual atmosphere path must remain available while an optional source is pending"
-        );
-        assert!(!graph_contains_pass(state, "Atmosphere_SkyToCube"));
-        assert!(!graph_contains_pass(state, "IBL_Compute"));
+            .expect("model buffer must be recreated before the next prepare");
+        assert_ne!(recreated.id, resized_physical_id);
     }
 }

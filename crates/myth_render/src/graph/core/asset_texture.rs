@@ -145,8 +145,6 @@ pub(crate) struct AssetTextureImportStore {
     live_paths: Vec<LiveAssetTexturePath>,
     live_current: Vec<bool>,
     candidate_current: Vec<bool>,
-    #[cfg(test)]
-    resident_hits: usize,
 }
 
 impl Default for AssetTextureImportStore {
@@ -161,8 +159,6 @@ impl Default for AssetTextureImportStore {
             live_paths: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
             live_current: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
             candidate_current: Vec::with_capacity(ASSET_TEXTURE_IMPORT_BASELINE),
-            #[cfg(test)]
-            resident_hits: 0,
         }
     }
 }
@@ -249,10 +245,6 @@ impl AssetTextureImportStore {
         self.live_owner_plans.clear();
         self.live_imports.clear();
         self.candidates.clear();
-        #[cfg(test)]
-        {
-            self.resident_hits = 0;
-        }
         self.planned.clear();
         self.lookup.clear();
         // Drops tracked views and any unconsumed Drop-bearing mip requests.
@@ -438,8 +430,6 @@ impl AssetTextureImportStore {
         debug_assert!(self.live_current.is_empty());
         debug_assert!(self.candidate_current.is_empty());
         debug_assert!(self.candidates.is_empty());
-        #[cfg(test)]
-        debug_assert_eq!(self.resident_hits, 0);
 
         for index in 0..self.entries.len() {
             let id = AssetTextureImportId::from_index(index);
@@ -472,10 +462,6 @@ impl AssetTextureImportStore {
             let path = if let Some(resident) =
                 resource_manager.exact_asset_texture_residency(entry.snapshot)
             {
-                #[cfg(test)]
-                {
-                    self.resident_hits += 1;
-                }
                 LiveAssetTexturePath::Resident(resident)
             } else {
                 let candidate = resource_manager.stage_asset_texture_candidate(
@@ -672,22 +658,6 @@ impl AssetTextureImportStore {
             && self.live_paths.is_empty()
             && self.live_current.is_empty()
             && self.candidate_current.is_empty()
-            && {
-                #[cfg(test)]
-                {
-                    self.resident_hits == 0
-                }
-                #[cfg(not(test))]
-                {
-                    true
-                }
-            }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn resident_hit_count(&self) -> usize {
-        self.resident_hits
     }
 }
 

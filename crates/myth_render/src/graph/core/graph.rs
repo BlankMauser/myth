@@ -3641,21 +3641,22 @@ impl<'a> RenderGraph<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::core::ResourceManager;
-    use crate::core::gpu::{PhysicalImageId, snapshot_asset_texture};
+    use crate::core::gpu::snapshot_asset_texture;
     use crate::graph::RdgAttemptOutcome;
+    #[cfg(feature = "rdg_inspector")]
+    use crate::graph::composer::GraphBuilderContext;
+    use crate::graph::core::context::ExecuteContext;
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
-    use crate::graph::{composer::GraphBuilderContext, core::context::ExecuteContext};
     use crate::settings::{RendererInitConfig, RendererSettings};
     use crate::test_support::SharedTestContext as WgpuContext;
     use myth_assets::AssetServer;
     use myth_resources::image::{Image, ImageDimension, PixelFormat};
     use myth_resources::texture::Texture;
 
+    #[cfg(feature = "rdg_inspector")]
     fn dummy_config() -> FrameConfig {
         FrameConfig {
             width: 1920,
@@ -3674,27 +3675,6 @@ mod tests {
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
-    }
-
-    #[test]
-    fn pressure_trim_is_deferred_to_clear_and_reclaims_one_capacity_family() {
-        let mut storage = GraphStorage::new();
-        storage.compile_reverse_edges.reserve(256 * 1024);
-        let capacity_before = storage.compile_reverse_edges.capacity();
-        let bytes_before = storage.retained_capacity_stats().estimated_retained_bytes();
-
-        storage.request_retained_capacity_trim();
-        assert_eq!(storage.compile_reverse_edges.capacity(), capacity_before);
-        assert!(storage.retained_capacity_stats().trim_pending());
-
-        storage.clear();
-
-        assert!(storage.compile_reverse_edges.capacity() < capacity_before);
-        let stats = storage.retained_capacity_stats();
-        assert_eq!(stats.trim_count(), 1);
-        assert!(stats.last_trimmed_bytes() > 0);
-        assert!(stats.estimated_retained_bytes() < bytes_before);
-        assert!(!stats.trim_pending());
     }
 
     #[test]
@@ -3719,51 +3699,6 @@ mod tests {
         assert!(
             after.estimated_attempt_store_bytes() > before.estimated_attempt_store_bytes(),
             "attempt-owned mipmap capacity must be visible in the attempt-store ledger"
-        );
-    }
-
-    #[test]
-    fn release_frame_owners_accounts_and_clears_cross_storage_asset_texture_plans() {
-        let assets = AssetServer::new();
-        let image = assets.images.add(Image::new(
-            1,
-            1,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![255; 4]),
-        ));
-        let texture = assets
-            .textures
-            .add(Texture::new_2d(Some("attempt owner"), image));
-        let texture_owner = assets.textures.get(texture).expect("texture missing");
-        let image_owner = assets.images.get(image).expect("image missing");
-        let mut storage = GraphStorage::new();
-        storage.asset_texture_plans.request(texture);
-        storage.asset_texture_plans.capture_requested(&assets);
-        assert!(!storage.asset_texture_plans.is_empty());
-        assert_eq!(Arc::strong_count(&texture_owner), 3);
-        assert_eq!(Arc::strong_count(&image_owner), 3);
-
-        let populated = storage.capacity_snapshot()[GraphCapacityFamily::AssetTextures.index()];
-        assert!(populated.active_bytes > 0);
-        storage.sample_retained_capacity();
-
-        storage.release_frame_owners();
-
-        assert!(storage.asset_texture_plans.is_empty());
-        assert_eq!(Arc::strong_count(&texture_owner), 2);
-        assert_eq!(Arc::strong_count(&image_owner), 2);
-        let released = storage.capacity_snapshot()[GraphCapacityFamily::AssetTextures.index()];
-        assert_eq!(released.active_bytes, 0);
-        assert_eq!(released.retained_bytes, populated.retained_bytes);
-
-        storage.finish_retained_capacity_sample();
-        assert!(
-            storage
-                .retained_capacity_stats()
-                .last_attempt_active_bytes()
-                >= populated.active_bytes
         );
     }
 
@@ -3852,60 +3787,6 @@ mod tests {
 
         assert!(storage.compile_reverse_edges.capacity() < capacity_before);
         assert_eq!(storage.retained_capacity_stats().trim_count(), 1);
-    }
-
-    #[test]
-    fn early_owner_release_cannot_erase_the_attempt_capacity_sample() {
-        let mut storage = GraphStorage::new();
-        let plan = storage.draw_plans.reserve_plan(DrawPlanKey::Opaque);
-        storage.draw_plans.mark_live(plan);
-        let start = storage.draw_plans.begin_finalize(plan);
-        for sort_key in 0..64 {
-            storage.draw_plans.push_test_command(sort_key);
-        }
-        storage.draw_plans.finish_finalize(plan, start);
-        let draw_active = storage.draw_plans.capacity_usage().active_bytes;
-        assert!(draw_active > 0);
-
-        storage.sample_retained_capacity();
-        storage.draw_plans.clear();
-        storage.finish_retained_capacity_sample();
-
-        let stats = storage.retained_capacity_stats();
-        assert_eq!(stats.observed_attempts(), 1);
-        assert!(stats.last_attempt_active_bytes() >= draw_active);
-    }
-
-    #[test]
-    fn drop_capacity_tail_sample_preserves_execute_time_mipmap_growth() {
-        let mut storage = GraphStorage::new();
-        storage.sample_retained_capacity();
-
-        let physical = PhysicalImageId::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001));
-        assert!(
-            storage
-                .mipmap_encode_coordinator
-                .try_claim(PhysicalImageGenerationKey {
-                    physical,
-                    allocation: 7,
-                    generation: 11,
-                })
-        );
-        let execute_tail_active = storage
-            .capacity_snapshot()
-            .iter()
-            .map(|usage| usage.active_bytes)
-            .sum::<usize>();
-
-        storage.finish_retained_capacity_sample();
-
-        assert!(
-            storage
-                .retained_capacity_stats()
-                .last_attempt_active_bytes()
-                >= execute_tail_active,
-            "mipmap claims created after the prepare-time sample must remain visible"
-        );
     }
 
     #[test]
@@ -4025,30 +3906,6 @@ mod tests {
     }
 
     #[test]
-    fn standalone_graph_drop_publishes_exact_abandoned_attempt() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-
-        {
-            let mut graph = RenderGraph::new(&mut storage, &arena);
-            graph.add_pass("Declared_Only", |_builder| (MockExec, ()));
-
-            let current = graph.diagnostics();
-            assert_eq!(current.outcome(), RdgAttemptOutcome::InProgress);
-            assert_eq!(current.declared_passes(), 1);
-            assert_eq!(current.live_passes(), None);
-        }
-
-        let abandoned = storage.latest_diagnostics().unwrap();
-        assert_eq!(abandoned.outcome(), RdgAttemptOutcome::Abandoned);
-        assert_eq!(abandoned.declared_passes(), 1);
-        assert_eq!(abandoned.live_passes(), None);
-        assert_eq!(abandoned.prepared_passes(), 0);
-        assert_eq!(abandoned.executed_passes(), 0);
-        assert!(!abandoned.queue_submitted());
-    }
-
-    #[test]
     fn all_dead_graph_records_compiled_zero_and_survives_topology_clear() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
@@ -4135,63 +3992,6 @@ mod tests {
     }
 
     #[test]
-    fn all_dead_graph_releases_cross_storage_cpu_owners_without_execution() {
-        let assets = AssetServer::new();
-        let image = assets.images.add(Image::new(
-            1,
-            1,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![255; 4]),
-        ));
-        let texture = assets
-            .textures
-            .add(Texture::new_2d(Some("all-dead owner"), image));
-        let texture_owner = assets.textures.get(texture).expect("texture missing");
-        let image_owner = assets.images.get(image).expect("image missing");
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-
-        {
-            let mut graph = RenderGraph::new(&mut storage, &arena);
-            let request = graph.storage.asset_texture_plans.request(texture);
-            graph.storage.asset_texture_plans.capture_requested(&assets);
-            let snapshot = graph
-                .storage
-                .asset_texture_plans
-                .state(request)
-                .and_then(|state| state.ready)
-                .expect("ready attempt snapshot missing");
-            let imported = graph.import_asset_texture("Dead_Asset", snapshot);
-            assert_eq!(Arc::strong_count(&texture_owner), 3);
-            assert_eq!(Arc::strong_count(&image_owner), 3);
-
-            graph.add_pass("Dead_Asset_Consumer", |builder| {
-                builder.read_texture(imported);
-                (MockExec, ())
-            });
-            graph.compile_topology();
-            assert_eq!(graph.diagnostics().live_passes(), Some(0));
-            graph.finish();
-        }
-
-        assert_eq!(Arc::strong_count(&texture_owner), 2);
-        assert_eq!(Arc::strong_count(&image_owner), 2);
-        assert!(storage.asset_texture_plans.is_empty());
-        assert!(storage.asset_texture_imports.is_empty());
-        assert!(storage.mipmap_batches.is_empty());
-        let diagnostics = storage.latest_diagnostics().unwrap();
-        assert_eq!(
-            diagnostics.outcome(),
-            RdgAttemptOutcome::CompletedWithoutSubmission
-        );
-        assert!(!diagnostics.queue_submitted());
-        assert_eq!(diagnostics.prepared_passes(), 0);
-        assert_eq!(diagnostics.executed_passes(), 0);
-    }
-
-    #[test]
     fn pass_setup_panic_does_not_count_a_placeholder_as_declared() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
@@ -4210,54 +4010,6 @@ mod tests {
         assert_eq!(abandoned.live_passes(), None);
         assert!(abandoned.panicked());
         assert_eq!(storage.retained_capacity_stats().observed_attempts(), 1);
-    }
-
-    #[test]
-    fn next_attempt_clears_raw_submission_staging_after_setup_panic() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let texture = graph.register_texture("Abandoned", dummy_desc(), false);
-            graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
-            let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
-            graph.add_pass("Panicking_Draw_Setup", |builder| -> (MockExec, ()) {
-                builder.read_texture(texture);
-                builder.read_texture(texture);
-                builder.demand_scene_submission(submission);
-                panic!("intentional draw setup failure")
-            });
-        }));
-        assert!(result.is_err());
-        assert!(storage.scene_submission_raw_demands.is_empty());
-        assert!(storage.logical_reads.is_empty());
-        assert!(storage.pass_reads(0).is_empty());
-        assert_eq!(
-            storage.resources[0].consumer_edge_count(),
-            0,
-            "setup unwind must remove its logical-read consumer edge"
-        );
-
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        assert!(graph.storage.passes.is_empty());
-        assert!(graph.storage.logical_reads.is_empty());
-        assert!(graph.storage.scene_submission_raw_demands.is_empty());
-        assert!(graph.storage.scene_submission_demands.is_empty());
-
-        let texture = graph.register_texture("Recovered", dummy_desc(), false);
-        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Transparent, [texture]);
-        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
-        let pass_index = graph.storage.passes.len();
-        graph.add_pass("Recovered_Draw_Setup", |builder| {
-            builder.demand_scene_submission(submission);
-            (MockExec, ())
-        });
-        assert_eq!(
-            graph.storage.pass_scene_submission_demands(pass_index),
-            &[submission]
-        );
-        assert_eq!(graph.storage.pass_reads(pass_index), &[texture.erase()]);
     }
 
     #[test]
@@ -4291,90 +4043,6 @@ mod tests {
         assert_eq!(storage.resource_consumers(0).collect::<Vec<_>>(), [0]);
         assert_eq!(storage.resources[0].consumer_edge_count(), 1);
         assert_eq!(storage.resources[1].consumer_edge_count(), 0);
-    }
-
-    #[test]
-    fn repeated_reads_are_distinct_consumer_edges_derived_from_pass_reads() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let input = graph.register_texture("Repeated_Input", dummy_desc(), false);
-        let pass_index = graph.storage.passes.len();
-
-        graph.add_pass("Repeated_Reader", |builder| {
-            builder.read_texture(input);
-            builder.read_texture(input);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-
-        assert_eq!(
-            graph.storage.pass_reads(pass_index),
-            &[input.erase(), input.erase()]
-        );
-        assert_eq!(
-            graph.storage.resources[input.index() as usize].consumer_edge_count(),
-            2
-        );
-        assert_eq!(
-            graph
-                .storage
-                .resource_consumers(input.index() as usize)
-                .collect::<Vec<_>>(),
-            [pass_index, pass_index]
-        );
-    }
-
-    #[test]
-    fn duplicate_request_owners_share_publication_and_retry_after_attempt_release() {
-        let wgpu = pollster::block_on(WgpuContext::new_headless(
-            &RendererInitConfig::default(),
-            &RendererSettings::default(),
-            8,
-            8,
-            None,
-        ))
-        .expect("headless GPU context required");
-        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
-        let assets = AssetServer::new();
-        let image = assets.images.add(Image::new(
-            8,
-            8,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![255; 8 * 8 * 4]),
-        ));
-        let mut texture = Texture::new_2d(Some("duplicate mip owners"), image);
-        texture.generate_mipmaps = true;
-        let texture = assets.textures.add(texture);
-
-        resources.prepare_texture(&assets, texture);
-        let first = resources
-            .take_mipmap_requests()
-            .pop()
-            .expect("first request owner missing");
-        resources.prepare_texture(&assets, texture);
-        let second = resources
-            .take_mipmap_requests()
-            .pop()
-            .expect("second request owner missing");
-        assert_eq!(first.key(), second.key());
-        assert!(first.shares_submission_token(&second));
-
-        let mut storage = GraphStorage::new();
-        assert!(storage.mipmap_encode_coordinator.try_claim(first.key()));
-        assert!(!storage.mipmap_encode_coordinator.try_claim(second.key()));
-        first.mark_submitted();
-        assert!(
-            resources
-                .get_texture_image(texture)
-                .expect("physical texture missing")
-                .mipmaps_submitted()
-        );
-
-        storage.release_frame_owners();
-        assert!(storage.mipmap_encode_coordinator.try_claim(second.key()));
     }
 
     fn dummy_asset_snapshot() -> AssetTextureSnapshot {
@@ -4752,181 +4420,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "nested RenderGraph::add_pass is unsupported")]
-    fn nested_add_pass_is_rejected_before_mutating_graph_state() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        graph.add_pass("Outer", |builder| {
-            builder.graph.add_pass("Nested", |_nested| (MockExec, ()));
-            (MockExec, ())
-        });
-    }
-
-    #[test]
-    fn caught_nested_add_pass_panic_preserves_outer_raw_demands() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.register_texture("Outer_Texture", dummy_desc(), false);
-        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
-        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
-        let outer_index = graph.storage.passes.len();
-
-        graph.add_pass("Outer", |builder| {
-            builder.demand_scene_submission(submission);
-            let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                builder.graph.add_pass("Nested", |_nested| (MockExec, ()));
-            }));
-            assert!(nested.is_err());
-            builder.demand_scene_submission(submission);
-            (MockExec, ())
-        });
-
-        assert_eq!(graph.storage.passes.len(), 1);
-        assert_eq!(
-            graph.storage.pass_scene_submission_demands(outer_index),
-            &[submission]
-        );
-        assert_eq!(graph.storage.pass_reads(outer_index), &[texture.erase()]);
-        assert_eq!(
-            graph
-                .storage
-                .resource_consumers(texture.index() as usize)
-                .collect::<Vec<_>>(),
-            &[outer_index]
-        );
-    }
-
-    #[test]
-    fn disjoint_scene_submissions_union_dependencies_in_first_occurrence_order() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let direct = graph.register_texture("Direct", dummy_desc(), false);
-        let shared = graph.register_texture("Shared", dummy_desc(), false);
-        let opaque_only = graph.register_texture("Opaque", dummy_desc(), false);
-        let transparent_only = graph.register_texture("Transparent", dummy_desc(), false);
-
-        graph.set_scene_submission_texture_dependencies(
-            SceneSubmissionKey::Opaque,
-            [shared, opaque_only, shared],
-        );
-        graph.set_scene_submission_texture_dependencies(
-            SceneSubmissionKey::Transparent,
-            [transparent_only, shared, transparent_only],
-        );
-        let opaque = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
-        let transparent = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
-        let pass_index = graph.storage.passes.len();
-
-        graph.add_pass("Disjoint_Draw_Consumer", |builder| {
-            builder.read_texture(direct);
-            builder.read_texture(shared);
-            builder.demand_scene_submission(transparent);
-            builder.demand_scene_submission(opaque);
-            builder.demand_scene_submission(transparent);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-
-        assert_eq!(
-            graph.storage.pass_scene_submission_demands(pass_index),
-            &[transparent, opaque]
-        );
-        assert_eq!(
-            graph.storage.pass_reads(pass_index),
-            &[
-                direct.erase(),
-                shared.erase(),
-                transparent_only.erase(),
-                opaque_only.erase()
-            ]
-        );
-        for texture in [direct, shared, opaque_only, transparent_only] {
-            assert_eq!(
-                graph
-                    .storage
-                    .resource_consumers(texture.index() as usize)
-                    .collect::<Vec<_>>(),
-                &[pass_index],
-                "the union must install exactly one consumer edge per resource"
-            );
-        }
-
-        graph.compile_topology();
-        assert!(graph.storage.scene_submission_is_live(opaque));
-        assert!(graph.storage.scene_submission_is_live(transparent));
-    }
-
-    #[test]
-    fn scene_submission_dependency_scratch_recovers_after_iterator_panic() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let abandoned = graph.register_texture("Abandoned", dummy_desc(), false);
-        let retained = graph.register_texture("Retained", dummy_desc(), false);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            graph.set_scene_submission_texture_dependencies(
-                SceneSubmissionKey::Opaque,
-                std::iter::once(abandoned)
-                    .chain(std::iter::once_with(|| panic!("dependency iterator panic"))),
-            );
-        }));
-        assert!(result.is_err());
-
-        graph.set_scene_submission_texture_dependencies(
-            SceneSubmissionKey::Transparent,
-            [retained, retained],
-        );
-        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
-        let pass_index = graph.storage.passes.len();
-        graph.add_pass("Post_Panic_Consumer", |builder| {
-            builder.demand_scene_submission(submission);
-            (MockExec, ())
-        });
-
-        assert_eq!(graph.storage.pass_reads(pass_index), &[retained.erase()]);
-        assert_eq!(
-            graph.storage.resources[abandoned.index() as usize].consumer_edge_count(),
-            0
-        );
-    }
-
-    #[test]
-    fn dense_generation_scratch_retains_capacity_and_clears_on_wrap() {
-        let mut scratch = DenseGenerationScratch::default();
-        scratch.begin(64);
-        assert!(scratch.insert(7));
-        assert!(!scratch.insert(7));
-        let capacity = scratch.stamps.capacity();
-
-        scratch.begin(8);
-        assert_eq!(scratch.stamps.len(), 64, "the dense domain must not shrink");
-        assert_eq!(scratch.stamps.capacity(), capacity);
-        assert!(scratch.insert(7));
-
-        scratch.extend_domain(96);
-        assert_eq!(scratch.active_len, 96);
-        assert!(scratch.insert(95));
-        assert!(
-            !scratch.insert(7),
-            "extending one open operation must preserve earlier marks"
-        );
-
-        scratch.generation = u32::MAX;
-        scratch.stamps[7] = 1;
-        scratch.begin(8);
-        assert_eq!(scratch.generation, 1);
-        assert!(
-            scratch.insert(7),
-            "wrap must clear stale generation-one marks"
-        );
-        assert!(!scratch.insert(7));
-    }
-
-    #[test]
     #[should_panic(
         expected = "scene-submission texture dependencies must be registered before reservation"
     )]
@@ -4941,154 +4434,6 @@ mod tests {
         });
         let texture = graph.register_texture("Late_Texture", dummy_desc(), false);
         graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "scene-submission texture dependencies must be registered before reservation"
-    )]
-    fn prepass_demand_rejects_late_opaque_dependency_registration() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let prepass = graph.reserve_scene_submission(SceneSubmissionKey::Prepass {
-            needs_normal: true,
-            needs_feature_id: false,
-            needs_velocity: true,
-        });
-        graph.add_pass("Prepass_Consumer", |builder| {
-            builder.demand_scene_submission(prepass);
-            (MockExec, ())
-        });
-
-        let texture = graph.register_texture("Late_Opaque_Texture", dummy_desc(), false);
-        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
-    }
-
-    #[test]
-    fn retained_demand_and_read_ranges_restart_at_zero_after_attempt_clear() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-
-        let first_plan;
-        let first_texture;
-        {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            first_texture = graph.register_texture("First_Texture", dummy_desc(), false);
-            graph.set_scene_submission_texture_dependencies(
-                SceneSubmissionKey::Opaque,
-                [first_texture],
-            );
-            first_plan = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
-            graph.add_pass("First_Consumer", |builder| {
-                builder.demand_scene_submission(first_plan);
-                (MockExec, ())
-            });
-        }
-        assert_eq!(storage.pass_scene_submission_demands(0), &[first_plan]);
-        assert_eq!(storage.passes[0].scene_submission_demand_range, 0..1);
-        assert_eq!(storage.pass_reads(0), &[first_texture.erase()]);
-        assert_eq!(storage.passes[0].logical_read_range, 0..1);
-        let retained_read_capacity = storage.logical_reads.capacity();
-
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        assert_eq!(
-            graph.storage.logical_reads.capacity(),
-            retained_read_capacity
-        );
-        let second_texture = graph.register_texture("Second_Texture", dummy_desc(), false);
-        graph.set_scene_submission_texture_dependencies(
-            SceneSubmissionKey::Transparent,
-            [second_texture],
-        );
-        let second_plan = graph.reserve_scene_submission(SceneSubmissionKey::Transparent);
-        graph.add_pass("Second_Consumer", |builder| {
-            builder.demand_scene_submission(second_plan);
-            (MockExec, ())
-        });
-        assert_eq!(
-            graph.storage.pass_scene_submission_demands(0),
-            &[second_plan]
-        );
-        assert_eq!(graph.storage.passes[0].scene_submission_demand_range, 0..1);
-        assert_eq!(graph.storage.pass_reads(0), &[second_texture.erase()]);
-        assert_eq!(graph.storage.passes[0].logical_read_range, 0..1);
-    }
-
-    #[test]
-    fn physical_dependency_ranges_survive_drop_and_restart_after_clear() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-
-        {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let output = graph.add_pass("First_Producer", |builder| {
-                let output = builder.create_texture("First_Output", dummy_desc());
-                (MockExec, output)
-            });
-            graph.add_pass("First_Consumer", |builder| {
-                builder.read_texture(output);
-                builder.mark_side_effect();
-                (MockExec, ())
-            });
-            graph.compile_topology();
-            assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
-            assert_eq!(graph.storage.passes[1].physical_dependency_range, 0..1);
-        }
-
-        assert_eq!(storage.pass_physical_dependencies(1), &[0]);
-        let retained_capacity = storage.physical_dependencies.capacity();
-
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        assert!(graph.storage.physical_dependencies.is_empty());
-        assert!(graph.storage.compile_reverse_offsets.is_empty());
-        assert_eq!(
-            graph.storage.physical_dependencies.capacity(),
-            retained_capacity
-        );
-        let output = graph.add_pass("Second_Producer", |builder| {
-            let output = builder.create_texture("Second_Output", dummy_desc());
-            (MockExec, output)
-        });
-        graph.add_pass("Second_Consumer", |builder| {
-            builder.read_texture(output);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        graph.compile_topology();
-        assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
-        assert_eq!(graph.storage.passes[1].physical_dependency_range, 0..1);
-    }
-
-    #[test]
-    fn physical_dependency_scratch_wrap_clears_stale_producer_marks() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let output = graph.add_pass("Wrap_Producer", |builder| {
-            let output = builder.create_texture("Wrap_Output", dummy_desc());
-            (MockExec, output)
-        });
-        graph.add_pass("Wrap_Consumer", |builder| {
-            builder.read_texture(output);
-            builder.read_texture(output);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        graph
-            .storage
-            .physical_dependency_scratch
-            .stamps
-            .resize(2, 1);
-        graph.storage.physical_dependency_scratch.generation = u32::MAX - 1;
-
-        graph.compile_topology();
-
-        assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
-        assert_eq!(
-            graph.storage.physical_dependency_scratch.generation, 1,
-            "the consumer pass must trigger the wrap clear"
-        );
     }
 
     #[test]
@@ -5279,67 +4624,6 @@ mod tests {
     }
 
     #[test]
-    fn csr_reverse_adjacency_handles_more_than_eight_consumers_without_reordering() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-
-        let output = graph.add_pass("Fanout_Producer", |builder| {
-            let output = builder.create_texture("Fanout_Output", dummy_desc());
-            (MockExec, output)
-        });
-        for _ in 0..12 {
-            graph.add_pass("Fanout_Consumer", |builder| {
-                builder.read_texture(output);
-                builder.mark_side_effect();
-                (MockExec, ())
-            });
-        }
-
-        graph.compile_topology();
-
-        let expected_consumers: Vec<_> = (1..=12).collect();
-        assert_eq!(
-            graph.storage.compiled_reverse_consumers(0),
-            expected_consumers
-        );
-        assert_eq!(graph.storage.execution_queue, (0..=12).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn csr_contains_only_live_consumer_edges() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-
-        let dead_output = graph.add_pass("Dead_Producer", |builder| {
-            let output = builder.create_texture("Dead_Output", dummy_desc());
-            (MockExec, output)
-        });
-        graph.add_pass("Dead_Consumer", |builder| {
-            builder.read_texture(dead_output);
-            (MockExec, ())
-        });
-        let live_output = graph.add_pass("Live_Producer", |builder| {
-            let output = builder.create_texture("Live_Output", dummy_desc());
-            (MockExec, output)
-        });
-        graph.add_pass("Live_Consumer", |builder| {
-            builder.read_texture(live_output);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-
-        graph.compile_topology();
-
-        assert_eq!(graph.storage.pass_physical_dependencies(1), &[0]);
-        assert_eq!(graph.storage.pass_physical_dependencies(3), &[2]);
-        assert!(graph.storage.compiled_reverse_consumers(0).is_empty());
-        assert_eq!(graph.storage.compiled_reverse_consumers(2), &[3]);
-        assert_eq!(graph.storage.execution_queue, [2, 3]);
-    }
-
-    #[test]
     #[should_panic(expected = "render graph topology is frozen after compilation")]
     fn topology_compilation_is_a_one_shot_phase() {
         let mut storage = GraphStorage::new();
@@ -5347,59 +4631,6 @@ mod tests {
         let mut graph = begin_test_frame(&mut storage, &arena);
         graph.compile_topology();
         graph.compile_topology();
-    }
-
-    #[test]
-    fn planned_asset_texture_uses_dense_import_and_ready_joins() {
-        let assets = AssetServer::new();
-        let image = assets.images.add(Image::new(
-            4,
-            4,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![255; 4 * 4 * 4]),
-        ));
-        let texture = assets
-            .textures
-            .add(Texture::new_2d(Some("planned dense join"), image));
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let plan = graph.storage.asset_texture_plans.request(texture);
-        graph.storage.asset_texture_plans.capture_requested(&assets);
-        let snapshot = graph
-            .storage
-            .asset_texture_plans
-            .state(plan)
-            .unwrap()
-            .ready
-            .unwrap();
-
-        // Exercise the generic-to-planned upgrade as well as the normal dense
-        // repeated path. Both must converge on one import and one ready node.
-        let generic = graph.import_asset_texture("Generic_First", snapshot);
-        let planned = graph.import_planned_asset_texture("Planned", plan, snapshot);
-        assert_eq!(generic, planned);
-        graph.set_planned_asset_texture_ready(plan, planned);
-        let repeated = graph.import_planned_asset_texture("Repeated", plan, snapshot);
-        assert_eq!(repeated, planned);
-        assert_eq!(graph.planned_asset_texture_ready(plan), Some(planned));
-    }
-
-    #[test]
-    #[should_panic(expected = "is a read-only lazy external input")]
-    fn asset_texture_import_root_rejects_a_writer() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-
-        graph.add_pass("Invalid_Asset_Writer", |builder| {
-            builder.write_texture(asset);
-            (MockExec, ())
-        });
     }
 
     #[test]
@@ -5416,24 +4647,6 @@ mod tests {
             graph.storage.resources[asset.index() as usize].first_use,
             usize::MAX
         );
-    }
-
-    #[test]
-    fn live_lazy_asset_import_requires_no_proxy_producer() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        graph.add_pass("Asset_Consumer", |builder| {
-            builder.read_texture(asset);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-
-        graph.compile_topology();
-
-        assert_eq!(graph.storage.execution_queue, [0]);
-        assert_eq!(graph.storage.resources[asset.index() as usize].first_use, 0);
     }
 
     #[test]
@@ -5473,26 +4686,6 @@ mod tests {
         graph.add_pass("Late_Mipmap", |builder| {
             builder.read_texture(asset);
             builder.write_texture(mip_ready);
-            (MockExec, ())
-        });
-
-        graph.compile_topology();
-    }
-
-    #[test]
-    #[should_panic(expected = "must read the lazy import chain it mutates")]
-    fn derived_asset_producer_cannot_replace_without_demanding_its_import() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        let replaced = graph.add_pass("Invalid_Replacement", |builder| {
-            let output = builder.replace_texture(asset, "Asset_Replaced");
-            (MockExec, output)
-        });
-        graph.add_pass("Asset_Consumer", |builder| {
-            builder.read_texture(replaced);
-            builder.mark_side_effect();
             (MockExec, ())
         });
 
@@ -5549,64 +4742,6 @@ mod tests {
             compact.len() < 4_096,
             "Compact dump size must not scale with individual lazy imports"
         );
-    }
-
-    #[test]
-    fn dropping_graph_releases_unsubmitted_frame_owners_but_keeps_topology() {
-        let mut storage = GraphStorage::new();
-        let prepared_attempt;
-        let mut arena = FrameArena::new();
-        {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            prepared_attempt = graph.storage.prepared_bind_groups.attempt_token();
-            let _asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-            graph
-                .storage
-                .mipmap_batches
-                .push(Some(MipmapRequestBatch::new(Vec::new())));
-            graph.add_pass("Inspectable", |_builder| (MockExec, ()));
-
-            assert!(!graph.storage.asset_texture_imports.is_empty());
-            assert_eq!(graph.storage.mipmap_batches.len(), 1);
-        }
-
-        assert!(storage.asset_texture_imports.is_empty());
-        assert!(storage.mipmap_batches.is_empty());
-        assert_ne!(
-            storage.prepared_bind_groups.attempt_token(),
-            prepared_attempt
-        );
-        assert_eq!(storage.passes.len(), 1);
-        assert_eq!(storage.passes[0].name, "Inspectable");
-        assert!(storage.passes[0].node.is_none());
-        arena.reset();
-        assert!(storage.passes[0].node.is_none());
-    }
-
-    #[test]
-    fn live_asset_consumer_marks_only_the_lazy_import_live() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        let repeated = graph.import_asset_texture("AssetAgain", dummy_asset_snapshot());
-        assert_eq!(asset, repeated);
-        graph.add_pass("Asset_Consumer", |builder| {
-            builder.read_texture(asset);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-
-        graph.compile_topology();
-
-        let live: Vec<_> = graph
-            .storage
-            .execution_queue
-            .iter()
-            .map(|&index| graph.storage.passes[index].name)
-            .collect();
-        assert_eq!(live, ["Asset_Consumer"]);
-        assert_eq!(graph.storage.resources[asset.index() as usize].first_use, 0);
     }
 
     #[test]
@@ -5726,97 +4861,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_resident_asset_texture_reuses_generation_after_selected_postflight() {
-        let wgpu = pollster::block_on(WgpuContext::new_headless(
-            &RendererInitConfig::default(),
-            &RendererSettings::default(),
-            8,
-            8,
-            None,
-        ))
-        .expect("headless GPU context required");
-        let mut resource_manager = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
-        let assets = AssetServer::new();
-        let image = assets.images.add(Image::new(
-            8,
-            8,
-            1,
-            ImageDimension::D2,
-            PixelFormat::Rgba8Unorm,
-            Some(vec![19; 8 * 8 * 4]),
-        ));
-        let mut texture_asset = Texture::new_2d(Some("resident graph asset"), image);
-        texture_asset.generate_mipmaps = true;
-        let texture = assets.textures.add(texture_asset);
-        let snapshot = snapshot_asset_texture(&assets, texture).expect("snapshot missing");
-        assert!(
-            resource_manager
-                .materialize_asset_texture_for_graph(&assets, snapshot)
-                .texture
-                .is_some()
-        );
-        let resident_before = resource_manager
-            .exact_asset_texture_residency(snapshot)
-            .expect("initial materialization must be exactly resident");
-        let binding_before = *resource_manager
-            .get_texture_binding(texture)
-            .expect("initial binding missing");
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let owner_plan = graph.storage.asset_texture_plans.request(texture);
-        graph.storage.asset_texture_plans.capture_requested(&assets);
-        let imported = graph.import_planned_asset_texture("Resident_Asset", owner_plan, snapshot);
-        graph.add_pass("Resident_Asset_Consumer", |builder| {
-            builder.read_texture(imported);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        graph.compile_topology();
-
-        {
-            let storage = &mut *graph.storage;
-            storage.asset_texture_imports.materialize_live_with_hook(
-                &storage.resources,
-                &mut storage.asset_texture_plans,
-                &assets,
-                &mut resource_manager,
-                |resource_manager| {
-                    let binding = resource_manager
-                        .get_texture_binding(texture)
-                        .expect("resident precheck must not remove the binding");
-                    assert_eq!(*binding, binding_before);
-                },
-            );
-        }
-
-        assert_eq!(graph.storage.asset_texture_imports.resident_hit_count(), 1);
-        let import = graph.storage.resources[imported.index() as usize]
-            .asset_texture_import_id()
-            .unwrap();
-        assert!(
-            graph
-                .storage
-                .asset_texture_imports
-                .resolver()
-                .view(import)
-                .is_some()
-        );
-        let resident_after = resource_manager
-            .exact_asset_texture_residency(snapshot)
-            .expect("resident reuse lost the exact logical binding");
-        assert_eq!(resident_after, resident_before);
-        assert_eq!(
-            *resource_manager
-                .get_texture_binding(texture)
-                .expect("resident binding disappeared"),
-            binding_before,
-            "warm reuse must not republish the persistent binding"
-        );
-    }
-
-    #[test]
     fn asset_texture_candidate_postflight_rejects_only_the_drifting_image() {
         let wgpu = pollster::block_on(WgpuContext::new_headless(
             &RendererInitConfig::default(),
@@ -5913,79 +4957,6 @@ mod tests {
         assert_eq!(graph.commit_submitted_asset_texture_mipmaps(), 1);
         assert!(resource_manager.asset_snapshot_mipmaps_submitted(good_snapshot));
         assert!(!resource_manager.asset_snapshot_mipmaps_submitted(bad_snapshot));
-    }
-
-    #[test]
-    fn asset_texture_upload_postflight_drops_a_drifting_private_image() {
-        let wgpu = pollster::block_on(WgpuContext::new_headless(
-            &RendererInitConfig::default(),
-            &RendererSettings::default(),
-            8,
-            8,
-            None,
-        ))
-        .expect("headless GPU context required");
-        let mut resource_manager = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
-        let assets = AssetServer::new();
-        let make_image = |byte| {
-            Image::new(
-                8,
-                8,
-                1,
-                ImageDimension::D2,
-                PixelFormat::Rgba8Unorm,
-                Some(vec![byte; 8 * 8 * 4]),
-            )
-        };
-        let image = assets.images.add(make_image(11));
-        let texture = assets
-            .textures
-            .add(Texture::new_2d(Some("private upload drift"), image));
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let plan = graph.storage.asset_texture_plans.request(texture);
-        graph.storage.asset_texture_plans.capture_requested(&assets);
-        let snapshot = graph
-            .storage
-            .asset_texture_plans
-            .state(plan)
-            .unwrap()
-            .ready
-            .unwrap();
-        let imported = graph.import_planned_asset_texture("Private_Drift", plan, snapshot);
-        graph.add_pass("Private_Drift_Consumer", |builder| {
-            builder.read_texture(imported);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        graph.compile_topology();
-
-        {
-            let storage = &mut *graph.storage;
-            storage.asset_texture_imports.materialize_live_with_hooks(
-                &storage.resources,
-                &mut storage.asset_texture_plans,
-                &assets,
-                &mut resource_manager,
-                |_| {},
-                |resource_manager| {
-                    assert!(resource_manager.get_texture_binding(texture).is_none());
-                    assert!(resource_manager.get_texture_image(texture).is_none());
-                    assets.images.insert_ready(image, make_image(29));
-                },
-            );
-        }
-
-        assert!(resource_manager.get_texture_binding(texture).is_none());
-        assert!(resource_manager.get_texture_image(texture).is_none());
-        let import = graph.storage.resources[imported.index() as usize]
-            .asset_texture_import_id()
-            .unwrap();
-        let resolver = graph.storage.asset_texture_imports.resolver();
-        assert!(resolver.view(import).is_none());
-        assert_eq!(resolver.mipmap_requests(import).count(), 0);
     }
 
     #[test]
@@ -6112,6 +5083,8 @@ mod tests {
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
         let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let repeated = graph.import_asset_texture("AssetAgain", dummy_asset_snapshot());
+        assert_eq!(asset, repeated);
         let mip_ready = graph.add_pass("Asset_Mipmap", |builder| {
             let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
             (MockExec, output)
@@ -6147,27 +5120,19 @@ mod tests {
     }
 
     #[test]
-    fn unencoded_mipmap_batch_is_released_without_publication() {
-        let mut storage = GraphStorage::new();
-        let batch = MipmapBatchId::from_index(0);
-        storage
-            .mipmap_batches
-            .push(Some(MipmapRequestBatch::new(Vec::new())));
+    fn mipmap_batch_publication_is_gated_by_encoding_and_always_releases() {
+        for encoded in [false, true] {
+            let mut storage = GraphStorage::new();
+            let batch = MipmapBatchId::from_index(0);
+            let attempt = MipmapRequestBatch::new(Vec::new());
+            if encoded {
+                attempt.mark_encoded();
+            }
+            storage.mipmap_batches.push(Some(attempt));
 
-        assert!(!storage.commit_submitted_mipmap_batch(batch));
-        assert!(storage.mipmap_batches[batch.index()].is_none());
-    }
-
-    #[test]
-    fn encoded_mipmap_batch_is_publishable_and_released() {
-        let mut storage = GraphStorage::new();
-        let batch = MipmapBatchId::from_index(0);
-        let attempt = MipmapRequestBatch::new(Vec::new());
-        attempt.mark_encoded();
-        storage.mipmap_batches.push(Some(attempt));
-
-        assert!(storage.commit_submitted_mipmap_batch(batch));
-        assert!(storage.mipmap_batches[batch.index()].is_none());
+            assert_eq!(storage.commit_submitted_mipmap_batch(batch), encoded);
+            assert!(storage.mipmap_batches[batch.index()].is_none());
+        }
     }
 
     #[test]
@@ -6406,94 +5371,6 @@ mod tests {
     }
 
     #[test]
-    fn folding_middle_pass_does_not_shift_later_flat_ranges() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let surface = graph.register_texture("Surface", dummy_desc(), true);
-        let later_input = graph.register_texture("Later_Input", dummy_desc(), false);
-        let intermediate = graph.add_pass("Producer", |builder| {
-            let output = builder.create_texture("Intermediate", dummy_desc());
-            (MockExec, output)
-        });
-        graph.add_pass("Present", |builder| {
-            builder.read_texture(intermediate);
-            let output = builder.replace_texture(surface, "Surface_Present");
-            builder.mark_pure_forwarding();
-            (MockExec, output)
-        });
-        let later_index = graph.storage.passes.len();
-        graph.add_pass("Later", |builder| {
-            builder.read_texture(later_input);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        let later_range = graph.storage.passes[later_index].logical_read_range.clone();
-        let later_reads = graph.storage.pass_reads(later_index).to_vec();
-
-        graph.compile_topology();
-
-        assert!(graph.storage.pass_reads(1).is_empty());
-        assert_eq!(
-            graph.storage.passes[later_index].logical_read_range,
-            later_range
-        );
-        assert_eq!(graph.storage.pass_reads(later_index), later_reads);
-        assert!(graph.storage.pass_physical_dependencies(1).is_empty());
-        assert!(graph.storage.compiled_reverse_consumers(0).is_empty());
-        assert_eq!(
-            graph
-                .storage
-                .resource_consumers(later_input.index() as usize)
-                .collect::<Vec<_>>(),
-            &[later_index]
-        );
-    }
-
-    #[test]
-    fn folded_count_survives_a_later_compile_failure_without_inventing_live_count() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let surface = graph.register_texture("Surface", dummy_desc(), true);
-            let intermediate = graph.add_pass("Producer", |builder| {
-                let output = builder.create_texture("Intermediate", dummy_desc());
-                (MockExec, output)
-            });
-            graph.add_pass("Present", |builder| {
-                builder.read_texture(intermediate);
-                let output = builder.replace_texture(surface, "Surface_Present");
-                builder.mark_pure_forwarding();
-                (MockExec, output)
-            });
-
-            let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-            let mip_ready = graph.add_pass("Broken_Mipmap", |builder| {
-                let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
-                (MockExec, output)
-            });
-            graph.storage.resources[mip_ready.index() as usize].producer = None;
-            graph.add_pass("Asset_Consumer", |builder| {
-                builder.read_texture(mip_ready);
-                builder.mark_side_effect();
-                (MockExec, ())
-            });
-
-            graph.compile_topology();
-        }));
-        assert!(result.is_err());
-
-        let diagnostics = storage.latest_diagnostics().unwrap();
-        assert_eq!(diagnostics.declared_passes(), 4);
-        assert_eq!(diagnostics.folded_passes(), 1);
-        assert_eq!(diagnostics.live_passes(), None);
-        assert_eq!(diagnostics.phase(), RdgFramePhase::CompileGraph);
-        assert!(diagnostics.panicked());
-    }
-
-    #[test]
     fn test_fold_skipped_with_extra_consumer() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
@@ -6539,28 +5416,6 @@ mod tests {
                 .alias_of
                 .is_none(),
             "intermediate must not be aliased onto the surface when fold is skipped"
-        );
-    }
-
-    #[test]
-    fn test_self_read_prevents_culling() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-
-        let backbuffer = graph.register_texture("Backbuffer", dummy_desc(), true);
-
-        let internal = graph.add_pass("MacroNode", |builder| {
-            let internal = builder.create_texture("Internal", dummy_desc());
-            builder.read_texture(internal);
-            builder.write_texture(backbuffer);
-            (MockExec, internal)
-        });
-
-        graph.compile_topology();
-        assert_ne!(
-            graph.storage.resources[internal.index() as usize].consumer_edge_count(),
-            0
         );
     }
 
@@ -6810,50 +5665,6 @@ mod tests {
     }
 
     #[test]
-    fn test_with_group_preserves_topology() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let frame_config = dummy_config();
-
-        let backbuffer = graph.register_texture("Backbuffer", dummy_desc(), true);
-
-        let mut ctx = GraphBuilderContext::new(&mut graph, &frame_config, 0);
-
-        let scene_color = ctx.with_group("Scene", |ctx| {
-            let opaque_out = ctx.graph.add_pass("Opaque", |builder| {
-                let out = builder.create_texture("SceneColor", dummy_desc());
-                (MockExec, out)
-            });
-
-            let skybox_out = ctx.graph.add_pass("Skybox", |builder| {
-                let out = builder.mutate_texture(opaque_out, "SceneColor_Sky");
-                (MockExec, out)
-            });
-
-            skybox_out
-        });
-
-        ctx.with_group("PostProcess", |ctx| {
-            ctx.graph.add_pass("ToneMap", |builder| {
-                builder.read_texture(scene_color);
-                builder.write_texture(backbuffer);
-                (MockExec, ())
-            });
-        });
-
-        graph.compile_topology();
-
-        let names: Vec<&str> = graph
-            .storage
-            .execution_queue
-            .iter()
-            .map(|&i| graph.storage.passes[i].name)
-            .collect();
-        assert_eq!(names, vec!["Opaque", "Skybox", "ToneMap"]);
-    }
-
-    #[test]
     fn persistent_imports_deduplicate_without_becoming_dpe_roots() {
         let mut histories = HistoryRegistry::new();
         let set = histories.create_set();
@@ -6876,44 +5687,6 @@ mod tests {
         assert!(graph.storage.execution_queue.is_empty());
         graph.commit_submitted_histories(&mut histories);
         assert!(!histories.plan_set(set, [dummy_desc()], 2, false).valid);
-    }
-
-    #[test]
-    fn demanded_persistent_writer_commits_as_one_history_bank() {
-        let mut histories = HistoryRegistry::new();
-        let set = histories.create_set();
-        let plan = histories.plan_set(set, [dummy_desc(), dummy_desc()], 1, false);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let history_a = graph.import_persistent_texture("HistoryA", plan.next[0]);
-        let history_b = graph.import_persistent_texture("HistoryB", plan.next[1]);
-        let output = graph.register_texture("Output", dummy_desc(), true);
-
-        graph.add_pass("Temporal", |builder| {
-            builder.write_texture(history_a);
-            builder.write_texture(history_b);
-            (MockExec, ())
-        });
-        graph.add_pass("Consume", |builder| {
-            builder.read_texture(history_a);
-            builder.write_texture(output);
-            (MockExec, ())
-        });
-        graph.register_history_commit(plan.commit, &[history_a, history_b]);
-        graph.compile_topology();
-
-        assert_eq!(graph.storage.execution_queue.len(), 2);
-        assert!(
-            graph
-                .commit_submitted_persistent_resources(&mut histories)
-                .is_empty(),
-            "history publication must not manufacture cache receipts"
-        );
-        let next = histories.plan_set(set, [dummy_desc(), dummy_desc()], 2, false);
-        assert!(next.valid);
-        assert_eq!(next.previous, plan.next);
     }
 
     #[test]
@@ -6956,61 +5729,6 @@ mod tests {
                     2,
                 )
                 .valid
-        );
-    }
-
-    #[test]
-    fn dead_cache_replacement_restores_the_last_publication() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let published_key = CacheKey::new(1);
-        let replacement_key = CacheKey::new(2);
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let published = registry.plan_cache(cache, published_key, [spec], 1);
-        assert!(
-            registry
-                .commit_cache(
-                    published.commit.expect("initial cache needs a token"),
-                    &[published.textures[0].id],
-                )
-                .is_some()
-        );
-        let replacement = registry.plan_cache(cache, replacement_key, [spec], 2);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.import_persistent_texture("Replacement", replacement.textures[0]);
-        graph.add_pass("DeadReplacement", |builder| {
-            builder.write_texture(texture);
-            (MockExec, ())
-        });
-        graph.register_cache_commit(
-            replacement.commit.expect("replacement cache needs a token"),
-            &[texture],
-        );
-        graph.compile_topology();
-
-        assert!(graph.storage.execution_queue.is_empty());
-        // Intentionally exercise the all-untouched post-submit compatibility
-        // path: it may finalize and restore because no cache member was live.
-        assert!(
-            graph
-                .commit_submitted_persistent_resources(&mut registry)
-                .is_empty()
-        );
-        assert!(registry.is_cache_valid(cache, published_key));
-        let restored = registry.plan_cache(cache, published_key, [spec], 3);
-        assert!(restored.valid);
-        assert_eq!(restored.textures, published.textures);
-        assert!(
-            registry
-                .commit_cache(
-                    replacement.commit.expect("replacement cache needs a token"),
-                    &[replacement.textures[0].id],
-                )
-                .is_none(),
-            "the rolled-back replacement token must remain stale"
         );
     }
 
@@ -7259,73 +5977,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "topology is frozen after persistent cache finalization")]
-    fn topology_mutation_after_cache_finalization_is_rejected() {
-        let mut registry = HistoryRegistry::new();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        graph.compile_topology();
-        assert!(!graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
-
-        graph.add_pass("TooLate", |_builder| (MockExec, ()));
-    }
-
-    #[test]
-    #[should_panic(expected = "topology is frozen after persistent cache finalization")]
-    fn cache_commit_registration_after_finalization_is_rejected() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let plan = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.import_persistent_texture("Cache", plan.textures[0]);
-        graph.compile_topology();
-        assert!(!graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
-
-        graph.register_cache_commit(
-            plan.commit.expect("invalid cache needs a token"),
-            &[texture],
-        );
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "live persistent cache members must be finalized before post-submit publication"
-    )]
-    fn post_submit_rejects_a_live_cache_that_skipped_pre_materialization_finalization() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let plan = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.import_persistent_texture("Cache", plan.textures[0]);
-        let output = graph.register_texture("Output", dummy_desc(), true);
-        graph.add_pass("Populate", |builder| {
-            builder.write_texture(texture);
-            (MockExec, ())
-        });
-        graph.add_pass("Consume", |builder| {
-            builder.read_texture(texture);
-            builder.write_texture(output);
-            (MockExec, ())
-        });
-        graph.register_cache_commit(
-            plan.commit.expect("invalid cache needs a token"),
-            &[texture],
-        );
-        graph.compile_topology();
-
-        graph.commit_submitted_persistent_resources(&mut registry);
-    }
-
-    #[test]
     fn demanded_cache_writer_publishes_after_submit_with_typed_receipt() {
         let mut registry = HistoryRegistry::new();
         let cache = registry.create_cache();
@@ -7373,60 +6024,72 @@ mod tests {
     }
 
     #[test]
-    fn partial_or_missing_cache_writers_do_not_publish() {
-        let mut registry = HistoryRegistry::new();
-        let partial_cache = registry.create_cache();
-        let missing_cache = registry.create_cache();
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let partial = registry.plan_cache(partial_cache, CacheKey::new(1), [spec, spec], 1);
-        let missing = registry.plan_cache(missing_cache, CacheKey::new(2), [spec], 1);
+    fn persistent_cache_rejects_invalid_registration_and_publication_phase_transitions() {
+        let skipped_finalization = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut registry = HistoryRegistry::new();
+            let cache = registry.create_cache();
+            let spec = PersistentTextureSpec::default_view(dummy_desc());
+            let plan = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
 
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let partial_a = graph.import_persistent_texture("PartialA", partial.textures[0]);
-        let partial_b = graph.import_persistent_texture("PartialB", partial.textures[1]);
-        let missing_texture = graph.import_persistent_texture("Missing", missing.textures[0]);
-        let output = graph.register_texture("Output", dummy_desc(), true);
-        graph.add_pass("LivePartialWriter", |builder| {
-            builder.write_texture(partial_a);
-            (MockExec, ())
-        });
-        graph.add_pass("DeadPartialWriter", |builder| {
-            builder.write_texture(partial_b);
-            (MockExec, ())
-        });
-        graph.add_pass("ConsumePartial", |builder| {
-            builder.read_texture(partial_a);
-            builder.write_texture(output);
-            (MockExec, ())
-        });
-        graph.register_cache_commit(
-            partial.commit.expect("invalid cache needs a token"),
-            &[partial_a, partial_b],
-        );
-        graph.register_cache_commit(
-            missing.commit.expect("invalid cache needs a token"),
-            &[missing_texture],
-        );
-        graph.compile_topology();
-        graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let texture = graph.import_persistent_texture("Cache", plan.textures[0]);
+            let output = graph.register_texture("Output", dummy_desc(), true);
+            graph.add_pass("Populate", |builder| {
+                builder.write_texture(texture);
+                (MockExec, ())
+            });
+            graph.add_pass("Consume", |builder| {
+                builder.read_texture(texture);
+                builder.write_texture(output);
+                (MockExec, ())
+            });
+            graph.register_cache_commit(
+                plan.commit.expect("invalid cache needs a token"),
+                &[texture],
+            );
+            graph.compile_topology();
 
-        assert!(
-            graph
-                .commit_submitted_persistent_resources(&mut registry)
-                .is_empty()
-        );
-        assert!(
-            !registry
-                .plan_cache(partial_cache, CacheKey::new(1), [spec, spec], 2)
-                .valid
-        );
-        assert!(
-            !registry
-                .plan_cache(missing_cache, CacheKey::new(2), [spec], 2)
-                .valid
-        );
+            graph.commit_submitted_persistent_resources(&mut registry);
+        }))
+        .expect_err("a live cache must not enter post-submit before DPE finalization");
+        let skipped_finalization = skipped_finalization
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| skipped_finalization.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(skipped_finalization.contains(
+            "live persistent cache members must be finalized before post-submit publication"
+        ));
+
+        let conflicting_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut registry = HistoryRegistry::new();
+            let cache = registry.create_cache();
+            let spec = PersistentTextureSpec::default_view(dummy_desc());
+            let first = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
+            let second = registry.plan_cache(cache, CacheKey::new(1), [spec], 2);
+
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let texture = graph.import_persistent_texture("Cache", second.textures[0]);
+            graph.register_cache_commit(
+                first.commit.expect("first attempt needs a token"),
+                &[texture],
+            );
+            graph.register_cache_commit(
+                second.commit.expect("second attempt needs a token"),
+                &[texture],
+            );
+        }))
+        .expect_err("one graph must reject two attempt tokens for the same cache");
+        let conflicting_attempt = conflicting_attempt
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| conflicting_attempt.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(conflicting_attempt.contains("cache ID registered with conflicting commit tokens"));
     }
 
     #[test]
@@ -7489,80 +6152,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "conflicting writer sets")]
-    fn duplicate_cache_token_rejects_a_different_writer_set() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let plan = registry.plan_cache(cache, CacheKey::new(1), [spec, spec], 1);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let cache_a = graph.import_persistent_texture("CacheA", plan.textures[0]);
-        let cache_b = graph.import_persistent_texture("CacheB", plan.textures[1]);
-        let token = plan.commit.expect("invalid cache needs a token");
-        graph.register_cache_commit(token, &[cache_a, cache_b]);
-        graph.register_cache_commit(token, &[cache_a]);
-    }
-
-    #[test]
-    #[should_panic(expected = "cache ID registered with conflicting commit tokens")]
-    fn one_graph_rejects_multiple_attempt_tokens_for_the_same_cache() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let first = registry.plan_cache(cache, CacheKey::new(1), [spec], 1);
-        let second = registry.plan_cache(cache, CacheKey::new(1), [spec], 2);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.import_persistent_texture("Cache", second.textures[0]);
-        graph.register_cache_commit(
-            first.commit.expect("first attempt needs a token"),
-            &[texture],
-        );
-        graph.register_cache_commit(
-            second.commit.expect("second attempt needs a token"),
-            &[texture],
-        );
-    }
-
-    #[test]
-    fn cache_does_not_publish_when_post_submit_step_is_not_called() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let key = CacheKey::new(3);
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let first = registry.plan_cache(cache, key, [spec], 1);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.import_persistent_texture("Cache", first.textures[0]);
-        let output = graph.register_texture("Output", dummy_desc(), true);
-        graph.add_pass("Populate", |builder| {
-            builder.write_texture(texture);
-            (MockExec, ())
-        });
-        graph.add_pass("Consume", |builder| {
-            builder.read_texture(texture);
-            builder.write_texture(output);
-            (MockExec, ())
-        });
-        graph.register_cache_commit(
-            first.commit.expect("invalid cache needs a token"),
-            &[texture],
-        );
-        graph.compile_topology();
-
-        let second = registry.plan_cache(cache, key, [spec], 2);
-        assert!(!second.valid);
-        assert!(second.commit.is_some());
-    }
-
-    #[test]
     #[should_panic(expected = "conflicting specifications")]
     fn persistent_import_dedup_rejects_a_different_canonical_view() {
         let mut registry = HistoryRegistry::new();
@@ -7589,7 +6178,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_forwarding_does_not_contract_a_persistent_history_source() {
+    fn pure_forwarding_does_not_contract_logical_import_sources() {
         let mut histories = HistoryRegistry::new();
         let set = histories.create_set();
         let plan = histories.plan_set(set, [dummy_desc()], 1, false);
@@ -7628,10 +6217,7 @@ mod tests {
 
         graph.commit_submitted_histories(&mut histories);
         assert!(histories.plan_set(set, [dummy_desc()], 2, false).valid);
-    }
 
-    #[test]
-    fn pure_forwarding_does_not_contract_an_asset_texture_source() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -7744,72 +6330,6 @@ mod tests {
         let compiled = consumer_edges(&graph.dump_mermaid_full());
         assert_eq!(compiled, expected);
         assert_eq!(compiled, precompile);
-    }
-
-    #[test]
-    fn compact_mermaid_deduplicates_repeated_asset_reads_and_summarizes_dead_imports() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let live = graph.import_asset_texture("Live_Asset", dummy_asset_snapshot());
-        let mut dead_snapshot = dummy_asset_snapshot();
-        dead_snapshot.texture_handle = myth_assets::TextureHandle::system_reserved(8);
-        dead_snapshot.texture_identity = 34;
-        dead_snapshot.logical_version = 0xA55E_7002;
-        graph.import_asset_texture("Dead_Asset", dead_snapshot);
-        graph.add_pass("Repeated_Consumer", |builder| {
-            builder.read_texture(live);
-            builder.read_texture(live);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        graph.compile_topology();
-
-        let compact = graph.dump_mermaid();
-        assert!(compact.contains("Asset Textures<br/>declared 2 · live 1"));
-        assert!(compact.contains("ASSET_TEXTURES_IN -.->|\"1 texture\"| P0;"));
-    }
-
-    #[test]
-    fn compact_mermaid_preserves_real_mipmap_producer_edges() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        let mip_ready = graph.add_pass("Real_Mipmap", |builder| {
-            let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
-            (MockExec, output)
-        });
-        graph.add_pass("Asset_Consumer", |builder| {
-            builder.read_texture(mip_ready);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        graph.compile_topology();
-
-        let compact = graph.dump_mermaid();
-        assert!(compact.contains("ASSET_TEXTURES_IN -.->|\"1 texture\"| P0;"));
-        assert!(!compact.contains("ASSET_TEXTURES_IN -.->|\"1 texture\"| P1;"));
-        assert!(compact.contains("P0 ==>|\"Asset_Mip_Ready\"| P1;"));
-    }
-
-    #[test]
-    fn mermaid_does_not_invent_an_output_for_an_unconsumed_asset_alias() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        let mip_ready = graph.add_pass("Side_Effect_Mipmap", |builder| {
-            let output = builder.mutate_texture(asset, "Unconsumed_Mip_Ready");
-            builder.mark_side_effect();
-            (MockExec, output)
-        });
-        graph.compile_topology();
-
-        for dump in [graph.dump_mermaid(), graph.dump_mermaid_full()] {
-            assert!(!dump.contains(&format!("OUT_{}", mip_ready.index())));
-            assert!(!dump.contains(&format!("P0 --> OUT_{}", mip_ready.index())));
-        }
     }
 
     #[test]

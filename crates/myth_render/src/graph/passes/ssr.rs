@@ -1193,4 +1193,384 @@ impl<'a> PassNode<'a> for SsrMergeNode<'a> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::graph::core::graph::FrameConfig;
+    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph};
+    use myth_resources::ssr::SsrSettings;
+    use myth_scene::camera::Camera;
+
+    const CUSTOM_RUNTIME_BIT: u32 = 1 << 7;
+
+    fn camera(camera_id: u128) -> RenderCamera {
+        let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
+        let mut render_camera = camera.extract_render_camera();
+        render_camera.camera_id = camera_id;
+        render_camera.camera_cut = 0;
+        render_camera
+    }
+
+    fn extract(
+        feature: &mut SsrFeature,
+        histories: &mut HistoryRegistry,
+        settings: &SsrSettings,
+        camera: &RenderCamera,
+        temporal_serial: u64,
+        size: (u32, u32),
+    ) -> SsrSnapshot {
+        feature.extract(
+            histories,
+            1,
+            camera,
+            temporal_serial,
+            &settings.uniforms,
+            size,
+            temporal_serial,
+            temporal_serial as u32,
+            false,
+            GlobalStateKey::new(1, 1),
+        )
+    }
+
+    fn commit(histories: &mut HistoryRegistry, snapshot: SsrSnapshot) {
+        assert!(histories.commit(
+            snapshot.history.commit,
+            &snapshot.history.next.map(|texture| texture.id),
+        ));
+    }
+
+    fn seeded_history(
+        camera_id: u128,
+        size: (u32, u32),
+    ) -> (
+        SsrFeature,
+        HistoryRegistry,
+        SsrSettings,
+        RenderCamera,
+        SsrSnapshot,
+    ) {
+        let mut feature = SsrFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsrSettings::default();
+        let camera = camera(camera_id);
+        let snapshot = extract(&mut feature, &mut histories, &settings, &camera, 1, size);
+        commit(&mut histories, snapshot);
+        (feature, histories, settings, camera, snapshot)
+    }
+
+    #[test]
+    fn trace_resolution_respects_quality_and_minimum_extent() {
+        assert_eq!(ssr_trace_resolution(0, 0, true), (1, 1));
+        assert_eq!(ssr_trace_resolution(1, 1, true), (1, 1));
+        assert_eq!(ssr_trace_resolution(1920, 1080, true), (960, 540));
+        assert_eq!(ssr_trace_resolution(2560, 1440, false), (2560, 1440));
+    }
+
+    #[test]
+    fn extract_derives_runtime_flags_without_mutating_scene_uniforms() {
+        let mut feature = SsrFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let mut settings = SsrSettings::default();
+        settings.set_history_flags(CUSTOM_RUNTIME_BIT);
+        let camera = camera(7);
+        let before = *settings.uniforms.read();
+
+        let first = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1920, 1080),
+        );
+        assert!(!first.history.valid);
+        assert_eq!(first.uniforms.frame_params.w, CUSTOM_RUNTIME_BIT);
+        assert_eq!(
+            bytemuck::bytes_of(&*settings.uniforms.read()),
+            bytemuck::bytes_of(&before),
+        );
+
+        commit(&mut histories, first);
+        let second = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            2,
+            (1920, 1080),
+        );
+        assert!(second.history.valid);
+        assert_eq!(
+            second.uniforms.frame_params.w,
+            CUSTOM_RUNTIME_BIT | SSR_HISTORY_FLAG_VALID,
+        );
+        assert_eq!(
+            bytemuck::bytes_of(&*settings.uniforms.read()),
+            bytemuck::bytes_of(&before),
+        );
+    }
+
+    #[test]
+    fn history_resets_for_ssr_specific_discontinuities() {
+        {
+            let (mut feature, mut histories, mut settings, camera, _) =
+                seeded_history(8, (1920, 1080));
+            settings.set_half_resolution_enabled(false);
+
+            let full_resolution = extract(
+                &mut feature,
+                &mut histories,
+                &settings,
+                &camera,
+                2,
+                (1920, 1080),
+            );
+            assert_eq!(full_resolution.trace_resolution, (1920, 1080));
+            assert!(!full_resolution.history.valid);
+        }
+
+        {
+            let (mut feature, mut histories, settings, camera, _) = seeded_history(9, (1920, 1080));
+
+            let odd_resize = extract(
+                &mut feature,
+                &mut histories,
+                &settings,
+                &camera,
+                2,
+                (1921, 1080),
+            );
+            assert_eq!(odd_resize.trace_resolution, (960, 540));
+            assert!(!odd_resize.history.valid);
+        }
+
+        {
+            let (mut feature, mut histories, settings, mut camera, _) =
+                seeded_history(10, (1920, 1080));
+            camera.camera_cut = 1;
+
+            let cut = extract(
+                &mut feature,
+                &mut histories,
+                &settings,
+                &camera,
+                2,
+                (1920, 1080),
+            );
+            assert!(!cut.history.valid);
+            assert_ne!(cut.uniforms.frame_params.w & SSR_HISTORY_FLAG_CAMERA_CUT, 0);
+        }
+
+        {
+            let (mut feature, mut histories, settings, camera, first) =
+                seeded_history(11, (1280, 720));
+
+            let reentered = extract(
+                &mut feature,
+                &mut histories,
+                &settings,
+                &camera,
+                TEMPORAL_DOMAIN_TTL_FRAMES + 2,
+                (1280, 720),
+            );
+            assert!(!reentered.history.valid);
+            assert_ne!(reentered.history.commit.set_id, first.history.commit.set_id);
+        }
+    }
+
+    struct TestRootNode;
+
+    impl<'a> PassNode<'a> for TestRootNode {
+        fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    fn add_test_root(graph: &mut RenderGraph<'_>, source: TextureNodeId) {
+        let output = graph.register_texture(
+            "SSR_Test_Root_Output",
+            TextureDesc::new_2d(
+                1280,
+                720,
+                HDR_TEXTURE_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            ),
+            true,
+        );
+        graph.add_pass("SSR_Test_Root", |builder| {
+            builder.read_texture(source);
+            builder.write_texture(output);
+            (TestRootNode, ())
+        });
+    }
+
+    #[test]
+    fn root_demand_selects_exact_chain_and_domains_remain_independent() {
+        #[derive(Clone, Copy)]
+        enum RootDemand {
+            #[cfg(feature = "debug_view")]
+            TraceDiagnostic,
+            #[cfg(feature = "debug_view")]
+            Resolved,
+            Merged,
+        }
+
+        let cases = [
+            #[cfg(feature = "debug_view")]
+            (
+                "trace diagnostic",
+                RootDemand::TraceDiagnostic,
+                &["SSR_Trace", "SSR_Test_Root"][..],
+                false,
+            ),
+            #[cfg(feature = "debug_view")]
+            (
+                "resolved",
+                RootDemand::Resolved,
+                &["SSR_Trace", "SSR_Temporal", "SSR_Resolve", "SSR_Test_Root"][..],
+                true,
+            ),
+            (
+                "merged",
+                RootDemand::Merged,
+                &[
+                    "SSR_Trace",
+                    "SSR_Temporal",
+                    "SSR_Resolve",
+                    "SSR_Merge",
+                    "SSR_Test_Root",
+                ][..],
+                true,
+            ),
+        ];
+
+        for (case_index, (name, demand, expected_live, expected_history_valid)) in
+            cases.into_iter().enumerate()
+        {
+            let mut feature = SsrFeature::new();
+            let mut histories = HistoryRegistry::new();
+            let settings = SsrSettings::default();
+            let camera = camera(20 + case_index as u128);
+            let snapshot = extract(
+                &mut feature,
+                &mut histories,
+                &settings,
+                &camera,
+                1,
+                (1280, 720),
+            );
+            #[cfg(feature = "debug_view")]
+            let snapshot = {
+                let mut snapshot = snapshot;
+                if matches!(demand, RootDemand::TraceDiagnostic) {
+                    snapshot.trace_diagnostics = true;
+                }
+                snapshot
+            };
+
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            let sampled = wgpu::TextureUsages::TEXTURE_BINDING;
+            let color = graph.register_texture(
+                "SSR_Test_Color",
+                TextureDesc::new_2d(1280, 720, HDR_TEXTURE_FORMAT, sampled),
+                true,
+            );
+            let depth = graph.register_texture(
+                "SSR_Test_Depth",
+                TextureDesc::new_2d(1280, 720, wgpu::TextureFormat::Depth32Float, sampled),
+                true,
+            );
+            let data = graph.register_texture(
+                "SSR_Test_Data",
+                TextureDesc::new_2d(1280, 720, SSR_TEXTURE_FORMAT, sampled),
+                true,
+            );
+            let config = FrameConfig {
+                width: 1280,
+                height: 720,
+                depth_format: wgpu::TextureFormat::Depth32Float,
+                msaa_samples: 1,
+                surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                hdr_format: HDR_TEXTURE_FORMAT,
+            };
+            let mut ctx = GraphBuilderContext::new(&mut graph, &config, 0);
+            let outputs = feature.add_to_graph(
+                &mut ctx, snapshot, color, depth, data, data, data, data, data,
+            );
+            let root = match demand {
+                #[cfg(feature = "debug_view")]
+                RootDemand::TraceDiagnostic => outputs
+                    .raw_diagnostic
+                    .expect("trace diagnostic output must exist"),
+                #[cfg(feature = "debug_view")]
+                RootDemand::Resolved => outputs.clean_reflection,
+                RootDemand::Merged => outputs.merged_color,
+            };
+            add_test_root(&mut graph, root);
+
+            graph.compile_topology();
+            let live: Vec<_> = graph
+                .storage
+                .execution_queue
+                .iter()
+                .map(|&pass_index| graph.storage.passes[pass_index].name)
+                .collect();
+            assert_eq!(live, expected_live, "{name} root live chain");
+
+            graph.commit_submitted_histories(&mut histories);
+            let followup = histories.plan_set(
+                snapshot.history.commit.set_id,
+                snapshot.history.next.map(|texture| texture.desc),
+                2,
+                false,
+            );
+            assert_eq!(
+                followup.valid, expected_history_valid,
+                "{name} root history publication",
+            );
+
+            graph.finish();
+            assert!(feature.raw.pipelines.is_empty());
+            assert!(feature.raw.layout.is_none());
+            assert!(feature.temporal.pipeline_id.is_none());
+            assert!(feature.temporal.layout.is_none());
+            assert!(feature.spatial.pipeline_id.is_none());
+            assert!(feature.spatial.layout.is_none());
+            assert!(feature.merge.pipeline_id.is_none());
+            assert!(feature.merge.layout.is_none());
+        }
+
+        let mut feature = SsrFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsrSettings::default();
+        let camera_a = camera(10);
+        let camera_b = camera(11);
+
+        let mut previous = [None, None];
+        for serial in 1..=4 {
+            for (index, camera) in [&camera_a, &camera_b].into_iter().enumerate() {
+                let global_frame = 100 + serial * 2 + index as u64;
+                let snapshot = feature.extract(
+                    &mut histories,
+                    1,
+                    camera,
+                    serial,
+                    &settings.uniforms,
+                    (1280, 720),
+                    global_frame,
+                    global_frame as u32,
+                    false,
+                    GlobalStateKey::new(1, 1),
+                );
+                assert_eq!(snapshot.uniforms.frame_params.x, serial as u32);
+                assert_eq!(snapshot.history.valid, serial > 1);
+                if let Some(previous) = previous[index] {
+                    assert_eq!(snapshot.history.previous[0].id, previous);
+                }
+                previous[index] = Some(snapshot.history.next[0].id);
+                commit(&mut histories, snapshot);
+            }
+            assert_ne!(previous[0], previous[1]);
+        }
+    }
+}

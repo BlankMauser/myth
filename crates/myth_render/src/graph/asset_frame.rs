@@ -1128,47 +1128,78 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_sources_share_one_exact_geometry_owner() {
+    fn duplicate_draw_sources_share_one_exact_owner_and_unique_capacity() {
+        const SOURCE_COUNT: usize = 4096;
         let assets = AssetServer::new();
         let handle = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
         let (_, asset_version, asset_identity) = assets
             .geometries
             .get_entry_with_identity(handle)
             .expect("geometry missing");
+        let template = extracted_item(handle, asset_version, asset_identity);
         let mut extracted = ExtractedScene::new();
-        extracted
-            .render_items
-            .push(extracted_item(handle, asset_version, asset_identity));
-        extracted
-            .render_items
-            .push(extracted_item(handle, asset_version, asset_identity));
-
         let mut lists = RenderLists::new();
-        let first = lists.intern_frame_source(ExtractedSourceId::from_index(0));
-        let second = lists.intern_frame_source(ExtractedSourceId::from_index(1));
+        let mut live = Vec::with_capacity(SOURCE_COUNT);
+        for index in 0..SOURCE_COUNT {
+            extracted.render_items.push(template.clone());
+            live.push(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
+        }
+        let first = live[0];
+        let last = *live.last().expect("source list is empty");
+
         let mut store = GeometryFrameStore::new();
         store.capture_visible(&assets, &extracted, &lists);
-        store.capture_live(&assets, &extracted, &lists, &[first, second]);
+        store.capture_live(&assets, &extracted, &lists, &live);
 
         let resolver = store.resolver();
         let first_id = resolver
             .geometry_id(first, &extracted.render_items[0])
             .expect("first geometry join missing");
-        let second_id = resolver
-            .geometry_id(second, &extracted.render_items[1])
-            .expect("second geometry join missing");
-        assert_eq!(first_id, second_id);
+        let last_id = resolver
+            .geometry_id(last, extracted.render_items.last().unwrap())
+            .expect("last geometry join missing");
+        assert_eq!(first_id, last_id);
         let mut cursor = resolver.monotonic_cursor();
         assert_eq!(
             resolver.geometry_id_monotonic(&mut cursor, first, &extracted.render_items[0]),
             Some(first_id)
         );
         assert_eq!(
-            resolver.geometry_id_monotonic(&mut cursor, second, &extracted.render_items[1]),
-            Some(second_id)
+            resolver.geometry_id_monotonic(
+                &mut cursor,
+                last,
+                extracted.render_items.last().unwrap()
+            ),
+            Some(last_id)
         );
         assert_eq!(store.geometry_count(), 1);
-        assert_eq!(store.joined_source_count(), 2);
+        assert_eq!(store.joined_source_count(), SOURCE_COUNT);
+        assert_eq!(store.asset_handles.len(), 1);
+        assert_eq!(store.asset_snapshots.len(), 1);
+        assert_eq!(store.live_snapshot_indices.len(), 1);
+        assert_eq!(store.live_snapshot_lookup.len(), 1);
+        assert_eq!(store.live_current.len(), 1);
+        assert_eq!(store.record_snapshots.len(), 1);
+        assert_eq!(store.snapshot_records.len(), 1);
+        assert_eq!(store.failed_snapshots.len(), 1);
+        for capacity in [
+            store.records.capacity(),
+            store.asset_handles.capacity(),
+            store.asset_handle_lookup.capacity(),
+            store.asset_snapshots.capacity(),
+            store.asset_current.capacity(),
+            store.live_snapshot_indices.capacity(),
+            store.live_snapshot_lookup.capacity(),
+            store.live_current.capacity(),
+            store.record_snapshots.capacity(),
+            store.snapshot_records.capacity(),
+            store.failed_snapshots.capacity(),
+        ] {
+            assert!(
+                capacity < SOURCE_COUNT / 4,
+                "unique Geometry tables must retain an asset, not draw-count, high-water mark"
+            );
+        }
         assert_eq!(
             Arc::strong_count(&resolver.geometry(first_id).unwrap().asset),
             3,
@@ -1268,76 +1299,37 @@ mod tests {
     }
 
     #[test]
-    fn shared_geometry_unique_tables_never_reserve_from_draw_count() {
-        const SOURCE_COUNT: usize = 4096;
+    fn post_dpe_nonprefix_selection_is_compact_reusable_and_aba_safe() {
+        const SOURCE_DOMAIN: usize = 4096;
         let assets = AssetServer::new();
-        let handle = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
-        let (_, asset_version, asset_identity) = assets
-            .geometries
-            .get_entry_with_identity(handle)
-            .expect("geometry missing");
-        let template = extracted_item(handle, asset_version, asset_identity);
         let mut extracted = ExtractedScene::new();
         let mut lists = RenderLists::new();
-        let mut live = Vec::with_capacity(SOURCE_COUNT);
-        for index in 0..SOURCE_COUNT {
-            extracted.render_items.push(template.clone());
-            live.push(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
-        }
-
-        let mut store = GeometryFrameStore::new();
-        store.capture_visible(&assets, &extracted, &lists);
-        store.capture_live(&assets, &extracted, &lists, &live);
-
-        assert_eq!(store.records.len(), 1);
-        assert_eq!(store.asset_handles.len(), 1);
-        assert_eq!(store.asset_snapshots.len(), 1);
-        assert_eq!(store.live_snapshot_indices.len(), 1);
-        assert_eq!(store.live_snapshot_lookup.len(), 1);
-        assert_eq!(store.live_current.len(), 1);
-        assert_eq!(store.record_snapshots.len(), 1);
-        assert_eq!(store.snapshot_records.len(), 1);
-        assert_eq!(store.failed_snapshots.len(), 1);
-        assert!(
-            store.records.capacity() < SOURCE_COUNT / 4,
-            "unique Geometry records must retain a unique-asset high-water mark"
-        );
-        assert!(store.asset_handles.capacity() < SOURCE_COUNT / 4);
-        assert!(store.asset_handle_lookup.capacity() < SOURCE_COUNT / 4);
-        assert!(store.asset_snapshots.capacity() < SOURCE_COUNT / 4);
-        assert!(store.asset_current.capacity() < SOURCE_COUNT / 4);
-        assert!(store.live_snapshot_indices.capacity() < SOURCE_COUNT / 4);
-        assert!(store.live_snapshot_lookup.capacity() < SOURCE_COUNT / 4);
-        assert!(store.live_current.capacity() < SOURCE_COUNT / 4);
-        assert!(store.record_snapshots.capacity() < SOURCE_COUNT / 4);
-        assert!(store.snapshot_records.capacity() < SOURCE_COUNT / 4);
-        assert!(store.failed_snapshots.capacity() < SOURCE_COUNT / 4);
-        assert_eq!(store.source_geometry_joins.len(), SOURCE_COUNT);
-    }
-
-    #[test]
-    fn sparse_live_geometry_join_does_not_materialize_the_frame_source_domain() {
-        const SOURCE_DOMAIN: usize = 100_000;
-        let assets = AssetServer::new();
-        let handle = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
-        let (_, asset_version, asset_identity) = assets
-            .geometries
-            .get_entry_with_identity(handle)
-            .expect("geometry missing");
-        let template = extracted_item(handle, asset_version, asset_identity);
-        let mut extracted = ExtractedScene::new();
-        let mut lists = RenderLists::new();
-        let mut last_source = None;
+        let mut sources = Vec::with_capacity(SOURCE_DOMAIN);
+        let mut last_asset_version = 0;
         for index in 0..SOURCE_DOMAIN {
-            extracted.render_items.push(template.clone());
-            last_source = Some(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
+            let handle = assets.geometries.add(Geometry::new());
+            let (_, version, identity) = assets
+                .geometries
+                .get_entry_with_identity(handle)
+                .expect("geometry missing");
+            last_asset_version = version;
+            extracted
+                .render_items
+                .push(extracted_item(handle, version, identity));
+            sources.push(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
         }
-        let last_source = last_source.expect("source domain is empty");
+        let first_source = sources[0];
+        let last_source = *sources.last().expect("source domain is empty");
+        let last_handle = extracted.render_items.last().unwrap().geometry;
 
         let mut store = GeometryFrameStore::new();
         store.capture_visible(&assets, &extracted, &lists);
         store.capture_live(&assets, &extracted, &lists, &[last_source]);
 
+        assert_eq!(store.asset_snapshots.len(), SOURCE_DOMAIN);
+        assert_eq!(store.live_snapshot_indices, [SOURCE_DOMAIN - 1]);
+        assert_eq!(store.live_current, [true]);
+        assert_eq!(store.records.len(), 1);
         assert_eq!(store.source_geometry_joins.len(), 1);
         assert!(
             store.source_geometry_joins.capacity() < SOURCE_DOMAIN / 4,
@@ -1349,10 +1341,33 @@ mod tests {
                 .geometry_id(last_source, extracted.render_items.last().unwrap())
                 .is_some()
         );
+        assert!(
+            store
+                .resolver()
+                .geometry_id(first_source, &extracted.render_items[0])
+                .is_none()
+        );
+        let resolver = store.resolver();
+        let mut cursor = resolver.monotonic_cursor();
+        assert!(
+            resolver
+                .geometry_id_monotonic(&mut cursor, first_source, &extracted.render_items[0])
+                .is_none()
+        );
+        assert!(
+            resolver
+                .geometry_id_monotonic(
+                    &mut cursor,
+                    last_source,
+                    extracted.render_items.last().unwrap()
+                )
+                .is_some(),
+            "a missing early source must not consume the later compact join"
+        );
         let retained_join_allocation = store.source_geometry_joins.as_ptr();
 
         // `clear` invalidates the old join without scanning or zeroing the
-        // 100k source domain, and an all-dead attempt publishes no stale slot.
+        // pre-DPE source domain, and an all-dead attempt publishes no stale slot.
         store.clear();
         store.capture_visible(&assets, &extracted, &lists);
         store.capture_live(&assets, &extracted, &lists, &[]);
@@ -1373,6 +1388,27 @@ mod tests {
             retained_join_allocation
         );
         assert_eq!(store.source_geometry_joins.len(), 1);
+
+        // Same-version replacement between pregraph capture and live
+        // projection must fail closed on identity, not alias the old owner.
+        store.clear();
+        store.capture_visible(&assets, &extracted, &lists);
+        assets.geometries.insert_ready(last_handle, Geometry::new());
+        assert_eq!(
+            assets.geometries.get_version(last_handle),
+            Some(last_asset_version)
+        );
+        store.capture_live(&assets, &extracted, &lists, &[last_source]);
+        assert_eq!(store.live_snapshot_indices, [SOURCE_DOMAIN - 1]);
+        assert_eq!(store.live_current, [false]);
+        assert!(store.records.is_empty());
+        assert_eq!(store.joined_source_count(), 0);
+        assert!(
+            store
+                .resolver()
+                .geometry_id(last_source, extracted.render_items.last().unwrap())
+                .is_none()
+        );
     }
 
     #[test]
@@ -1446,98 +1482,6 @@ mod tests {
             "capacity trimming must release recycled nested spill allocations"
         );
         assert!(store.capacity_usage().retained_bytes < retained.retained_bytes);
-    }
-
-    #[test]
-    fn post_dpe_geometry_revalidation_projects_only_the_nonprefix_live_subset() {
-        const VISIBLE_COUNT: usize = 130;
-        let assets = AssetServer::new();
-        let mut extracted = ExtractedScene::new();
-        let mut lists = RenderLists::new();
-        let mut sources = Vec::with_capacity(VISIBLE_COUNT);
-        for index in 0..VISIBLE_COUNT {
-            let handle = assets.geometries.add(Geometry::new());
-            let (_, version, identity) = assets
-                .geometries
-                .get_entry_with_identity(handle)
-                .expect("geometry missing");
-            extracted
-                .render_items
-                .push(extracted_item(handle, version, identity));
-            sources.push(lists.intern_frame_source(ExtractedSourceId::from_index(index)));
-        }
-
-        let live = *sources.last().expect("visible source list is empty");
-        let mut store = GeometryFrameStore::new();
-        store.capture_visible(&assets, &extracted, &lists);
-        store.capture_live(&assets, &extracted, &lists, &[live]);
-
-        assert_eq!(store.asset_snapshots.len(), VISIBLE_COUNT);
-        assert_eq!(store.live_snapshot_indices, [VISIBLE_COUNT - 1]);
-        assert_eq!(store.live_current, [true]);
-        assert_eq!(store.records.len(), 1);
-        assert_eq!(
-            store.records[0].key.handle,
-            extracted.render_items.last().unwrap().geometry
-        );
-        assert!(
-            store
-                .resolver()
-                .geometry_id(live, extracted.render_items.last().unwrap())
-                .is_some()
-        );
-        assert!(
-            store
-                .resolver()
-                .geometry_id(sources[0], &extracted.render_items[0])
-                .is_none()
-        );
-        let resolver = store.resolver();
-        let mut cursor = resolver.monotonic_cursor();
-        assert!(
-            resolver
-                .geometry_id_monotonic(&mut cursor, sources[0], &extracted.render_items[0])
-                .is_none()
-        );
-        assert!(
-            resolver
-                .geometry_id_monotonic(&mut cursor, live, extracted.render_items.last().unwrap(),)
-                .is_some(),
-            "a missing early source must not consume a later compact join"
-        );
-    }
-
-    #[test]
-    fn selected_live_geometry_rejects_same_version_replacement_after_pregraph_capture() {
-        let assets = AssetServer::new();
-        let handle = assets.geometries.add(Geometry::new());
-        let (_, version, identity) = assets
-            .geometries
-            .get_entry_with_identity(handle)
-            .expect("geometry missing");
-        let mut extracted = ExtractedScene::new();
-        extracted
-            .render_items
-            .push(extracted_item(handle, version, identity));
-        let mut lists = RenderLists::new();
-        let source = lists.intern_frame_source(ExtractedSourceId::from_index(0));
-        let mut store = GeometryFrameStore::new();
-        store.capture_visible(&assets, &extracted, &lists);
-
-        assets.geometries.insert_ready(handle, Geometry::new());
-        assert_eq!(assets.geometries.get_version(handle), Some(version));
-        store.capture_live(&assets, &extracted, &lists, &[source]);
-
-        assert_eq!(store.live_snapshot_indices, [0]);
-        assert_eq!(store.live_current, [false]);
-        assert!(store.records.is_empty());
-        assert_eq!(store.joined_source_count(), 0);
-        assert!(
-            store
-                .resolver()
-                .geometry_id(source, &extracted.render_items[0])
-                .is_none()
-        );
     }
 
     #[test]

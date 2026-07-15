@@ -954,4 +954,265 @@ impl HistoryRegistry {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    fn desc(width: u32) -> TextureDesc {
+        TextureDesc::new_2d(
+            width,
+            64,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        )
+    }
+
+    fn spec(width: u32) -> PersistentTextureSpec {
+        PersistentTextureSpec::default_view(desc(width))
+    }
+
+    fn commit_history<const N: usize>(
+        registry: &mut HistoryRegistry,
+        plan: HistoryPlan<N>,
+    ) -> bool {
+        registry.commit(plan.commit, &plan.next.map(|texture| texture.id))
+    }
+
+    fn commit_cache<const N: usize>(
+        registry: &mut HistoryRegistry,
+        plan: CachePlan<N>,
+    ) -> Option<CachePublicationReceipt> {
+        registry.commit_cache(plan.commit?, &plan.textures.map(|texture| texture.id))
+    }
+
+    fn assert_panics_with(expected: &str, action: impl FnOnce()) {
+        let payload = catch_unwind(AssertUnwindSafe(action)).expect_err("operation must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic payload");
+        assert!(
+            message.contains(expected),
+            "panic `{message}` did not contain `{expected}`"
+        );
+    }
+
+    #[test]
+    fn history_banks_ping_pong_only_after_a_complete_current_commit() {
+        let mut registry = HistoryRegistry::new();
+        let set = registry.create_set();
+        let descriptors = [desc(64), desc(32)];
+
+        let first = registry.plan_set(set, descriptors, 1, false);
+        let repeated = registry.plan_set(set, descriptors, 1, false);
+        assert!(!first.valid);
+        assert_eq!(first.previous, repeated.previous);
+        assert_eq!(first.next, repeated.next);
+        assert_eq!(first.commit, repeated.commit);
+
+        assert!(!registry.commit(first.commit, &[first.next[0].id]));
+        assert!(!registry.commit(first.commit, &[first.previous[0].id, first.previous[1].id]));
+        assert!(commit_history(&mut registry, first));
+        assert!(!commit_history(&mut registry, repeated));
+
+        let second = registry.plan_set(set, descriptors, 2, false);
+        assert!(second.valid);
+        assert_eq!(second.previous, first.next);
+        assert_eq!(second.next, first.previous);
+    }
+
+    #[test]
+    fn history_reset_gap_and_descriptor_change_invalidate_without_aliasing() {
+        let mut registry = HistoryRegistry::new();
+        let set = registry.create_set();
+
+        let stale = registry.plan_set(set, [desc(64)], 1, false);
+        let reset = registry.plan_set(set, [desc(64)], 1, true);
+        let repeated_reset = registry.plan_set(set, [desc(64)], 1, true);
+        assert!(!commit_history(&mut registry, stale));
+        assert_eq!(reset.previous, repeated_reset.previous);
+        assert_eq!(reset.next, repeated_reset.next);
+        assert_eq!(reset.commit, repeated_reset.commit);
+        assert!(commit_history(&mut registry, reset));
+
+        let skipped = registry.plan_set(set, [desc(64)], 3, false);
+        assert!(!skipped.valid);
+        assert!(commit_history(&mut registry, skipped));
+
+        let resized = registry.plan_set(set, [desc(128)], 4, false);
+        assert!(!resized.valid);
+        assert_eq!(resized.previous[0].id, skipped.next[0].id);
+        assert_eq!(resized.next[0].id, skipped.previous[0].id);
+        assert_eq!(registry.physical_texture_count(), 0);
+    }
+
+    #[test]
+    fn retired_history_rejects_tokens_and_never_reuses_identity() {
+        let mut registry = HistoryRegistry::new();
+        let retired = registry.create_set();
+        let pending = registry.plan_set(retired, [desc(64), desc(32)], 1, false);
+
+        assert_eq!(registry.history_set_count(), 1);
+        assert!(registry.remove_set(retired));
+        assert_eq!(registry.history_set_count(), 0);
+        assert!(!commit_history(&mut registry, pending));
+        assert!(!registry.remove_set(retired));
+
+        let replacement = registry.create_set();
+        assert_ne!(replacement, retired);
+        assert!(
+            !registry
+                .plan_set(replacement, [desc(64), desc(32)], 1, false)
+                .valid
+        );
+    }
+
+    #[test]
+    fn cache_publication_requires_the_complete_latest_attempt() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let key = CacheKey::new(7);
+
+        let stale = registry.plan_cache(cache, key, [spec(64), spec(32)], 10);
+        let repeated = registry.plan_cache(cache, key, [spec(64), spec(32)], 10);
+        assert!(!stale.valid);
+        assert_eq!(stale.textures, repeated.textures);
+        assert_eq!(stale.commit, repeated.commit);
+        assert!(
+            registry
+                .commit_cache(
+                    stale.commit.expect("invalid plan needs a token"),
+                    &[stale.textures[0].id]
+                )
+                .is_none()
+        );
+
+        let current = registry.plan_cache(cache, key, [spec(64), spec(32)], 11);
+        assert!(commit_cache(&mut registry, stale).is_none());
+        let receipt = commit_cache(&mut registry, current).expect("latest full bank must publish");
+        assert_eq!(receipt.cache_id, cache);
+        assert_eq!(receipt.key, key);
+        assert!(commit_cache(&mut registry, current).is_none());
+
+        let warm = registry.plan_cache(cache, key, [spec(64), spec(32)], 12);
+        assert!(warm.valid);
+        assert!(warm.commit.is_none());
+        assert_eq!(warm.textures, current.textures);
+    }
+
+    #[test]
+    fn cache_key_spec_and_member_count_changes_advance_one_coherent_epoch() {
+        let mut registry = HistoryRegistry::new();
+        let cache = registry.create_cache();
+        let first = registry.plan_cache(cache, CacheKey::new(1), [spec(64)], 1);
+        assert!(commit_cache(&mut registry, first).is_some());
+
+        let rekeyed = registry.plan_cache(cache, CacheKey::new(2), [spec(64)], 2);
+        assert!(!rekeyed.valid);
+        assert_eq!(rekeyed.epoch, first.epoch.wrapping_add(1));
+        assert_eq!(rekeyed.textures[0].id, first.textures[0].id);
+        assert!(commit_cache(&mut registry, rekeyed).is_some());
+
+        let cube_desc = TextureDesc::new(
+            128,
+            128,
+            6,
+            1,
+            1,
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        );
+        let cube_spec =
+            PersistentTextureSpec::new(cube_desc, Some(wgpu::TextureViewDimension::Cube));
+        let resized = registry.plan_cache(cache, CacheKey::new(2), [cube_spec], 3);
+        assert!(!resized.valid);
+        assert_eq!(resized.epoch, rekeyed.epoch.wrapping_add(1));
+        assert_eq!(resized.textures[0].id, rekeyed.textures[0].id);
+        assert_eq!(
+            registry.logical_specs.get(&resized.textures[0].id),
+            Some(&cube_spec)
+        );
+
+        let retired_member = resized.textures[0].id;
+        let expanded = registry.plan_cache(cache, CacheKey::new(2), [spec(64), spec(32)], 4);
+        assert!(!expanded.valid);
+        assert_eq!(expanded.epoch, resized.epoch.wrapping_add(1));
+        assert!(
+            expanded
+                .textures
+                .iter()
+                .all(|texture| texture.id != retired_member)
+        );
+        assert!(!registry.logical_specs.contains_key(&retired_member));
+        assert!(commit_cache(&mut registry, resized).is_none());
+        assert!(commit_cache(&mut registry, expanded).is_some());
+    }
+
+    #[test]
+    fn retired_cache_and_invalid_planning_sequences_fail_closed() {
+        let mut registry = HistoryRegistry::new();
+        let retired = registry.create_cache();
+        let pending = registry.plan_cache(retired, CacheKey::new(1), [spec(64)], 1);
+        let retired_member = pending.textures[0].id;
+
+        assert_eq!(registry.cache_count(), 1);
+        assert!(registry.remove_cache(retired));
+        assert_eq!(registry.cache_count(), 0);
+        assert!(commit_cache(&mut registry, pending).is_none());
+        assert!(!registry.remove_cache(retired));
+
+        let replacement = registry.create_cache();
+        assert_ne!(replacement, retired);
+        let replacement_plan = registry.plan_cache(replacement, CacheKey::new(1), [spec(64)], 1);
+        assert_ne!(replacement_plan.textures[0].id, retired_member);
+
+        assert_panics_with("cache ID is retired", || {
+            let _ = registry.plan_cache(retired, CacheKey::new(1), [spec(64)], 2);
+        });
+
+        let monotonic = registry.create_cache();
+        let _ = registry.plan_cache(monotonic, CacheKey::new(9), [spec(64)], 20);
+        assert_panics_with("attempt serial moved backwards", || {
+            let _ = registry.plan_cache(monotonic, CacheKey::new(9), [spec(64)], 19);
+        });
+
+        let coherent = registry.create_cache();
+        let _ = registry.plan_cache(coherent, CacheKey::new(1), [spec(64)], 1);
+        assert_panics_with("conflicting key/spec in one attempt", || {
+            let _ = registry.plan_cache(coherent, CacheKey::new(2), [spec(64)], 1);
+        });
+    }
+
+    #[test]
+    fn persistent_texture_import_rejects_every_noncanonical_spec() {
+        fn unplanned() {
+            let registry = HistoryRegistry::new();
+            registry.assert_texture_spec_is_current(PersistentTextureId::new(), spec(64));
+        }
+
+        fn stale() {
+            let mut registry = HistoryRegistry::new();
+            let cache = registry.create_cache();
+            let old = registry.plan_cache(cache, CacheKey::new(1), [spec(64)], 1);
+            let _ = registry.plan_cache(cache, CacheKey::new(1), [spec(128)], 2);
+            registry.assert_texture_spec_is_current(old.textures[0].id, old.textures[0].spec);
+        }
+
+        fn wrong_dimension() {
+            let mut registry = HistoryRegistry::new();
+            let cache = registry.create_cache();
+            let plan = registry.plan_cache(cache, CacheKey::new(1), [spec(64)], 1);
+            registry.assert_texture_spec_is_current(
+                plan.textures[0].id,
+                PersistentTextureSpec::new(desc(64), Some(wgpu::TextureViewDimension::D2Array)),
+            );
+        }
+
+        for action in [unplanned as fn(), stale as fn(), wrong_dimension as fn()] {
+            assert_panics_with("unplanned or stale specification", action);
+        }
+    }
+}

@@ -1178,4 +1178,341 @@ fn binding_recipe_matches_plan(
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
+    use slotmap::KeyData;
+
+    const ASSET_VERSION: u32 = 7;
+    const ASSET_IDENTITY: u64 = 11;
+    const MATERIAL_VERSION: u64 = 13;
+
+    fn test_resource_manager() -> ResourceManager {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1)
+    }
+
+    fn test_material_handle(index: u32) -> MaterialHandle {
+        test_material_handle_generation(index, 1)
+    }
+
+    fn test_material_handle_generation(index: u32, generation: u32) -> MaterialHandle {
+        MaterialHandle::from(KeyData::from_ffi(
+            (u64::from(generation) << 32) | u64::from(index),
+        ))
+    }
+
+    fn resource_ids(ids: &[u64]) -> ResourceIdSet {
+        let mut result = ResourceIdSet::with_capacity(ids.len());
+        for &id in ids {
+            result.push(id);
+        }
+        result
+    }
+
+    fn test_pipeline_snapshot() -> Arc<MaterialPipelineSnapshot> {
+        Arc::new(MaterialPipelineSnapshot::capture(&Material::new_unlit(
+            glam::Vec4::ONE,
+        )))
+    }
+
+    fn build_gpu_material(resources: &mut ResourceManager, ids: &[u64]) -> GpuMaterial {
+        resources.build_material_from_builder(
+            &ResourceBuilder::new(),
+            resource_ids(ids),
+            ASSET_VERSION,
+            ASSET_IDENTITY,
+            MATERIAL_VERSION,
+            false,
+            test_pipeline_snapshot(),
+            None,
+        )
+    }
+
+    fn clone_gpu_material(source: &GpuMaterial, bind_group_id: u64) -> GpuMaterial {
+        GpuMaterial {
+            asset_version: source.asset_version,
+            asset_identity: source.asset_identity,
+            bind_group: source.bind_group.clone(),
+            bind_group_id,
+            layout: source.layout.clone(),
+            layout_id: source.layout_id,
+            layout_hash: source.layout_hash,
+            binding_wgsl: Arc::clone(&source.binding_wgsl),
+            binding_interface_id: source.binding_interface_id,
+            pipeline_snapshot: Arc::clone(&source.pipeline_snapshot),
+            canonical_binding_stamp: source.canonical_binding_stamp,
+            resource_ids: source.resource_ids.clone(),
+            version: source.version,
+            last_used_frame: source.last_used_frame,
+            last_verified_frame: source.last_verified_frame,
+        }
+    }
+
+    fn stage_rebuild(
+        resources: &mut ResourceManager,
+        batch: &mut PlannedMaterialCandidateBatch,
+        handle: MaterialHandle,
+        ids: &[u64],
+        observed_bind_group_id: Option<u64>,
+    ) -> PlannedMaterialCandidateId {
+        let private_slot = batch.private_materials.len();
+        batch
+            .private_materials
+            .push(Some(Box::new(build_gpu_material(resources, ids))));
+        batch.push(
+            handle,
+            ASSET_VERSION,
+            ASSET_IDENTITY,
+            MATERIAL_VERSION,
+            false,
+            PlannedMaterialCandidateSource::Rebuild {
+                observed_bind_group_id,
+                private_slot,
+            },
+        )
+    }
+
+    #[test]
+    fn publication_cas_preserves_epoch_and_physical_resource_coherence() {
+        let mut resources = test_resource_manager();
+
+        // An independently prepared but physically equivalent winner is reused.
+        let equivalent_handle = test_material_handle(1);
+        let mut equivalent_batch = PlannedMaterialCandidateBatch::new();
+        let equivalent_candidate = stage_rebuild(
+            &mut resources,
+            &mut equivalent_batch,
+            equivalent_handle,
+            &[101, 102],
+            None,
+        );
+        let private = equivalent_batch.private_materials[0]
+            .as_ref()
+            .expect("private candidate missing");
+        let winner_bind_group_id = private.bind_group_id.wrapping_add(10_000);
+        resources.resources.insert_material(
+            equivalent_handle,
+            clone_gpu_material(private, winner_bind_group_id),
+        );
+
+        resources.publish_planned_material_candidates(&mut equivalent_batch, &[true]);
+
+        assert!(equivalent_batch.result(equivalent_candidate));
+        assert_eq!(
+            resources
+                .get_material(equivalent_handle)
+                .expect("equivalent winner disappeared")
+                .bind_group_id,
+            winner_bind_group_id
+        );
+        assert!(equivalent_batch.private_materials[0].is_some());
+
+        // A winner from a different physical recipe, asset identity, or Material
+        // epoch must never be mistaken for the candidate's coherent generation.
+        for drift in 0..3_u32 {
+            let handle = test_material_handle(10 + drift);
+            let mut batch = PlannedMaterialCandidateBatch::new();
+            let candidate = stage_rebuild(
+                &mut resources,
+                &mut batch,
+                handle,
+                &[200 + u64::from(drift)],
+                None,
+            );
+            let private = batch.private_materials[0]
+                .as_ref()
+                .expect("private candidate missing");
+            let mut conflicting = clone_gpu_material(private, private.bind_group_id + 10_000);
+            match drift {
+                0 => conflicting.resource_ids = resource_ids(&[999]),
+                1 => conflicting.asset_identity += 1,
+                2 => conflicting.version += 1,
+                _ => unreachable!(),
+            }
+            let conflicting_bind_group_id = conflicting.bind_group_id;
+            resources.resources.insert_material(handle, conflicting);
+
+            resources.publish_planned_material_candidates(&mut batch, &[true]);
+
+            assert!(!batch.result(candidate));
+            assert_eq!(
+                resources
+                    .get_material(handle)
+                    .expect("conflicting winner disappeared")
+                    .bind_group_id,
+                conflicting_bind_group_id
+            );
+            assert!(batch.private_materials[0].is_some());
+        }
+
+        // When the observed owner is still current, publication swaps without
+        // growing the slot store and defers destruction of the retired owner.
+        let replacement_handle = test_material_handle(4_096);
+        let cached = build_gpu_material(&mut resources, &[401]);
+        let cached_bind_group_id = cached.bind_group_id;
+        resources
+            .resources
+            .insert_material(replacement_handle, cached);
+        let mut replacement_batch = PlannedMaterialCandidateBatch::new();
+        let replacement = stage_rebuild(
+            &mut resources,
+            &mut replacement_batch,
+            replacement_handle,
+            &[402],
+            Some(cached_bind_group_id),
+        );
+        let replacement_bind_group_id = replacement_batch.private_materials[0]
+            .as_ref()
+            .expect("private candidate missing")
+            .bind_group_id;
+        let slot_capacity = resources.resources.material_slot_capacity();
+
+        resources.publish_planned_material_candidates(&mut replacement_batch, &[true]);
+
+        assert!(replacement_batch.result(replacement));
+        assert_eq!(resources.resources.material_slot_capacity(), slot_capacity);
+        assert_eq!(
+            resources
+                .get_material(replacement_handle)
+                .expect("published Material missing")
+                .bind_group_id,
+            replacement_bind_group_id
+        );
+        assert_eq!(
+            replacement_batch.private_materials[0]
+                .as_ref()
+                .expect("retired owner must remain batch-scoped")
+                .bind_group_id,
+            cached_bind_group_id
+        );
+        replacement_batch.clear();
+        assert!(replacement_batch.is_empty());
+    }
+
+    #[test]
+    fn publication_gate_fails_closed_under_postflight_and_handle_aba() {
+        let mut resources = test_resource_manager();
+
+        // A failed postflight cannot alter the observed cache entry.
+        let stale_handle = test_material_handle(3);
+        let cached = build_gpu_material(&mut resources, &[301]);
+        let cached_bind_group_id = cached.bind_group_id;
+        resources.resources.insert_material(stale_handle, cached);
+        let mut stale_batch = PlannedMaterialCandidateBatch::new();
+        let stale_candidate = stage_rebuild(
+            &mut resources,
+            &mut stale_batch,
+            stale_handle,
+            &[302],
+            Some(cached_bind_group_id),
+        );
+        resources.publish_planned_material_candidates(&mut stale_batch, &[false]);
+        assert!(!stale_batch.result(stale_candidate));
+        let retained = resources
+            .get_material(stale_handle)
+            .expect("stale publication removed the cache entry");
+        assert_eq!(retained.bind_group_id, cached_bind_group_id);
+        assert_eq!(retained.resource_ids, resource_ids(&[301]));
+
+        // A logically current but unavailable candidate is still unpublishable.
+        let mut unavailable = PlannedMaterialCandidateBatch::new();
+        let unavailable_id = unavailable.push_unavailable(
+            stale_handle,
+            ASSET_VERSION,
+            ASSET_IDENTITY,
+            MATERIAL_VERSION,
+        );
+        assert!(!resources.publish_planned_material_candidate(
+            &mut unavailable,
+            unavailable_id,
+            true,
+        ));
+        assert!(unavailable.all_published());
+        assert!(!unavailable.result(unavailable_id));
+
+        // A newer generation retires the obsolete slot before publication.
+        let old_handle = test_material_handle_generation(8_192, 1);
+        let new_handle = test_material_handle_generation(8_192, 3);
+        let old_material = build_gpu_material(&mut resources, &[501]);
+        resources
+            .resources
+            .insert_material(old_handle, old_material);
+        let mut new_batch = PlannedMaterialCandidateBatch::new();
+        let new_candidate = stage_rebuild(&mut resources, &mut new_batch, new_handle, &[502], None);
+        let mut current = [true];
+        resources.reserve_planned_material_candidate_slots(&new_batch, &mut current);
+        assert_eq!(current, [true]);
+        assert!(resources.get_material(old_handle).is_none());
+        assert!(resources.get_material(new_handle).is_none());
+        let slot_capacity = resources.resources.material_slot_capacity();
+        assert!(resources.publish_planned_material_candidate(&mut new_batch, new_candidate, true,));
+        assert_eq!(resources.resources.material_slot_capacity(), slot_capacity);
+        assert!(resources.get_material(new_handle).is_some());
+        assert!(new_batch.private_materials[0].is_none());
+
+        // The inverse ABA direction and null handle both fail closed.
+        let obsolete_handle = test_material_handle_generation(12_288, 1);
+        let current_handle = test_material_handle_generation(12_288, 3);
+        let current_material = build_gpu_material(&mut resources, &[551]);
+        let current_bind_group_id = current_material.bind_group_id;
+        resources
+            .resources
+            .insert_material(current_handle, current_material);
+        let mut obsolete_batch = PlannedMaterialCandidateBatch::new();
+        let obsolete = stage_rebuild(
+            &mut resources,
+            &mut obsolete_batch,
+            obsolete_handle,
+            &[552],
+            None,
+        );
+        resources.publish_planned_material_candidates(&mut obsolete_batch, &[true]);
+        assert!(!obsolete_batch.result(obsolete));
+        assert!(resources.get_material(obsolete_handle).is_none());
+        assert_eq!(
+            resources
+                .get_material(current_handle)
+                .expect("newer cache owner was displaced")
+                .bind_group_id,
+            current_bind_group_id
+        );
+        assert!(
+            !resources
+                .resources
+                .reserve_material_slot(MaterialHandle::default())
+        );
+    }
+
+    #[test]
+    fn candidate_batch_storage_retains_reuses_and_trims() {
+        let mut batch = PlannedMaterialCandidateBatch::new();
+        let handle = test_material_handle(4);
+        for version in 0..(PLANNED_MATERIAL_CANDIDATE_BASELINE * 16) {
+            batch.push_unavailable(handle, version as u32, version as u64, version as u64);
+        }
+        let peak_retained = batch.retained_bytes();
+        assert!(batch.active_bytes() > 0);
+        assert!(peak_retained > PlannedMaterialCandidateBatch::baseline_bytes());
+
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(batch.active_bytes(), 0);
+        assert_eq!(batch.retained_bytes(), peak_retained);
+
+        batch.trim_capacity(0, peak_retained);
+        assert!(batch.retained_bytes() < peak_retained);
+        assert!(batch.retained_bytes() >= PlannedMaterialCandidateBatch::baseline_bytes());
+        assert_eq!(batch.push_unavailable(handle, 1, 2, 3).index(), 0);
+        batch.clear();
+        assert!(batch.is_empty());
+    }
+}

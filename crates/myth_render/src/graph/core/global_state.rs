@@ -324,4 +324,396 @@ impl GlobalStateAttempt {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::core::{ResourceManager, WgpuContext};
+    use crate::graph::core::diagnostics::RdgDiagnosticsRecorder;
+    use crate::graph::core::{
+        ExecuteContext, FrameArena, GraphStorage, PassNode, PrepareContext, RenderGraph,
+    };
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext;
+    use myth_resources::buffer::BufferRef;
+
+    struct EmptyNode;
+
+    impl PassNode<'_> for EmptyNode {
+        fn prepare(&mut self, _ctx: &mut PrepareContext<'_>) {}
+
+        fn execute(&self, _ctx: &ExecuteContext<'_>, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    struct TestSources {
+        camera: CpuBuffer<RenderStateUniforms>,
+        environment: CpuBuffer<EnvironmentUniforms>,
+        directional: CpuBuffer<Vec<GpuLightStorage>>,
+    }
+
+    impl TestSources {
+        fn new() -> Self {
+            Self {
+                camera: CpuBuffer::new(
+                    RenderStateUniforms::default(),
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    Some("global state camera test"),
+                ),
+                environment: CpuBuffer::new(
+                    EnvironmentUniforms::default(),
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    Some("global state environment test"),
+                ),
+                directional: CpuBuffer::new(
+                    vec![GpuLightStorage::default()],
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    Some("global state directional test"),
+                ),
+            }
+        }
+
+        fn get(&self) -> GlobalStateSources<'_> {
+            GlobalStateSources {
+                camera: &self.camera,
+                environment: &self.environment,
+                directional_lights: &self.directional,
+            }
+        }
+
+        fn ids(&self) -> [u64; 3] {
+            [
+                self.camera.id(),
+                self.environment.id(),
+                self.directional.id(),
+            ]
+        }
+    }
+
+    fn gpu() -> WgpuContext {
+        pollster::block_on(SharedTestContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required")
+    }
+
+    fn materialize(
+        graph: &mut RenderGraph<'_>,
+        sources: &TestSources,
+        wgpu: &WgpuContext,
+        resources: &mut ResourceManager,
+    ) -> Result<(), GlobalStateMaterializationFailure> {
+        let mut uploads = BufferUploadContext::new(
+            &wgpu.device,
+            &wgpu.queue,
+            resources.frame_index,
+            &mut resources.resources,
+            &resources.internal_textures,
+        );
+        graph.materialize_live_global_state(sources.get(), &mut uploads)
+    }
+
+    fn live_graph<'a>(
+        storage: &'a mut GraphStorage,
+        arena: &'a FrameArena,
+        key: GlobalStateKey,
+        sources: &TestSources,
+    ) -> RenderGraph<'a> {
+        let mut graph = RenderGraph::new(storage, arena);
+        graph.capture_global_state_plan(key, sources.get());
+        graph.add_pass("global consumer", |builder| {
+            builder.demand_global_state(key);
+            builder.demand_global_state(key);
+            builder.mark_side_effect();
+            (EmptyNode, ())
+        });
+        graph.compile_topology();
+        graph
+    }
+
+    #[test]
+    fn dpe_materializes_only_live_demand_once_and_stages_its_owner() {
+        let wgpu = gpu();
+        let sources = TestSources::new();
+        let key = GlobalStateKey::new(1, 2);
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        {
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            graph.capture_global_state_plan(key, sources.get());
+            graph.add_pass("dead global consumer", |builder| {
+                builder.demand_global_state(key);
+                (EmptyNode, ())
+            });
+            graph.compile_topology();
+            assert_eq!(
+                materialize(&mut graph, &sources, &wgpu, &mut resources),
+                Ok(()),
+            );
+            assert_eq!(graph.global_state_allowed_key(), None);
+            assert!(graph.materialized_global_buffer_tokens().is_none());
+            assert_eq!(graph.finalized_global_state_key(), None);
+        }
+        assert!(
+            sources
+                .ids()
+                .into_iter()
+                .all(|id| resources.get_gpu_buffer_by_cpu_id(id).is_none())
+        );
+
+        {
+            let mut graph = live_graph(&mut storage, &arena, key, &sources);
+            assert!(graph.materialized_global_buffer_tokens().is_none());
+            assert_eq!(
+                materialize(&mut graph, &sources, &wgpu, &mut resources),
+                Ok(()),
+            );
+            let tokens = graph
+                .materialized_global_buffer_tokens()
+                .expect("live global batch must be owned by the graph attempt");
+            let physical_ids = graph
+                .materialized_global_buffer_ids()
+                .expect("live global batch must expose exact physical identities");
+            assert_eq!(graph.global_state_allowed_key(), Some(key));
+            assert_eq!(tokens.map(|token| token.physical_id), physical_ids);
+            assert_eq!(
+                tokens.map(|token| token.stamp),
+                [
+                    sources.camera.stamp(),
+                    sources.environment.stamp(),
+                    sources.directional.stamp(),
+                ],
+            );
+            assert_eq!(
+                tokens.map(|token| Some(token.handle)),
+                [
+                    sources.camera.gpu_handle(),
+                    sources.environment.gpu_handle(),
+                    sources.directional.gpu_handle(),
+                ],
+            );
+
+            // A successful attempt is sticky: later source drift cannot cause
+            // a second batch materialization or replace the owned tokens.
+            drop(sources.camera.write());
+            assert_eq!(
+                materialize(&mut graph, &sources, &wgpu, &mut resources),
+                Ok(()),
+            );
+            assert_eq!(graph.materialized_global_buffer_tokens(), Some(tokens));
+            assert_eq!(graph.materialized_global_buffer_ids(), Some(physical_ids));
+
+            let layout = wgpu
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("global state owner test"),
+                    entries: &[],
+                });
+            let bind_group = wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("global state owner test"),
+                layout: &layout,
+                entries: &[],
+            });
+            graph.stage_finalized_global_bind_group(key, &bind_group);
+            assert!(graph.finalized_global_bind_group().is_some());
+            assert_eq!(graph.finalized_global_state_key(), Some(key));
+        }
+        assert!(storage.global_state_attempt.prepared.is_empty());
+    }
+
+    #[test]
+    fn failed_batches_publish_nothing_and_a_fresh_exact_plan_can_retry() {
+        let wgpu = gpu();
+        let key = GlobalStateKey::new(3, 4);
+        let arena = FrameArena::new();
+
+        // Snapshot drift fails before uploading any member and is sticky only
+        // for the failed graph attempt.
+        let sources = TestSources::new();
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let mut storage = GraphStorage::new();
+        {
+            let mut graph = live_graph(&mut storage, &arena, key, &sources);
+            drop(sources.environment.write());
+            assert_eq!(
+                materialize(&mut graph, &sources, &wgpu, &mut resources),
+                Err(GlobalStateMaterializationFailure::SnapshotDrift),
+            );
+            assert_eq!(
+                materialize(&mut graph, &sources, &wgpu, &mut resources),
+                Err(GlobalStateMaterializationFailure::Unavailable),
+            );
+        }
+        assert!(
+            sources
+                .ids()
+                .into_iter()
+                .all(|id| resources.get_gpu_buffer_by_cpu_id(id).is_none())
+        );
+        assert!(sources.camera.gpu_handle().is_none());
+        assert!(sources.environment.gpu_handle().is_none());
+        assert!(sources.directional.gpu_handle().is_none());
+        {
+            let mut retry = live_graph(&mut storage, &arena, key, &sources);
+            assert_eq!(
+                materialize(&mut retry, &sources, &wgpu, &mut resources),
+                Ok(()),
+            );
+        }
+
+        // A newer companion already in the physical store rejects the whole
+        // three-buffer batch. Once the CPU plan catches up, a new attempt can
+        // reuse that exact companion and publish all three atomically.
+        let sources = TestSources::new();
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let mut storage = GraphStorage::new();
+        let directional = sources.directional.stamp();
+        let newer = BufferRef::with_fixed_id(
+            directional.id,
+            directional.size,
+            directional.usage,
+            directional.version + 1,
+            None,
+        );
+        resources.ensure_buffer_ref(&newer, sources.directional.read().as_bytes());
+        {
+            let mut graph = live_graph(&mut storage, &arena, key, &sources);
+            assert_eq!(
+                materialize(&mut graph, &sources, &wgpu, &mut resources),
+                Err(GlobalStateMaterializationFailure::ConflictingPhysicalState),
+            );
+        }
+        assert!(
+            resources
+                .get_gpu_buffer_by_cpu_id(sources.camera.id())
+                .is_none()
+        );
+        assert!(
+            resources
+                .get_gpu_buffer_by_cpu_id(sources.environment.id())
+                .is_none()
+        );
+        assert_eq!(
+            resources
+                .get_gpu_buffer_by_cpu_id(directional.id)
+                .expect("seeded directional buffer missing")
+                .last_uploaded_version,
+            directional.version + 1,
+        );
+        assert!(sources.camera.gpu_handle().is_none());
+        assert!(sources.environment.gpu_handle().is_none());
+        assert!(sources.directional.gpu_handle().is_none());
+
+        drop(sources.directional.write());
+        let mut retry = live_graph(&mut storage, &arena, key, &sources);
+        assert_eq!(
+            materialize(&mut retry, &sources, &wgpu, &mut resources),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn warm_batches_reuse_exact_handles_and_recover_from_a_bad_hint() {
+        let wgpu = gpu();
+        let sources = TestSources::new();
+        let key = GlobalStateKey::new(5, 6);
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+
+        let run = |storage: &mut GraphStorage,
+                   resources: &mut ResourceManager|
+         -> [MaterializedBufferToken; 3] {
+            let mut graph = live_graph(storage, &arena, key, &sources);
+            assert_eq!(materialize(&mut graph, &sources, &wgpu, resources), Ok(()));
+            graph
+                .materialized_global_buffer_tokens()
+                .expect("materialized global tokens missing")
+        };
+
+        let cold = run(&mut storage, &mut resources);
+        let warm = run(&mut storage, &mut resources);
+        assert_eq!(warm, cold);
+        assert_eq!(
+            [
+                sources.camera.gpu_handle(),
+                sources.environment.gpu_handle(),
+                sources.directional.gpu_handle(),
+            ],
+            cold.map(|token| Some(token.handle)),
+        );
+
+        sources.camera.set_gpu_handle(warm[1].handle);
+        assert_eq!(run(&mut storage, &mut resources), cold);
+        assert_eq!(sources.camera.gpu_handle(), Some(cold[0].handle));
+    }
+
+    #[test]
+    fn plan_boundaries_and_conflicting_live_demands_fail_closed() {
+        let key = GlobalStateKey::new(7, 8);
+        let other = GlobalStateKey::new(9, 10);
+        let arena = FrameArena::new();
+
+        // A standalone graph may omit a plan, but cannot materialize its live
+        // demand. Renderer-owned attempts reject that omission at projection.
+        let wgpu = gpu();
+        let sources = TestSources::new();
+        let mut resources = ResourceManager::new(wgpu.device.clone(), wgpu.queue.clone(), 1);
+        let mut storage = GraphStorage::new();
+        let mut graph = RenderGraph::new(&mut storage, &arena);
+        graph.add_pass("standalone global consumer", |builder| {
+            builder.demand_global_state(key);
+            builder.mark_side_effect();
+            (EmptyNode, ())
+        });
+        graph.compile_topology();
+        assert_eq!(
+            materialize(&mut graph, &sources, &wgpu, &mut resources),
+            Err(GlobalStateMaterializationFailure::Unavailable),
+        );
+        drop(graph);
+
+        let diagnostics = RdgDiagnosticsRecorder::default();
+        diagnostics.start_renderer_attempt(1);
+        let renderer_missing_plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut storage = GraphStorage::new();
+            let mut graph =
+                RenderGraph::from_started_renderer_attempt(&mut storage, &arena, &diagnostics);
+            graph.add_pass("renderer global consumer", |builder| {
+                builder.demand_global_state(key);
+                builder.mark_side_effect();
+                (EmptyNode, ())
+            });
+            graph.compile_topology();
+        }));
+        assert!(renderer_missing_plan.is_err());
+
+        let same_pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut storage = GraphStorage::new();
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            graph.add_pass("conflicting pass", |builder| {
+                builder.demand_global_state(key);
+                builder.demand_global_state(other);
+                (EmptyNode, ())
+            });
+        }));
+        assert!(same_pass.is_err());
+
+        let live_graph = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut storage = GraphStorage::new();
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            for demanded in [key, other] {
+                graph.add_pass("conflicting live pass", |builder| {
+                    builder.demand_global_state(demanded);
+                    builder.mark_side_effect();
+                    (EmptyNode, ())
+                });
+            }
+            graph.compile_topology();
+        }));
+        assert!(live_graph.is_err());
+    }
+}

@@ -1182,4 +1182,431 @@ impl<'a> PassNode<'a> for SsgiMergeNode<'a> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::graph::core::graph::FrameConfig;
+    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph};
+    use myth_resources::ssgi::SsgiSettings;
+    use myth_scene::camera::Camera;
+
+    const CUSTOM_RUNTIME_BIT: u32 = 1 << 7;
+
+    fn camera() -> RenderCamera {
+        let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
+        let mut render_camera = camera.extract_render_camera();
+        render_camera.camera_id = 7;
+        render_camera.camera_cut = 0;
+        render_camera
+    }
+
+    fn extract(
+        feature: &mut SsgiFeature,
+        histories: &mut HistoryRegistry,
+        settings: &SsgiSettings,
+        camera: &RenderCamera,
+        serial: u64,
+        size: (u32, u32),
+    ) -> SsgiSnapshot {
+        feature.extract(
+            histories,
+            1,
+            camera,
+            serial,
+            serial,
+            &settings.uniforms,
+            size,
+            serial as u32,
+            None,
+            GlobalStateKey::new(1, 1),
+        )
+    }
+
+    fn commit_histories(histories: &mut HistoryRegistry, snapshot: SsgiSnapshot) {
+        assert!(histories.commit(
+            snapshot.indirect_history.commit,
+            &snapshot.indirect_history.next.map(|texture| texture.id),
+        ));
+        assert!(histories.commit(
+            snapshot.source_history.commit,
+            &snapshot.source_history.next.map(|texture| texture.id),
+        ));
+    }
+
+    #[test]
+    fn snapshot_preserves_scene_uniforms_and_encodes_runtime_validity() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let mut settings = SsgiSettings::default();
+        settings.set_history_flags(CUSTOM_RUNTIME_BIT);
+        let camera = camera();
+        let before = *settings.uniforms.read();
+
+        let first = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1920, 1080),
+        );
+        assert!(!first.indirect_history.valid);
+        assert!(!first.source_history.valid);
+        assert_eq!(first.uniforms.frame_params.w, CUSTOM_RUNTIME_BIT);
+        assert_eq!(
+            bytemuck::bytes_of(&*settings.uniforms.read()),
+            bytemuck::bytes_of(&before),
+        );
+
+        commit_histories(&mut histories, first);
+        let second = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            2,
+            (1920, 1080),
+        );
+        assert!(second.indirect_history.valid);
+        assert!(second.source_history.valid);
+        assert_eq!(
+            second.uniforms.frame_params.w,
+            CUSTOM_RUNTIME_BIT | HISTORY_FLAG_INDIRECT_VALID | HISTORY_FLAG_SOURCE_VALID,
+        );
+        assert_eq!(
+            bytemuck::bytes_of(&*settings.uniforms.read()),
+            bytemuck::bytes_of(&before),
+        );
+    }
+
+    #[test]
+    fn taa_source_requires_committed_ssgi_source_history() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let camera = camera();
+        let taa_set = histories.create_set();
+        let taa_plan = histories.plan_set(
+            taa_set,
+            [TextureDesc::new_2d(
+                1280,
+                720,
+                HDR_TEXTURE_FORMAT,
+                wgpu::TextureUsages::TEXTURE_BINDING,
+            )],
+            1,
+            false,
+        );
+        let taa_previous = taa_plan.previous[0];
+
+        let first = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            1,
+            1,
+            &settings.uniforms,
+            (1280, 720),
+            1,
+            Some(taa_previous),
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(first.taa_history.is_none());
+        assert!(histories.commit(
+            first.source_history.commit,
+            &first.source_history.next.map(|texture| texture.id),
+        ));
+
+        let second = feature.extract(
+            &mut histories,
+            1,
+            &camera,
+            2,
+            2,
+            &settings.uniforms,
+            (1280, 720),
+            2,
+            Some(taa_previous),
+            GlobalStateKey::new(1, 1),
+        );
+        assert!(!second.indirect_history.valid);
+        assert!(second.source_history.valid);
+        assert_eq!(second.taa_history, Some(taa_previous));
+    }
+
+    #[test]
+    fn both_histories_reset_for_full_extent_cut_and_expired_domain() {
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let settings = SsgiSettings::default();
+        let mut camera = camera();
+
+        let first = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            1,
+            (1280, 720),
+        );
+        commit_histories(&mut histories, first);
+
+        let resized = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            2,
+            (1280, 721),
+        );
+        assert_eq!(first.half_resolution, resized.half_resolution);
+        assert!(!resized.indirect_history.valid);
+        assert!(!resized.source_history.valid);
+        commit_histories(&mut histories, resized);
+
+        camera.camera_cut = 1;
+        let cut = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            3,
+            (1280, 721),
+        );
+        assert!(!cut.indirect_history.valid);
+        assert!(!cut.source_history.valid);
+        assert_ne!(cut.uniforms.frame_params.w & HISTORY_FLAG_CAMERA_CUT, 0);
+
+        camera.camera_cut = 0;
+        let expired = extract(
+            &mut feature,
+            &mut histories,
+            &settings,
+            &camera,
+            TEMPORAL_DOMAIN_TTL_FRAMES + 4,
+            (1280, 721),
+        );
+        assert!(!expired.indirect_history.valid);
+        assert!(!expired.source_history.valid);
+        assert_ne!(
+            expired.indirect_history.commit.set_id,
+            cut.indirect_history.commit.set_id,
+        );
+        assert_ne!(
+            expired.source_history.commit.set_id,
+            cut.source_history.commit.set_id,
+        );
+        assert_eq!(
+            feature.garbage_collect(&mut histories, TEMPORAL_DOMAIN_TTL_FRAMES + 7, 2),
+            1,
+        );
+    }
+
+    struct TestRootNode;
+
+    impl<'a> PassNode<'a> for TestRootNode {
+        fn execute(&self, _ctx: &ExecuteContext, _encoder: &mut wgpu::CommandEncoder) {}
+    }
+
+    fn add_test_root(graph: &mut RenderGraph<'_>, source: TextureNodeId) {
+        let output = graph.register_texture(
+            "SSGI_Test_Root_Output",
+            TextureDesc::new_2d(
+                1280,
+                720,
+                HDR_TEXTURE_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            ),
+            true,
+        );
+        graph.add_pass("SSGI_Test_Root", |builder| {
+            builder.read_texture(source);
+            builder.write_texture(output);
+            (TestRootNode, ())
+        });
+    }
+
+    #[test]
+    fn root_demand_selects_exact_chain_and_commits_only_live_history_sets() {
+        #[derive(Clone, Copy)]
+        enum RootDemand {
+            Raw,
+            Clean,
+            Merged,
+        }
+
+        let cases = [
+            (
+                "raw",
+                RootDemand::Raw,
+                &["SSGI_Raw", "SSGI_Test_Root"][..],
+                (false, false),
+            ),
+            (
+                "clean",
+                RootDemand::Clean,
+                &[
+                    "SSGI_Raw",
+                    "SSGI_Temporal",
+                    "SSGI_ATrous_Step_1",
+                    "SSGI_ATrous_Step_2",
+                    "SSGI_ATrous_Step_4",
+                    "SSGI_Test_Root",
+                ][..],
+                (true, false),
+            ),
+            (
+                "merged",
+                RootDemand::Merged,
+                &[
+                    "SSGI_Raw",
+                    "SSGI_Temporal",
+                    "SSGI_ATrous_Step_1",
+                    "SSGI_ATrous_Step_2",
+                    "SSGI_ATrous_Step_4",
+                    "SSGI_Merge",
+                    "SSGI_Test_Root",
+                ][..],
+                (true, true),
+            ),
+        ];
+
+        for (name, demand, expected_live, expected_validity) in cases {
+            let mut feature = SsgiFeature::new();
+            let mut histories = HistoryRegistry::new();
+            let settings = SsgiSettings::default();
+            let snapshot = extract(
+                &mut feature,
+                &mut histories,
+                &settings,
+                &camera(),
+                1,
+                (1280, 720),
+            );
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = RenderGraph::new(&mut storage, &arena);
+            let sampled = wgpu::TextureUsages::TEXTURE_BINDING;
+            let color = graph.register_texture(
+                "SSGI_Test_Color",
+                TextureDesc::new_2d(1280, 720, HDR_TEXTURE_FORMAT, sampled),
+                true,
+            );
+            let depth = graph.register_texture(
+                "SSGI_Test_Depth",
+                TextureDesc::new_2d(1280, 720, wgpu::TextureFormat::Depth32Float, sampled),
+                true,
+            );
+            let hiz = graph.register_texture(
+                "SSGI_Test_HiZ",
+                TextureDesc::new_2d(1280, 720, wgpu::TextureFormat::R32Float, sampled),
+                true,
+            );
+            let data = graph.register_texture(
+                "SSGI_Test_Data",
+                TextureDesc::new_2d(1280, 720, SSGI_TEXTURE_FORMAT, sampled),
+                true,
+            );
+            let config = FrameConfig {
+                width: 1280,
+                height: 720,
+                depth_format: wgpu::TextureFormat::Depth32Float,
+                msaa_samples: 1,
+                surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                hdr_format: HDR_TEXTURE_FORMAT,
+            };
+            let mut ctx = GraphBuilderContext::new(&mut graph, &config, 0);
+            let outputs = feature.add_to_graph(
+                &mut ctx, snapshot, color, depth, hiz, data, data, data, None,
+            );
+            let root = match demand {
+                RootDemand::Raw => outputs.raw_indirect,
+                RootDemand::Clean => outputs.clean_indirect,
+                RootDemand::Merged => outputs.merged_color,
+            };
+            add_test_root(&mut graph, root);
+
+            graph.compile_topology();
+            let live: Vec<_> = graph
+                .storage
+                .execution_queue
+                .iter()
+                .map(|&pass_index| graph.storage.passes[pass_index].name)
+                .collect();
+            assert_eq!(live, expected_live, "{name} root live chain");
+
+            graph.commit_submitted_histories(&mut histories);
+            let indirect = histories.plan_set(
+                snapshot.indirect_history.commit.set_id,
+                snapshot.indirect_history.next.map(|texture| texture.desc),
+                2,
+                false,
+            );
+            let source = histories.plan_set(
+                snapshot.source_history.commit.set_id,
+                snapshot.source_history.next.map(|texture| texture.desc),
+                2,
+                false,
+            );
+            assert_eq!(
+                (indirect.valid, source.valid),
+                expected_validity,
+                "{name} root history publication",
+            );
+
+            graph.finish();
+            assert!(feature.raw.pipelines.is_empty());
+            assert!(feature.raw.layout.is_none());
+            assert!(feature.temporal.pipeline_id.is_none());
+            assert!(feature.temporal.layout.is_none());
+            assert!(
+                feature
+                    .atrous
+                    .iter()
+                    .all(|stage| stage.pipeline_id.is_none() && stage.layout.is_none())
+            );
+            assert!(feature.merge.pipeline_id.is_none());
+            assert!(feature.merge.layout.is_none());
+        }
+
+        let mut feature = SsgiFeature::new();
+        let mut histories = HistoryRegistry::new();
+        let mut settings = SsgiSettings::default();
+        settings.set_checkerboard_enabled(true);
+        let mut camera_a = camera();
+        camera_a.camera_id = 71;
+        let mut camera_b = camera();
+        camera_b.camera_id = 72;
+
+        let mut previous = [None, None];
+        let mut sampled_phases = [0_u32; 2];
+        for serial in 1..=4 {
+            for (index, camera) in [&camera_a, &camera_b].into_iter().enumerate() {
+                let scene_id = index as u32 + 1;
+                let global_frame = 100 + serial * 2 + index as u64;
+                let snapshot = feature.extract(
+                    &mut histories,
+                    scene_id,
+                    camera,
+                    serial,
+                    global_frame,
+                    &settings.uniforms,
+                    (1280, 720),
+                    global_frame as u32,
+                    None,
+                    GlobalStateKey::new(1, scene_id),
+                );
+                assert_eq!(snapshot.uniforms.frame_params.x, serial as u32);
+                sampled_phases[index] |= 1 << (snapshot.uniforms.frame_params.x & 3);
+                assert_eq!(snapshot.indirect_history.valid, serial > 1);
+                assert_eq!(snapshot.source_history.valid, serial > 1);
+                if let Some(previous) = previous[index] {
+                    assert_eq!(snapshot.indirect_history.previous[0].id, previous);
+                }
+                previous[index] = Some(snapshot.indirect_history.next[0].id);
+                commit_histories(&mut histories, snapshot);
+            }
+            assert_ne!(previous[0], previous[1]);
+        }
+        assert_eq!(sampled_phases, [0b1111, 0b1111]);
+    }
+}

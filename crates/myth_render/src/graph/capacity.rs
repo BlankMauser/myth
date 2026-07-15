@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_hysteresis_keeps_twice_the_window_peak() {
+    fn automatic_hysteresis_tracks_peak_and_restarts_after_growth() {
         let mut governor = CapacityGovernor::<1>::new(test_policy());
         governor.observe([usage(20, 400, 50)]);
         governor.observe([usage(30, 400, 50)]);
@@ -566,91 +566,7 @@ mod tests {
         assert_eq!(pending.target_bytes, 60);
         assert_eq!(pending.recoverable_bytes, 340);
         assert!(!pending.explicit);
-    }
 
-    #[test]
-    fn chooses_only_the_largest_recoverable_family() {
-        let mut governor = CapacityGovernor::<3>::new(test_policy());
-        for _ in 0..3 {
-            governor.observe([usage(10, 300, 50), usage(10, 700, 50), usage(10, 500, 50)]);
-        }
-        let pending = governor.pending_target().unwrap();
-        assert_eq!(pending.family, 1);
-        assert_eq!(pending.recoverable_bytes, 650);
-    }
-
-    #[test]
-    fn consuming_a_target_enforces_global_cooldown() {
-        let mut governor = CapacityGovernor::<2>::new(test_policy());
-        for _ in 0..3 {
-            governor.observe([usage(10, 500, 50), usage(10, 400, 50)]);
-        }
-        assert_eq!(governor.take_pending_target().unwrap().family, 0);
-        governor.observe([usage(10, 100, 50), usage(10, 400, 50)]);
-        assert_eq!(governor.pending_target(), None);
-        governor.observe([usage(10, 100, 50), usage(10, 400, 50)]);
-        assert_eq!(
-            governor.pending_target(),
-            Some(PendingCapacityTrim {
-                family: 1,
-                target_bytes: 50,
-                retained_bytes: 400,
-                recoverable_bytes: 350,
-                explicit: false,
-            })
-        );
-    }
-
-    #[test]
-    fn explicit_request_waits_through_cooldown_without_being_lost() {
-        let mut governor = CapacityGovernor::<1>::new(test_policy());
-        for _ in 0..3 {
-            governor.observe([usage(10, 500, 50)]);
-        }
-        assert!(governor.take_pending_target().is_some());
-
-        governor.request_trim();
-        governor.resolve_requested_trim([usage(10, 500, 50)]);
-        assert_eq!(governor.pending_target(), None);
-        assert!(governor.stats().explicit_request_queued);
-
-        governor.observe([usage(10, 500, 50)]);
-        assert_eq!(governor.pending_target(), None);
-        governor.observe([usage(10, 500, 50)]);
-
-        let pending = governor.pending_target().unwrap();
-        assert!(pending.explicit);
-        assert!(!governor.stats().explicit_request_queued);
-    }
-
-    #[test]
-    fn explicit_request_bypasses_cold_gate_but_keeps_recent_headroom() {
-        let mut governor = CapacityGovernor::<1>::new(test_policy());
-        governor.observe([usage(180, 400, 20)]);
-        governor.request_trim();
-        governor.observe([usage(120, 400, 20)]);
-
-        let pending = governor.pending_target().unwrap();
-        assert!(pending.explicit);
-        assert_eq!(pending.target_bytes, 360);
-        assert_eq!(pending.recoverable_bytes, 40);
-    }
-
-    #[test]
-    fn explicit_request_can_resolve_at_a_safe_boundary_without_a_fake_attempt() {
-        let mut governor = CapacityGovernor::<1>::new(test_policy());
-        governor.observe([usage(80, 400, 20)]);
-        governor.request_trim();
-        governor.resolve_requested_trim([usage(40, 400, 20)]);
-
-        let pending = governor.pending_target().unwrap();
-        assert!(pending.explicit);
-        assert_eq!(pending.target_bytes, 160);
-        assert_eq!(governor.stats().attempts, 1);
-    }
-
-    #[test]
-    fn dormant_family_serves_a_full_cold_window_after_first_growth() {
         let mut governor = CapacityGovernor::<1>::new(test_policy());
         for _ in 0..6 {
             governor.observe([usage(0, 0, 0)]);
@@ -662,10 +578,7 @@ mod tests {
 
         governor.observe([usage(10, 400, 50)]);
         assert!(governor.pending_target().is_some());
-    }
 
-    #[test]
-    fn retained_growth_restarts_an_existing_cold_window() {
         let mut governor = CapacityGovernor::<1>::new(test_policy());
         governor.observe([usage(10, 400, 50)]);
         governor.observe([usage(10, 400, 50)]);
@@ -679,18 +592,61 @@ mod tests {
     }
 
     #[test]
-    fn explicit_headroom_has_no_tumbling_window_cliff() {
-        let mut governor = CapacityGovernor::<1>::new(test_policy());
+    fn family_selection_and_consumption_enforce_global_cooldown() {
+        let mut governor = CapacityGovernor::<3>::new(test_policy());
         for _ in 0..3 {
-            governor.observe([usage(180, 400, 20)]);
+            governor.observe([usage(10, 300, 50), usage(10, 700, 50), usage(10, 500, 50)]);
+        }
+        let pending = governor.take_pending_target().unwrap();
+        assert_eq!(pending.family, 1);
+        assert_eq!(pending.recoverable_bytes, 650);
+
+        governor.observe([usage(10, 300, 50), usage(10, 100, 50), usage(10, 500, 50)]);
+        assert_eq!(governor.pending_target(), None);
+        governor.observe([usage(10, 300, 50), usage(10, 100, 50), usage(10, 500, 50)]);
+        assert_eq!(governor.pending_target().unwrap().family, 2);
+    }
+
+    #[test]
+    fn explicit_requests_survive_cooldown_and_use_recent_headroom() {
+        let mut cooling = CapacityGovernor::<1>::new(test_policy());
+        for _ in 0..3 {
+            cooling.observe([usage(10, 500, 50)]);
+        }
+        assert!(cooling.take_pending_target().is_some());
+        cooling.request_trim();
+        cooling.resolve_requested_trim([usage(10, 500, 50)]);
+        assert_eq!(cooling.pending_target(), None);
+        assert!(cooling.stats().explicit_request_queued);
+        cooling.observe([usage(10, 500, 50)]);
+        assert_eq!(cooling.pending_target(), None);
+        cooling.observe([usage(10, 500, 50)]);
+        assert!(cooling.pending_target().unwrap().explicit);
+        assert!(!cooling.stats().explicit_request_queued);
+
+        for active_after_request in [120, 20] {
+            let mut governor = CapacityGovernor::<1>::new(test_policy());
+            for _ in 0..3 {
+                governor.observe([usage(180, 400, 20)]);
+            }
+            governor.request_trim();
+            governor.observe([usage(active_after_request, 400, 20)]);
+
+            let pending = governor.pending_target().unwrap();
+            assert!(pending.explicit);
+            assert_eq!(pending.target_bytes, 360);
+            assert_eq!(pending.recoverable_bytes, 40);
         }
 
-        governor.request_trim();
-        governor.observe([usage(20, 400, 20)]);
+        let mut safe_boundary = CapacityGovernor::<1>::new(test_policy());
+        safe_boundary.observe([usage(80, 400, 20)]);
+        safe_boundary.request_trim();
+        safe_boundary.resolve_requested_trim([usage(40, 400, 20)]);
 
-        let pending = governor.pending_target().unwrap();
+        let pending = safe_boundary.pending_target().unwrap();
         assert!(pending.explicit);
-        assert_eq!(pending.target_bytes, 360);
+        assert_eq!(pending.target_bytes, 160);
+        assert_eq!(safe_boundary.stats().attempts, 1);
     }
 
     #[test]

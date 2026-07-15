@@ -2119,7 +2119,7 @@ mod shadow_metadata_tests {
     }
 
     #[test]
-    fn stable_no_shadow_layers_leave_both_light_buffer_stamps_unchanged() {
+    fn empty_shadow_metadata_is_a_noop_after_current_light_payload_synchronization() {
         let mut scene = ExtractedScene::new();
         scene.prepare_gpu_scene_inputs(0.0);
         let local_before = scene.local_light_storage_buffer.stamp();
@@ -2132,11 +2132,10 @@ mod shadow_metadata_tests {
             scene.directional_light_storage_buffer.stamp(),
             directional_before
         );
-    }
 
-    #[test]
-    fn shadow_to_no_shadow_transition_clears_stale_fields_before_early_return() {
-        let mut scene = ExtractedScene::new();
+        // On a shadow-to-no-shadow transition extraction first synchronizes
+        // the current light payload. The empty metadata update must preserve
+        // that synchronized stamp and must not resurrect stale shadow fields.
         seed_prior_shadow_metadata(&scene.local_light_storage_buffer);
         seed_prior_shadow_metadata(&scene.directional_light_storage_buffer);
         let stale_local = scene.local_light_storage_buffer.stamp();
@@ -2205,10 +2204,39 @@ mod draw_plan_tests {
     }
 
     #[test]
-    fn prepared_source_join_is_paid_once_and_retains_stable_identities() {
+    fn plan_ids_are_deduplicated_and_attempt_scoped() {
+        let mut store = DrawPlanStore::new();
+        let plan = store.reserve_plan(DrawPlanKey::Opaque);
+        assert_eq!(store.reserve_plan(DrawPlanKey::Opaque), plan);
+        store.mark_live(plan);
+        let start = store.begin_finalize(plan);
+        store.finish_finalize(plan, start);
+        assert!(store.resolve_plan(plan).is_some());
+
+        store.clear();
+        assert!(store.resolve_plan(plan).is_none());
+        assert!(!store.validate_reserved(plan));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn prepared_source_join_is_lazy_generation_scoped_and_trimmable() {
         let frame_source = FrameSourceId::from_index(37);
         let extracted_source = ExtractedSourceId::from_index(17);
         let mut prepared = PreparedDrawStore::new();
+
+        let retained_before = prepared.capacity_usage().retained_bytes;
+        let indices_len_before = prepared.source_join_indices.len();
+        let stamps_len_before = prepared.source_join_stamps.len();
+        prepared.begin_sources(0, 4096);
+        assert_eq!(prepared.source_domain_len, 0);
+        assert_eq!(prepared.source_join_indices.len(), indices_len_before);
+        assert_eq!(prepared.source_join_stamps.len(), stamps_len_before);
+        assert_eq!(prepared.capacity_usage().active_bytes, 0);
+        assert_eq!(prepared.capacity_usage().retained_bytes, retained_before);
+        assert_eq!(prepared.prepared_source_id(frame_source), None);
+        prepared.clear();
+
         prepared.begin_sources(1, frame_source.index() + 1);
         let prepared_source = prepared.insert_source(PreparedDrawSource {
             frame_source,
@@ -2269,32 +2297,7 @@ mod draw_plan_tests {
             prepared.source_join_stamps.iter().all(|&stamp| stamp == 0),
             "generation wrap must erase ancient prepared-source stamps once"
         );
-    }
 
-    #[test]
-    fn all_dead_prepared_source_attempt_does_not_materialize_frame_domain() {
-        let mut prepared = PreparedDrawStore::new();
-        let retained_before = prepared.capacity_usage().retained_bytes;
-        let indices_len_before = prepared.source_join_indices.len();
-        let stamps_len_before = prepared.source_join_stamps.len();
-
-        prepared.begin_sources(0, 4096);
-        assert!(prepared.sources_initialized);
-        assert_eq!(prepared.source_domain_len, 0);
-        assert_eq!(prepared.source_join_indices.len(), indices_len_before);
-        assert_eq!(prepared.source_join_stamps.len(), stamps_len_before);
-        assert_eq!(prepared.capacity_usage().active_bytes, 0);
-        assert_eq!(prepared.capacity_usage().retained_bytes, retained_before);
-        assert_eq!(
-            prepared.prepared_source_id(FrameSourceId::from_index(0)),
-            None
-        );
-        prepared.clear();
-    }
-
-    #[test]
-    fn prepared_source_dense_join_is_inactive_after_clear_and_trimmable() {
-        let mut prepared = PreparedDrawStore::new();
         prepared.begin_sources(1, 4096);
         assert!(prepared.capacity_usage().active_bytes > 0);
         prepared.clear();
@@ -2310,7 +2313,7 @@ mod draw_plan_tests {
     }
 
     #[test]
-    fn frame_source_interner_is_dense_deduplicated_and_resettable() {
+    fn frame_source_interner_is_dense_generation_scoped_and_resettable() {
         let mut lists = RenderLists::new();
         let extracted_9 = ExtractedSourceId::from_index(9);
         let extracted_3 = ExtractedSourceId::from_index(3);
@@ -2343,11 +2346,9 @@ mod draw_plan_tests {
         let reinterned = lists.intern_frame_source(extracted_9);
         assert_eq!(reinterned, FrameSourceId::from_index(0));
         assert_eq!(lists.extracted_source(reinterned), Some(extracted_9));
-    }
 
-    #[test]
-    fn frame_source_generation_wrap_clears_ancient_stamps_once() {
-        let mut lists = RenderLists::new();
+        // A generation wrap is the one cold-path full clear. Ancient stamps
+        // must not alias the first generation after wrapping.
         let extracted = ExtractedSourceId::from_index(7);
         lists.frame_source_indices.resize(8, 0);
         lists.frame_source_stamps.resize(8, 1);
@@ -2365,21 +2366,7 @@ mod draw_plan_tests {
     }
 
     #[test]
-    fn clearing_store_invalidates_attempt_scoped_plan_ids() {
-        let mut store = DrawPlanStore::new();
-        let plan = store.reserve_plan(DrawPlanKey::Opaque);
-        store.mark_live(plan);
-        let start = store.begin_finalize(plan);
-        store.finish_finalize(plan, start);
-
-        assert!(store.resolve_plan(plan).is_some());
-        store.clear();
-        assert!(store.resolve_plan(plan).is_none());
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn rigid_draw_plan_attempts_do_not_materialize_morph_history_storage() {
+    fn morph_history_storage_is_cold_until_needed_and_generation_deduplicated() {
         let mut store = DrawPlanStore::new();
         assert!(store.emitted_morph_history_sources().is_empty());
         assert_eq!(store.morph_history_sources.capacity(), 0);
@@ -2394,13 +2381,7 @@ mod draw_plan_tests {
         assert!(store.emitted_morph_history_sources().is_empty());
         assert_eq!(store.morph_history_sources.capacity(), 0);
         assert_eq!(store.morph_history_source_stamps.capacity(), 0);
-        store.clear();
-        assert_eq!(store.morph_history_active_domain_len, 0);
-    }
 
-    #[test]
-    fn emitted_morph_history_sources_are_retained_and_generation_deduplicated() {
-        let mut store = DrawPlanStore::new();
         let source_37 = FrameSourceId::from_index(37);
         let source_5 = FrameSourceId::from_index(5);
 
@@ -2431,79 +2412,7 @@ mod draw_plan_tests {
                 .all(|&stamp| stamp == 0),
             "generation wrap must erase ancient morph-history stamps once"
         );
-    }
-
-    #[test]
-    fn reservations_are_keyed_and_demanded_empty_plans_finalize() {
-        let mut store = DrawPlanStore::new();
-        let opaque = store.reserve_plan(DrawPlanKey::Opaque);
-        let repeated = store.reserve_plan(DrawPlanKey::Opaque);
-        let transparent = store.reserve_plan(DrawPlanKey::Transparent);
-
-        assert_eq!(opaque, repeated);
-        assert_ne!(opaque, transparent);
-        assert!(!store.is_live(opaque));
-        assert!(store.resolve_plan(opaque).is_none());
-
-        store.mark_live(opaque);
-        let start = store.begin_finalize(opaque);
-        store.finish_finalize(opaque, start);
-
-        assert!(store.is_live(opaque));
-        assert!(
-            store
-                .resolve_plan(opaque)
-                .is_some_and(<[DrawCommand]>::is_empty)
-        );
-        assert!(store.resolve_plan(transparent).is_none());
-        assert_eq!(
-            store.plan_meta(0),
-            Some(DrawPlanMeta {
-                id: opaque,
-                key: DrawPlanKey::Opaque,
-                is_live: true,
-                is_finalized: true,
-            })
-        );
-    }
-
-    #[test]
-    fn non_empty_plans_finalize_and_sort_out_of_reservation_order() {
-        let mut store = DrawPlanStore::new();
-        let first = store.reserve_plan(DrawPlanKey::Opaque);
-        let second = store.reserve_plan(DrawPlanKey::Transparent);
-        store.mark_live(first);
-        store.mark_live(second);
-
-        let second_start = store.begin_finalize(second);
-        store.push_command(test_command(30), &[]);
-        store.push_command(test_command(10), &[]);
-        store.sort_commands_from(second_start);
-        store.finish_finalize(second, second_start);
-        let first_start = store.begin_finalize(first);
-        store.push_command(test_command(20), &[]);
-        store.sort_commands_from(first_start);
-        store.finish_finalize(first, first_start);
-
-        assert_eq!(
-            store
-                .resolve_plan(first)
-                .unwrap()
-                .iter()
-                .map(|command| command.sort_key)
-                .collect::<Vec<_>>(),
-            vec![20]
-        );
-        assert_eq!(
-            store
-                .resolve_plan(second)
-                .unwrap()
-                .iter()
-                .map(|command| command.sort_key)
-                .collect::<Vec<_>>(),
-            vec![10, 30]
-        );
-        assert_eq!(store.plan_count(), 2);
+        assert_eq!(store.morph_history_active_domain_len, 0);
     }
 
     #[test]
@@ -2554,13 +2463,16 @@ mod draw_plan_tests {
         let material_bind_group_slot = store.intern_bind_group(&material_bind_group, 303);
 
         let transparent = store.reserve_plan(DrawPlanKey::Transparent);
-        let _dead = store.reserve_plan(DrawPlanKey::Shadow {
+        assert_eq!(store.reserve_plan(DrawPlanKey::Transparent), transparent);
+        let dead = store.reserve_plan(DrawPlanKey::Shadow {
             light_id: 9,
             layer_index: 2,
         });
         let opaque = store.reserve_plan(DrawPlanKey::Opaque);
         store.mark_live(transparent);
         store.mark_live(opaque);
+        assert_eq!(store.plan_count(), 3);
+        assert!(!store.is_live(dead));
 
         // Finalize out of reservation order. The observation remains keyed by
         // canonical plan order, and a finalized empty stream remains visible.
@@ -2607,6 +2519,21 @@ mod draw_plan_tests {
 
         assert_eq!(store.buffer_owner_count(), 2);
         assert_eq!(store.bind_group_owner_count(), 2);
+        assert!(
+            store
+                .resolve_plan(opaque)
+                .is_some_and(<[DrawCommand]>::is_empty)
+        );
+        assert!(store.resolve_plan(dead).is_none());
+        assert_eq!(
+            store.plan_meta(2),
+            Some(DrawPlanMeta {
+                id: opaque,
+                key: DrawPlanKey::Opaque,
+                is_live: true,
+                is_finalized: true,
+            })
+        );
         assert_eq!(
             store.observe_live_streams(),
             vec![
@@ -2656,7 +2583,7 @@ mod draw_plan_tests {
     }
 
     #[test]
-    fn live_prepass_and_exact_shadow_select_only_their_deduplicated_sources() {
+    fn live_plan_source_union_is_exact_and_deduplicated() {
         let mut lists = RenderLists::new();
         for extracted in 0..=5 {
             lists.intern_frame_source(ExtractedSourceId::from_index(extracted));

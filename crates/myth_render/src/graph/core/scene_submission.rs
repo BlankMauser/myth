@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_plan_has_no_stream_and_live_projection_is_exact() {
+    fn dead_live_and_finalized_empty_plans_obey_one_submission_state_machine() {
         let mut draw_plans = DrawPlanStore::new();
         let first_draw = draw_plans.reserve_plan(DrawPlanKey::Opaque);
         let second_draw = draw_plans.reserve_plan(DrawPlanKey::Transparent);
@@ -655,29 +655,29 @@ mod tests {
         );
         assert!(store.resolve_stream(dead, &draw_plans).is_none());
         assert!(store.resolve_stream(live, &draw_plans).is_none());
-    }
 
-    #[test]
-    fn finalized_empty_cpu_direct_plan_resolves_opaque_stream() {
-        let mut draw_plans = DrawPlanStore::new();
-        let draw_plan = finalized_direct(&mut draw_plans, None);
-        let mut store = SceneSubmissionStore::new();
-        let plan =
-            store.reserve_cpu_direct(&draw_plans, draw_plan, &SceneSubmissionDependencies::new());
-        store.mark_live(plan);
-
+        // A live backend becomes resolvable even when finalization produced an
+        // empty direct command slice; deadness and emptiness are independent.
+        draw_plans.mark_live(second_draw);
+        let start = draw_plans.begin_finalize(second_draw);
+        draw_plans.finish_finalize(second_draw, start);
         let stream = store
-            .resolve_stream(plan, &draw_plans)
+            .resolve_stream(live, &draw_plans)
             .expect("live empty direct plan must still be finalized");
         assert!(store.validate_stream(stream));
-        assert_eq!(store.cpu_direct_stream(stream), Some(draw_plan));
+        assert_eq!(store.cpu_direct_stream(stream), Some(second_draw));
+        assert!(draw_plans.resolve_plan(second_draw).unwrap().is_empty());
 
         // Re-reservation is idempotent and does not duplicate the record.
         assert_eq!(
-            store.reserve_cpu_direct(&draw_plans, draw_plan, &SceneSubmissionDependencies::new(),),
-            plan
+            store.reserve_cpu_direct(
+                &draw_plans,
+                second_draw,
+                &SceneSubmissionDependencies::new(),
+            ),
+            live
         );
-        assert_eq!(store.plan_count(), 1);
-        assert_eq!(store.reserved_index(plan), Some(0));
+        assert_eq!(store.plan_count(), 2);
+        assert_eq!(store.reserved_index(live), Some(1));
     }
 }

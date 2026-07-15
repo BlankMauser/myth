@@ -1084,22 +1084,16 @@ mod tests {
     }
 
     #[test]
-    fn infinite_camera_far_resolves_to_finite_cluster_depth() {
+    fn upload_depth_derivation_is_finite_and_preserves_topology_fields() {
         let far = resolve_cluster_far_depth(0.1, f32::INFINITY, Some(48.0));
         assert!(far.is_finite());
         assert!(far > 48.0);
-    }
 
-    #[test]
-    fn infinite_camera_far_uses_fallback_when_scene_depth_missing() {
         let near = 0.25;
         let far = resolve_cluster_far_depth(near, f32::INFINITY, None);
         assert!(far.is_finite());
         assert!(far >= near + DEFAULT_CLUSTER_FAR_DEPTH_FALLBACK);
-    }
 
-    #[test]
-    fn upload_derivation_resolves_depth_without_changing_topology_fields() {
         let snapshot = snapshot(true, 3);
 
         let resolved = resolve_cluster_params_for_upload(
@@ -1185,13 +1179,9 @@ mod tests {
     }
 
     #[test]
-    fn final_lights_only_culls_cluster_suffix() {
+    fn final_lights_keep_only_the_merge_for_both_cluster_modes() {
         let live = final_lights_live_passes(true);
         assert_eq!(live, ["Merge_Local_Lights", "Cluster_Test_Root"]);
-    }
-
-    #[test]
-    fn merge_stays_live_when_clustering_is_disabled() {
         assert_eq!(
             final_lights_live_passes(false),
             ["Merge_Local_Lights", "Cluster_Test_Root"]

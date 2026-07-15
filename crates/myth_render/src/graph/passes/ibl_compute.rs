@@ -986,64 +986,14 @@ mod tests {
     }
 
     #[test]
-    fn procedural_celestial_throttle_uses_only_matching_published_static_state() {
-        let mut registry = HistoryRegistry::new();
-        let mut feature = EnvironmentCacheFeature::new();
-        let initial = feature.extract(
-            &mut registry,
-            7,
-            &procedural_environment(256, 128, 100),
-            1,
-            101,
-            202,
-            Some(Vec3::Z),
-            Some(-Vec3::Z),
-            256,
-        );
-        let base_receipt = publish(&mut registry, initial.base_plan.unwrap());
-        feature.observe_publications(&[base_receipt]);
-
-        let near_sun = glam::Quat::from_rotation_y(0.25_f32.to_radians()) * Vec3::Z;
-        let throttled = feature.extract(
-            &mut registry,
-            7,
-            &procedural_environment(256, 128, 101),
-            2,
-            101,
-            202,
-            Some(near_sun),
-            Some(-Vec3::Z),
-            256,
-        );
-        assert_eq!(initial.base_key, throttled.base_key);
-        assert!(throttled.base_plan.unwrap().valid);
-
-        let mut changed_static = procedural_environment(256, 128, 102);
-        changed_static.procedural_physics_hash += 1;
-        let invalidated = feature.extract(
-            &mut registry,
-            7,
-            &changed_static,
-            3,
-            101,
-            202,
-            Some(near_sun),
-            Some(-Vec3::Z),
-            256,
-        );
-        assert_ne!(throttled.base_key, invalidated.base_key);
-        assert!(invalidated.base_plan.unwrap().commit.is_some());
-    }
-
-    #[test]
-    fn procedural_day_night_motion_throttles_both_sun_and_moon() {
+    fn procedural_throttle_uses_the_last_published_static_and_celestial_baseline() {
         let mut registry = HistoryRegistry::new();
         let mut feature = EnvironmentCacheFeature::new();
         let initial_sun = Vec3::Z;
         let initial_moon = -Vec3::Z;
         let initial = feature.extract(
             &mut registry,
-            8,
+            7,
             &procedural_environment(256, 128, 100),
             1,
             101,
@@ -1055,87 +1005,49 @@ mod tests {
         let base_receipt = publish(&mut registry, initial.base_plan.unwrap());
         feature.observe_publications(&[base_receipt]);
 
-        let first_small_step = glam::Quat::from_rotation_y(0.4_f32.to_radians());
+        let small_step = glam::Quat::from_rotation_y(0.4_f32.to_radians());
         let throttled = feature.extract(
             &mut registry,
-            8,
+            7,
             &procedural_environment(256, 128, 101),
             2,
             101,
             202,
-            Some(first_small_step * initial_sun),
-            Some(first_small_step * initial_moon),
+            Some(small_step * initial_sun),
+            Some(small_step * initial_moon),
             256,
         );
         assert_eq!(initial.base_key, throttled.base_key);
         assert!(throttled.base_plan.unwrap().valid);
 
-        // Each incremental step is only 0.4 degrees, but the second state is
-        // 0.8 degrees from the last successfully published baseline. This
-        // catches an accidental rolling baseline that would never accumulate.
-        let second_small_step = glam::Quat::from_rotation_y(0.8_f32.to_radians());
+        // Two individually small motions must accumulate from the last
+        // publication instead of advancing a rolling, unsubmitted baseline.
+        let accumulated_step = glam::Quat::from_rotation_y(0.8_f32.to_radians());
         let invalidated = feature.extract(
             &mut registry,
-            8,
+            7,
             &procedural_environment(256, 128, 102),
             3,
             101,
             202,
-            Some(second_small_step * initial_sun),
-            Some(second_small_step * initial_moon),
+            Some(accumulated_step * initial_sun),
+            Some(accumulated_step * initial_moon),
             256,
         );
-        assert_ne!(throttled.base_key, invalidated.base_key);
-        assert!(invalidated.base_plan.unwrap().commit.is_some());
-    }
-
-    #[test]
-    fn culled_celestial_replacement_does_not_advance_the_published_baseline() {
-        let mut registry = HistoryRegistry::new();
-        let mut feature = EnvironmentCacheFeature::new();
-        let initial_sun = Vec3::Z;
-        let initial_moon = -Vec3::Z;
-        let initial = feature.extract(
-            &mut registry,
-            10,
-            &procedural_environment(256, 128, 100),
-            1,
-            101,
-            202,
-            Some(initial_sun),
-            Some(initial_moon),
-            256,
-        );
-        let base_receipt = publish(&mut registry, initial.base_plan.unwrap());
-        feature.observe_publications(&[base_receipt]);
-
-        let culled_step = glam::Quat::from_rotation_y(0.75_f32.to_radians());
-        let culled = feature.extract(
-            &mut registry,
-            10,
-            &procedural_environment(256, 128, 101),
-            2,
-            101,
-            202,
-            Some(culled_step * initial_sun),
-            Some(culled_step * initial_moon),
-            256,
-        );
-        let culled_token = culled
+        let invalidated_token = invalidated
             .base_plan
             .and_then(|plan| plan.commit)
-            .expect("over-threshold replacement needs a base token");
-        assert!(registry.rollback_cache(culled_token));
+            .expect("accumulated motion must schedule a replacement");
+        assert_ne!(initial.base_key, invalidated.base_key);
+        assert!(registry.rollback_cache(invalidated_token));
 
-        // This is only 0.25 degrees past the culled attempt, but a full degree
-        // from the last submitted publication. Without a receipt for the
-        // culled attempt, it must still schedule a replacement.
+        // A culled replacement must not become the next throttle baseline.
         let next_step = glam::Quat::from_rotation_y(1.0_f32.to_radians());
         let next = feature.extract(
             &mut registry,
-            10,
-            &procedural_environment(256, 128, 102),
-            3,
+            7,
+            &procedural_environment(256, 128, 103),
+            4,
             101,
             202,
             Some(next_step * initial_sun),
@@ -1143,44 +1055,31 @@ mod tests {
             256,
         );
         assert_ne!(initial.base_key, next.base_key);
-        assert!(next.base_plan.unwrap().commit.is_some());
-    }
+        let next_token = next
+            .base_plan
+            .and_then(|plan| plan.commit)
+            .expect("motion from the published baseline must still replace");
+        assert!(registry.rollback_cache(next_token));
 
-    #[test]
-    fn pending_source_keeps_still_valid_published_environment_textures() {
-        let mut registry = HistoryRegistry::new();
-        let mut feature = EnvironmentCacheFeature::new();
-        let ready = feature.extract(
+        let mut changed_static = procedural_environment(256, 128, 104);
+        changed_static.procedural_physics_hash += 1;
+        let static_replacement = feature.extract(
             &mut registry,
-            9,
-            &procedural_environment(256, 128, 100),
-            1,
+            7,
+            &changed_static,
+            5,
             101,
             202,
-            Some(Vec3::Y),
-            Some(-Vec3::Y),
+            Some(small_step * initial_sun),
+            Some(small_step * initial_moon),
             256,
         );
-        let receipts = [
-            publish(&mut registry, ready.base_plan.unwrap()),
-            publish(&mut registry, ready.pmrem_plan.unwrap()),
-        ];
-        feature.observe_publications(&receipts);
-
-        let mut pending = procedural_environment(256, 64, 200);
-        pending.source_type = CubeSourceType::Equirectangular;
-        pending.source_ready = false;
-        let fallback = feature.extract(&mut registry, 9, &pending, 2, 303, 202, None, None, 256);
-
-        assert!(fallback.base_plan.is_some_and(|plan| plan.valid));
-        assert!(fallback.pmrem_plan.is_some_and(|plan| plan.valid));
-        assert!(!fallback.needs_pmrem_write());
-        assert_eq!(fallback.base_texture(), ready.base_texture());
-        assert_eq!(fallback.pmrem_texture(), ready.pmrem_texture());
+        assert_ne!(initial.base_key, static_replacement.base_key);
+        assert!(static_replacement.base_plan.unwrap().commit.is_some());
     }
 
     #[test]
-    fn culled_replacement_does_not_erase_pending_fallback() {
+    fn pending_or_culled_replacement_keeps_the_last_published_textures() {
         let mut registry = HistoryRegistry::new();
         let mut feature = EnvironmentCacheFeature::new();
         let published = feature.extract(
@@ -1228,20 +1127,13 @@ mod tests {
             )
         );
 
-        let fallback = feature.extract(
-            &mut registry,
-            11,
-            &texture_environment(200, false),
-            3,
-            101,
-            202,
-            None,
-            None,
-            256,
-        );
+        let mut pending = procedural_environment(512, 64, 300);
+        pending.source_ready = false;
+        let fallback = feature.extract(&mut registry, 11, &pending, 3, 303, 404, None, None, 256);
         assert_eq!(fallback.base_texture(), published.base_texture());
         assert_eq!(fallback.pmrem_texture(), published.pmrem_texture());
         assert!(fallback.base_plan.is_some_and(|plan| plan.valid));
         assert!(fallback.pmrem_plan.is_some_and(|plan| plan.valid));
+        assert!(!fallback.needs_pmrem_write());
     }
 }

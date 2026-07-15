@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_shadow_graph_does_not_initialize_or_upload() {
+    fn shadow_demand_matrix_is_cold_and_keeps_only_the_required_branches() {
         let facts = build_graph(2, 6, RootDemand::None);
 
         assert!(facts.live_passes.is_empty());
@@ -782,10 +782,7 @@ mod tests {
                 .count(),
             1
         );
-    }
 
-    #[test]
-    fn d2_only_graph_has_one_upload_and_correct_descriptor() {
         let facts = build_graph(2, 0, RootDemand::D2);
 
         assert_eq!(
@@ -807,10 +804,7 @@ mod tests {
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             ))
         );
-    }
 
-    #[test]
-    fn cube_only_graph_has_one_upload_and_correct_descriptor() {
         let facts = build_graph(0, 6, RootDemand::Cube);
 
         assert_eq!(
@@ -832,10 +826,7 @@ mod tests {
                 .logical_size,
             6 * u64::from(TEST_STRIDE)
         );
-    }
 
-    #[test]
-    fn d2_and_cube_share_exactly_one_vp_upload() {
         let facts = build_graph(2, 6, RootDemand::Both);
 
         assert!(facts.live_passes.contains(&"Shadow_2D_Pass"));
@@ -861,10 +852,7 @@ mod tests {
                 .logical_size,
             8 * u64::from(TEST_STRIDE)
         );
-    }
 
-    #[test]
-    fn dpe_keeps_only_the_demanded_shadow_branch() {
         let d2 = build_graph(2, 6, RootDemand::D2);
         assert!(d2.live_passes.contains(&"Shadow_VP_Upload"));
         assert!(d2.live_passes.contains(&"Shadow_2D_Pass"));
@@ -932,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn matrix_packing_uses_aligned_slots_and_zeroes_padding() {
+    fn matrix_packing_uses_aligned_zeroed_slots() {
         let d2 = shadow_light(10, 0, 0, false, 11.0);
         let cube = shadow_light(20, 0, 0, true, 101.0);
 
@@ -958,10 +946,7 @@ mod tests {
                 .iter()
                 .all(|&byte| byte == 0)
         );
-    }
 
-    #[test]
-    fn uniform_alignment_rounds_up_to_the_next_slot() {
         assert_eq!(align_to(64, 1), 64);
         assert_eq!(align_to(64, 256), 256);
         assert_eq!(align_to(256, 256), 256);

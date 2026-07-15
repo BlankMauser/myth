@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn physics_mutation_rekeys_both_lut_plans() {
+    fn lut_plan_keys_track_physics_and_individual_shader_identity() {
         let mut registry = HistoryRegistry::new();
         let mut feature = AtmosphereFeature::new();
         let first = feature.plan_luts(&mut registry, &snapshot(1, 11), 1);
@@ -1305,34 +1305,16 @@ mod tests {
         let steady = feature.plan_luts(&mut registry, &snapshot(1, 11), 2);
         assert!(steady.transmittance_plan.valid);
         assert!(steady.multi_scatter_plan.valid);
-        let changed = feature.plan_luts(&mut registry, &snapshot(1, 12), 3);
-        assert!(!changed.transmittance_plan.valid);
-        assert!(!changed.multi_scatter_plan.valid);
-    }
 
-    #[test]
-    fn only_multi_shader_change_keeps_transmittance_valid() {
-        let mut registry = HistoryRegistry::new();
-        let mut feature = AtmosphereFeature::new();
-        let initial = feature.plan_luts(&mut registry, &snapshot(2, 7), 1);
-        registry
-            .commit_cache(
-                initial.transmittance_plan.commit.unwrap(),
-                &[initial.transmittance_plan.textures[0].id],
-            )
-            .unwrap();
-        registry
-            .commit_cache(
-                initial.multi_scatter_plan.commit.unwrap(),
-                &[initial.multi_scatter_plan.textures[0].id],
-            )
-            .unwrap();
-
-        let mut changed = snapshot(2, 7);
-        changed.multi_scatter_shader_identity += 1;
-        let next = feature.plan_luts(&mut registry, &changed, 2);
+        let mut multi_changed = snapshot(1, 11);
+        multi_changed.multi_scatter_shader_identity += 1;
+        let next = feature.plan_luts(&mut registry, &multi_changed, 3);
         assert!(next.transmittance_plan.valid);
         assert!(!next.multi_scatter_plan.valid);
+
+        let changed = feature.plan_luts(&mut registry, &snapshot(1, 12), 4);
+        assert!(!changed.transmittance_plan.valid);
+        assert!(!changed.multi_scatter_plan.valid);
     }
 
     #[test]
@@ -1347,22 +1329,16 @@ mod tests {
     }
 
     #[test]
-    fn cache_commit_registration_does_not_keep_dead_luts_alive() {
+    fn graph_demand_matrix_keeps_only_the_required_lut_writers_live() {
         assert!(live_passes(TestRoot::None).is_empty());
-    }
 
-    #[test]
-    fn transmittance_only_demand_does_not_publish_multi_scatter() {
         let live = live_passes(TestRoot::Transmittance);
         assert!(live.contains(&"Atmosphere_Params_Upload"));
         assert!(live.contains(&"Atmosphere_Transmittance"));
         assert!(!live.contains(&"Atmosphere_MultiScatter"));
         assert!(!live.contains(&"Atmosphere_SkyView"));
         assert!(!live.contains(&"Atmosphere_Bake_Params_Upload"));
-    }
 
-    #[test]
-    fn sky_view_demand_keeps_both_lut_writers_live() {
         let live = live_passes(TestRoot::SkyView);
         assert!(live.contains(&"Atmosphere_Params_Upload"));
         assert!(live.contains(&"Atmosphere_Transmittance"));

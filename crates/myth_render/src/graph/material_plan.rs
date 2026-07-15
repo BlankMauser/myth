@@ -1915,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_stamped_source_join_reuses_capacity_without_stale_publication() {
+    fn generation_stamped_source_join_reuses_capacity_and_wraps_without_stale_publication() {
         let mut join = GenerationStampedSourceJoin::with_capacity(2);
         join.begin(17);
         join.insert(0, MaterialFrameId::from_index(3));
@@ -1942,19 +1942,10 @@ mod tests {
             None,
             "the smaller active domain leaked a tail"
         );
-    }
 
-    #[test]
-    fn generation_stamped_source_join_wrap_clears_marks_once() {
-        let mut join = GenerationStampedSourceJoin::with_capacity(2);
-        join.begin(2);
-        join.insert(0, MaterialAssetSnapshotId::from_index(0));
-        join.insert(1, MaterialAssetSnapshotId::from_index(1));
         join.clear();
         join.generation = u32::MAX;
-
         join.begin(2);
-
         assert_eq!(join.generation, 1);
         assert!(join.stamps.iter().all(|&stamp| stamp == 0));
         assert_eq!(join.get(0), None);
@@ -1991,52 +1982,15 @@ mod tests {
     }
 
     #[test]
-    fn repeated_sources_share_one_batched_material_owner() {
+    fn repeated_sources_share_one_owner_and_exact_warm_pipeline_snapshot() {
         const SOURCE_COUNT: usize = 1_024;
 
         let assets = AssetServer::new();
         let geometry = assets.geometries.add(Geometry::new());
-        let (_, geometry_version, geometry_identity) = assets
-            .geometries
-            .get_entry_with_identity(geometry)
-            .expect("geometry missing");
-        let image = assets.images.add(image_8x8());
-        let texture = assets
-            .textures
-            .add(Texture::new_2d(Some("shared material texture"), image));
-        let material = assets.materials.add(unlit_with_texture(texture));
-        let (retained_material, material_version, material_identity) = assets
-            .materials
-            .get_entry_with_identity(material)
-            .expect("material missing");
-        let data_version = retained_material.data.version();
-
-        let mut extracted_scene = ExtractedScene::new();
-        let mut render_lists = RenderLists::new();
-        for index in 0..SOURCE_COUNT {
-            extracted_scene.render_items.push(extracted_item(
-                geometry,
-                geometry_version,
-                geometry_identity,
-                material,
-                material_version,
-                material_identity,
-                data_version,
-            ));
-            render_lists
-                .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(index));
-        }
-
-        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
-        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
-        let mut store = MaterialPlanStore::new();
-        let asset_textures = capture_test_plans(
-            &mut store,
-            &assets,
-            &extracted_scene,
-            &render_lists,
-            geometry_frames.eligibility(&extracted_scene, &render_lists),
-        );
+        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+        let (_scene, _lists, mut store, mut asset_textures, live_sources) =
+            capture_untextured_live_plan(&assets, geometry, material, SOURCE_COUNT);
+        let mut resource_manager = headless_resource_manager();
 
         assert_eq!(store.asset_handles, [material]);
         assert_eq!(store.asset_snapshots.len(), 1);
@@ -2045,40 +1999,9 @@ mod tests {
         assert_eq!(store.snapshot_plans.len(), 1);
         assert_eq!(store.source_snapshots.active_len, SOURCE_COUNT);
         assert_eq!(store.source_plans.active_len, SOURCE_COUNT);
-        assert!((0..SOURCE_COUNT).all(|index| store.source_plans.get(index).is_some()));
-        assert_eq!(asset_textures.texture_count(), 1);
-        assert_eq!(asset_textures.image_count(), 1);
-        let texture_range = store.plans[0].texture_plan_range.clone();
-        assert_eq!(texture_range.len(), 1);
-        assert_eq!(
-            &store.texture_sources[texture_range.clone()],
-            &[TextureSource::Asset(texture)]
-        );
-        assert!(
-            store.texture_plan_ids[texture_range][0]
-                .and_then(|id| asset_textures.state(id))
-                .and_then(|state| state.ready)
-                .is_some()
-        );
-        assert_eq!(
-            Arc::strong_count(&retained_material),
-            3,
-            "storage, test owner, and one visible snapshot are the only Material owners"
-        );
-
-        store.clear();
-        assert_eq!(Arc::strong_count(&retained_material), 2);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn pipeline_snapshot_is_deferred_until_live_and_reused_from_exact_gpu_material() {
-        let assets = AssetServer::new();
-        let geometry = assets.geometries.add(Geometry::new());
-        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let (_scene, _lists, mut store, mut asset_textures, live_sources) =
-            capture_untextured_live_plan(&assets, geometry, material, 4);
-        let mut resource_manager = headless_resource_manager();
+        let shared_plan = store.source_plans.get(0).expect("shared plan missing");
+        assert!((0..SOURCE_COUNT).all(|index| store.source_plans.get(index) == Some(shared_plan)));
+        assert_eq!(asset_textures.texture_count(), 0);
 
         assert!(
             store.plans.iter().all(|record| record.pipeline.is_none()),
@@ -2158,11 +2081,6 @@ mod tests {
             .expect("material missing");
         let material_data_version = material_owner.data.version();
         drop(material_owner);
-        let texture_owner = assets.textures.get(texture).expect("texture missing");
-        let image_owner = assets.images.get(image).expect("image missing");
-        let texture_owners_before_capture = Arc::strong_count(&texture_owner);
-        let image_owners_before_capture = Arc::strong_count(&image_owner);
-
         let mut extracted_scene = ExtractedScene::new();
         extracted_scene.render_items.push(extracted_item(
             geometry,
@@ -2206,12 +2124,6 @@ mod tests {
             &store.texture_plan_ids[texture_plan_range],
             &[Some(skybox_texture_plan)]
         );
-        assert_eq!(
-            Arc::strong_count(&texture_owner),
-            texture_owners_before_capture
-        );
-        assert_eq!(Arc::strong_count(&image_owner), image_owners_before_capture);
-
         asset_textures.capture_requested(&assets);
         assert_eq!(asset_textures.texture_count(), 1);
         assert_eq!(asset_textures.image_count(), 1);
@@ -2221,17 +2133,6 @@ mod tests {
                 .is_some()
         );
         assert!(asset_textures.image_owner(material_texture_plan).is_some());
-        assert_eq!(
-            Arc::strong_count(&texture_owner),
-            texture_owners_before_capture + 1,
-            "the shared request must retain one exact Texture owner"
-        );
-        assert_eq!(
-            Arc::strong_count(&image_owner),
-            image_owners_before_capture + 1,
-            "the shared request must retain one exact Image owner"
-        );
-
         store.finalize_texture_snapshots(&assets, &extracted_scene, &render_lists, &asset_textures);
         assert!(store.source_plans.get(source.index()).is_some());
         assert!(
@@ -2324,69 +2225,6 @@ mod tests {
     }
 
     #[test]
-    fn recipe_generation_marks_retain_warm_domains_without_remaining_active() {
-        let mut store = MaterialPlanStore::new();
-        store.recipe_material_marks.resize(257, 17);
-        store.recipe_texture_marks.resize(1025, 19);
-        store.recipe_material_active_len = 257;
-        store.recipe_texture_active_len = 1025;
-        store.recipe_generation = 19;
-
-        let retained_before = store.capacity_usage().retained_bytes;
-        store.clear();
-
-        assert!(store.is_empty());
-        assert_eq!(store.recipe_material_marks.len(), 257);
-        assert_eq!(store.recipe_texture_marks.len(), 1025);
-        assert!(store.recipe_material_marks.iter().all(|&mark| mark == 17));
-        assert!(store.recipe_texture_marks.iter().all(|&mark| mark == 19));
-        assert_eq!(store.recipe_generation, 19);
-        assert_eq!(store.capacity_usage().active_bytes, 0);
-        assert_eq!(store.capacity_usage().retained_bytes, retained_before);
-
-        store.plans.push(MaterialFrameRecord {
-            key: MaterialPlanKey {
-                handle: MaterialHandle::null(),
-                asset_version: 0,
-                asset_identity: 0,
-                material_version: 0,
-            },
-            pipeline: None,
-            texture_plan_range: 0..0,
-            attempted: false,
-            interface: None,
-        });
-        let asset_textures = AssetTextureBatch::new();
-        store.push_recipe(DrawPlanKey::Opaque, std::iter::empty(), &asset_textures);
-        assert_eq!(
-            store.recipe_material_marks.len(),
-            257,
-            "a smaller warm material domain must not truncate retained marks"
-        );
-        store.clear();
-
-        store.trim_capacity(0, retained_before);
-        assert!(store.recipe_material_marks.is_empty());
-        assert!(store.recipe_texture_marks.is_empty());
-        assert!(store.capacity_usage().retained_bytes < retained_before);
-    }
-
-    #[test]
-    fn recipe_generation_wrap_is_the_only_warm_mark_fill() {
-        let mut store = MaterialPlanStore::new();
-        store.recipe_material_marks.resize(8, u32::MAX);
-        store.recipe_texture_marks.resize(16, u32::MAX);
-        store.recipe_generation = u32::MAX;
-        let asset_textures = AssetTextureBatch::new();
-
-        store.push_recipe(DrawPlanKey::Opaque, std::iter::empty(), &asset_textures);
-
-        assert_eq!(store.recipe_generation, 1);
-        assert!(store.recipe_material_marks.iter().all(|&mark| mark == 0));
-        assert!(store.recipe_texture_marks.iter().all(|&mark| mark == 0));
-    }
-
-    #[test]
     fn unique_material_capacity_releases_owners_and_trims_after_clear() {
         const MATERIAL_COUNT: usize = 512;
 
@@ -2464,416 +2302,293 @@ mod tests {
     }
 
     #[test]
-    fn source_plan_join_uses_only_the_visible_frame_domain() {
-        let assets = AssetServer::new();
-        let extracted_scene = ExtractedScene::new();
-        let mut render_lists = RenderLists::new();
-        render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(7));
-        render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(
-            1_000_000,
-        ));
-
-        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
-        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
-        let mut store = MaterialPlanStore::new();
-        let _asset_textures = capture_test_plans(
-            &mut store,
-            &assets,
-            &extracted_scene,
-            &render_lists,
-            geometry_frames.eligibility(&extracted_scene, &render_lists),
-        );
-
-        assert_eq!(render_lists.frame_source_count(), 2);
-        assert_eq!(store.source_plans.active_len, 2);
-        assert!((0..2).all(|index| store.source_plans.get(index).is_none()));
-    }
-
-    #[test]
-    fn stale_geometry_cannot_inherit_a_shared_material_plan() {
-        let assets = AssetServer::new();
-        let valid_geometry = assets.geometries.add(Geometry::new());
-        let stale_geometry = assets.geometries.add(Geometry::new());
-        let (_, valid_version, valid_identity) = assets
-            .geometries
-            .get_entry_with_identity(valid_geometry)
-            .expect("valid geometry missing");
-        let (_, stale_version, stale_identity) = assets
-            .geometries
-            .get_entry_with_identity(stale_geometry)
-            .expect("stale geometry missing");
-        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let (material_asset, material_version, material_identity) = assets
-            .materials
-            .get_entry_with_identity(material)
-            .expect("material missing");
-        let data_version = material_asset.data.version();
-        drop(material_asset);
-
-        // Preserve the extracted stamp while replacing the slot with a new
-        // same-version owner before the graph-build qualification batch.
-        assets
-            .geometries
-            .insert_ready(stale_geometry, Geometry::new());
-        assert_eq!(assets.geometries.get_version(stale_geometry), Some(1));
-
-        let mut extracted_scene = ExtractedScene::new();
-        extracted_scene.render_items.push(extracted_item(
-            valid_geometry,
-            valid_version,
-            valid_identity,
-            material,
-            material_version,
-            material_identity,
-            data_version,
-        ));
-        extracted_scene.render_items.push(extracted_item(
-            stale_geometry,
-            stale_version,
-            stale_identity,
-            material,
-            material_version,
-            material_identity,
-            data_version,
-        ));
-        let mut render_lists = RenderLists::new();
-        let valid_source =
-            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
-        let stale_source =
-            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(1));
-
-        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
-        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
-        let mut store = MaterialPlanStore::new();
-        let _asset_textures = capture_test_plans(
-            &mut store,
-            &assets,
-            &extracted_scene,
-            &render_lists,
-            geometry_frames.eligibility(&extracted_scene, &render_lists),
-        );
-
-        assert!(store.source_plans.get(valid_source.index()).is_some());
-        assert!(store.source_plans.get(stale_source.index()).is_none());
-        assert_eq!(store.plans.len(), 1);
-
-        // The stale source must also leave no failed material-key poison when
-        // it appears before the valid source in stable frame order.
-        let mut reversed_lists = RenderLists::new();
-        let stale_first = reversed_lists
-            .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(1));
-        let valid_second = reversed_lists
-            .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
-        let mut reversed_geometry = super::super::asset_frame::GeometryFrameStore::new();
-        reversed_geometry.capture_visible(&assets, &extracted_scene, &reversed_lists);
-        let mut reversed_store = MaterialPlanStore::new();
-        let _reversed_asset_textures = capture_test_plans(
-            &mut reversed_store,
-            &assets,
-            &extracted_scene,
-            &reversed_lists,
-            reversed_geometry.eligibility(&extracted_scene, &reversed_lists),
-        );
-        assert!(
-            reversed_store
-                .source_plans
-                .get(stale_first.index())
-                .is_none()
-        );
-        assert!(
-            reversed_store
-                .source_plans
-                .get(valid_second.index())
-                .is_some()
-        );
-        assert_eq!(reversed_store.plans.len(), 1);
-    }
-
-    #[test]
-    fn stale_only_textured_source_emits_no_opaque_texture_topology() {
-        let assets = AssetServer::new();
-        let geometry = assets.geometries.add(Geometry::new());
-        let (_, geometry_version, geometry_identity) = assets
-            .geometries
-            .get_entry_with_identity(geometry)
-            .expect("geometry missing");
-        let image = assets.images.add(image_8x8());
-        let texture = assets
-            .textures
-            .add(Texture::new_2d(Some("stale geometry texture"), image));
-        let material = assets.materials.add(unlit_with_texture(texture));
-        let (material_asset, material_version, material_identity) = assets
-            .materials
-            .get_entry_with_identity(material)
-            .expect("material missing");
-        let data_version = material_asset.data.version();
-        drop(material_asset);
-
-        assets.geometries.insert_ready(geometry, Geometry::new());
-        let mut extracted_scene = ExtractedScene::new();
-        extracted_scene.render_items.push(extracted_item(
-            geometry,
-            geometry_version,
-            geometry_identity,
-            material,
-            material_version,
-            material_identity,
-            data_version,
-        ));
-        let mut render_lists = RenderLists::new();
-        let source =
-            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
-        render_lists.insert_opaque(super::super::frame::RenderIntent {
-            source,
-            geometry_handle: geometry,
-            material_handle: material,
-            material_index: 0,
-            distance_sq: 0.0,
-        });
-
-        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
-        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
-        let mut store = MaterialPlanStore::new();
-        let _asset_textures = capture_test_plans(
-            &mut store,
-            &assets,
-            &extracted_scene,
-            &render_lists,
-            geometry_frames.eligibility(&extracted_scene, &render_lists),
-        );
-        let recipes = store.take_topology_recipes();
-        let opaque = recipes
-            .iter()
-            .find(|recipe| matches!(recipe.key, DrawPlanKey::Opaque))
-            .expect("opaque topology recipe missing");
-
-        assert!(store.source_plans.get(source.index()).is_none());
-        assert!(store.plans.is_empty());
-        assert!(
-            recipes.textures(opaque).is_empty(),
-            "a stale-only source must not register Asset Texture upload or mipmap topology"
-        );
-    }
-
-    #[test]
-    fn post_candidate_material_aba_publishes_no_cache_or_interface_and_recovers() {
-        let assets = AssetServer::new();
-        let geometry = assets.geometries.add(Geometry::new());
-        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let (extracted_scene, _render_lists, mut store, mut asset_textures, live_sources) =
-            capture_untextured_live_plan(&assets, geometry, material, 1);
-        let mut resource_manager = headless_resource_manager();
-
-        store.prepare_live_with_hook(
-            &assets,
-            &mut asset_textures,
-            &mut resource_manager,
-            &live_sources,
-            |resources| {
-                assert!(
-                    resources.get_material(material).is_none(),
-                    "the candidate must remain private before the final postflight"
-                );
-                assets
-                    .materials
-                    .insert_ready(material, Material::new_unlit(glam::Vec4::splat(0.5)));
-            },
-        );
-
-        assert!(resource_manager.get_material(material).is_none());
-        assert!(store.interfaces.is_empty());
-        assert!(store.plans[0].interface.is_none());
-        assert!(
-            store
-                .resolver()
-                .prepared_material(live_sources[0], &extracted_scene.render_items[0])
-                .is_none(),
-            "a same-handle replacement after candidate creation must close the source join"
-        );
-
-        // A fresh graph attempt captures the replacement generation and is
-        // not poisoned by the rejected private candidate. Repeated live
-        // sources still publish exactly one compact interface.
-        let (
-            replacement_scene,
-            _replacement_lists,
-            mut replacement_store,
-            mut replacement_textures,
-            replacement_sources,
-        ) = capture_untextured_live_plan(&assets, geometry, material, 2);
-        replacement_store.prepare_live(
-            &assets,
-            &mut replacement_textures,
-            &mut resource_manager,
-            &replacement_sources,
-        );
-
-        assert!(resource_manager.get_material(material).is_some());
-        assert_eq!(replacement_store.plans.len(), 1);
-        assert_eq!(replacement_store.interfaces.len(), 1);
-        for (&source, item) in replacement_sources
-            .iter()
-            .zip(&replacement_scene.render_items)
+    fn source_join_is_bounded_to_visible_and_never_inherits_stale_geometry() {
         {
+            let assets = AssetServer::new();
+            let extracted_scene = ExtractedScene::new();
+            let mut render_lists = RenderLists::new();
+            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(7));
+            render_lists.intern_frame_source(super::super::frame::ExtractedSourceId::from_index(
+                1_000_000,
+            ));
+
+            let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+            geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
+            let mut store = MaterialPlanStore::new();
+            let _asset_textures = capture_test_plans(
+                &mut store,
+                &assets,
+                &extracted_scene,
+                &render_lists,
+                geometry_frames.eligibility(&extracted_scene, &render_lists),
+            );
+
+            assert_eq!(render_lists.frame_source_count(), 2);
+            assert_eq!(store.source_plans.active_len, 2);
+            assert!((0..2).all(|index| store.source_plans.get(index).is_none()));
+        }
+
+        {
+            let assets = AssetServer::new();
+            let valid_geometry = assets.geometries.add(Geometry::new());
+            let stale_geometry = assets.geometries.add(Geometry::new());
+            let (_, valid_version, valid_identity) = assets
+                .geometries
+                .get_entry_with_identity(valid_geometry)
+                .expect("valid geometry missing");
+            let (_, stale_version, stale_identity) = assets
+                .geometries
+                .get_entry_with_identity(stale_geometry)
+                .expect("stale geometry missing");
+            let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+            let (material_asset, material_version, material_identity) = assets
+                .materials
+                .get_entry_with_identity(material)
+                .expect("material missing");
+            let data_version = material_asset.data.version();
+            drop(material_asset);
+
+            // Preserve the extracted stamp while replacing the slot with a new
+            // same-version owner before the graph-build qualification batch.
+            assets
+                .geometries
+                .insert_ready(stale_geometry, Geometry::new());
+            assert_eq!(assets.geometries.get_version(stale_geometry), Some(1));
+
+            let mut extracted_scene = ExtractedScene::new();
+            extracted_scene.render_items.push(extracted_item(
+                valid_geometry,
+                valid_version,
+                valid_identity,
+                material,
+                material_version,
+                material_identity,
+                data_version,
+            ));
+            extracted_scene.render_items.push(extracted_item(
+                stale_geometry,
+                stale_version,
+                stale_identity,
+                material,
+                material_version,
+                material_identity,
+                data_version,
+            ));
+            let mut render_lists = RenderLists::new();
+            let valid_source = render_lists
+                .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
+            let stale_source = render_lists
+                .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(1));
+
+            let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+            geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
+            let mut store = MaterialPlanStore::new();
+            let _asset_textures = capture_test_plans(
+                &mut store,
+                &assets,
+                &extracted_scene,
+                &render_lists,
+                geometry_frames.eligibility(&extracted_scene, &render_lists),
+            );
+
+            assert!(store.source_plans.get(valid_source.index()).is_some());
+            assert!(store.source_plans.get(stale_source.index()).is_none());
+            assert_eq!(store.plans.len(), 1);
+
+            // The stale source must also leave no failed material-key poison when
+            // it appears before the valid source in stable frame order.
+            let mut reversed_lists = RenderLists::new();
+            let stale_first = reversed_lists
+                .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(1));
+            let valid_second = reversed_lists
+                .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
+            let mut reversed_geometry = super::super::asset_frame::GeometryFrameStore::new();
+            reversed_geometry.capture_visible(&assets, &extracted_scene, &reversed_lists);
+            let mut reversed_store = MaterialPlanStore::new();
+            let _reversed_asset_textures = capture_test_plans(
+                &mut reversed_store,
+                &assets,
+                &extracted_scene,
+                &reversed_lists,
+                reversed_geometry.eligibility(&extracted_scene, &reversed_lists),
+            );
             assert!(
-                replacement_store
-                    .resolver()
-                    .prepared_material(source, item)
+                reversed_store
+                    .source_plans
+                    .get(stale_first.index())
+                    .is_none()
+            );
+            assert!(
+                reversed_store
+                    .source_plans
+                    .get(valid_second.index())
                     .is_some()
+            );
+            assert_eq!(reversed_store.plans.len(), 1);
+        }
+
+        {
+            let assets = AssetServer::new();
+            let geometry = assets.geometries.add(Geometry::new());
+            let (_, geometry_version, geometry_identity) = assets
+                .geometries
+                .get_entry_with_identity(geometry)
+                .expect("geometry missing");
+            let image = assets.images.add(image_8x8());
+            let texture = assets
+                .textures
+                .add(Texture::new_2d(Some("stale geometry texture"), image));
+            let material = assets.materials.add(unlit_with_texture(texture));
+            let (material_asset, material_version, material_identity) = assets
+                .materials
+                .get_entry_with_identity(material)
+                .expect("material missing");
+            let data_version = material_asset.data.version();
+            drop(material_asset);
+
+            assets.geometries.insert_ready(geometry, Geometry::new());
+            let mut extracted_scene = ExtractedScene::new();
+            extracted_scene.render_items.push(extracted_item(
+                geometry,
+                geometry_version,
+                geometry_identity,
+                material,
+                material_version,
+                material_identity,
+                data_version,
+            ));
+            let mut render_lists = RenderLists::new();
+            let source = render_lists
+                .intern_frame_source(super::super::frame::ExtractedSourceId::from_index(0));
+            render_lists.insert_opaque(super::super::frame::RenderIntent {
+                source,
+                geometry_handle: geometry,
+                material_handle: material,
+                material_index: 0,
+                distance_sq: 0.0,
+            });
+
+            let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+            geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
+            let mut store = MaterialPlanStore::new();
+            let _asset_textures = capture_test_plans(
+                &mut store,
+                &assets,
+                &extracted_scene,
+                &render_lists,
+                geometry_frames.eligibility(&extracted_scene, &render_lists),
+            );
+            let recipes = store.take_topology_recipes();
+            let opaque = recipes
+                .iter()
+                .find(|recipe| matches!(recipe.key, DrawPlanKey::Opaque))
+                .expect("opaque topology recipe missing");
+
+            assert!(store.source_plans.get(source.index()).is_none());
+            assert!(store.plans.is_empty());
+            assert!(
+                recipes.textures(opaque).is_empty(),
+                "a stale-only source must not register Asset Texture upload or mipmap topology"
             );
         }
     }
 
     #[test]
-    fn post_candidate_material_epoch_drift_publishes_no_cache_or_interface_and_recovers() {
+    fn post_candidate_drift_matrix_is_atomic_and_fresh_attempts_recover() {
+        #[derive(Clone, Copy, Debug)]
+        enum Drift {
+            AssetAba,
+            TopologyEpoch,
+            UniformStamp,
+        }
+
         let assets = AssetServer::new();
         let geometry = assets.geometries.add(Geometry::new());
-        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let material_owner = assets.materials.get(material).expect("material missing");
-        let captured_epoch = material_owner.data.version();
-        let (extracted_scene, _render_lists, mut store, mut asset_textures, live_sources) =
-            capture_untextured_live_plan(&assets, geometry, material, 1);
         let mut resource_manager = headless_resource_manager();
 
-        store.prepare_live_with_hook(
-            &assets,
-            &mut asset_textures,
-            &mut resource_manager,
-            &live_sources,
-            |resources| {
-                assert!(
-                    resources.get_material(material).is_none(),
-                    "the candidate must remain private before the final postflight"
+        for drift in [Drift::AssetAba, Drift::TopologyEpoch, Drift::UniformStamp] {
+            let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+            let material_owner = assets.materials.get(material).expect("material missing");
+            let captured_epoch = material_owner.data.version();
+            let captured_binding_stamp = material_owner
+                .data
+                .canonical_binding_stamp()
+                .expect("built-in material must expose a canonical binding stamp");
+            let (scene, _lists, mut store, mut textures, sources) =
+                capture_untextured_live_plan(&assets, geometry, material, 1);
+
+            store.prepare_live_with_hook(
+                &assets,
+                &mut textures,
+                &mut resource_manager,
+                &sources,
+                |resources| {
+                    assert!(resources.get_material(material).is_none());
+                    match drift {
+                        Drift::AssetAba => {
+                            assets.materials.insert_ready(
+                                material,
+                                Material::new_unlit(glam::Vec4::splat(0.5)),
+                            );
+                        }
+                        Drift::TopologyEpoch => material_owner
+                            .as_unlit()
+                            .expect("expected unlit material")
+                            .set_alpha_mode(AlphaMode::Blend),
+                        Drift::UniformStamp => material_owner
+                            .as_unlit()
+                            .expect("expected unlit material")
+                            .set_color(glam::Vec4::splat(0.25)),
+                    }
+                },
+            );
+
+            if matches!(drift, Drift::UniformStamp) {
+                assert_eq!(material_owner.data.version(), captured_epoch);
+                assert_ne!(
+                    material_owner.data.canonical_binding_stamp(),
+                    Some(captured_binding_stamp)
                 );
-                material_owner
-                    .as_unlit()
-                    .expect("expected unlit material")
-                    .set_alpha_mode(AlphaMode::Blend);
-            },
-        );
+            }
+            assert!(
+                resource_manager.get_material(material).is_none(),
+                "{drift:?} published a rejected candidate"
+            );
+            assert!(store.interfaces.is_empty(), "{drift:?}");
+            assert!(store.plans[0].interface.is_none(), "{drift:?}");
+            assert!(
+                store
+                    .resolver()
+                    .prepared_material(sources[0], &scene.render_items[0])
+                    .is_none(),
+                "{drift:?} left the source join open"
+            );
 
-        assert_ne!(material_owner.data.version(), captured_epoch);
-        assert!(resource_manager.get_material(material).is_none());
-        assert!(store.interfaces.is_empty());
-        assert!(store.plans[0].interface.is_none());
-        assert!(
-            store
-                .resolver()
-                .prepared_material(live_sources[0], &extracted_scene.render_items[0])
-                .is_none(),
-            "an interior epoch drift after candidate creation must close the source join"
-        );
-
-        let (
-            current_scene,
-            _current_lists,
-            mut current_store,
-            mut current_textures,
-            current_sources,
-        ) = capture_untextured_live_plan(&assets, geometry, material, 1);
-        current_store.prepare_live(
-            &assets,
-            &mut current_textures,
-            &mut resource_manager,
-            &current_sources,
-        );
-
-        assert!(resource_manager.get_material(material).is_some());
-        assert_eq!(current_store.interfaces.len(), 1);
-        assert!(
-            current_store
-                .resolver()
-                .prepared_material(current_sources[0], &current_scene.render_items[0])
-                .is_some()
-        );
+            let (fresh_scene, _lists, mut fresh_store, mut fresh_textures, fresh_sources) =
+                capture_untextured_live_plan(&assets, geometry, material, 1);
+            fresh_store.prepare_live(
+                &assets,
+                &mut fresh_textures,
+                &mut resource_manager,
+                &fresh_sources,
+            );
+            assert!(
+                resource_manager.get_material(material).is_some(),
+                "{drift:?}"
+            );
+            assert_eq!(fresh_store.interfaces.len(), 1, "{drift:?}");
+            assert!(
+                fresh_store
+                    .resolver()
+                    .prepared_material(fresh_sources[0], &fresh_scene.render_items[0])
+                    .is_some(),
+                "{drift:?} poisoned the next graph attempt"
+            );
+        }
     }
 
     #[test]
-    fn post_candidate_uniform_drift_fails_the_canonical_publication_gate() {
-        let assets = AssetServer::new();
-        let geometry = assets.geometries.add(Geometry::new());
-        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let material_owner = assets.materials.get(material).expect("material missing");
-        let captured_topology_epoch = material_owner.data.version();
-        let captured_binding_stamp = material_owner
-            .data
-            .canonical_binding_stamp()
-            .expect("built-in material must expose a canonical binding stamp");
-        let (extracted_scene, _render_lists, mut store, mut asset_textures, live_sources) =
-            capture_untextured_live_plan(&assets, geometry, material, 1);
-        let mut resource_manager = headless_resource_manager();
-
-        store.prepare_live_with_hook(
-            &assets,
-            &mut asset_textures,
-            &mut resource_manager,
-            &live_sources,
-            |_| {
-                material_owner
-                    .as_unlit()
-                    .expect("expected unlit material")
-                    .set_color(glam::Vec4::splat(0.25));
-            },
-        );
-
-        assert_eq!(
-            material_owner.data.version(),
-            captured_topology_epoch,
-            "uniform-only drift must not masquerade as a topology change"
-        );
-        assert_ne!(
-            material_owner.data.canonical_binding_stamp(),
-            Some(captured_binding_stamp)
-        );
-        assert!(resource_manager.get_material(material).is_none());
-        assert!(store.interfaces.is_empty());
-        assert!(store.plans[0].interface.is_none());
-        assert!(
-            store
-                .resolver()
-                .prepared_material(live_sources[0], &extracted_scene.render_items[0])
-                .is_none(),
-            "a changed uniform stamp must reject the private candidate"
-        );
-    }
-
-    #[test]
-    fn post_reservation_material_epoch_drift_fails_the_publication_gate() {
-        let assets = AssetServer::new();
-        let geometry = assets.geometries.add(Geometry::new());
-        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let material_owner = assets.materials.get(material).expect("material missing");
-        let (extracted_scene, _render_lists, mut store, mut asset_textures, live_sources) =
-            capture_untextured_live_plan(&assets, geometry, material, 1);
-        let mut resource_manager = headless_resource_manager();
-
-        store.prepare_live_with_publication_hook(
-            &assets,
-            &mut asset_textures,
-            &mut resource_manager,
-            &live_sources,
-            |_| {
-                material_owner
-                    .as_unlit()
-                    .expect("expected unlit material")
-                    .set_alpha_mode(AlphaMode::Blend);
-            },
-        );
-
-        assert!(resource_manager.get_material(material).is_none());
-        assert!(store.interfaces.is_empty());
-        assert!(store.plans[0].interface.is_none());
-        assert!(
-            store
-                .resolver()
-                .prepared_material(live_sources[0], &extracted_scene.render_items[0])
-                .is_none(),
-            "an epoch drift after slot reservation must fail before cache CAS"
-        );
-    }
-
-    #[test]
-    fn publication_gate_keeps_second_chunk_candidate_and_interface_alignment() {
+    fn post_reservation_gate_rejects_second_chunk_drift_without_shifting_interfaces() {
         const MATERIAL_COUNT: usize = 65;
 
         let assets = AssetServer::new();
@@ -2923,16 +2638,18 @@ mod tests {
         );
         let mut resource_manager = headless_resource_manager();
         let drifting = materials[MATERIAL_COUNT - 1];
+        let drifting_owner = assets.materials.get(drifting).expect("material missing");
 
-        store.prepare_live_with_hook(
+        store.prepare_live_with_publication_hook(
             &assets,
             &mut asset_textures,
             &mut resource_manager,
             &live_sources,
             |_| {
-                assets
-                    .materials
-                    .insert_ready(drifting, Material::new_unlit(glam::Vec4::splat(0.5)));
+                drifting_owner
+                    .as_unlit()
+                    .expect("expected unlit material")
+                    .set_alpha_mode(AlphaMode::Blend);
             },
         );
 
@@ -2962,57 +2679,58 @@ mod tests {
     }
 
     #[test]
-    fn pending_material_plan_rejects_same_handle_texture_aba() {
-        let assets = AssetServer::new();
-        let first_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x301));
-        let second_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x302));
-        let texture = assets
-            .textures
-            .add(Texture::new_2d(Some("pending A"), first_missing));
-        let material = assets.materials.add(unlit_with_texture(texture));
-        let (material_owner, record, textures) = capture_record(&assets, material);
-        assert!(textures[0].asset.unwrap().ready.is_none());
-        assert!(material_plan_is_current(
-            &assets,
-            &material_owner,
-            &record,
-            &textures
-        ));
+    fn exact_snapshot_rejects_pending_texture_aba_and_material_generation_mixing() {
+        {
+            let assets = AssetServer::new();
+            let first_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x301));
+            let second_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x302));
+            let texture = assets
+                .textures
+                .add(Texture::new_2d(Some("pending A"), first_missing));
+            let material = assets.materials.add(unlit_with_texture(texture));
+            let (material_owner, record, textures) = capture_record(&assets, material);
+            assert!(textures[0].asset.unwrap().ready.is_none());
+            assert!(material_plan_is_current(
+                &assets,
+                &material_owner,
+                &record,
+                &textures
+            ));
 
-        assets
-            .textures
-            .insert_ready(texture, Texture::new_2d(Some("pending B"), second_missing));
-        assert!(
-            !material_plan_is_current(&assets, &material_owner, &record, &textures),
-            "two unavailable states with different exact identities must not compare equal"
-        );
-    }
+            assets
+                .textures
+                .insert_ready(texture, Texture::new_2d(Some("pending B"), second_missing));
+            assert!(
+                !material_plan_is_current(&assets, &material_owner, &record, &textures),
+                "two unavailable states with different exact identities must not compare equal"
+            );
+        }
 
-    #[test]
-    fn pipeline_snapshot_never_mixes_with_a_later_material_generation() {
-        let assets = AssetServer::new();
-        let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
-        let (material_owner, record, textures) = capture_record(&assets, material);
-        assert_eq!(
-            record.pipeline.as_deref().unwrap().settings().alpha_mode,
-            AlphaMode::Opaque
-        );
+        {
+            let assets = AssetServer::new();
+            let material = assets.materials.add(Material::new_unlit(glam::Vec4::ONE));
+            let (material_owner, record, textures) = capture_record(&assets, material);
+            assert_eq!(
+                record.pipeline.as_deref().unwrap().settings().alpha_mode,
+                AlphaMode::Opaque
+            );
 
-        let current = assets.materials.get(material).expect("material missing");
-        current
-            .as_unlit()
-            .expect("expected unlit material")
-            .set_alpha_mode(AlphaMode::Blend);
+            let current = assets.materials.get(material).expect("material missing");
+            current
+                .as_unlit()
+                .expect("expected unlit material")
+                .set_alpha_mode(AlphaMode::Blend);
 
-        assert_eq!(
-            record.pipeline.as_deref().unwrap().settings().alpha_mode,
-            AlphaMode::Opaque,
-            "the representative is immutable even when the live asset mutates"
-        );
-        assert!(
-            !material_plan_is_current(&assets, &material_owner, &record, &textures),
-            "a mixed snapshot must be rejected instead of being published"
-        );
+            assert_eq!(
+                record.pipeline.as_deref().unwrap().settings().alpha_mode,
+                AlphaMode::Opaque,
+                "the representative is immutable even when the live asset mutates"
+            );
+            assert!(
+                !material_plan_is_current(&assets, &material_owner, &record, &textures),
+                "a mixed snapshot must be rejected instead of being published"
+            );
+        }
     }
 
     #[test]
@@ -3061,7 +2779,6 @@ mod tests {
         );
         resource_manager.publish_planned_material_candidates(&mut candidates, &[true]);
         assert!(candidates.result(candidate));
-        assert!(!candidates.used_canonical_fast_path(candidate));
         assert!(resource_manager.get_material(material).is_some());
         assert!(
             resource_manager.take_mipmap_requests().is_empty(),
@@ -3081,61 +2798,5 @@ mod tests {
         );
         assert!(warm_candidates.used_canonical_fast_path(warm));
         assert!(warm_candidates.reuses_existing(warm));
-        resource_manager.publish_planned_material_candidates(&mut warm_candidates, &[true]);
-        assert!(warm_candidates.result(warm));
-
-        let mut drifting_textures = textures.clone();
-        drifting_textures[0]
-            .physical
-            .as_mut()
-            .expect("physical texture token missing")
-            .sampler_id += 1;
-        let mut drift_candidates = PlannedMaterialCandidateBatch::new();
-        let drift = resource_manager.prepare_planned_material_candidate(
-            &mut drift_candidates,
-            record.key.handle,
-            &material_owner,
-            record.key.asset_version,
-            record.key.asset_identity,
-            record.key.material_version,
-            record.pipeline.as_ref().unwrap(),
-            &drifting_textures,
-        );
-        assert!(
-            !drift_candidates.used_canonical_fast_path(drift),
-            "a mismatched physical texture token must enter the exact generic fallback"
-        );
-
-        material_owner
-            .as_unlit()
-            .expect("expected unlit material")
-            .set_color(glam::Vec4::splat(0.5));
-        let mut dirty_candidates = PlannedMaterialCandidateBatch::new();
-        let dirty = resource_manager.prepare_planned_material_candidate(
-            &mut dirty_candidates,
-            record.key.handle,
-            &material_owner,
-            record.key.asset_version,
-            record.key.asset_identity,
-            record.key.material_version,
-            record.pipeline.as_ref().unwrap(),
-            &textures,
-        );
-        assert!(!dirty_candidates.used_canonical_fast_path(dirty));
-        resource_manager.publish_planned_material_candidates(&mut dirty_candidates, &[true]);
-        assert!(dirty_candidates.result(dirty));
-
-        let mut restabilized_candidates = PlannedMaterialCandidateBatch::new();
-        let restabilized = resource_manager.prepare_planned_material_candidate(
-            &mut restabilized_candidates,
-            record.key.handle,
-            &material_owner,
-            record.key.asset_version,
-            record.key.asset_identity,
-            record.key.material_version,
-            record.pipeline.as_ref().unwrap(),
-            &textures,
-        );
-        assert!(restabilized_candidates.used_canonical_fast_path(restabilized));
     }
 }

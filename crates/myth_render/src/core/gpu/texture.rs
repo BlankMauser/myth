@@ -922,4 +922,535 @@ impl ResourceManager {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
+    use myth_resources::image::{ColorSpace, ImageDimension, PixelFormat};
+
+    fn image_8x8(fill: u8) -> Image {
+        Image::new(
+            8,
+            8,
+            1,
+            ImageDimension::D2,
+            PixelFormat::Rgba8Unorm,
+            Some(vec![fill; 8 * 8 * 4]),
+        )
+    }
+
+    fn resource_manager() -> ResourceManager {
+        let context = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        ResourceManager::new(context.device.clone(), context.queue.clone(), 1)
+    }
+
+    fn prepare_ready(
+        resources: &mut ResourceManager,
+        assets: &AssetServer,
+        texture: TextureHandle,
+    ) {
+        assert!(matches!(
+            resources.prepare_texture(assets, texture),
+            ResourceState::Ready
+        ));
+    }
+
+    #[test]
+    fn snapshots_canonicalize_specs_and_separate_content_versions() {
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8(255));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("snapshot"), image));
+
+        let first = snapshot_asset_texture(&assets, texture).expect("ready snapshot missing");
+        assert_eq!(
+            (first.texture_version, first.image_version, first.mip_count),
+            (1, 1, 1)
+        );
+        assert_eq!(first.format, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+        let mut changed = Texture::new_2d(Some("linear mipped"), image);
+        changed.color_space = ColorSpace::Linear;
+        changed.generate_mipmaps = true;
+        assert_eq!(assets.textures.update(texture, changed), Some(2));
+
+        let second = snapshot_asset_texture(&assets, texture).expect("updated snapshot missing");
+        assert_eq!(
+            (
+                second.texture_version,
+                second.image_version,
+                second.mip_count
+            ),
+            (2, 1, 4),
+            "texture policy drift must not masquerade as image-content drift"
+        );
+        assert_eq!(second.format, wgpu::TextureFormat::Rgba8Unorm);
+        assert_ne!(first.logical_version, second.logical_version);
+        assert_eq!(second.physical_spec().image_handle, image);
+    }
+
+    #[test]
+    fn exact_residency_cas_fails_closed_across_logical_and_content_drift() {
+        let mut resources = resource_manager();
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8(255));
+        let texture = assets
+            .textures
+            .add(Texture::new_2d(Some("resident"), image));
+
+        let initial = snapshot_asset_texture(&assets, texture).expect("initial snapshot missing");
+        assert!(
+            resources
+                .materialize_asset_texture_for_graph(&assets, initial)
+                .texture
+                .is_some()
+        );
+        let initial_token = resources
+            .exact_asset_texture_residency(initial)
+            .expect("initial residency token missing");
+        let initial_generation = resources
+            .resources
+            .texture_generation_key(texture)
+            .expect("initial generation missing");
+        assert_eq!(
+            resources
+                .reuse_exact_asset_texture_for_graph(initial, initial_token)
+                .and_then(|materialized| materialized.texture)
+                .expect("unchanged residency must be reusable")
+                .generation_key,
+            initial_generation
+        );
+
+        let mut sampler_changed = Texture::new_2d(Some("nearest"), image);
+        sampler_changed.sampler.mag_filter = wgpu::FilterMode::Nearest;
+        assert_eq!(assets.textures.update(texture, sampler_changed), Some(2));
+        let sampler_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("sampler snapshot missing");
+        assert!(
+            resources
+                .materialize_asset_texture_for_graph(&assets, sampler_snapshot)
+                .texture
+                .is_some()
+        );
+        let sampler_token = resources
+            .exact_asset_texture_residency(sampler_snapshot)
+            .expect("sampler residency token missing");
+        let sampler_generation = resources
+            .resources
+            .texture_generation_key(texture)
+            .expect("sampler generation missing");
+        assert_eq!(sampler_generation, initial_generation);
+        assert_ne!(sampler_token, initial_token);
+        let sampler_binding = *resources
+            .get_texture_binding(texture)
+            .expect("sampler binding missing");
+        assert!(
+            resources
+                .reuse_exact_asset_texture_for_graph(initial, initial_token)
+                .is_none()
+        );
+        assert_eq!(
+            *resources
+                .get_texture_binding(texture)
+                .expect("failed CAS removed the current binding"),
+            sampler_binding
+        );
+
+        assert_eq!(assets.images.update(image, image_8x8(37)), Some(2));
+        let image_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("image snapshot missing");
+        assert!(
+            resources
+                .materialize_asset_texture_for_graph(&assets, image_snapshot)
+                .texture
+                .is_some()
+        );
+        let image_generation = resources
+            .resources
+            .texture_generation_key(texture)
+            .expect("refreshed generation missing");
+        assert_eq!(image_generation.allocation, sampler_generation.allocation);
+        assert_ne!(image_generation, sampler_generation);
+        let image_binding = *resources
+            .get_texture_binding(texture)
+            .expect("refreshed binding missing");
+        assert!(
+            resources
+                .reuse_exact_asset_texture_for_graph(sampler_snapshot, sampler_token)
+                .is_none()
+        );
+        assert_eq!(
+            *resources
+                .get_texture_binding(texture)
+                .expect("generation CAS failure removed the winner"),
+            image_binding
+        );
+        assert_eq!(
+            resources.resources.texture_generation_key(texture),
+            Some(image_generation)
+        );
+    }
+
+    #[test]
+    fn canonical_physical_pool_shares_exact_specs_and_isolates_lease_ownership() {
+        let mut resources = resource_manager();
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8(255));
+
+        let mut first_asset = Texture::new_2d(Some("first"), image);
+        first_asset.generate_mipmaps = true;
+        let first = assets.textures.add(first_asset);
+        let mut second_asset = Texture::new_2d(Some("second nearest"), image);
+        second_asset.generate_mipmaps = true;
+        second_asset.sampler.mag_filter = wgpu::FilterMode::Nearest;
+        let second = assets.textures.add(second_asset);
+        let mut linear_asset = Texture::new_2d(Some("linear"), image);
+        linear_asset.color_space = ColorSpace::Linear;
+        linear_asset.generate_mipmaps = true;
+        let linear = assets.textures.add(linear_asset);
+
+        for handle in [first, second, linear] {
+            prepare_ready(&mut resources, &assets, handle);
+        }
+        resources.resources.assert_texture_pool_consistent();
+
+        let first_lease = resources
+            .resources
+            .texture_image_lease(first)
+            .expect("first lease missing");
+        let second_lease = resources
+            .resources
+            .texture_image_lease(second)
+            .expect("second lease missing");
+        let linear_lease = resources
+            .resources
+            .texture_image_lease(linear)
+            .expect("linear lease missing");
+        assert_eq!(first_lease.physical_id, second_lease.physical_id);
+        assert_ne!(first_lease.physical_id, linear_lease.physical_id);
+        assert_eq!(
+            resources
+                .resources
+                .physical_image_member_count(first_lease.physical_id),
+            Some(2)
+        );
+        assert_eq!(
+            resources
+                .get_texture_image(first)
+                .expect("shared image missing")
+                .id,
+            resources
+                .get_texture_image(second)
+                .expect("second shared image missing")
+                .id
+        );
+        assert_ne!(
+            resources
+                .get_texture_binding(first)
+                .expect("first binding missing")
+                .sampler_id,
+            resources
+                .get_texture_binding(second)
+                .expect("second binding missing")
+                .sampler_id,
+            "samplers remain lease-local even when the image allocation is shared"
+        );
+        assert_eq!(
+            resources
+                .get_texture_image(linear)
+                .expect("linear image missing")
+                .format,
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        let requests = resources.take_mipmap_requests();
+        assert_eq!(requests.len(), 2, "one request per physical generation");
+
+        assert_eq!(
+            assets
+                .textures
+                .update(first, Texture::new_2d(Some("first without mips"), image),),
+            Some(2)
+        );
+        prepare_ready(&mut resources, &assets, first);
+        let migrated = resources
+            .resources
+            .texture_image_lease(first)
+            .expect("migrated lease missing")
+            .physical_id;
+        assert_ne!(migrated, second_lease.physical_id);
+        assert_eq!(
+            resources
+                .resources
+                .physical_image_member_count(second_lease.physical_id),
+            Some(1)
+        );
+
+        resources.resources.remove_texture_image(first);
+        assert!(!resources.resources.contains_physical_image(migrated));
+        assert!(resources.get_texture_image(second).is_some());
+        resources.resources.remove_texture_image(second);
+        assert!(
+            !resources
+                .resources
+                .contains_physical_image(second_lease.physical_id)
+        );
+        assert!(resources.get_texture_image(linear).is_some());
+        resources.resources.assert_texture_pool_consistent();
+    }
+
+    #[test]
+    fn same_handle_same_version_replacements_refresh_exact_gpu_identity() {
+        let mut resources = resource_manager();
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8(255));
+        let mut initial_asset = Texture::new_2d(Some("ABA sRGB"), image);
+        initial_asset.generate_mipmaps = true;
+        let texture = assets.textures.add(initial_asset);
+
+        let initial_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("initial snapshot missing");
+        prepare_ready(&mut resources, &assets, texture);
+        let initial_binding = *resources
+            .get_texture_binding(texture)
+            .expect("initial binding missing");
+        let initial_allocation = resources
+            .get_texture_image(texture)
+            .expect("initial image missing")
+            .id;
+        let initial_physical = resources
+            .resources
+            .texture_image_lease(texture)
+            .expect("initial lease missing")
+            .physical_id;
+        let _ = resources.take_mipmap_requests();
+
+        let texture_uuid = assets
+            .textures
+            .get(texture)
+            .expect("initial texture missing")
+            .uuid;
+        let mut replacement = Texture::new_2d(Some("ABA linear"), image);
+        replacement.uuid = texture_uuid;
+        replacement.color_space = ColorSpace::Linear;
+        replacement.generate_mipmaps = true;
+        assets.textures.insert_ready(texture, replacement);
+
+        let replacement_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("replacement snapshot missing");
+        assert_eq!(
+            replacement_snapshot.texture_version,
+            initial_snapshot.texture_version
+        );
+        assert_ne!(
+            replacement_snapshot.texture_identity,
+            initial_snapshot.texture_identity
+        );
+        prepare_ready(&mut resources, &assets, texture);
+        let replacement_binding = *resources
+            .get_texture_binding(texture)
+            .expect("replacement binding missing");
+        let replacement_image = resources
+            .get_texture_image(texture)
+            .expect("replacement image missing");
+        let replacement_allocation = replacement_image.id;
+        let replacement_generation = replacement_image.generation_id;
+        let replacement_image_identity = replacement_image.image_identity;
+        let replacement_physical = resources
+            .resources
+            .texture_image_lease(texture)
+            .expect("replacement lease missing")
+            .physical_id;
+        assert_ne!(replacement_allocation, initial_allocation);
+        assert_ne!(replacement_physical, initial_physical);
+        assert_ne!(
+            replacement_binding.texture_identity,
+            initial_binding.texture_identity
+        );
+        let _ = resources.take_mipmap_requests();
+
+        let mut sampler_replacement = Texture::new_2d(Some("ABA nearest"), image);
+        sampler_replacement.uuid = texture_uuid;
+        sampler_replacement.color_space = ColorSpace::Linear;
+        sampler_replacement.generate_mipmaps = true;
+        sampler_replacement.sampler.mag_filter = wgpu::FilterMode::Nearest;
+        assets.textures.insert_ready(texture, sampler_replacement);
+        let sampler_snapshot =
+            snapshot_asset_texture(&assets, texture).expect("sampler snapshot missing");
+        let deferred = resources.materialize_asset_texture_for_graph(&assets, sampler_snapshot);
+        assert!(deferred.texture.is_some() && deferred.mipmap_request.is_some());
+        let sampler_binding = *resources
+            .get_texture_binding(texture)
+            .expect("sampler binding missing");
+        assert_eq!(
+            resources
+                .resources
+                .texture_image_lease(texture)
+                .expect("sampler lease missing")
+                .physical_id,
+            replacement_physical
+        );
+        assert_ne!(sampler_binding.sampler_id, replacement_binding.sampler_id);
+        assert_eq!(
+            sampler_binding.texture_identity,
+            sampler_snapshot.texture_identity
+        );
+        assert!(resources.take_mipmap_requests().is_empty());
+        drop(deferred);
+
+        let image_uuid = assets
+            .images
+            .get(image)
+            .expect("initial image missing")
+            .uuid;
+        let mut image_replacement = image_8x8(31);
+        image_replacement.uuid = image_uuid;
+        assets.images.insert_ready(image, image_replacement);
+        prepare_ready(&mut resources, &assets, texture);
+        let updated = resources
+            .get_texture_image(texture)
+            .expect("updated image missing");
+        assert_eq!(updated.id, replacement_allocation);
+        assert_ne!(updated.image_identity, replacement_image_identity);
+        assert_ne!(updated.generation_id, replacement_generation);
+        assert_eq!(
+            resources
+                .resources
+                .texture_image_lease(texture)
+                .expect("updated lease missing")
+                .physical_id,
+            replacement_physical
+        );
+        assert_eq!(
+            resources
+                .get_texture_binding(texture)
+                .expect("updated binding missing")
+                .image_identity,
+            updated.image_identity
+        );
+        assert_eq!(resources.take_mipmap_requests().len(), 1);
+    }
+
+    #[test]
+    fn shared_refresh_revalidates_leases_and_rejects_stale_mip_and_alias_state() {
+        let mut resources = resource_manager();
+        let assets = AssetServer::new();
+        let image = assets.images.add(image_8x8(255));
+        let mut first_asset = Texture::new_2d(Some("first"), image);
+        first_asset.generate_mipmaps = true;
+        let first = assets.textures.add(first_asset);
+        let mut second_asset = Texture::new_2d(Some("second"), image);
+        second_asset.generate_mipmaps = true;
+        let second = assets.textures.add(second_asset);
+
+        prepare_ready(&mut resources, &assets, first);
+        let stale = resources
+            .take_mipmap_requests()
+            .pop()
+            .expect("initial mip request missing");
+        prepare_ready(&mut resources, &assets, second);
+        let _ = resources.take_mipmap_requests();
+        let stale_after_drain = resources
+            .resources
+            .texture_mipmap_request(first)
+            .expect("stale generation owner missing");
+        let shared_physical = resources
+            .resources
+            .texture_image_lease(first)
+            .expect("shared lease missing")
+            .physical_id;
+        let shared_allocation = resources
+            .get_texture_image(first)
+            .expect("shared image missing")
+            .id;
+
+        assert_eq!(assets.images.update(image, image_8x8(17)), Some(2));
+        prepare_ready(&mut resources, &assets, first);
+        let current_generation = resources
+            .resources
+            .texture_generation_key(first)
+            .expect("current generation missing");
+        assert_eq!(current_generation.physical, shared_physical);
+        assert_eq!(current_generation.allocation, shared_allocation);
+        assert_ne!(current_generation.generation, stale.generation_id);
+        assert!(
+            resources.get_texture_binding(second).is_none(),
+            "other logical leases must fail closed until their new content stamp is revalidated"
+        );
+
+        stale.mark_submitted();
+        assert!(
+            !resources
+                .get_texture_image(first)
+                .expect("current image missing")
+                .mipmaps_submitted()
+        );
+        resources.resources.queue_mipmap_request(stale);
+        let current = resources
+            .take_mipmap_requests()
+            .pop()
+            .expect("current generation retry missing");
+        assert_eq!(current.key(), current_generation);
+        current.mark_submitted();
+        assert!(
+            resources
+                .get_texture_image(first)
+                .expect("submitted image missing")
+                .mipmaps_submitted()
+        );
+        stale_after_drain.mark_submitted();
+        resources.resources.queue_mipmap_request(stale_after_drain);
+        assert!(resources.take_mipmap_requests().is_empty());
+        assert!(
+            resources
+                .get_texture_image(first)
+                .expect("late stale publication removed the current image")
+                .mipmaps_submitted()
+        );
+
+        prepare_ready(&mut resources, &assets, second);
+        assert_eq!(
+            resources
+                .resources
+                .texture_image_lease(second)
+                .expect("revalidated lease missing")
+                .physical_id,
+            shared_physical
+        );
+        assert_eq!(
+            resources
+                .resources
+                .physical_image_member_count(shared_physical),
+            Some(2)
+        );
+
+        let other_image = assets.images.add(image_8x8(91));
+        assert_eq!(
+            assets
+                .textures
+                .update(first, Texture::new_2d(Some("redirected"), other_image),),
+            Some(2)
+        );
+        prepare_ready(&mut resources, &assets, first);
+        assert_eq!(
+            resources.resources.latest_texture_alias(image),
+            Some(second),
+            "redirecting a lease must repair the old ImageHandle compatibility alias"
+        );
+        assert_eq!(
+            resources.resources.latest_texture_alias(other_image),
+            Some(first)
+        );
+        resources.resources.remove_texture_image(second);
+        assert!(!resources.resources.contains_physical_image(shared_physical));
+        assert!(resources.get_texture_image(first).is_some());
+        resources.resources.assert_texture_pool_consistent();
+    }
+}

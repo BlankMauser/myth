@@ -444,6 +444,8 @@ mod tests {
     use super::*;
     use myth_scene::camera::Camera;
 
+    const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
     fn render_camera(camera_id: u128) -> RenderCamera {
         let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
         let mut render_camera = camera.extract_render_camera();
@@ -452,233 +454,92 @@ mod tests {
         render_camera
     }
 
-    #[test]
-    fn submitted_history_becomes_available_on_the_next_frame() {
-        let mut registry = HistoryRegistry::new();
-        let mut feature = TaaFeature::new();
-        let camera = render_camera(7);
-
-        let first = feature.extract(
-            &mut registry,
-            1,
-            &camera,
+    fn extract(
+        feature: &mut TaaFeature,
+        registry: &mut HistoryRegistry,
+        scene_id: u32,
+        camera: &RenderCamera,
+        temporal_serial: u64,
+        renderer_frame: u64,
+    ) -> TaaSnapshot {
+        feature.extract(
+            registry,
+            scene_id,
+            camera,
             0.9,
-            1,
-            1,
+            temporal_serial,
+            renderer_frame,
             (128, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        assert!(first.previous_color().is_none());
-        assert_eq!(first.params[2], 1.0);
+            DEPTH_FORMAT,
+        )
+    }
 
+    fn commit(registry: &mut HistoryRegistry, snapshot: TaaSnapshot) {
         assert!(registry.commit(
-            first.history.commit,
-            &first.history.next.map(|texture| texture.id),
+            snapshot.history.commit,
+            &snapshot.history.next.map(|texture| texture.id),
         ));
-        let second = feature.extract(
-            &mut registry,
-            1,
-            &camera,
-            0.9,
-            2,
-            2,
-            (128, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        assert_eq!(second.previous_color(), Some(first.history.next[0]));
-        assert_eq!(second.params[2], 0.0);
     }
 
     #[test]
-    fn histories_are_partitioned_by_scene_and_camera() {
-        let mut registry = HistoryRegistry::new();
-        let mut feature = TaaFeature::new();
-        let camera_a = render_camera(11);
-        let camera_b = render_camera(12);
-
-        let scene_a_camera_a = feature.extract(
-            &mut registry,
-            1,
-            &camera_a,
-            0.9,
-            1,
-            1,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        let scene_a_camera_b = feature.extract(
-            &mut registry,
-            1,
-            &camera_b,
-            0.9,
-            1,
-            1,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        let scene_b_camera_a = feature.extract(
-            &mut registry,
-            2,
-            &camera_a,
-            0.9,
-            1,
-            1,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-
-        assert_ne!(
-            scene_a_camera_a.history.next[0].id,
-            scene_a_camera_b.history.next[0].id
-        );
-        assert_ne!(
-            scene_a_camera_a.history.next[0].id,
-            scene_b_camera_a.history.next[0].id
-        );
-    }
-
-    #[test]
-    fn alternating_camera_domains_keep_independent_continuity() {
+    fn taa_domain_keying_keeps_committed_histories_independent() {
         let mut registry = HistoryRegistry::new();
         let mut feature = TaaFeature::new();
         let camera_a = render_camera(21);
         let camera_b = render_camera(22);
 
-        let a1 = feature.extract(
-            &mut registry,
-            1,
-            &camera_a,
-            0.9,
-            1,
-            1,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        assert!(registry.commit(
-            a1.history.commit,
-            &a1.history.next.map(|texture| texture.id),
-        ));
-        let b1 = feature.extract(
-            &mut registry,
-            1,
-            &camera_b,
-            0.9,
-            1,
-            1,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        assert!(registry.commit(
-            b1.history.commit,
-            &b1.history.next.map(|texture| texture.id),
-        ));
+        let a1 = extract(&mut feature, &mut registry, 1, &camera_a, 1, 1);
+        let b1 = extract(&mut feature, &mut registry, 1, &camera_b, 1, 1);
+        let other_scene = extract(&mut feature, &mut registry, 2, &camera_a, 1, 1);
+        assert!(a1.previous_color().is_none());
+        assert_eq!(a1.params[2], 1.0);
+        assert_ne!(a1.history.next[0].id, b1.history.next[0].id);
+        assert_ne!(a1.history.next[0].id, other_scene.history.next[0].id);
 
-        let a2 = feature.extract(
-            &mut registry,
-            1,
-            &camera_a,
-            0.9,
-            2,
-            2,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        let b2 = feature.extract(
-            &mut registry,
-            1,
-            &camera_b,
-            0.9,
-            2,
-            2,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
+        commit(&mut registry, a1);
+        commit(&mut registry, b1);
+        let a2 = extract(&mut feature, &mut registry, 1, &camera_a, 2, 2);
+        let b2 = extract(&mut feature, &mut registry, 1, &camera_b, 2, 2);
 
         assert!(a2.history.valid);
         assert!(b2.history.valid);
         assert_eq!(a2.previous_color(), Some(a1.history.next[0]));
         assert_eq!(b2.previous_color(), Some(b1.history.next[0]));
+        assert_eq!(a2.params[2], 0.0);
     }
 
     #[test]
-    fn abandoned_domain_expires_after_ttl_and_reenters_with_invalid_history() {
+    fn taa_cut_and_idle_reentry_reset_the_existing_domain_atomically() {
         let mut registry = HistoryRegistry::new();
         let mut feature = TaaFeature::new();
-        let camera = render_camera(31);
+        let mut camera = render_camera(31);
 
-        let first = feature.extract(
-            &mut registry,
-            1,
-            &camera,
-            0.9,
-            1,
-            10,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        assert!(registry.commit(
-            first.history.commit,
-            &first.history.next.map(|texture| texture.id),
+        let first = extract(&mut feature, &mut registry, 1, &camera, 1, 1);
+        commit(&mut registry, first);
+        let warm = extract(&mut feature, &mut registry, 1, &camera, 2, 2);
+        assert!(warm.history.valid);
+
+        camera.camera_cut = 1;
+        let cut = extract(&mut feature, &mut registry, 1, &camera, 3, 3);
+        assert!(!cut.history.valid);
+        assert_eq!(cut.params[2], 1.0);
+        assert_eq!(cut.history.commit.set_id, first.history.commit.set_id);
+        assert!(!registry.commit(
+            warm.history.commit,
+            &warm.history.next.map(|texture| texture.id),
         ));
+        commit(&mut registry, cut);
 
-        assert_eq!(feature.garbage_collect(&mut registry, 12, 2), 0);
-        assert_eq!(feature.histories.len(), 1);
-        assert_eq!(feature.garbage_collect(&mut registry, 13, 2), 1);
-        assert!(feature.histories.is_empty());
-
-        let replacement = feature.extract(
+        camera.camera_cut = 0;
+        let expired = extract(
+            &mut feature,
             &mut registry,
             1,
             &camera,
-            0.9,
-            2,
-            13,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
+            4,
+            TEMPORAL_DOMAIN_TTL_FRAMES + 4,
         );
-        assert!(!replacement.history.valid);
-        assert_ne!(
-            replacement.history.commit.set_id,
-            first.history.commit.set_id
-        );
-        assert_ne!(replacement.history.next[0].id, first.history.next[0].id);
-    }
-
-    #[test]
-    fn reentry_expires_stale_history_even_without_a_periodic_sweep() {
-        let mut registry = HistoryRegistry::new();
-        let mut feature = TaaFeature::new();
-        let camera = render_camera(32);
-
-        let first = feature.extract(
-            &mut registry,
-            1,
-            &camera,
-            0.9,
-            1,
-            1,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        assert!(registry.commit(
-            first.history.commit,
-            &first.history.next.map(|texture| texture.id),
-        ));
-
-        let replacement = feature.extract(
-            &mut registry,
-            1,
-            &camera,
-            0.9,
-            2,
-            TEMPORAL_DOMAIN_TTL_FRAMES + 2,
-            (64, 64),
-            wgpu::TextureFormat::Depth32Float,
-        );
-        assert!(!replacement.history.valid);
-        assert_ne!(
-            replacement.history.commit.set_id,
-            first.history.commit.set_id
-        );
+        assert!(!expired.history.valid);
+        assert_ne!(expired.history.commit.set_id, cut.history.commit.set_id);
     }
 }

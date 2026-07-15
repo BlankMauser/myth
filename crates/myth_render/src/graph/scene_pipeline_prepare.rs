@@ -1278,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn planning_restores_semantic_order_after_permuted_gather() {
+    fn planning_restores_semantic_order_and_deduplicates_to_the_earliest_owner() {
         let mut plans = DrawPlanStore::new();
         let plan_ids = [
             plans.reserve_plan(DrawPlanKey::Opaque),
@@ -1352,45 +1352,25 @@ mod tests {
             );
         }
 
-        // Request coordination order follows the first semantic consumer,
-        // independent of which worker happened to gather it first.
+        // Exact keys share one coordinated request across plans, and its
+        // owner is the first semantic consumer rather than the first worker
+        // that happened to gather it.
+        assert_eq!(store.prepass_request_count(), 3);
+        let shared_request = store.prepass_draws(0)[2].pipeline;
+        assert_eq!(store.prepass_draws(1)[0].pipeline, shared_request);
+        assert_eq!(store.prepass_draws(2)[1].pipeline, shared_request);
+        let (_, owner, result) = store.prepass_request(shared_request);
+        assert_eq!(owner, PreparedSourceId::from_index(2));
+        assert_eq!(result, None);
+
+        // Request coordination order follows each key's first semantic
+        // consumer, independent of worker gather order.
         let ordered_keys = store
             .prepass_request_order()
             .iter()
             .map(|&id| store.prepass_request(id).0)
             .collect::<Vec<_>>();
         assert_eq!(ordered_keys, [keys[1], keys[2], keys[0]]);
-    }
-
-    #[test]
-    fn exact_prepass_keys_deduplicate_consumers_and_select_earliest_owner() {
-        let mut plans = DrawPlanStore::new();
-        let plan = plans.reserve_plan(DrawPlanKey::Opaque);
-        let shared = prepass_key(7);
-        let distinct = PrepassPipelineL1Key {
-            material_version: shared.material_version + 1,
-            ..shared
-        };
-        let mut store = ScenePipelinePrepareStore::new();
-
-        push_prepass_test_recipe(&mut store, plan, 0, 9, 9, shared);
-        push_prepass_test_recipe(&mut store, plan, 0, 2, 2, shared);
-        push_prepass_test_recipe(&mut store, plan, 0, 5, 5, distinct);
-        store.plan(1);
-
-        assert_eq!(store.prepass_request_count(), 2);
-        let draws = store.prepass_draws(0);
-        assert_eq!(draws.len(), 3);
-        assert_eq!(draws[0].ordinal, SceneRecipeOrdinal::new(0, 2));
-        assert_eq!(draws[1].ordinal, SceneRecipeOrdinal::new(0, 5));
-        assert_eq!(draws[2].ordinal, SceneRecipeOrdinal::new(0, 9));
-        assert_eq!(draws[0].pipeline, draws[2].pipeline);
-        assert_ne!(draws[0].pipeline, draws[1].pipeline);
-
-        let shared_request = draws[0].pipeline;
-        let (_, owner, result) = store.prepass_request(shared_request);
-        assert_eq!(owner, PreparedSourceId::from_index(2));
-        assert_eq!(result, None);
     }
 
     #[test]
@@ -1419,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn participating_sources_are_unique_and_generation_wrap_clears_stamps() {
+    fn participating_source_generations_and_capacity_follow_retained_store_contract() {
         let mut plans = DrawPlanStore::new();
         let plan = plans.reserve_plan(DrawPlanKey::Opaque);
         let mut store = ScenePipelinePrepareStore::new();
@@ -1449,6 +1429,45 @@ mod tests {
         push_prepass_test_recipe(&mut store, plan, 0, 0, source.index(), prepass_key(10));
         store.plan(1);
         assert_eq!(store.participating_source_count(), 1);
+
+        // The same store retains a high-water allocation across clear/reuse,
+        // then releases only excess capacity when explicitly trimmed.
+        store.clear();
+        let key = prepass_key(11);
+        for intent_index in 0..(DRAW_RECIPE_BASELINE * 16) {
+            push_prepass_test_recipe(&mut store, plan, 0, intent_index, intent_index, key);
+        }
+        store.plan(1);
+        let populated = store.capacity_usage();
+        assert!(populated.active_bytes > 0);
+        assert!(populated.retained_bytes > populated.baseline_bytes);
+
+        store.clear();
+        let retained = store.capacity_usage();
+        assert_eq!(retained.active_bytes, 0);
+        assert_eq!(retained.retained_bytes, populated.retained_bytes);
+
+        for intent_index in 0..(DRAW_RECIPE_BASELINE * 16) {
+            push_prepass_test_recipe(&mut store, plan, 0, intent_index, intent_index, key);
+        }
+        store.plan(1);
+        assert_eq!(
+            store.capacity_usage().retained_bytes,
+            retained.retained_bytes
+        );
+
+        store.clear();
+        let retained = store.capacity_usage();
+        store.trim_capacity(0, retained.retained_bytes);
+        let trimmed = store.capacity_usage();
+        assert!(trimmed.retained_bytes < retained.retained_bytes);
+        assert!(
+            trimmed.retained_bytes
+                >= ScenePipelinePrepareStore::new()
+                    .capacity_usage()
+                    .retained_bytes
+        );
+        assert!(store.is_empty());
     }
 
     #[test]
@@ -1511,45 +1530,5 @@ mod tests {
             accepted_owner.source_join_generation,
             PreparedSourceId::from_index(5),
         ));
-    }
-
-    #[test]
-    fn clear_retains_then_trim_releases_excess_capacity() {
-        let mut plans = DrawPlanStore::new();
-        let plan = plans.reserve_plan(DrawPlanKey::Opaque);
-        let key = prepass_key(11);
-        let mut store = ScenePipelinePrepareStore::new();
-        for intent_index in 0..(DRAW_RECIPE_BASELINE * 16) {
-            push_prepass_test_recipe(&mut store, plan, 0, intent_index, intent_index, key);
-        }
-        store.plan(1);
-        let populated = store.capacity_usage();
-        assert!(populated.active_bytes > 0);
-        assert!(populated.retained_bytes > populated.baseline_bytes);
-
-        store.clear();
-        let retained = store.capacity_usage();
-        assert_eq!(retained.active_bytes, 0);
-        assert_eq!(retained.retained_bytes, populated.retained_bytes);
-
-        for intent_index in 0..(DRAW_RECIPE_BASELINE * 16) {
-            push_prepass_test_recipe(&mut store, plan, 0, intent_index, intent_index, key);
-        }
-        store.plan(1);
-        let same_shape = store.capacity_usage();
-        assert_eq!(same_shape.retained_bytes, retained.retained_bytes);
-
-        store.clear();
-        let retained = store.capacity_usage();
-        store.trim_capacity(0, retained.retained_bytes);
-        let trimmed = store.capacity_usage();
-        assert!(trimmed.retained_bytes < retained.retained_bytes);
-        assert!(
-            trimmed.retained_bytes
-                >= ScenePipelinePrepareStore::new()
-                    .capacity_usage()
-                    .retained_bytes
-        );
-        assert!(store.is_empty());
     }
 }

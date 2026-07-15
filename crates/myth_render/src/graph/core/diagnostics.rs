@@ -972,12 +972,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uncompiled_and_all_dead_attempts_are_distinct() {
+    fn terminal_outcome_matrix_preserves_compile_and_submission_boundaries() {
         let recorder = RdgDiagnosticsRecorder::default();
+
+        // A graph abandoned before compilation must not be confused with a
+        // successfully compiled graph whose complete topology was culled.
         recorder.start_standalone_attempt();
         recorder.record_declared_pass();
         recorder.finish_standalone_attempt();
-        assert_eq!(recorder.latest().unwrap().live_passes(), None);
+        let uncompiled = recorder.latest().unwrap();
+        assert_eq!(uncompiled.outcome(), RdgAttemptOutcome::Abandoned);
+        assert_eq!(uncompiled.live_passes(), None);
 
         recorder.start_standalone_attempt();
         recorder.record_declared_pass();
@@ -991,11 +996,9 @@ mod tests {
         assert_eq!(all_dead.live_passes(), Some(0));
         assert_eq!(all_dead.prepared_passes(), 0);
         assert_eq!(all_dead.executed_passes(), 0);
-    }
 
-    #[test]
-    fn post_submit_abandonment_preserves_submission_truth() {
-        let recorder = RdgDiagnosticsRecorder::default();
+        // Submission is already externally visible even when publication is
+        // abandoned later in the attempt.
         recorder.start_standalone_attempt();
         recorder.record_declared_pass();
         recorder.record_compiled_live_passes(1);
@@ -1005,18 +1008,15 @@ mod tests {
         recorder.enter_phase(RdgFramePhase::Publish);
         recorder.finish_standalone_attempt();
 
-        let snapshot = recorder.latest().unwrap();
+        let post_submit = recorder.latest().unwrap();
         assert_eq!(
-            snapshot.outcome(),
+            post_submit.outcome(),
             RdgAttemptOutcome::SubmittedThenAbandoned
         );
-        assert!(snapshot.queue_submitted());
-        assert_eq!(snapshot.phase(), RdgFramePhase::Publish);
-    }
+        assert!(post_submit.queue_submitted());
+        assert_eq!(post_submit.phase(), RdgFramePhase::Publish);
 
-    #[test]
-    fn resource_materialization_failure_is_terminal_without_submission() {
-        let recorder = RdgDiagnosticsRecorder::default();
+        // Materialization failure is a clean pre-prepare terminal state.
         recorder.start_renderer_attempt(3);
         let guard = RdgComposerAttemptGuard::new(&recorder);
         recorder.enter_phase(RdgFramePhase::MaterializeResources);
@@ -1043,8 +1043,10 @@ mod tests {
     }
 
     #[test]
-    fn a_new_attempt_publishes_an_unfinished_predecessor_once() {
+    fn guards_publish_or_handoff_once_and_stale_guards_are_inert() {
         let recorder = RdgDiagnosticsRecorder::default();
+
+        // Starting a newer attempt first publishes its unfinished predecessor.
         recorder.start_renderer_attempt(41);
         let first_id = recorder.current().unwrap().attempt_id();
         recorder.start_renderer_attempt(42);
@@ -1054,11 +1056,8 @@ mod tests {
         assert_eq!(abandoned.renderer_frame(), Some(41));
         assert_eq!(abandoned.outcome(), RdgAttemptOutcome::Abandoned);
         assert_eq!(recorder.current().unwrap().attempt_id(), first_id + 1);
-    }
 
-    #[test]
-    fn pre_composer_guard_publishes_abandonment_unless_handed_off() {
-        let recorder = RdgDiagnosticsRecorder::default();
+        // A pre-composer guard owns abandonment until it explicitly hands off.
         recorder.start_renderer_attempt(7);
         {
             let guard = RdgRendererAttemptGuard::new(&recorder);
@@ -1073,43 +1072,43 @@ mod tests {
         RdgRendererAttemptGuard::new(&recorder).hand_off();
         assert!(recorder.current().is_some());
         assert_eq!(recorder.latest().unwrap().renderer_frame(), Some(7));
-    }
 
-    #[test]
-    fn stale_guard_cannot_finish_a_newer_attempt() {
-        let recorder = RdgDiagnosticsRecorder::default();
-        recorder.start_renderer_attempt(10);
+        // Once a newer attempt supersedes the handed-off attempt, its stale
+        // composer guard cannot terminate the new owner.
         let stale = RdgComposerAttemptGuard::new(&recorder);
-        recorder.start_renderer_attempt(11);
+        recorder.start_renderer_attempt(9);
         let current_id = recorder.current().unwrap().attempt_id();
 
         drop(stale);
 
         let current = recorder.current().expect("newer attempt was terminated");
         assert_eq!(current.attempt_id(), current_id);
-        assert_eq!(current.renderer_frame(), Some(11));
-        RdgComposerAttemptGuard::new(&recorder);
+        assert_eq!(current.renderer_frame(), Some(9));
+        drop(RdgComposerAttemptGuard::new(&recorder));
     }
 
     #[test]
-    fn submission_truth_survives_a_diagnostic_panic() {
+    fn irreversible_external_facts_survive_diagnostic_panics() {
         let recorder = RdgDiagnosticsRecorder::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+
+        let submission_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             recorder.start_renderer_attempt(12);
             let _guard = RdgComposerAttemptGuard::new(&recorder);
             // Deliberately omit compiled-live state. The recorder must set the
             // irreversible submission flag before rejecting this drift.
             recorder.mark_queue_submitted();
         }));
-        assert!(result.is_err());
+        assert!(submission_result.is_err());
 
-        let snapshot = recorder.latest().expect("panic snapshot missing");
+        let submitted = recorder
+            .latest()
+            .expect("submission panic snapshot missing");
         assert_eq!(
-            snapshot.outcome(),
+            submitted.outcome(),
             RdgAttemptOutcome::SubmittedThenAbandoned
         );
-        assert!(snapshot.queue_submitted());
-        assert!(snapshot.panicked());
+        assert!(submitted.queue_submitted());
+        assert!(submitted.panicked());
     }
 
     #[test]

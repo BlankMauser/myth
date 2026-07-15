@@ -1480,16 +1480,13 @@ mod tests {
     }
 
     #[test]
-    fn procedural_skybox_declares_all_physical_inputs() {
+    fn graph_inputs_are_explicit_and_follow_skybox_demand() {
         let live = procedural_graph_live_passes(true);
         assert!(live.contains(&"SkyView_Producer"));
         assert!(live.contains(&"Transmittance_Producer"));
         assert!(live.contains(&"Bake_Params_Producer"));
         assert!(live.contains(&"Skybox_Pass"));
-    }
 
-    #[test]
-    fn texture_skybox_declares_the_mip_ready_input() {
         let live = texture_graph_live_passes(true);
         let mip = live
             .iter()
@@ -1500,11 +1497,9 @@ mod tests {
             .position(|&name| name == "Skybox_Pass")
             .expect("texture Skybox pass must remain live");
         assert!(mip < skybox);
-    }
 
-    #[test]
-    fn dead_texture_skybox_culls_its_mip_ready_chain() {
         assert!(texture_graph_live_passes(false).is_empty());
+        assert!(procedural_graph_live_passes(false).is_empty());
     }
 
     #[test]
@@ -1697,10 +1692,5 @@ mod tests {
         assert!(live.contains(&"Inline_Bake_Params_Producer"));
         assert!(live.contains(&"SimpleForward_Pass"));
         assert!(!live.contains(&"Skybox_Pass"));
-    }
-
-    #[test]
-    fn dead_procedural_skybox_culls_its_entire_input_chain() {
-        assert!(procedural_graph_live_passes(false).is_empty());
     }
 }
