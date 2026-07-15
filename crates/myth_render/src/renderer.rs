@@ -1545,6 +1545,42 @@ mod tests {
         (assets, scene)
     }
 
+    /// Forest-shaped single-bin workload for runtime backend/path switching.
+    /// All instances deliberately share one Geometry/Material identity so the
+    /// Auto policy has a stable, profitable GPU cohort without making this
+    /// headless regression test raster-heavy.
+    fn make_gpu_scene_switch_fixture() -> (AssetServer, Scene, NodeHandle) {
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
+        let material = assets
+            .materials
+            .add(PhysicalMaterial::new(Vec4::new(0.32, 0.56, 0.24, 1.0)));
+        let mut scene = Scene::new();
+
+        for _ in 0..256 {
+            let instance = scene.spawn(geometry, material, &assets);
+            scene
+                .node(&instance)
+                .set_cast_shadows(true)
+                .set_receive_shadows(true);
+        }
+
+        let mut directional = Light::new_directional(Vec3::ONE, 1.0);
+        directional.cast_shadows = true;
+        if let Some(shadow) = directional.shadow.as_mut() {
+            shadow.map_size = 64;
+            shadow.cascade_count = 4;
+        }
+        let sun = scene.add_light(directional);
+        scene
+            .node(&sun)
+            .set_position(-4.0, 6.0, -4.0)
+            .look_at(Vec3::ZERO);
+        scene.update_matrix_world();
+
+        (assets, scene, sun)
+    }
+
     /// Two distinct textured bins whose solid texels make both material
     /// bindings observable in a headless readback.
     fn make_gpu_scene_textured_fixture() -> (AssetServer, Scene, [TextureHandle; 2]) {
@@ -2069,6 +2105,119 @@ mod tests {
             .execution_queue
             .iter()
             .any(|&index| state.graph_storage.passes[index].name == name)
+    }
+
+    fn assert_gpu_scene_indirect_buffer_usage(state: &RendererState, stage: &str) {
+        const NAME: &str = "GpuScene_MultiBin_Indexed_Indirect_Arguments";
+        let required = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_DST;
+        let mut materialized = 0;
+
+        for resource in state
+            .graph_storage
+            .resources
+            .iter()
+            .filter(|resource| resource.name == NAME && resource.physical_index.is_some())
+        {
+            materialized += 1;
+            let logical = resource.buffer_desc();
+            assert!(
+                logical.usage.contains(required),
+                "{stage}: {NAME} logical usage {:?} lost {:?}",
+                logical.usage,
+                required
+            );
+
+            let physical_index = resource
+                .physical_index
+                .expect("filtered materialized buffer lost its allocation");
+            let physical = state
+                .transient_pool
+                .buffers
+                .get(physical_index)
+                .and_then(Option::as_ref)
+                .unwrap_or_else(|| {
+                    panic!("{stage}: {NAME} physical allocation {physical_index} is missing")
+                });
+            assert!(
+                physical.usage.contains(required),
+                "{stage}: {NAME} physical allocation {} (uid {}) has usage {:?}, expected {:?}",
+                physical_index,
+                physical.buffer.id(),
+                physical.usage,
+                required
+            );
+        }
+
+        assert!(
+            materialized > 0,
+            "{stage}: no live {NAME} allocation was materialized"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_gpu_scene_switch_stage(
+        renderer: &mut Renderer,
+        scene: &mut Scene,
+        camera: RenderCamera,
+        assets: &AssetServer,
+        sun: NodeHandle,
+        frame_index: u64,
+        stage: &str,
+        path: RenderPath,
+        mode: GpuDrivenMode,
+        cast_shadows: bool,
+        expected_backend: RdgSceneSubmissionBackend,
+    ) {
+        renderer.set_render_path(path);
+        renderer.set_gpu_driven_mode(mode);
+        scene
+            .get_light_mut(sun)
+            .expect("switch fixture sun is missing")
+            .cast_shadows = cast_shadows;
+
+        render_frame(renderer, scene, camera, assets, frame_index);
+
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .unwrap_or_else(|| panic!("{stage}: submitted RDG diagnostics missing"));
+        assert_eq!(
+            diagnostics.outcome(),
+            RdgAttemptOutcome::Submitted,
+            "{stage}: frame did not reach queue submission"
+        );
+        let main = diagnostics.scene_submission_family(RdgSceneSubmissionFamily::MainPrepass);
+        assert_eq!(
+            main.selected_backend(),
+            expected_backend,
+            "{stage}: unexpected selected main backend; reason={:?}, policy={:?}",
+            main.selection_reason(),
+            diagnostics.gpu_driven_policy()
+        );
+        assert_eq!(
+            main.live_backend(),
+            expected_backend,
+            "{stage}: unexpected live main backend"
+        );
+
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        if expected_backend == RdgSceneSubmissionBackend::GpuDriven {
+            assert!(
+                execution_contains_pass(state, "GpuScene_Cull"),
+                "{stage}: GPU-driven main cull was not executed"
+            );
+            assert_gpu_scene_indirect_buffer_usage(state, stage);
+        } else {
+            assert!(
+                expected_backend == RdgSceneSubmissionBackend::CpuDirect,
+                "the switch test only models live CPU or GPU ownership"
+            );
+            assert!(
+                !execution_contains_pass(state, "GpuScene_Cull"),
+                "{stage}: CpuDirect main unexpectedly executed GPU cull"
+            );
+        }
     }
 
     #[cfg(feature = "3dgs")]
@@ -4053,6 +4202,142 @@ mod tests {
             changed_pixels >= 32,
             "shadow-enabled fixture changed only {changed_pixels} pixels"
         );
+    }
+
+    #[test]
+    fn gpu_driven_runtime_path_and_policy_switches_preserve_indirect_buffer_usage() {
+        let mut renderer =
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Auto);
+        if !renderer
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            return;
+        }
+        let (assets, mut scene, sun) = make_gpu_scene_switch_fixture();
+        let camera = make_shadow_camera();
+
+        // Auto requires three successful queue submissions before entering
+        // the GPU path. These stages model the Forest workload selector and
+        // submission-mode UI against one long-lived transient pool.
+        let stages = [
+            (
+                "high-fidelity-csm-auto-confirmation-1",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Auto,
+                true,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "high-fidelity-csm-auto-confirmation-2",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Auto,
+                true,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "high-fidelity-csm-auto-enter",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Auto,
+                true,
+                RdgSceneSubmissionBackend::GpuDriven,
+            ),
+            (
+                "high-fidelity-csm-required",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Required,
+                true,
+                RdgSceneSubmissionBackend::GpuDriven,
+            ),
+            (
+                "high-fidelity-csm-off",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Off,
+                true,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "high-fidelity-no-shadow-auto-confirmation-1",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Auto,
+                false,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "high-fidelity-no-shadow-auto-confirmation-2",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Auto,
+                false,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "high-fidelity-no-shadow-auto-enter",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Auto,
+                false,
+                RdgSceneSubmissionBackend::GpuDriven,
+            ),
+            (
+                "basic-forward-auto-confirmation-1",
+                RenderPath::BasicForward,
+                GpuDrivenMode::Auto,
+                false,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "basic-forward-auto-confirmation-2",
+                RenderPath::BasicForward,
+                GpuDrivenMode::Auto,
+                false,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "basic-forward-auto-enter",
+                RenderPath::BasicForward,
+                GpuDrivenMode::Auto,
+                false,
+                RdgSceneSubmissionBackend::GpuDriven,
+            ),
+            (
+                "basic-forward-required",
+                RenderPath::BasicForward,
+                GpuDrivenMode::Required,
+                false,
+                RdgSceneSubmissionBackend::GpuDriven,
+            ),
+            (
+                "basic-forward-off",
+                RenderPath::BasicForward,
+                GpuDrivenMode::Off,
+                false,
+                RdgSceneSubmissionBackend::CpuDirect,
+            ),
+            (
+                "high-fidelity-csm-required-reentry",
+                RenderPath::HighFidelity,
+                GpuDrivenMode::Required,
+                true,
+                RdgSceneSubmissionBackend::GpuDriven,
+            ),
+        ];
+
+        for (frame_index, (stage, path, mode, shadows, expected_backend)) in
+            stages.into_iter().enumerate()
+        {
+            render_gpu_scene_switch_stage(
+                &mut renderer,
+                &mut scene,
+                camera,
+                &assets,
+                sun,
+                frame_index as u64,
+                stage,
+                path,
+                mode,
+                shadows,
+                expected_backend,
+            );
+        }
     }
 
     #[test]

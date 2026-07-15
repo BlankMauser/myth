@@ -25,29 +25,29 @@ const FOREST_SPACING: f32 = 1.34;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForestWorkload {
-    HighFidelityShadows,
-    HighFidelityNoShadows,
-    BasicForwardNoShadows,
+    HighFidelityCsm,
+    HighFidelityUnshadowed,
+    BasicForwardUnshadowed,
 }
 
 impl ForestWorkload {
     const fn label(self) -> &'static str {
         match self {
-            Self::HighFidelityShadows => "HighFidelity + 4 CSM",
-            Self::HighFidelityNoShadows => "HighFidelity / no shadows",
-            Self::BasicForwardNoShadows => "BasicForward / no shadows",
+            Self::HighFidelityCsm => "HighFidelity + 4 CSM",
+            Self::HighFidelityUnshadowed => "HighFidelity / no shadows",
+            Self::BasicForwardUnshadowed => "BasicForward / no shadows",
         }
     }
 
     const fn render_path(self) -> RenderPath {
         match self {
-            Self::HighFidelityShadows | Self::HighFidelityNoShadows => RenderPath::HighFidelity,
-            Self::BasicForwardNoShadows => RenderPath::BasicForward,
+            Self::HighFidelityCsm | Self::HighFidelityUnshadowed => RenderPath::HighFidelity,
+            Self::BasicForwardUnshadowed => RenderPath::BasicForward,
         }
     }
 
     const fn shadows_enabled(self) -> bool {
-        matches!(self, Self::HighFidelityShadows)
+        matches!(self, Self::HighFidelityCsm)
     }
 }
 
@@ -197,7 +197,7 @@ impl AppHandler for GpuDrivenForestDemo {
             fps_counter: FpsCounter::new(),
             ui_pass,
             mode: GpuDrivenMode::Auto,
-            workload: ForestWorkload::HighFidelityShadows,
+            workload: ForestWorkload::HighFidelityCsm,
             sun,
         }
     }
@@ -271,18 +271,18 @@ impl AppHandler for GpuDrivenForestDemo {
                 ui.label("Rendering workload");
                 ui.selectable_value(
                     &mut self.workload,
-                    ForestWorkload::HighFidelityShadows,
-                    ForestWorkload::HighFidelityShadows.label(),
+                    ForestWorkload::HighFidelityCsm,
+                    ForestWorkload::HighFidelityCsm.label(),
                 );
                 ui.selectable_value(
                     &mut self.workload,
-                    ForestWorkload::HighFidelityNoShadows,
-                    ForestWorkload::HighFidelityNoShadows.label(),
+                    ForestWorkload::HighFidelityUnshadowed,
+                    ForestWorkload::HighFidelityUnshadowed.label(),
                 );
                 ui.selectable_value(
                     &mut self.workload,
-                    ForestWorkload::BasicForwardNoShadows,
-                    ForestWorkload::BasicForwardNoShadows.label(),
+                    ForestWorkload::BasicForwardUnshadowed,
+                    ForestWorkload::BasicForwardUnshadowed.label(),
                 );
 
                 if let Some(diagnostics) = diagnostics {
@@ -322,16 +322,15 @@ impl AppHandler for GpuDrivenForestDemo {
             self.fps_counter = FpsCounter::new();
         }
 
-        if self.workload != previous_workload {
-            if let Some(scene) = engine.scene_manager.active_scene_mut()
-                && let Some(sun) = scene.get_light_mut(self.sun)
-            {
-                // Keep the complete four-cascade configuration resident and
-                // toggle only whether it contributes shadow views. This makes
-                // profile changes cheap and preserves the exact same scene,
-                // light, and asset identities across A/B measurements.
-                sun.cast_shadows = self.workload.shadows_enabled();
-            }
+        if self.workload != previous_workload
+            && let Some(scene) = engine.scene_manager.active_scene_mut()
+            && let Some(sun) = scene.get_light_mut(self.sun)
+        {
+            // Keep the complete four-cascade configuration resident and
+            // toggle only whether it contributes shadow views. This makes
+            // profile changes cheap and preserves the exact same scene,
+            // light, and asset identities across A/B measurements.
+            sun.cast_shadows = self.workload.shadows_enabled();
         }
 
         if let Some(scene) = engine.scene_manager.active_scene_mut()

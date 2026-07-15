@@ -108,8 +108,6 @@ fn buffer_allocation_is_available(
 // --- Physical Texture ----------------------------------------------------------
 
 pub(crate) struct PhysicalTexture {
-    /// Monotonically-increasing allocation identifier.
-    pub(crate) uid: u64,
     pub(crate) desc: TextureDesc,
     /// Raw wgpu texture handle — kept alive for sub-view creation.
     pub(crate) texture: wgpu::Texture,
@@ -124,7 +122,6 @@ pub(crate) struct PhysicalTexture {
 }
 
 pub(crate) struct PhysicalBuffer {
-    pub(crate) uid: u64,
     pub(crate) physical_size: u64,
     pub(crate) usage: wgpu::BufferUsages,
     pub(crate) buffer: Tracked<wgpu::Buffer>,
@@ -146,8 +143,6 @@ pub struct TransientPool {
     /// Per-frame timeline occupancy: `active_allocations[i]` holds the
     /// exclusive upper bound of the last timeline slot that acquired texture `i`.
     active_allocations: Vec<usize>,
-    /// Monotonically-increasing allocation UID counter.
-    uid_counter: u64,
     /// Bucketed free-list: maps `(Dimension, Format)` → indices into `resources`.
     buckets: FxHashMap<BucketKey, Vec<usize>>,
     /// All physical buffers, indexed by dense slot index.
@@ -175,7 +170,6 @@ impl TransientPool {
             resources: Vec::new(),
             free_slots: Vec::new(),
             active_allocations: Vec::new(),
-            uid_counter: 0,
             buckets: FxHashMap::default(),
             buffers: Vec::new(),
             buffer_free_slots: Vec::new(),
@@ -325,8 +319,6 @@ impl TransientPool {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let default_view = Tracked::new(view);
 
-        self.uid_counter += 1;
-
         // Optional cached view for the first mip level (common case for render targets).
         let base_mip = if texture.mip_level_count() > 1 {
             Some(Tracked::new(texture.create_view(
@@ -347,7 +339,6 @@ impl TransientPool {
         };
 
         let physical_tex = PhysicalTexture {
-            uid: self.uid_counter,
             desc: *desc,
             texture,
             default_view,
@@ -411,10 +402,7 @@ impl TransientPool {
             mapped_at_creation: false,
         }));
 
-        self.uid_counter += 1;
-
         let physical_buffer = PhysicalBuffer {
-            uid: self.uid_counter,
             physical_size,
             usage: desc.usage,
             buffer,
@@ -497,11 +485,13 @@ impl TransientPool {
         &self.get_tex(index).texture
     }
 
-    /// Returns the allocation UID (monotonically increasing, unique per texture).
+    /// Returns the allocation UID from the process-wide tracked-resource
+    /// namespace. Transient and external resources may therefore be interned in
+    /// one identity table without numeric aliases.
     #[inline]
     #[must_use]
     pub fn get_uid(&self, index: usize) -> u64 {
-        self.get_tex(index).uid
+        self.get_tex(index).default_view.id()
     }
 
     /// Returns the raw `wgpu::Buffer` handle.
@@ -518,11 +508,12 @@ impl TransientPool {
         &self.get_buffer_ref(index).buffer
     }
 
-    /// Returns the allocation UID for the given transient buffer.
+    /// Returns the allocation UID from the process-wide tracked-resource
+    /// namespace.
     #[inline]
     #[must_use]
     pub fn get_buffer_uid(&self, index: usize) -> u64 {
-        self.get_buffer_ref(index).uid
+        self.get_buffer_ref(index).buffer.id()
     }
 
     /// Lazily creates and caches a sub-view for the given physical texture.
@@ -563,7 +554,11 @@ impl TransientPool {
 
 #[cfg(test)]
 mod tests {
-    use super::buffer_allocation_is_available;
+    use super::{TransientPool, buffer_allocation_is_available};
+    use crate::core::WgpuContext;
+    use crate::core::gpu::Tracked;
+    use crate::graph::core::{BufferDesc, TextureDesc};
+    use crate::settings::{RendererInitConfig, RendererSettings};
 
     #[test]
     fn copy_dst_buffer_can_reuse_a_previous_frame_allocation() {
@@ -592,5 +587,54 @@ mod tests {
             2,
             wgpu::BufferUsages::STORAGE,
         ));
+    }
+
+    #[test]
+    fn transient_allocations_use_the_global_tracked_identity_namespace() {
+        let Ok(context) = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            4,
+            4,
+            None,
+        )) else {
+            return;
+        };
+        let external = Tracked::new(context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("External Identity Sentinel"),
+            size: 256,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        let mut pool = TransientPool::new();
+        let buffer = pool.acquire_buffer(
+            &context.device,
+            &BufferDesc::new(
+                256,
+                wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            ),
+            0,
+            0,
+        );
+        let texture = pool.acquire(
+            &context.device,
+            &TextureDesc::new_2d(
+                4,
+                4,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            ),
+            0,
+            0,
+        );
+
+        assert_eq!(
+            pool.get_buffer_uid(buffer),
+            pool.get_tracked_buffer(buffer).id()
+        );
+        assert_eq!(pool.get_uid(texture), pool.get_tracked_view(texture).id());
+        assert_ne!(pool.get_buffer_uid(buffer), external.id());
+        assert_ne!(pool.get_uid(texture), external.id());
+        assert_ne!(pool.get_uid(texture), pool.get_buffer_uid(buffer));
     }
 }
