@@ -23,20 +23,15 @@ pub(crate) fn collect_draw_intents(
     extracted_scene: &ExtractedScene,
     render_lists: &mut RenderLists,
     camera: &RenderCamera,
+    gpu_owns_opaque: bool,
+    gpu_owns_shadows: bool,
 ) {
-    render_lists.begin_intent_collection();
-
     let camera_frustum = camera.frustum;
     let camera_pos = camera.position;
 
     // Main-camera intents. Pipeline-dependent ordering is intentionally left
     // to the post-DPE plan finalizer; these records contain only CPU facts.
     for (item_idx, item) in extracted_scene.render_items.iter().enumerate() {
-        let aabb = item.world_aabb;
-        if aabb.is_finite() && !camera_frustum.intersects_aabb(&aabb) {
-            continue;
-        }
-
         let use_transmission = item
             .material_classification
             .contains(MaterialClassification::USES_TRANSMISSION);
@@ -44,6 +39,18 @@ pub(crate) fn collect_draw_intents(
             .material_classification
             .contains(MaterialClassification::TRANSPARENT);
         render_lists.use_transmission |= use_transmission;
+
+        // A selected GPU Scene batch owns the complete pre-frustum opaque
+        // domain. Do not repeat CPU visibility, source interning, or intent
+        // writes for objects that will be compacted by the Cull node.
+        if gpu_owns_opaque && !is_transparent && !use_transmission {
+            continue;
+        }
+
+        let aabb = item.world_aabb;
+        if aabb.is_finite() && !camera_frustum.intersects_aabb(&aabb) {
+            continue;
+        }
 
         let item_pos = Vec3A::from(item.world_matrix.w_axis.truncate());
         let source = render_lists.intern_frame_source(ExtractedSourceId::from_index(item_idx));
@@ -64,6 +71,10 @@ pub(crate) fn collect_draw_intents(
 
     // Shadow queues retain the exact active-view topology even when a view
     // has no casters, keeping an empty live plan distinct from no plan.
+    if gpu_owns_shadows {
+        return;
+    }
+
     for view_index in 0..render_lists.active_views.len() {
         let view = &render_lists.active_views[view_index];
         let ViewTarget::ShadowLight {

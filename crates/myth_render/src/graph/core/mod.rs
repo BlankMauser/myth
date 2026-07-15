@@ -11,6 +11,7 @@ mod global_state;
 pub mod graph;
 pub mod node;
 pub mod persistent;
+mod persistent_buffer;
 mod scene_buffer;
 pub(crate) mod scene_submission;
 pub mod template_pass;
@@ -31,7 +32,8 @@ pub use context::{
 #[cfg(feature = "rdg_bench_support")]
 pub use diagnostics::RdgDetailPhase;
 pub use diagnostics::{
-    RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
+    RdgAttemptOutcome, RdgCommandEncodingFailure, RdgFrameDiagnostics, RdgFramePhase,
+    RdgGpuDrivenFailure, RdgPostSubmitPublicationFailure, RdgRenderTargetKind,
     RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
 };
 pub(crate) use diagnostics::{
@@ -44,6 +46,20 @@ pub use persistent::{
     CacheCommitToken, CacheId, CacheKey, CachePlan, CachePublicationReceipt, HistoryCommitToken,
     HistoryPlan, HistoryRegistry, HistorySetId, HistoryTextureRef, PersistentTextureId,
     PersistentTextureRef, PersistentTextureSpec, TemporalDomainKey,
+};
+#[cfg(test)]
+pub(crate) use persistent_buffer::PersistentBufferCommitRequest;
+pub use persistent_buffer::PersistentBufferId;
+#[cfg(test)]
+pub(crate) use persistent_buffer::PersistentBufferPlanFailure;
+#[allow(
+    unused_imports,
+    reason = "M7.4 GPU Scene four-table owner consumes the coherent planning facade"
+)]
+pub(crate) use persistent_buffer::{PersistentBufferBatchPlanFailure, PersistentBufferPlanRequest};
+pub(crate) use persistent_buffer::{
+    PersistentBufferMaterializationFailure, PersistentBufferPlan, PersistentBufferRef,
+    PersistentBufferRegistry, PersistentBufferResolver, PersistentBufferSpec,
 };
 pub use scene_buffer::SceneBufferImportId;
 pub(crate) use scene_buffer::{

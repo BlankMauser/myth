@@ -53,6 +53,7 @@ impl SimpleForwardFeature {
     pub(crate) fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        opaque_submission: SceneSubmissionPlanId,
         global_state_key: GlobalStateKey,
         // surface_out: TextureNodeId,
         clear_color: wgpu::Color,
@@ -78,9 +79,6 @@ impl SimpleForwardFeature {
 
         let out_desc = fc.create_surface_desc(wgpu::TextureUsages::TEXTURE_BINDING);
         let depth_desc = fc.create_depth_desc(wgpu::TextureUsages::TEXTURE_BINDING);
-        let opaque_submission = ctx
-            .graph
-            .reserve_scene_submission(SceneSubmissionKey::Opaque);
         let transparent_submission = ctx
             .graph
             .reserve_scene_submission(SceneSubmissionKey::Transparent);

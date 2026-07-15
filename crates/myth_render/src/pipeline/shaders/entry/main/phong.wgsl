@@ -12,6 +12,10 @@ $$ endif
 {$ include 'core/vertex_output' $}
 {$ include 'core/fragment_output' $}
 
+$$ if USE_GPU_SCENE is defined
+{$ include 'modules/gpu_scene_transform' $}
+$$ endif
+
 {$ include 'modules/geometry/morphing' $}
 {$ include 'modules/geometry/skinning' $}
 {$ include 'core/common' $}
@@ -36,7 +40,11 @@ $$ endif
 
 
 @vertex
+$$ if USE_GPU_SCENE is defined
+fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
+$$ else
 fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+$$ endif
     var out: VertexOutput;
 
     var local_position = vec3<f32>(in.position.xyz);
@@ -87,7 +95,22 @@ fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexO
         $$ endif
     $$ endif
 
-    let world_pos = u_model.world_matrix * local_pos;
+    $$ if USE_GPU_SCENE is defined
+    // Cull validated the generation-stamped visible record. The instance
+    // table is immutable between Cull and Draw, so no per-vertex revalidation
+    // is required here.
+    let gpu_scene_visible = st_gpu_scene_visible_instances[instance_index];
+    let gpu_scene_slot = gpu_scene_visible.slot;
+    let model_world_matrix = st_gpu_scene_instances[gpu_scene_slot].world_matrix;
+    let model_normal_matrix = gpu_scene_normal_matrix_from_inverse(
+        st_gpu_scene_instances[gpu_scene_slot].world_matrix_inverse,
+    );
+    $$ else
+    let model_world_matrix = u_model.world_matrix;
+    let model_normal_matrix = u_model.normal_matrix;
+    $$ endif
+
+    let world_pos = model_world_matrix * local_pos;
 
     $$ if IN_TRANSPARENT_PASS is defined
         out.position = u_render_state.unjittered_view_projection * world_pos;
@@ -106,10 +129,10 @@ fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexO
     $$ endif
 
     out.geometry_normal = local_normal;
-    out.normal = normalize(u_model.normal_matrix * local_normal);
+    out.normal = normalize(model_normal_matrix * local_normal);
 
     $$ if HAS_TANGENT is defined
-        let v_tangent = normalize(( u_model.world_matrix  * vec4f(object_tangent, 0.0) ).xyz);
+        let v_tangent = normalize((model_world_matrix * vec4f(object_tangent, 0.0)).xyz);
         let v_bitangent = normalize(cross(out.normal, v_tangent) * in.tangent.w);
         out.v_tangent = vec3<f32>(v_tangent);
         out.v_bitangent = vec3<f32>(v_bitangent);

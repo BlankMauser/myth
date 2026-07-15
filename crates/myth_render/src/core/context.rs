@@ -14,6 +14,173 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use crate::settings::{RenderPath, RendererInitConfig, RendererSettings};
 use myth_core::{Error, PlatformError, Result};
 
+/// GPU-driven primitive capability tier of the active logical device.
+///
+/// The tier reflects capabilities that are safe to use immediately. Optional
+/// adapter features do not raise the tier unless they were explicitly enabled
+/// when the device was requested. It does not claim that every Myth GPU Scene
+/// workload fits the device limits; the GPU Scene preflight validates each
+/// complete view-family ABI against [`GpuDrivenCapabilities::device_limits`].
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum GpuDrivenTier {
+    /// Required compute/indirect/vertex-storage primitives are unavailable.
+    Unavailable,
+    /// Compute-generated indexed indirect drawing and vertex-stage scene-table
+    /// reads are available.
+    Indirect,
+    /// The baseline is available and the device has enabled indirect-count
+    /// multi-draw support.
+    MultiDrawIndirectCount,
+}
+
+/// Immutable adapter/device capability snapshot used by the GPU-driven path.
+///
+/// Adapter features describe what could be enabled by recreating the device;
+/// device features describe what may be used by the current device. Keeping
+/// both sets prevents an adapter-only optional feature from leaking into live
+/// backend selection. Optional tiers are never inferred from adapter support:
+/// the corresponding feature must be enabled on the logical device.
+#[derive(Debug, Clone)]
+pub struct GpuDrivenCapabilities {
+    adapter_features: wgpu::Features,
+    device_features: wgpu::Features,
+    downlevel: wgpu::DownlevelCapabilities,
+    adapter_limits: wgpu::Limits,
+    device_limits: wgpu::Limits,
+    tier: GpuDrivenTier,
+}
+
+impl GpuDrivenCapabilities {
+    const BASELINE_DOWNLEVEL_FLAGS: wgpu::DownlevelFlags = wgpu::DownlevelFlags::COMPUTE_SHADERS
+        .union(wgpu::DownlevelFlags::INDIRECT_EXECUTION)
+        .union(wgpu::DownlevelFlags::VERTEX_STORAGE);
+
+    fn capture(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Self {
+        Self::from_parts(
+            adapter.features(),
+            device.features(),
+            adapter.get_downlevel_capabilities(),
+            adapter.limits(),
+            device.limits(),
+        )
+    }
+
+    pub(crate) fn from_parts(
+        adapter_features: wgpu::Features,
+        device_features: wgpu::Features,
+        downlevel: wgpu::DownlevelCapabilities,
+        adapter_limits: wgpu::Limits,
+        device_limits: wgpu::Limits,
+    ) -> Self {
+        let has_baseline_flags = downlevel.flags.contains(Self::BASELINE_DOWNLEVEL_FLAGS);
+        let has_baseline_limits = device_limits.max_storage_buffers_per_shader_stage > 0
+            && device_limits.max_storage_buffer_binding_size > 0
+            && device_limits.max_buffer_size > 0
+            && device_limits.max_compute_workgroups_per_dimension > 0
+            && device_limits.max_compute_invocations_per_workgroup > 0
+            && device_limits.max_compute_workgroup_size_x > 0;
+
+        let tier = if !has_baseline_flags || !has_baseline_limits {
+            GpuDrivenTier::Unavailable
+        } else if device_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT) {
+            GpuDrivenTier::MultiDrawIndirectCount
+        } else {
+            GpuDrivenTier::Indirect
+        };
+
+        Self {
+            adapter_features,
+            device_features,
+            downlevel,
+            adapter_limits,
+            device_limits,
+            tier,
+        }
+    }
+
+    /// Returns the GPU-driven primitive tier of the current logical device.
+    #[inline]
+    #[must_use]
+    pub const fn tier(&self) -> GpuDrivenTier {
+        self.tier
+    }
+
+    /// Returns all optional features advertised by the physical adapter.
+    #[inline]
+    #[must_use]
+    pub const fn adapter_features(&self) -> wgpu::Features {
+        self.adapter_features
+    }
+
+    /// Returns the optional features enabled on the current logical device.
+    #[inline]
+    #[must_use]
+    pub const fn device_features(&self) -> wgpu::Features {
+        self.device_features
+    }
+
+    /// Returns the adapter's downlevel capability snapshot.
+    #[inline]
+    #[must_use]
+    pub const fn downlevel(&self) -> &wgpu::DownlevelCapabilities {
+        &self.downlevel
+    }
+
+    /// Returns the limits advertised by the physical adapter.
+    #[inline]
+    #[must_use]
+    pub const fn adapter_limits(&self) -> &wgpu::Limits {
+        &self.adapter_limits
+    }
+
+    /// Returns the limits enabled on the current logical device.
+    #[inline]
+    #[must_use]
+    pub const fn device_limits(&self) -> &wgpu::Limits {
+        &self.device_limits
+    }
+
+    /// Returns whether the primitives needed to build a compute-generated
+    /// indirect workload are available.
+    #[inline]
+    #[must_use]
+    pub const fn supports_indirect_primitives(&self) -> bool {
+        !matches!(self.tier, GpuDrivenTier::Unavailable)
+    }
+
+    /// Returns whether non-zero `first_instance` indirect arguments are
+    /// enabled on the current logical device.
+    #[inline]
+    #[must_use]
+    pub const fn supports_indirect_first_instance(&self) -> bool {
+        self.supports_indirect_primitives()
+            && self
+                .device_features
+                .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
+    }
+
+    /// Returns whether indirect-count multi-draw is enabled on the current
+    /// logical device.
+    #[inline]
+    #[must_use]
+    pub const fn supports_multi_draw_indirect_count(&self) -> bool {
+        matches!(self.tier, GpuDrivenTier::MultiDrawIndirectCount)
+    }
+
+    /// Returns whether storage buffers may also be used as index buffers.
+    ///
+    /// This is not required by the M7 baseline, but it determines whether a
+    /// later geometry mega-buffer can combine `STORAGE` and `INDEX` usages.
+    #[inline]
+    #[must_use]
+    pub const fn supports_storage_index_buffers(&self) -> bool {
+        self.downlevel
+            .flags
+            .contains(wgpu::DownlevelFlags::UNRESTRICTED_INDEX_BUFFER)
+    }
+}
+
 /// Core wgpu context holding GPU handles and render target state.
 ///
 /// This struct owns the fundamental wgpu resources needed for rendering:
@@ -63,6 +230,8 @@ pub struct WgpuContext {
     /// Version counter for pipeline-affecting settings (HDR, MSAA, RenderPath).
     /// Incremented when these settings change, used to invalidate L1 pipeline cache.
     pub pipeline_settings_version: u64,
+
+    gpu_driven_capabilities: GpuDrivenCapabilities,
 }
 
 impl WgpuContext {
@@ -136,6 +305,8 @@ impl WgpuContext {
                 Error::Render(myth_core::RenderError::RequestDeviceFailed(e.to_string()))
             })?;
 
+        let gpu_driven_capabilities = GpuDrivenCapabilities::capture(&adapter, &device);
+
         let view_format = surface_format.add_srgb_suffix();
 
         let present_mode = if settings.vsync {
@@ -171,6 +342,7 @@ impl WgpuContext {
             anisotropy_clamp: settings.anisotropy_clamp,
             render_path: settings.path,
             pipeline_settings_version: 0,
+            gpu_driven_capabilities,
         })
     }
 
@@ -231,6 +403,8 @@ impl WgpuContext {
                 Error::Render(myth_core::RenderError::RequestDeviceFailed(e.to_string()))
             })?;
 
+        let gpu_driven_capabilities = GpuDrivenCapabilities::capture(&adapter, &device);
+
         let view_format = target_format.unwrap_or(wgpu::TextureFormat::Rgba8UnormSrgb);
 
         let headless_texture = Self::create_headless_texture(&device, width, height, view_format);
@@ -249,6 +423,7 @@ impl WgpuContext {
             anisotropy_clamp: settings.anisotropy_clamp,
             render_path: settings.path,
             pipeline_settings_version: 0,
+            gpu_driven_capabilities,
         })
     }
 
@@ -259,6 +434,7 @@ impl WgpuContext {
     pub(crate) fn from_shared_test_device(
         device: wgpu::Device,
         queue: wgpu::Queue,
+        gpu_driven_capabilities: GpuDrivenCapabilities,
         init_config: &RendererInitConfig,
         settings: &RendererSettings,
         width: u32,
@@ -287,6 +463,7 @@ impl WgpuContext {
             anisotropy_clamp: settings.anisotropy_clamp,
             render_path: settings.path,
             pipeline_settings_version: 0,
+            gpu_driven_capabilities,
         }
     }
 
@@ -399,5 +576,111 @@ impl WgpuContext {
     #[must_use]
     pub fn is_headless(&self) -> bool {
         self.surface.is_none()
+    }
+
+    /// Returns the immutable GPU-driven capability snapshot captured during
+    /// device initialization.
+    #[inline]
+    #[must_use]
+    pub const fn gpu_driven_capabilities(&self) -> &GpuDrivenCapabilities {
+        &self.gpu_driven_capabilities
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuDrivenCapabilities, GpuDrivenTier};
+
+    fn baseline_downlevel() -> wgpu::DownlevelCapabilities {
+        wgpu::DownlevelCapabilities {
+            flags: wgpu::DownlevelFlags::COMPUTE_SHADERS
+                | wgpu::DownlevelFlags::INDIRECT_EXECUTION
+                | wgpu::DownlevelFlags::VERTEX_STORAGE,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn baseline_capabilities_select_indirect_tier() {
+        let capabilities = GpuDrivenCapabilities::from_parts(
+            wgpu::Features::empty(),
+            wgpu::Features::empty(),
+            baseline_downlevel(),
+            wgpu::Limits::default(),
+            wgpu::Limits::default(),
+        );
+
+        assert_eq!(capabilities.tier(), GpuDrivenTier::Indirect);
+        assert!(capabilities.supports_indirect_primitives());
+        assert!(!capabilities.supports_multi_draw_indirect_count());
+    }
+
+    #[test]
+    fn adapter_only_optional_features_are_not_reported_as_enabled() {
+        let optional =
+            wgpu::Features::INDIRECT_FIRST_INSTANCE | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        let capabilities = GpuDrivenCapabilities::from_parts(
+            optional,
+            wgpu::Features::empty(),
+            baseline_downlevel(),
+            wgpu::Limits::default(),
+            wgpu::Limits::default(),
+        );
+
+        assert!(capabilities.adapter_features().contains(optional));
+        assert!(!capabilities.device_features().intersects(optional));
+        assert_eq!(capabilities.tier(), GpuDrivenTier::Indirect);
+        assert!(!capabilities.supports_indirect_first_instance());
+        assert!(!capabilities.supports_multi_draw_indirect_count());
+    }
+
+    #[test]
+    fn enabled_indirect_count_promotes_the_device_tier() {
+        let capabilities = GpuDrivenCapabilities::from_parts(
+            wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+            wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+            baseline_downlevel(),
+            wgpu::Limits::default(),
+            wgpu::Limits::default(),
+        );
+
+        assert_eq!(capabilities.tier(), GpuDrivenTier::MultiDrawIndirectCount);
+        assert!(capabilities.supports_multi_draw_indirect_count());
+    }
+
+    #[test]
+    fn missing_downlevel_requirement_disables_gpu_driven_baseline() {
+        let mut downlevel = baseline_downlevel();
+        downlevel
+            .flags
+            .remove(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+        let capabilities = GpuDrivenCapabilities::from_parts(
+            wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+            wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+            downlevel,
+            wgpu::Limits::default(),
+            wgpu::Limits::default(),
+        );
+
+        assert_eq!(capabilities.tier(), GpuDrivenTier::Unavailable);
+        assert!(!capabilities.supports_indirect_primitives());
+        assert!(!capabilities.supports_multi_draw_indirect_count());
+    }
+
+    #[test]
+    fn zero_storage_limit_disables_gpu_driven_baseline() {
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 0,
+            ..wgpu::Limits::default()
+        };
+        let capabilities = GpuDrivenCapabilities::from_parts(
+            wgpu::Features::empty(),
+            wgpu::Features::empty(),
+            baseline_downlevel(),
+            wgpu::Limits::default(),
+            limits,
+        );
+
+        assert_eq!(capabilities.tier(), GpuDrivenTier::Unavailable);
     }
 }

@@ -81,10 +81,18 @@ pub struct ShadowOutput {
 /// deliberately absent and are materialized by the live upload node after DPE.
 #[derive(Clone, Copy)]
 pub(crate) struct ShadowSnapshot<'a> {
-    d2_lights: &'a [ShadowLightInstance],
-    cube_lights: &'a [ShadowLightInstance],
+    pub(crate) d2_lights: &'a [ShadowLightInstance],
+    pub(crate) cube_lights: &'a [ShadowLightInstance],
     shadow_2d_resolution: u32,
     shadow_cube_resolution: u32,
+}
+
+/// Optional backend-neutral submission set supplied by the GPU Scene
+/// coordinator. `None` preserves the CpuDirect reservation path.
+#[derive(Clone, Copy)]
+pub(crate) struct ShadowSubmissions<'a> {
+    pub(crate) d2: &'a [SceneSubmissionPlanId],
+    pub(crate) cube: &'a [SceneSubmissionPlanId],
 }
 
 /// Shadow rendering feature.
@@ -182,6 +190,7 @@ impl ShadowFeature {
                 texture_layer_index,
                 light_buffer_index: view.light_buffer_index,
                 light_view_projection: view.view_projection,
+                frustum: view.frustum,
                 is_point,
             });
         }
@@ -206,6 +215,7 @@ impl ShadowFeature {
         &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
         snapshot: ShadowSnapshot<'a>,
+        submissions: Option<ShadowSubmissions<'a>>,
     ) -> ShadowOutput {
         let mut output = ShadowOutput {
             shadow_2d: None,
@@ -218,28 +228,41 @@ impl ShadowFeature {
 
         let d2_lights = snapshot.d2_lights;
         let cube_lights = snapshot.cube_lights;
-        let mut d2_submissions = SmallVec::<[SceneSubmissionPlanId; 16]>::new();
-        for light in d2_lights {
-            d2_submissions.push(
-                ctx.graph
-                    .reserve_scene_submission(SceneSubmissionKey::Shadow {
+        let (d2_submissions, cube_submissions) = if let Some(submissions) = submissions {
+            assert_eq!(
+                submissions.d2.len(),
+                d2_lights.len(),
+                "GPU Shadow 2D submission count drifted from the snapshot"
+            );
+            assert_eq!(
+                submissions.cube.len(),
+                cube_lights.len(),
+                "GPU Shadow Cube submission count drifted from the snapshot"
+            );
+            (submissions.d2, submissions.cube)
+        } else {
+            let mut d2_submissions = SmallVec::<[SceneSubmissionPlanId; 16]>::new();
+            for light in d2_lights {
+                d2_submissions.push(ctx.graph.reserve_scene_submission(
+                    SceneSubmissionKey::Shadow {
                         light_id: light.light_id,
                         layer_index: light.view_layer_index,
-                    }),
-            );
-        }
-        let d2_submissions = ctx.graph.alloc_slice(&d2_submissions);
-        let mut cube_submissions = SmallVec::<[SceneSubmissionPlanId; 16]>::new();
-        for light in cube_lights {
-            cube_submissions.push(
-                ctx.graph
-                    .reserve_scene_submission(SceneSubmissionKey::Shadow {
+                    },
+                ));
+            }
+            let d2_submissions = ctx.graph.alloc_slice(&d2_submissions);
+            let mut cube_submissions = SmallVec::<[SceneSubmissionPlanId; 16]>::new();
+            for light in cube_lights {
+                cube_submissions.push(ctx.graph.reserve_scene_submission(
+                    SceneSubmissionKey::Shadow {
                         light_id: light.light_id,
                         layer_index: light.view_layer_index,
-                    }),
-            );
-        }
-        let cube_submissions = ctx.graph.alloc_slice(&cube_submissions);
+                    },
+                ));
+            }
+            let cube_submissions = ctx.graph.alloc_slice(&cube_submissions);
+            (d2_submissions, cube_submissions)
+        };
         let prepared = ctx.graph.alloc_shared_state(ShadowPreparedState {
             bind_group: OnceLock::new(),
         });
@@ -652,6 +675,7 @@ mod tests {
                 15.0,
                 matrix_seed + 3.0,
             ]),
+            frustum: Frustum::default(),
             is_point,
         }
     }
@@ -685,7 +709,7 @@ mod tests {
             let config = frame_config();
             let outputs = {
                 let mut ctx = GraphBuilderContext::new(&mut graph, &config, 0);
-                feature.add_to_graph(&mut ctx, snapshot)
+                feature.add_to_graph(&mut ctx, snapshot, None)
             };
 
             if !matches!(demand, RootDemand::None) {

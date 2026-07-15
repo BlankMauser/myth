@@ -19,6 +19,9 @@ pub mod core;
 pub mod culling;
 pub mod extracted;
 pub mod frame;
+pub(crate) mod gpu_scene;
+pub(crate) mod gpu_scene_capacity;
+pub(crate) mod gpu_scene_submission;
 pub(crate) mod material_plan;
 pub mod passes;
 pub mod render_state;
@@ -31,7 +34,8 @@ pub use composer::FrameComposer;
 #[cfg(feature = "rdg_bench_support")]
 pub use core::RdgDetailPhase;
 pub use core::{
-    MermaidDumpMode, RdgAttemptOutcome, RdgFrameDiagnostics, RdgFramePhase, RdgRenderTargetKind,
+    MermaidDumpMode, RdgAttemptOutcome, RdgCommandEncodingFailure, RdgFrameDiagnostics,
+    RdgFramePhase, RdgGpuDrivenFailure, RdgPostSubmitPublicationFailure, RdgRenderTargetKind,
     RdgResourceMaterializationFailure, RdgRetainedCapacityStats, RdgSurfaceAcquireFailure,
 };
 pub use extracted::{ExtractedRenderItem, ExtractedScene, ExtractedSkeleton, ItemShaderFeatures};

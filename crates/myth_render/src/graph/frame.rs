@@ -32,7 +32,7 @@ use crate::renderer::FrameTime;
 use crate::settings::{ClusteredShadingMode, RenderPath};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_scene::Scene;
-use myth_scene::camera::RenderCamera;
+use myth_scene::camera::{Frustum, RenderCamera};
 
 use super::asset_frame::{GeometryFrameId, ObjectInterfaceId};
 use super::capacity::{
@@ -1379,6 +1379,9 @@ pub struct ShadowLightInstance {
     pub texture_layer_index: u32,
     pub light_buffer_index: usize,
     pub light_view_projection: Mat4,
+    /// Exact CPU culling volume captured from the active RenderView. GPU
+    /// Shadow culling consumes the same six planes as the CpuDirect oracle.
+    pub frustum: Frustum,
     /// `true` if this layer belongs to a point light (cube array target).
     pub is_point: bool,
 }
@@ -1399,6 +1402,17 @@ pub struct RenderLists {
     pub opaque: Vec<RenderIntent>,
     /// Main-view transparent intents.
     pub transparent: Vec<RenderIntent>,
+    /// Deterministic pre-frustum representatives of opaque GPU bins. Each bin
+    /// contributes at most one source to asset/topology capture; physical
+    /// preparation still selects only representatives whose GPU submissions
+    /// survive DPE. The retained vector scales with unique bins rather than
+    /// visible instances.
+    gpu_opaque_representatives: Vec<FrameSourceId>,
+    /// Generation-stamped membership indexed directly by dense
+    /// [`FrameSourceId`]. Ordinary frame resets retain both allocation and
+    /// bytes; only generation wrap clears the table.
+    gpu_opaque_representative_stamps: Vec<u32>,
+    gpu_opaque_representative_generation: u32,
     /// Shadow intent queues, keyed by `(light_id, layer_index)` for exact
     /// per-view demand projection.
     ///
@@ -1432,6 +1446,9 @@ impl RenderLists {
         Self {
             opaque: Vec::with_capacity(512),
             transparent: Vec::with_capacity(128),
+            gpu_opaque_representatives: Vec::with_capacity(4),
+            gpu_opaque_representative_stamps: Vec::with_capacity(4),
+            gpu_opaque_representative_generation: 1,
             shadow_queues: FxHashMap::default(),
             frame_sources: Vec::with_capacity(512),
             frame_source_indices: Vec::with_capacity(512),
@@ -1459,6 +1476,8 @@ impl RenderLists {
         self.transparent.clear();
         self.shadow_queues.clear();
         self.frame_sources.clear();
+        self.gpu_opaque_representatives.clear();
+        self.advance_gpu_opaque_representative_generation();
         self.advance_frame_source_generation();
         self.use_transmission = false;
     }
@@ -1492,6 +1511,15 @@ impl RenderLists {
         }
     }
 
+    fn advance_gpu_opaque_representative_generation(&mut self) {
+        self.gpu_opaque_representative_generation =
+            self.gpu_opaque_representative_generation.wrapping_add(1);
+        if self.gpu_opaque_representative_generation == 0 {
+            self.gpu_opaque_representative_stamps.fill(0);
+            self.gpu_opaque_representative_generation = 1;
+        }
+    }
+
     /// Resolve a compact frame source back to the immutable extraction table.
     #[must_use]
     pub(crate) fn extracted_source(&self, source: FrameSourceId) -> Option<ExtractedSourceId> {
@@ -1508,6 +1536,55 @@ impl RenderLists {
         let count = u32::try_from(self.frame_sources.len())
             .expect("validated frame source count exceeds u32::MAX");
         (0..count).map(FrameSourceId)
+    }
+
+    /// Append one pre-frustum source used to prepare an opaque GPU bin's fixed
+    /// state. Repeated semantic sources are idempotent in O(1) through the
+    /// retained generation-stamped dense join and preserve stable
+    /// first-occurrence order. This never inserts a CPU draw intent and
+    /// therefore cannot cause duplicate opaque rendering.
+    pub(crate) fn append_gpu_opaque_representative(
+        &mut self,
+        extracted: ExtractedSourceId,
+    ) -> FrameSourceId {
+        let source = self.intern_frame_source(extracted);
+        let required = source.index() + 1;
+        if self.gpu_opaque_representative_stamps.len() < required {
+            self.gpu_opaque_representative_stamps.resize(required, 0);
+        }
+        let stamp = &mut self.gpu_opaque_representative_stamps[source.index()];
+        if *stamp != self.gpu_opaque_representative_generation {
+            *stamp = self.gpu_opaque_representative_generation;
+            self.gpu_opaque_representatives.push(source);
+        }
+        source
+    }
+
+    /// Compatibility facade for the original single-bin selector. M7.4 bin
+    /// selection should call [`Self::append_gpu_opaque_representative`] for
+    /// every unique bin.
+    #[cfg(test)]
+    pub(crate) fn set_gpu_opaque_representative(
+        &mut self,
+        extracted: ExtractedSourceId,
+    ) -> FrameSourceId {
+        self.append_gpu_opaque_representative(extracted)
+    }
+
+    /// Iterate retained GPU-bin representatives in deterministic insertion
+    /// order.
+    pub(crate) fn gpu_opaque_representatives(
+        &self,
+    ) -> impl ExactSizeIterator<Item = FrameSourceId> + '_ {
+        self.gpu_opaque_representatives.iter().copied()
+    }
+
+    /// Compatibility accessor for the original single-bin tests and selector.
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub(crate) fn gpu_opaque_representative(&self) -> Option<FrameSourceId> {
+        self.gpu_opaque_representatives.first().copied()
     }
 
     /// Inserts an opaque render intent.
@@ -2363,6 +2440,67 @@ mod draw_plan_tests {
             FrameSourceId::from_index(0),
             "a pre-wrap stamp must not alias the new generation"
         );
+    }
+
+    #[test]
+    fn gpu_opaque_representatives_append_deduplicate_and_retain_capacity() {
+        let mut lists = RenderLists::new();
+        let initial_capacity = lists.gpu_opaque_representatives.capacity();
+        let extracted_9 = ExtractedSourceId::from_index(9);
+        let extracted_3 = ExtractedSourceId::from_index(3);
+
+        let first = lists.append_gpu_opaque_representative(extracted_9);
+        let second = lists.append_gpu_opaque_representative(extracted_3);
+        let repeated = lists.append_gpu_opaque_representative(extracted_9);
+
+        assert_eq!(repeated, first);
+        assert_eq!(lists.gpu_opaque_representative(), Some(first));
+        assert_eq!(
+            lists.gpu_opaque_representatives().collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(lists.frame_source_count(), 2);
+        let populated_capacity = lists.gpu_opaque_representatives.capacity();
+        assert!(populated_capacity >= initial_capacity);
+        let stamps_before_reset = lists.gpu_opaque_representative_stamps.clone();
+        let generation_before_reset = lists.gpu_opaque_representative_generation;
+
+        lists.begin_intent_collection();
+        assert!(lists.gpu_opaque_representatives().next().is_none());
+        assert_eq!(lists.gpu_opaque_representative(), None);
+        assert_eq!(
+            lists.gpu_opaque_representative_stamps, stamps_before_reset,
+            "ordinary warm reset must not fill retained representative stamps"
+        );
+        assert_eq!(
+            lists.gpu_opaque_representative_generation,
+            generation_before_reset + 1
+        );
+        assert_eq!(
+            lists.gpu_opaque_representatives.capacity(),
+            populated_capacity,
+            "frame reset must retain representative-bin allocation"
+        );
+    }
+
+    #[test]
+    fn gpu_opaque_representative_generation_wrap_is_the_only_stamp_fill() {
+        let mut lists = RenderLists::new();
+        lists.gpu_opaque_representative_stamps = vec![u32::MAX; 32];
+        lists.gpu_opaque_representative_generation = u32::MAX;
+
+        lists.begin_intent_collection();
+
+        assert_eq!(lists.gpu_opaque_representative_generation, 1);
+        assert!(
+            lists
+                .gpu_opaque_representative_stamps
+                .iter()
+                .all(|&stamp| stamp == 0)
+        );
+        let source = lists.append_gpu_opaque_representative(ExtractedSourceId::from_index(31));
+        assert_eq!(source, FrameSourceId::from_index(0));
+        assert_eq!(lists.gpu_opaque_representative_stamps[0], 1);
     }
 
     #[test]

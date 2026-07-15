@@ -19,8 +19,11 @@ pub mod settings;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use core::{GpuDrivenCapabilities, GpuDrivenTier};
 pub use renderer::Renderer;
-pub use settings::{ClusteredShadingMode, RenderPath, RendererInitConfig, RendererSettings};
+pub use settings::{
+    ClusteredShadingMode, GpuDrivenMode, RenderPath, RendererInitConfig, RendererSettings,
+};
 pub use wgpu;
 
 /// HDR texture format used for high dynamic range render targets.

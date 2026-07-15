@@ -22,13 +22,18 @@ use crate::pipeline::RenderPipelineId;
 use crate::pipeline::{PipelineCache, ShaderManager};
 use myth_assets::AssetServer;
 use myth_scene::RenderCamera;
+use smallvec::SmallVec;
 use wgpu::{Device, Queue, TextureView};
 
 use super::allocator::{SubViewKey, TransientPool};
 #[cfg(feature = "3dgs")]
 use super::gaussian::GaussianFrameResolver;
-use super::graph::MipmapEncodeCoordinator;
+use super::graph::{
+    MipmapEncodeCoordinator, PersistentBufferCommitGroupId, PersistentBufferCommitTracker,
+    PersistentBufferUploadPreparer, PersistentBufferWriteCoverage,
+};
 use super::persistent::HistoryRegistry;
+use super::persistent_buffer::PersistentBufferResolver;
 use super::scene_submission::{
     SceneSubmissionPlanId, SceneSubmissionResolver, SceneSubmissionStore,
 };
@@ -88,7 +93,7 @@ pub(crate) struct SceneDrawPrepareContext<'a> {
     pub(crate) object_interfaces: ObjectInterfaceResolver<'a>,
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) pipeline_settings_version: u64,
-    scene_submissions: &'a SceneSubmissionStore,
+    pub(crate) scene_submissions: &'a mut SceneSubmissionStore,
     scene_pipeline_prepare: &'a mut ScenePipelinePrepareStore,
     #[cfg(feature = "rdg_bench_support")]
     rdg_diagnostics: &'a RdgDiagnosticsRecorder,
@@ -105,7 +110,7 @@ impl<'a> SceneDrawPrepareContext<'a> {
         object_interfaces: ObjectInterfaceResolver<'a>,
         depth_format: wgpu::TextureFormat,
         pipeline_settings_version: u64,
-        scene_submissions: &'a SceneSubmissionStore,
+        scene_submissions: &'a mut SceneSubmissionStore,
         scene_pipeline_prepare: &'a mut ScenePipelinePrepareStore,
         #[cfg(feature = "rdg_bench_support")] rdg_diagnostics: &'a RdgDiagnosticsRecorder,
     ) -> Self {
@@ -164,6 +169,26 @@ impl<'a> SceneDrawPrepareContext<'a> {
         layout: &Tracked<wgpu::BindGroupLayout>,
     ) -> ShadowPipelineLayoutId {
         self.scene_pipeline_prepare.intern_shadow_layout(layout)
+    }
+
+    /// Whether this live backend still needs the legacy per-source recipe
+    /// gather. GPU-indirect plans are finalized by their typed coordinator
+    /// after the common prepare barrier and must not enter CpuDirect stores.
+    #[inline]
+    #[must_use]
+    pub(crate) fn submission_is_cpu_direct(&self, submission: SceneSubmissionPlanId) -> bool {
+        self.scene_submissions.cpu_direct_plan(submission).is_some()
+    }
+
+    /// Resolve the one live Shadow Group 0 layout registered by the deferred
+    /// VP producer. GPU-indirect Shadow pipeline finalization uses this exact
+    /// physical ABI after all pass prepare callbacks have completed.
+    #[must_use]
+    pub(crate) fn registered_shadow_pipeline_layout(
+        &self,
+    ) -> Option<&Tracked<wgpu::BindGroupLayout>> {
+        let id = self.scene_pipeline_prepare.registered_shadow_layout()?;
+        Some(self.scene_pipeline_prepare.shadow_layout(id))
     }
 
     /// Publish only coordinator-accepted Prepass results into Feature-owned
@@ -302,9 +327,26 @@ pub struct PrepareContext<'a> {
     /// Drop-aware ownership for the exact bind groups used by this graph
     /// attempt. Nodes receive only generational IDs into this store.
     pub(crate) prepared_bind_groups: &'a mut PreparedBindGroupStore,
+    /// Narrow writer for the unique packed upload owned by each live
+    /// persistent-Buffer transaction.
+    pub(crate) persistent_buffer_uploads: PersistentBufferUploadPreparer<'a>,
 }
 
 impl PrepareContext<'_> {
+    /// Create and fill the exact graph-attempt staging Buffer for one atomic
+    /// persistent-Buffer commit group.
+    ///
+    /// The commit-group ID remains the only handle carried into execute.
+    pub(crate) fn stage_persistent_buffer_upload(
+        &mut self,
+        group: PersistentBufferCommitGroupId,
+        buffer: wgpu::Buffer,
+        coverage: PersistentBufferWriteCoverage,
+    ) {
+        self.persistent_buffer_uploads
+            .stage_buffer(group, buffer, coverage);
+    }
+
     /// Run the single-threaded M6 coordinator after all live pass nodes have
     /// gathered recipes. Keeping this inside the existing context preserves
     /// the exact attempt capabilities across both prepare barriers.
@@ -357,6 +399,7 @@ pub struct ViewResolver<'a> {
     pub resources: &'a [ResourceRecord],
     pub pool: &'a mut TransientPool,
     pub persistent_resources: &'a HistoryRegistry,
+    pub(crate) persistent_buffers: PersistentBufferResolver<'a>,
     pub(crate) asset_textures: AssetTextureResolver<'a>,
     pub(crate) scene_buffers: SceneBufferResolver<'a>,
 }
@@ -459,7 +502,7 @@ pub struct BindGroupBuilder<'ctx, 'frame> {
     layout: &'ctx wgpu::BindGroupLayout,
     label: Option<&'static str>,
     key: BindGroupKey,
-    entries: Vec<wgpu::BindGroupEntry<'ctx>>,
+    entries: SmallVec<[wgpu::BindGroupEntry<'ctx>; 8]>,
 }
 
 #[inline]
@@ -537,7 +580,7 @@ impl<'ctx, 'frame> BindGroupBuilder<'ctx, 'frame> {
             layout,
             label,
             key: BindGroupKey::new(layout.id()),
-            entries: Vec::with_capacity(8),
+            entries: SmallVec::new(),
         }
     }
 
@@ -1008,6 +1051,7 @@ fn resolve_buffer_resource(
 fn is_graph_resource_allocated<T: GraphResourceType>(
     resources: &[ResourceRecord],
     persistent_resources: &HistoryRegistry,
+    persistent_buffers: PersistentBufferResolver<'_>,
     asset_textures: AssetTextureResolver<'_>,
     scene_buffers: SceneBufferResolver<'_>,
     id: ResourceNodeId<T>,
@@ -1019,6 +1063,9 @@ fn is_graph_resource_allocated<T: GraphResourceType>(
     }
     if let Some(id) = res.persistent_texture_id() {
         return persistent_resources.is_texture_materialized(id);
+    }
+    if let Some(id) = res.persistent_buffer_id() {
+        return persistent_buffers.is_materialized(id);
     }
     if let Some(id) = res.scene_buffer_import_id() {
         return scene_buffers.buffer(id).is_some();
@@ -1153,6 +1200,12 @@ impl ViewResolver<'_> {
         let (_, res) = resolve_buffer_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_buffer_id() {
+                return self
+                    .persistent_buffers
+                    .buffer(id)
+                    .expect("live persistent Buffer import did not materialize its buffer");
+            }
             if let Some(id) = res.scene_buffer_import_id() {
                 return self
                     .scene_buffers
@@ -1186,6 +1239,21 @@ impl ViewResolver<'_> {
             let physical_index = res.physical_index.expect("No physical memory!");
             self.pool.get_buffer_uid(physical_index)
         }
+    }
+
+    /// Return the exact graph-attempt physical identity of a persistent
+    /// Buffer import. Ordinary transient/external buffers intentionally have
+    /// no such token.
+    #[must_use]
+    pub(crate) fn persistent_buffer_physical_token(
+        &self,
+        id: BufferNodeId,
+    ) -> Option<super::persistent_buffer::PersistentBufferPhysicalToken> {
+        let (_, res) = resolve_buffer_resource(self.resources, id);
+        let persistent = res.persistent_buffer_id()?;
+        self.persistent_buffers
+            .materialization(persistent)
+            .map(|materialization| materialization.token)
     }
 
     /// Returns a buffer binding truncated to the resource's logical size.
@@ -1226,6 +1294,7 @@ impl ViewResolver<'_> {
         is_graph_resource_allocated(
             self.resources,
             self.persistent_resources,
+            self.persistent_buffers,
             self.asset_textures,
             self.scene_buffers,
             id,
@@ -1474,6 +1543,8 @@ pub struct ExecuteContext<'a> {
     pub resources: &'a [ResourceRecord],
     pub pool: &'a TransientPool,
     pub persistent_resources: &'a HistoryRegistry,
+    pub(crate) persistent_buffers: PersistentBufferResolver<'a>,
+    pub(crate) persistent_buffer_commits: PersistentBufferCommitTracker<'a>,
     pub(crate) asset_textures: AssetTextureResolver<'a>,
     pub(crate) scene_buffers: SceneBufferResolver<'a>,
     pub device: &'a Device,
@@ -1513,6 +1584,26 @@ pub struct ExecuteContext<'a> {
 }
 
 impl ExecuteContext<'_> {
+    /// Resolve the prepare-owned packed upload for this exact transaction.
+    #[must_use]
+    pub(crate) fn resolve_persistent_buffer_upload(
+        &self,
+        id: PersistentBufferCommitGroupId,
+    ) -> &wgpu::Buffer {
+        self.persistent_buffer_commits.resolve_staging(id)
+    }
+
+    /// Acknowledge exact Full/Delta coverage for a staged copy transaction.
+    #[inline]
+    pub(crate) fn mark_persistent_buffer_commit_group_encoded_with_coverage(
+        &self,
+        id: PersistentBufferCommitGroupId,
+        coverage: PersistentBufferWriteCoverage,
+    ) {
+        self.persistent_buffer_commits
+            .mark_encoded_with_coverage(id, coverage);
+    }
+
     /// Claim the right to record one physical mipmap generation in this graph
     /// attempt. A false result means an earlier node in the serial execution
     /// queue has already recorded the same generation.
@@ -1681,6 +1772,12 @@ impl ExecuteContext<'_> {
         let (_, res) = resolve_buffer_resource(self.resources, id);
 
         if res.is_external {
+            if let Some(id) = res.persistent_buffer_id() {
+                return self
+                    .persistent_buffers
+                    .buffer(id)
+                    .expect("live persistent Buffer import did not materialize its buffer");
+            }
             if let Some(id) = res.scene_buffer_import_id() {
                 return self
                     .scene_buffers
@@ -1756,6 +1853,7 @@ impl ExecuteContext<'_> {
         is_graph_resource_allocated(
             self.resources,
             self.persistent_resources,
+            self.persistent_buffers,
             self.asset_textures,
             self.scene_buffers,
             id,
@@ -1887,11 +1985,15 @@ impl ExecuteContext<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ViewResolver, is_graph_resource_allocated, with_buffer_binding_identity};
+    use super::{
+        PersistentBufferResolver, ViewResolver, is_graph_resource_allocated,
+        with_buffer_binding_identity,
+    };
     use crate::core::binding::BindGroupKey;
     use crate::core::gpu::{AssetTextureMaterialization, AssetTextureSnapshot};
     use crate::graph::core::{
-        FrameArena, GraphStorage, HistoryRegistry, RenderGraph, SubViewKey, TransientPool,
+        FrameArena, GraphStorage, HistoryRegistry, PersistentBufferRegistry, RenderGraph,
+        SubViewKey, TransientPool,
     };
 
     fn unavailable_asset_snapshot() -> AssetTextureSnapshot {
@@ -1945,11 +2047,16 @@ mod tests {
         asset_textures.materialize(import, AssetTextureMaterialization::unavailable());
 
         let histories = HistoryRegistry::new();
+        let persistent_buffers = PersistentBufferRegistry::new();
+        let persistent_buffer_tokens = rustc_hash::FxHashMap::default();
+        let persistent_buffer_resolver =
+            PersistentBufferResolver::new(&persistent_buffers, &persistent_buffer_tokens);
         let mut pool = TransientPool::new();
         let views = ViewResolver {
             resources: &graph.storage.resources,
             pool: &mut pool,
             persistent_resources: &histories,
+            persistent_buffers: persistent_buffer_resolver,
             asset_textures,
             scene_buffers,
         };
@@ -1958,6 +2065,7 @@ mod tests {
         assert!(!is_graph_resource_allocated(
             &graph.storage.resources,
             &histories,
+            persistent_buffer_resolver,
             asset_textures,
             scene_buffers,
             asset,

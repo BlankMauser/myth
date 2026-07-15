@@ -611,6 +611,17 @@ pub struct Frustum {
 }
 
 impl Frustum {
+    /// Returns the normalized plane equations used by CPU culling.
+    ///
+    /// GPU-driven culling consumes this exact snapshot so CPU reference tests
+    /// and compute visibility cannot silently diverge in plane extraction or
+    /// infinite-far handling.
+    #[inline]
+    #[must_use]
+    pub const fn planes(&self) -> &[Vec4; 6] {
+        &self.planes
+    }
+
     /// Extract frustum planes from a **reverse-Z, infinite-far** VP matrix.
     ///
     /// This is the default for the main camera (using `perspective_infinite_reverse_rh`).

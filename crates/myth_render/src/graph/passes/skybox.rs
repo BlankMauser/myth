@@ -1578,8 +1578,12 @@ mod tests {
                 texture_snapshot(wgpu::TextureFormat::Bgra8UnormSrgb),
                 TextureSkyboxInput::Graph(mip_ready),
             );
+            let opaque = ctx.graph.reserve_scene_submission(
+                crate::graph::core::scene_submission::SceneSubmissionKey::Opaque,
+            );
             simple_forward.add_to_graph(
                 &mut ctx,
+                opaque,
                 GlobalStateKey::new(1, 1),
                 wgpu::Color::BLACK,
                 Some(skybox),
@@ -1663,8 +1667,12 @@ mod tests {
                     bake_params,
                 },
             );
+            let opaque = ctx.graph.reserve_scene_submission(
+                crate::graph::core::scene_submission::SceneSubmissionKey::Opaque,
+            );
             simple_forward.add_to_graph(
                 &mut ctx,
+                opaque,
                 GlobalStateKey::new(1, 1),
                 wgpu::Color::BLACK,
                 Some(skybox),

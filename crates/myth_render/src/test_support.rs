@@ -9,12 +9,13 @@ use std::sync::OnceLock;
 
 use myth_core::Result;
 
-use crate::core::WgpuContext;
+use crate::core::{GpuDrivenCapabilities, WgpuContext};
 use crate::settings::{RendererInitConfig, RendererSettings};
 
 struct SharedTestGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    gpu_driven_capabilities: GpuDrivenCapabilities,
 }
 
 static SHARED_TEST_GPU: OnceLock<SharedTestGpu> = OnceLock::new();
@@ -29,10 +30,12 @@ fn shared_test_gpu() -> &'static SharedTestGpu {
             None,
         ))
         .expect("shared headless GPU context required");
+        let gpu_driven_capabilities = context.gpu_driven_capabilities().clone();
 
         SharedTestGpu {
             device: context.device,
             queue: context.queue,
+            gpu_driven_capabilities,
         }
     })
 }
@@ -55,6 +58,7 @@ impl SharedTestContext {
         ready(Ok(WgpuContext::from_shared_test_device(
             shared.device.clone(),
             shared.queue.clone(),
+            shared.gpu_driven_capabilities.clone(),
             init_config,
             settings,
             width,

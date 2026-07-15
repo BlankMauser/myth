@@ -16,7 +16,7 @@ use rustc_hash::FxHashMap;
 
 use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
-use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
+use crate::graph::core::scene_submission::SceneSubmissionPlanId;
 use crate::graph::core::{
     ExecuteContext, PassNode, PrepareContext, RenderTargetOps, TextureDesc, TextureNodeId,
 };
@@ -123,6 +123,9 @@ impl PrepassFeature {
         snapshot: PrepassSnapshot,
         submission: SceneSubmissionPlanId,
     ) {
+        if !ctx.scene_draws.submission_is_cpu_direct(submission) {
+            return;
+        }
         let render_lists = ctx.scene_draws.render_lists;
         let extracted_scene = ctx.scene_draws.extracted_scene;
         let prepared_draws = ctx.scene_draws.prepared_draws;
@@ -235,9 +238,10 @@ impl PrepassFeature {
     /// All shared resources (`Scene_Depth`, `Scene_Normals`, `Feature_ID`)
     /// are created here so the Composer can wire them to downstream passes
     /// via explicit [`TextureNodeId`] connections.
-    pub fn add_to_graph<'a>(
+    pub(crate) fn add_to_graph<'a>(
         &'a mut self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        scene_submission: SceneSubmissionPlanId,
         snapshot: PrepassSnapshot,
     ) -> PrepassOutputs {
         let fc = ctx.frame_config;
@@ -293,14 +297,6 @@ impl PrepassFeature {
         } else {
             None
         };
-        let scene_submission = ctx
-            .graph
-            .reserve_scene_submission(SceneSubmissionKey::Prepass {
-                needs_normal: snapshot.needs_normal,
-                needs_feature_id: snapshot.needs_feature_id,
-                needs_velocity: snapshot.needs_velocity,
-            });
-
         let node = PrepassPassNode {
             feature: self,
             snapshot,

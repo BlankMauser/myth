@@ -633,7 +633,11 @@ impl MaterialPlanStore {
 
         self.push_recipe(
             DrawPlanKey::Opaque,
-            render_lists.opaque.iter().map(|intent| intent.source),
+            render_lists
+                .opaque
+                .iter()
+                .map(|intent| intent.source)
+                .chain(render_lists.gpu_opaque_representatives()),
             asset_textures,
         );
         self.push_recipe(
@@ -1764,9 +1768,18 @@ mod tests {
             material,
             geometry_asset_version,
             geometry_asset_identity,
+            geometry_structure_version: 1,
+            geometry_layout_version: 1,
+            geometry_topology: wgpu::PrimitiveTopology::TriangleList,
+            geometry_index_format: Some(wgpu::IndexFormat::Uint32),
+            geometry_index_count: 3,
+            geometry_has_morph_targets: false,
+            geometry_has_vertex_attributes: true,
+            geometry_has_instanced_attributes: false,
             material_asset_version,
             material_asset_identity,
             material_version,
+            material_gpu_scene_compatible: true,
             material_index: 0,
             material_classification: MaterialClassification::empty(),
             skeleton: None,
@@ -2140,6 +2153,108 @@ mod tests {
                 .state(material_texture_plan)
                 .is_some_and(|state| state.ready.is_some())
         );
+    }
+
+    #[test]
+    fn opaque_recipe_includes_every_deduplicated_gpu_bin_representative() {
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let (_, geometry_version, geometry_identity) = assets
+            .geometries
+            .get_entry_with_identity(geometry)
+            .expect("geometry missing");
+
+        let first_image = assets.images.add(image_8x8());
+        let second_image = assets.images.add(image_8x8());
+        let first_texture = assets
+            .textures
+            .add(Texture::new_2d(Some("GPU bin texture A"), first_image));
+        let second_texture = assets
+            .textures
+            .add(Texture::new_2d(Some("GPU bin texture B"), second_image));
+        let first_material = assets.materials.add(unlit_with_texture(first_texture));
+        let second_material = assets.materials.add(unlit_with_texture(second_texture));
+
+        let material_stamp = |handle| {
+            let (owner, version, identity) = assets
+                .materials
+                .get_entry_with_identity(handle)
+                .expect("material missing");
+            (version, identity, owner.data.version())
+        };
+        let first_stamp = material_stamp(first_material);
+        let second_stamp = material_stamp(second_material);
+        let mut extracted_scene = ExtractedScene::new();
+        extracted_scene.render_items.push(extracted_item(
+            geometry,
+            geometry_version,
+            geometry_identity,
+            first_material,
+            first_stamp.0,
+            first_stamp.1,
+            first_stamp.2,
+        ));
+        extracted_scene.render_items.push(extracted_item(
+            geometry,
+            geometry_version,
+            geometry_identity,
+            second_material,
+            second_stamp.0,
+            second_stamp.1,
+            second_stamp.2,
+        ));
+
+        let mut render_lists = RenderLists::new();
+        let first = render_lists.append_gpu_opaque_representative(
+            super::super::frame::ExtractedSourceId::from_index(0),
+        );
+        let second = render_lists.append_gpu_opaque_representative(
+            super::super::frame::ExtractedSourceId::from_index(1),
+        );
+        assert_eq!(
+            render_lists.append_gpu_opaque_representative(
+                super::super::frame::ExtractedSourceId::from_index(0),
+            ),
+            first
+        );
+        assert_eq!(
+            render_lists
+                .gpu_opaque_representatives()
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+
+        let mut geometry_frames = super::super::asset_frame::GeometryFrameStore::new();
+        geometry_frames.capture_visible(&assets, &extracted_scene, &render_lists);
+        let mut store = MaterialPlanStore::new();
+        let asset_textures = capture_test_plans(
+            &mut store,
+            &assets,
+            &extracted_scene,
+            &render_lists,
+            geometry_frames.eligibility(&extracted_scene, &render_lists),
+        );
+        assert!(store.source_plans.get(first.index()).is_some());
+        assert!(store.source_plans.get(second.index()).is_some());
+
+        let recipes = store.take_topology_recipes();
+        let opaque = recipes
+            .iter()
+            .find(|recipe| matches!(recipe.key, DrawPlanKey::Opaque))
+            .expect("opaque topology recipe missing");
+        let textures = recipes.textures(opaque);
+        assert_eq!(textures.len(), 2);
+        assert!(
+            textures
+                .iter()
+                .any(|planned| planned.snapshot.texture_handle == first_texture)
+        );
+        assert!(
+            textures
+                .iter()
+                .any(|planned| planned.snapshot.texture_handle == second_texture)
+        );
+        assert_eq!(asset_textures.texture_count(), 2);
     }
 
     #[test]

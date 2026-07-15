@@ -19,7 +19,7 @@ use crate::graph::frame::{DrawPlanStore, RenderLists};
 use bitflags::{Flags, bitflags};
 use myth_assets::{AssetServer, GeometryHandle, MaterialHandle};
 use myth_resources::buffer::CpuBuffer;
-use myth_resources::material::AlphaMode;
+use myth_resources::material::{AlphaMode, MaterialType};
 use myth_resources::shader_defines::ShaderDefines;
 use myth_resources::uniforms::{EnvironmentUniforms, GpuLightStorage, LightBufferMetadata};
 use myth_resources::{BoundingBox, RenderableMaterialTrait};
@@ -90,6 +90,10 @@ impl ItemShaderFeatures {
 ///
 /// Contains all per-object attributes needed for view-independent filtering and culling.
 #[derive(Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the CPU snapshot preserves independent exact scene/asset eligibility facts"
+)]
 pub struct ExtractedRenderItem {
     /// Node handle (for debugging and cache write-back)
     pub node_handle: NodeHandle,
@@ -107,10 +111,21 @@ pub struct ExtractedRenderItem {
     /// versions alone can ABA when a reserved slot is repopulated.
     pub(crate) geometry_asset_version: u32,
     pub(crate) geometry_asset_identity: u64,
+    /// Coherent geometry facts consumed by the pre-frustum GPU-driven
+    /// selector. Backend selection must not reopen the live asset dictionary.
+    pub(crate) geometry_structure_version: u64,
+    pub(crate) geometry_layout_version: u64,
+    pub(crate) geometry_topology: wgpu::PrimitiveTopology,
+    pub(crate) geometry_index_format: Option<wgpu::IndexFormat>,
+    pub(crate) geometry_index_count: u32,
+    pub(crate) geometry_has_morph_targets: bool,
+    pub(crate) geometry_has_vertex_attributes: bool,
+    pub(crate) geometry_has_instanced_attributes: bool,
     pub(crate) material_asset_version: u32,
     pub(crate) material_asset_identity: u64,
     /// Interior material epoch captured with classification-relevant state.
     pub(crate) material_version: u64,
+    pub(crate) material_gpu_scene_compatible: bool,
 
     /// Copy-only draw classification captured coherently with
     /// `material_version`. Culling consumes these fields without reopening
@@ -646,9 +661,26 @@ impl ExtractedScene {
                     material: mesh.material,
                     geometry_asset_version: geometry.version,
                     geometry_asset_identity: geometry.identity,
+                    geometry_structure_version: geometry.structure_version(),
+                    geometry_layout_version: geometry.layout_version(),
+                    geometry_topology: geometry.topology,
+                    geometry_index_format: geometry.index_attribute().map(|indices| indices.format),
+                    geometry_index_count: geometry
+                        .index_attribute()
+                        .map_or(0, |indices| indices.count),
+                    geometry_has_morph_targets: geometry.has_morph_targets(),
+                    geometry_has_vertex_attributes: !geometry.attributes().is_empty(),
+                    geometry_has_instanced_attributes: geometry
+                        .attributes()
+                        .values()
+                        .any(|attribute| attribute.step_mode == wgpu::VertexStepMode::Instance),
                     material_asset_version: material.version,
                     material_asset_identity: material.identity,
                     material_version,
+                    material_gpu_scene_compatible: !matches!(
+                        &material.data,
+                        MaterialType::Custom(_)
+                    ),
                     material_index,
                     material_classification,
                     skeleton: skeleton_key,

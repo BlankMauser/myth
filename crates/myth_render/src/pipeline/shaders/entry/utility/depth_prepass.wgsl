@@ -10,6 +10,10 @@
 {$ include 'modules/geometry/skinning' $}
 {$ include 'core/alpha_test' $}
 
+$$ if USE_GPU_SCENE is defined
+{$ include 'modules/gpu_scene_transform' $}
+$$ endif
+
 struct VertexOutput {
     @builtin(position) @invariant position: vec4<f32>,
     $$ if HAS_UV
@@ -25,7 +29,11 @@ struct VertexOutput {
 };
 
 @vertex
+$$ if USE_GPU_SCENE is defined
+fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
+$$ else
 fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+$$ endif
     var out: VertexOutput;
 
     var local_position = vec3<f32>(in.position.xyz);
@@ -86,7 +94,29 @@ fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexO
         $$ endif
     $$ endif
 
-    let world_pos = u_model.world_matrix * local_pos;
+    $$ if USE_GPU_SCENE is defined
+    let gpu_scene_visible = st_gpu_scene_visible_instances[instance_index];
+    let gpu_scene_slot = gpu_scene_visible.slot;
+    let model_world_matrix = st_gpu_scene_instances[gpu_scene_slot].world_matrix;
+        $$ if HAS_VELOCITY_TARGET is defined
+    let model_previous_world_matrix = st_gpu_scene_instances[gpu_scene_slot].previous_world_matrix;
+        $$ endif
+        $$ if OUTPUT_NORMAL and HAS_NORMAL
+    let model_normal_matrix = gpu_scene_normal_matrix_from_inverse(
+        st_gpu_scene_instances[gpu_scene_slot].world_matrix_inverse,
+    );
+        $$ endif
+    $$ else
+    let model_world_matrix = u_model.world_matrix;
+        $$ if HAS_VELOCITY_TARGET is defined
+    let model_previous_world_matrix = u_model.previous_world_matrix;
+        $$ endif
+        $$ if OUTPUT_NORMAL and HAS_NORMAL
+    let model_normal_matrix = u_model.normal_matrix;
+        $$ endif
+    $$ endif
+
+    let world_pos = model_world_matrix * local_pos;
 
     $$ if SHADOW_PASS
     out.position = u_shadow_light.view_projection * world_pos;
@@ -95,7 +125,7 @@ fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexO
     $$ endif
 
     $$ if HAS_VELOCITY_TARGET is defined
-    let prev_world_pos = u_model.previous_world_matrix * prev_local_pos;
+    let prev_world_pos = model_previous_world_matrix * prev_local_pos;
     out.prev_clip_position = u_render_state.prev_unjittered_view_projection * prev_world_pos;
     out.curr_unjittered_clip_position = u_render_state.unjittered_view_projection * world_pos;
     $$ endif
@@ -105,7 +135,7 @@ fn vs_main(in: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VertexO
     $$ endif
 
     $$ if OUTPUT_NORMAL and HAS_NORMAL
-    out.world_normal = normalize(u_model.normal_matrix * local_normal);
+    out.world_normal = normalize(model_normal_matrix * local_normal);
     $$ endif
 
     return out;

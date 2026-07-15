@@ -31,7 +31,7 @@ use crate::HDR_TEXTURE_FORMAT;
 use crate::core::binding::PreparedBindGroupId;
 use crate::core::gpu::GlobalStateKey;
 use crate::graph::composer::GraphBuilderContext;
-use crate::graph::core::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId};
+use crate::graph::core::scene_submission::SceneSubmissionPlanId;
 use crate::graph::core::{
     ClusteredScreenBindings, ExecuteContext, PassNode, PrepareContext, RenderTargetOps,
     TextureDesc, TextureNodeId, build_screen_bind_group,
@@ -69,9 +69,14 @@ impl OpaqueFeature {
         Self
     }
 
-    pub fn add_to_graph<'a>(
+    #[allow(
+        clippy::unused_self,
+        reason = "the stateless Feature facade keeps pass construction uniform with stateful Features"
+    )]
+    pub(crate) fn add_to_graph<'a>(
         &'a self,
         ctx: &mut GraphBuilderContext<'a, '_>,
+        scene_submission: SceneSubmissionPlanId,
         global_state_key: GlobalStateKey,
         scene_depth_ss: TextureNodeId,
         clear_color: wgpu::Color,
@@ -95,10 +100,6 @@ impl OpaqueFeature {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
-        let scene_submission = ctx
-            .graph
-            .reserve_scene_submission(SceneSubmissionKey::Opaque);
-
         ctx.graph.add_pass("Opaque_Pass", |builder| {
             builder.demand_global_state(global_state_key);
             builder.demand_scene_submission(scene_submission);

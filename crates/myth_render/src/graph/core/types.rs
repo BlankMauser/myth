@@ -4,6 +4,7 @@ use crate::core::gpu::Tracked;
 
 use super::asset_texture::AssetTextureImportId;
 use super::persistent::PersistentTextureId;
+use super::persistent_buffer::PersistentBufferId;
 use super::scene_buffer::SceneBufferImportId;
 
 pub trait GraphResourceType: 'static + Send + Sync + Copy + Clone {}
@@ -293,6 +294,10 @@ pub enum TextureBacking {
 pub enum BufferBacking {
     Transient,
     External(*const Tracked<wgpu::Buffer>),
+    /// Cross-frame logical backing owned by the RDG persistent-buffer
+    /// registry. The physical buffer is materialized only after DPE leaves a
+    /// consumer or producer alive.
+    Persistent(PersistentBufferId),
     /// Frame-scoped logical import of one exact scene-buffer stamp.
     ///
     /// Its physical handle is filled into GraphStorage only when DPE leaves a
@@ -399,6 +404,15 @@ impl ResourceKind {
 
     #[inline]
     #[must_use]
+    pub const fn persistent_buffer(desc: BufferDesc, id: PersistentBufferId) -> Self {
+        Self::Buffer {
+            desc,
+            backing: BufferBacking::Persistent(id),
+        }
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn scene_buffer(desc: BufferDesc, id: SceneBufferImportId) -> Self {
         Self::Buffer {
             desc,
@@ -498,6 +512,18 @@ impl ResourceKind {
                 backing: BufferBacking::External(ptr),
                 ..
             } => Some(*ptr),
+            Self::Texture { .. } | Self::Buffer { .. } => None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn persistent_buffer_id(&self) -> Option<PersistentBufferId> {
+        match self {
+            Self::Buffer {
+                backing: BufferBacking::Persistent(id),
+                ..
+            } => Some(*id),
             Self::Texture { .. } | Self::Buffer { .. } => None,
         }
     }
@@ -634,6 +660,12 @@ impl ResourceRecord {
 
     #[inline]
     #[must_use]
+    pub const fn persistent_buffer_id(&self) -> Option<PersistentBufferId> {
+        self.kind.persistent_buffer_id()
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn scene_buffer_import_id(&self) -> Option<SceneBufferImportId> {
         self.kind.scene_buffer_import_id()
     }
@@ -672,6 +704,16 @@ mod tests {
         assert!(
             std::mem::size_of::<TextureBacking>() <= 2 * std::mem::size_of::<u64>(),
             "per-resource backing must not embed full persistent texture specifications"
+        );
+    }
+
+    #[test]
+    fn buffer_backing_remains_an_id_or_pointer_sized_discriminated_value() {
+        assert!(
+            std::mem::size_of::<BufferBacking>()
+                <= std::mem::size_of::<SceneBufferImportId>()
+                    + std::mem::align_of::<SceneBufferImportId>(),
+            "per-resource backing must not embed persistent buffer specifications"
         );
     }
 }

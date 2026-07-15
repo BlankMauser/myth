@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 
 use myth_assets::AssetServer;
 use parking_lot::Mutex;
@@ -14,18 +15,16 @@ use crate::core::gpu::{
 use crate::graph::asset_frame::{GeometryFrameStore, ObjectInterfaceStore};
 use crate::graph::asset_texture_batch::{AssetTextureBatch, AssetTextureBatchId};
 use crate::graph::capacity::{
-    CapacityGovernor, CapacityUsage, PendingCapacityTrim, binary_heap_footprint,
-    estimated_hash_map_footprint, estimated_hash_set_footprint, shrink_binary_heap_by_family_ratio,
-    shrink_hash_map_by_family_ratio, shrink_hash_set_by_family_ratio, shrink_vec_by_family_ratio,
-    vec_footprint,
+    CapacityGovernor, CapacityGovernorStats, CapacityUsage, PendingCapacityTrim,
+    binary_heap_footprint, estimated_hash_map_footprint, estimated_hash_set_footprint,
+    shrink_binary_heap_by_family_ratio, shrink_hash_map_by_family_ratio,
+    shrink_hash_set_by_family_ratio, shrink_vec_by_family_ratio, vec_footprint,
 };
 use crate::graph::core::allocator::TransientPool;
 use crate::graph::core::arena::FrameArena;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::{GaussianFrameBatch, GaussianFrameBatchId, GaussianFrameCloud};
-#[cfg(test)]
-use crate::graph::frame::DrawPlanKey;
-use crate::graph::frame::{DrawPlanStore, PreparedDrawStore};
+use crate::graph::frame::{DrawPlanKey, DrawPlanStore, FrameSourceId, PreparedDrawStore};
 use crate::graph::material_plan::MaterialPlanStore;
 use crate::graph::scene_pipeline_prepare::ScenePipelinePrepareStore;
 use crate::graph::scene_source_prepare::SceneSourcePrepareStore;
@@ -46,13 +45,19 @@ use super::persistent::{
     CacheCommitToken, CachePublicationReceipt, HistoryCommitToken, HistoryRegistry,
     PersistentTextureId, PersistentTextureRef,
 };
+use super::persistent_buffer::{
+    PersistentBufferCommitFailure, PersistentBufferCommitRequest, PersistentBufferCommitToken,
+    PersistentBufferId, PersistentBufferMaterialization, PersistentBufferMaterializationFailure,
+    PersistentBufferMaterializationPreflight, PersistentBufferPlan, PersistentBufferRef,
+    PersistentBufferRegistry,
+};
 use super::scene_buffer::{
     SceneBufferImportStore, SceneBufferMaterializationFailure, SceneBufferRecipe,
     SceneBufferSources,
 };
-#[cfg(test)]
-use super::scene_submission::SceneSubmissionDependencies;
-use super::scene_submission::{SceneSubmissionKey, SceneSubmissionPlanId, SceneSubmissionStore};
+use super::scene_submission::{
+    GpuIndirectPlanDescriptor, SceneSubmissionKey, SceneSubmissionPlanId, SceneSubmissionStore,
+};
 use super::types::{
     BufferDesc, BufferNodeId, ErasedResourceNodeId, GraphResourceType, ResourceClass, ResourceKind,
     ResourceNodeId, ResourceRecord, TextureDesc, TextureNodeId,
@@ -94,12 +99,18 @@ pub struct RdgRetainedCapacityStats {
     estimated_topology_bytes: usize,
     estimated_compile_scratch_bytes: usize,
     estimated_attempt_store_bytes: usize,
+    estimated_renderer_owned_bytes: usize,
+    estimated_gpu_scene_authority_bytes: usize,
+    estimated_gpu_scene_scratch_bytes: usize,
     last_attempt_active_bytes: usize,
     observed_attempts: u64,
     cooldown_attempts_remaining: u32,
     trim_pending: bool,
     trim_count: u64,
     last_trimmed_bytes: usize,
+    gpu_scene_trim_pending: bool,
+    gpu_scene_trim_count: u64,
+    gpu_scene_last_trimmed_bytes: usize,
 }
 
 impl RdgRetainedCapacityStats {
@@ -121,6 +132,26 @@ impl RdgRetainedCapacityStats {
     #[must_use]
     pub const fn estimated_attempt_store_bytes(self) -> usize {
         self.estimated_attempt_store_bytes
+    }
+
+    /// Cross-frame CPU storage owned by renderer features rather than
+    /// `GraphStorage`. GPU Scene is currently the first such family.
+    #[must_use]
+    pub const fn estimated_renderer_owned_bytes(self) -> usize {
+        self.estimated_renderer_owned_bytes
+    }
+
+    /// Stable GPU Scene authority, including slots, records, journals,
+    /// domains, and non-shrinkable generation watermarks.
+    #[must_use]
+    pub const fn estimated_gpu_scene_authority_bytes(self) -> usize {
+        self.estimated_gpu_scene_authority_bytes
+    }
+
+    /// Identity-free GPU Scene planning and submission-finalization scratch.
+    #[must_use]
+    pub const fn estimated_gpu_scene_scratch_bytes(self) -> usize {
+        self.estimated_gpu_scene_scratch_bytes
     }
 
     #[must_use]
@@ -151,6 +182,53 @@ impl RdgRetainedCapacityStats {
     #[must_use]
     pub const fn last_trimmed_bytes(self) -> usize {
         self.last_trimmed_bytes
+    }
+
+    #[must_use]
+    pub const fn gpu_scene_trim_pending(self) -> bool {
+        self.gpu_scene_trim_pending
+    }
+
+    #[must_use]
+    pub const fn gpu_scene_trim_count(self) -> u64 {
+        self.gpu_scene_trim_count
+    }
+
+    #[must_use]
+    pub const fn gpu_scene_last_trimmed_bytes(self) -> usize {
+        self.gpu_scene_last_trimmed_bytes
+    }
+
+    #[must_use]
+    pub const fn total_trim_count(self) -> u64 {
+        self.trim_count.saturating_add(self.gpu_scene_trim_count)
+    }
+
+    pub(crate) fn with_gpu_scene_capacity(
+        mut self,
+        authority: CapacityUsage,
+        scratch: CapacityUsage,
+        governor: CapacityGovernorStats,
+    ) -> Self {
+        let renderer_owned = authority + scratch;
+        self.estimated_retained_bytes = self
+            .estimated_retained_bytes
+            .saturating_add(renderer_owned.retained_bytes);
+        self.estimated_renderer_owned_bytes = renderer_owned.retained_bytes;
+        self.estimated_gpu_scene_authority_bytes = authority.retained_bytes;
+        self.estimated_gpu_scene_scratch_bytes = scratch.retained_bytes;
+        self.last_attempt_active_bytes = self
+            .last_attempt_active_bytes
+            .saturating_add(renderer_owned.active_bytes);
+        self.cooldown_attempts_remaining = self
+            .cooldown_attempts_remaining
+            .max(governor.cooldown_remaining);
+        self.gpu_scene_trim_pending =
+            governor.pending.is_some() || governor.explicit_request_queued;
+        self.trim_pending |= self.gpu_scene_trim_pending;
+        self.gpu_scene_trim_count = governor.trim_count;
+        self.gpu_scene_last_trimmed_bytes = governor.last_trimmed_bytes;
+        self
     }
 }
 
@@ -244,6 +322,241 @@ struct CacheCommitRequest {
 struct PersistentTextureImport {
     node: TextureNodeId,
     spec: super::persistent::PersistentTextureSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistentBufferImport {
+    node: BufferNodeId,
+    buffer: PersistentBufferRef,
+    valid: bool,
+    commit_group: Option<u32>,
+}
+
+pub(crate) struct PersistentBufferCommitGroup {
+    members: SmallVec<[(PersistentBufferCommitToken, ErasedResourceNodeId); 4]>,
+    attempt: PersistentBufferAttemptIdentity,
+    /// Sole mapped-at-prepare upload owner for this atomic transaction.
+    ///
+    /// Keeping the staging Buffer beside its publication state makes abort,
+    /// submission, and stale-ID behavior share one graph-attempt lifetime.
+    /// Execute receives only the commit-group ID and can never retain a raw
+    /// Buffer beyond the graph.
+    prepared_upload: Option<PersistentBufferPreparedUpload>,
+    /// Zero until execute acknowledges exact write coverage; otherwise the
+    /// encoded [`PersistentBufferWriteCoverage`] discriminant.
+    encoded_coverage: AtomicU8,
+    /// The first group is the attempt-scoped submission claim. Keeping this
+    /// state behind the opt-in group path avoids stores on ordinary frames.
+    submission_issued: AtomicBool,
+}
+
+/// Copy coverage asserted by a prepared persistent-Buffer upload.
+///
+/// `Full` is deliberately group-wide: for a multi-member atomic transaction,
+/// it promises complete logical contents for every member, not merely the
+/// first Buffer packed into the staging allocation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistentBufferWriteCoverage {
+    Delta = 1,
+    Full = 2,
+}
+
+struct PersistentBufferPreparedUpload {
+    buffer: wgpu::Buffer,
+    coverage: PersistentBufferWriteCoverage,
+}
+
+impl PersistentBufferCommitGroup {
+    fn preflight_write_coverage(
+        encoded_coverage: u8,
+        requires_full_initialization: bool,
+    ) -> Result<(), PersistentBufferCommitFailure> {
+        debug_assert!(matches!(encoded_coverage, 1 | 2));
+        if requires_full_initialization
+            && encoded_coverage != PersistentBufferWriteCoverage::Full as u8
+        {
+            return Err(PersistentBufferCommitFailure::FullInitializationRequired);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PersistentBufferAttemptIdentity(u64);
+
+/// Process-unique persistent-Buffer graph-attempt IDs close the address-reuse
+/// ABA hole without adding any work to graphs that never register a commit
+/// group. Allocation happens exactly once on the first group registration.
+static NEXT_PERSISTENT_BUFFER_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_persistent_buffer_attempt_identity() -> PersistentBufferAttemptIdentity {
+    let id = NEXT_PERSISTENT_BUFFER_ATTEMPT_ID
+        .fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| current.checked_add(1),
+        )
+        .expect("persistent Buffer process attempt identity overflowed");
+    PersistentBufferAttemptIdentity(id)
+}
+
+/// Opaque authority to acknowledge one complete persistent-Buffer patch
+/// group during this exact graph attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PersistentBufferCommitGroupId {
+    attempt: PersistentBufferAttemptIdentity,
+    index: u32,
+}
+
+/// Execute-phase view of persistent-Buffer write acknowledgements.
+#[derive(Clone, Copy)]
+pub(crate) struct PersistentBufferCommitTracker<'a> {
+    attempt: Option<PersistentBufferAttemptIdentity>,
+    groups: &'a [PersistentBufferCommitGroup],
+}
+
+/// Prepare-phase writer for transaction-owned persistent-Buffer uploads.
+///
+/// This is deliberately narrower than `GraphStorage`: one live writer may
+/// stage exactly one packed upload for its commit group. The group ID is also
+/// the execute-time lookup key, so no parallel frame-local ID namespace is
+/// required.
+pub(crate) struct PersistentBufferUploadPreparer<'a> {
+    attempt: Option<PersistentBufferAttemptIdentity>,
+    groups: &'a mut [PersistentBufferCommitGroup],
+}
+
+impl<'a> PersistentBufferUploadPreparer<'a> {
+    #[inline]
+    pub(crate) fn new(groups: &'a mut [PersistentBufferCommitGroup]) -> Self {
+        let attempt = groups.first().map(|group| group.attempt);
+        debug_assert!(groups.iter().all(|group| Some(group.attempt) == attempt));
+        Self { attempt, groups }
+    }
+
+    /// Transfer ownership of the unique, already-packed staging Buffer for
+    /// `id` into the graph transaction.
+    pub(crate) fn stage_buffer(
+        &mut self,
+        id: PersistentBufferCommitGroupId,
+        buffer: wgpu::Buffer,
+        coverage: PersistentBufferWriteCoverage,
+    ) {
+        assert_eq!(
+            self.attempt,
+            Some(id.attempt),
+            "persistent Buffer commit-group ID belongs to another graph attempt"
+        );
+        let group = self
+            .groups
+            .get_mut(id.index as usize)
+            .expect("persistent Buffer commit-group ID is out of range");
+        assert!(
+            group.prepared_upload.is_none(),
+            "persistent Buffer commit group staged more than one upload"
+        );
+        assert!(
+            buffer.size() != 0,
+            "persistent Buffer upload cannot be empty"
+        );
+        assert_eq!(
+            buffer.size() % wgpu::COPY_BUFFER_ALIGNMENT,
+            0,
+            "persistent Buffer upload size must satisfy COPY_BUFFER_ALIGNMENT"
+        );
+        assert!(
+            buffer.usage().contains(wgpu::BufferUsages::COPY_SRC),
+            "persistent Buffer upload requires COPY_SRC usage"
+        );
+        group.prepared_upload = Some(PersistentBufferPreparedUpload { buffer, coverage });
+    }
+}
+
+impl<'a> PersistentBufferCommitTracker<'a> {
+    #[inline]
+    pub(crate) const fn new(
+        attempt: Option<PersistentBufferAttemptIdentity>,
+        groups: &'a [PersistentBufferCommitGroup],
+    ) -> Self {
+        PersistentBufferCommitTracker { attempt, groups }
+    }
+
+    pub(crate) fn mark_encoded_with_coverage(
+        self,
+        id: PersistentBufferCommitGroupId,
+        coverage: PersistentBufferWriteCoverage,
+    ) {
+        assert_eq!(
+            self.attempt,
+            Some(id.attempt),
+            "persistent Buffer commit-group ID belongs to another graph attempt"
+        );
+        let group = self
+            .groups
+            .get(id.index as usize)
+            .expect("persistent Buffer commit-group ID is out of range");
+        if let Some(upload) = &group.prepared_upload {
+            assert_eq!(
+                upload.coverage, coverage,
+                "persistent Buffer encoded coverage disagrees with its prepared upload"
+            );
+        }
+        assert!(
+            group
+                .encoded_coverage
+                .compare_exchange(
+                    0,
+                    coverage as u8,
+                    AtomicOrdering::Release,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_ok(),
+            "persistent Buffer commit group was encoded more than once"
+        );
+    }
+
+    /// Resolve the unique prepare-owned staging Buffer for this transaction.
+    #[must_use]
+    pub(crate) fn resolve_staging(self, id: PersistentBufferCommitGroupId) -> &'a wgpu::Buffer {
+        assert_eq!(
+            self.attempt,
+            Some(id.attempt),
+            "persistent Buffer commit-group ID belongs to another graph attempt"
+        );
+        self.groups
+            .get(id.index as usize)
+            .expect("persistent Buffer commit-group ID is out of range")
+            .prepared_upload
+            .as_ref()
+            .map(|upload| &upload.buffer)
+            .expect("persistent Buffer commit group has no prepared staging upload")
+    }
+}
+
+/// One-shot evidence that this exact graph submitted its command buffer.
+///
+/// The type is deliberately neither `Copy` nor `Clone`; publication consumes
+/// it, preventing a second acknowledgement from the same queue submission.
+#[derive(Debug)]
+pub(crate) struct SubmittedGraphReceipt {
+    persistent_buffer_attempt: Option<PersistentBufferAttemptIdentity>,
+}
+
+/// Failure to establish an exact physical persistent-buffer set for the
+/// DPE-live graph. Every variant terminates the attempt before Pass prepare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistentBufferGraphMaterializationFailure {
+    Registry(PersistentBufferMaterializationFailure),
+    InvalidLiveBufferHasNoCommit,
+    PartialCommitGroup,
+    PublishedBufferHasLiveWriter,
+}
+
+impl From<PersistentBufferMaterializationFailure> for PersistentBufferGraphMaterializationFailure {
+    fn from(value: PersistentBufferMaterializationFailure) -> Self {
+        Self::Registry(value)
+    }
 }
 
 // Rust's BinaryHeap is a max-heap, so we define the ordering such that higher priority scores come first.
@@ -473,9 +786,18 @@ pub struct GraphStorage {
     /// materializing twice and lets a failed surface acquisition terminate in
     /// `TopologyCompiled` without creating or recycling GPU resources.
     compile_phase: GraphCompilePhase,
-
     /// Per-frame logical import deduplication for persistent textures.
     persistent_texture_lookup: FxHashMap<PersistentTextureId, PersistentTextureImport>,
+    /// Per-frame logical import deduplication for exact persistent-buffer
+    /// plans. Full plan identity stays out of every ResourceRecord.
+    persistent_buffer_lookup: FxHashMap<PersistentBufferId, PersistentBufferImport>,
+    /// Exact physical generations materialized for this graph attempt. The
+    /// resolver never looks up a persistent buffer by logical ID alone.
+    pub(crate) persistent_buffer_materializations:
+        FxHashMap<PersistentBufferId, PersistentBufferMaterialization>,
+    /// Atomic post-submit publication groups. Registration adds no dependency
+    /// and therefore never roots an otherwise dead patch branch.
+    pub(crate) persistent_buffer_commit_groups: Vec<PersistentBufferCommitGroup>,
     /// Logical asset roots and destructible live-prepare materialization slots.
     pub(crate) asset_texture_imports: AssetTextureImportStore,
     /// Canonical CPU Texture -> Image owners shared by every graph producer
@@ -591,6 +913,9 @@ impl GraphStorage {
             physical_dependencies: Vec::with_capacity(256),
             compile_phase: GraphCompilePhase::Building,
             persistent_texture_lookup: FxHashMap::default(),
+            persistent_buffer_lookup: FxHashMap::default(),
+            persistent_buffer_materializations: FxHashMap::default(),
+            persistent_buffer_commit_groups: Vec::new(),
             asset_texture_imports: AssetTextureImportStore::new(),
             asset_texture_plans: AssetTextureBatch::new(),
             scene_buffer_imports: SceneBufferImportStore::new(),
@@ -633,6 +958,13 @@ impl GraphStorage {
         }
     }
 
+    #[inline]
+    fn persistent_buffer_attempt_identity(&self) -> Option<PersistentBufferAttemptIdentity> {
+        self.persistent_buffer_commit_groups
+            .first()
+            .map(|group| group.attempt)
+    }
+
     fn capacity_snapshot(&self) -> [CapacityUsage; GRAPH_CAPACITY_FAMILY_COUNT] {
         let topology = vec_footprint(&self.passes, 64)
             + vec_footprint(&self.resources, 128)
@@ -640,6 +972,9 @@ impl GraphStorage {
             + vec_footprint(&self.logical_reads, 256)
             + vec_footprint(&self.physical_dependencies, 256)
             + estimated_hash_map_footprint(&self.persistent_texture_lookup, 32)
+            + estimated_hash_map_footprint(&self.persistent_buffer_lookup, 8)
+            + estimated_hash_map_footprint(&self.persistent_buffer_materializations, 8)
+            + vec_footprint(&self.persistent_buffer_commit_groups, 4)
             + vec_footprint(&self.history_commit_requests, 16)
             + vec_footprint(&self.cache_commit_requests, 16)
             + vec_footprint(&self.scene_submission_demands, 64)
@@ -755,12 +1090,18 @@ impl GraphStorage {
             estimated_topology_bytes: topology,
             estimated_compile_scratch_bytes: compile,
             estimated_attempt_store_bytes: total.saturating_sub(topology).saturating_sub(compile),
+            estimated_renderer_owned_bytes: 0,
+            estimated_gpu_scene_authority_bytes: 0,
+            estimated_gpu_scene_scratch_bytes: 0,
             last_attempt_active_bytes: governor.usage.active_bytes,
             observed_attempts: governor.attempts,
             cooldown_attempts_remaining: governor.cooldown_remaining,
             trim_pending: governor.pending.is_some() || governor.explicit_request_queued,
             trim_count: governor.trim_count,
             last_trimmed_bytes: governor.last_trimmed_bytes,
+            gpu_scene_trim_pending: false,
+            gpu_scene_trim_count: 0,
+            gpu_scene_last_trimmed_bytes: 0,
         }
     }
 
@@ -778,6 +1119,24 @@ impl GraphStorage {
         shrink_hash_map_by_family_ratio(
             &mut self.persistent_texture_lookup,
             32,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.persistent_buffer_lookup,
+            8,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.persistent_buffer_materializations,
+            8,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.persistent_buffer_commit_groups,
+            4,
             target_bytes,
             retained_bytes,
         );
@@ -982,6 +1341,8 @@ impl GraphStorage {
         self.pass_setup_active = false;
         self.compile_phase = GraphCompilePhase::Building;
         self.persistent_texture_lookup.clear();
+        self.persistent_buffer_lookup.clear();
+        self.persistent_buffer_materializations.clear();
         self.history_commit_requests.clear();
         self.cache_commit_requests.clear();
         self.persistent_cache_finalization = None;
@@ -1234,6 +1595,10 @@ impl GraphStorage {
         self.mipmap_batches.clear();
         self.mipmap_encode_coordinator.clear();
         self.prepared_bind_groups.clear();
+        // Transaction staging is consumed by execute, so it deliberately
+        // survives `release_prepare_owners`. This terminal boundary drops it
+        // for submitted, abandoned, and unwinding attempts alike.
+        self.persistent_buffer_commit_groups.clear();
         self.release_prepare_owners();
         self.scene_submissions.clear();
         self.draw_plans.clear();
@@ -1898,6 +2263,29 @@ impl<'a> RenderGraph<'a> {
         self.arena.alloc_slice_copy(src)
     }
 
+    /// Allocates and initializes a POD slice directly on the frame arena.
+    ///
+    /// This is the zero-temporary counterpart of [`Self::alloc_slice`] for
+    /// graph-build projections whose final length is known up front.
+    #[inline]
+    pub(crate) fn alloc_slice_fill_with<T: Copy>(
+        &self,
+        len: usize,
+        fill: impl FnMut(usize) -> T,
+    ) -> &'a [T] {
+        self.arena.alloc_slice_fill_with(len, fill)
+    }
+
+    /// Allocates a mutable POD slice initialized with one copied value.
+    ///
+    /// This supports graph-build reservations whose exact element count is
+    /// known up front while later values require mutable graph access. The
+    /// slice remains frame-scoped and owns no Drop-bearing payload.
+    #[inline]
+    pub(crate) fn alloc_slice_fill_copy_mut<T: Copy>(&self, len: usize, value: T) -> &'a mut [T] {
+        self.arena.alloc_slice_fill_copy(len, value)
+    }
+
     /// Allocates a mutable copy of `src` on the per-frame arena.
     #[inline]
     pub(crate) fn alloc_slice_mut<T: Copy>(&self, src: &[T]) -> &'a mut [T] {
@@ -1931,25 +2319,129 @@ impl<'a> RenderGraph<'a> {
         submissions.reserve_cpu_direct_textures(draw_plans, draw_plan, dependencies)
     }
 
-    /// Test-only topology backend proving that indirect instance/argument/
-    /// count buffers can participate as ordinary RDG dependencies without a
-    /// Feature knowing the selected submission backend.
+    /// Coordinator-only reservation for a GPU-indirect scene submission.
+    ///
+    /// Feature passes still receive only the returned backend-neutral ID. The
+    /// descriptor's typed Buffer resources become ordinary RDG dependencies.
     #[cfg(test)]
-    fn reserve_indirect_scene_submission_for_test(
+    pub(super) fn reserve_gpu_indirect_scene_submission(
         &mut self,
-        stub_key: u64,
-        dependencies: &SceneSubmissionDependencies,
+        descriptor: GpuIndirectPlanDescriptor,
+    ) -> SceneSubmissionPlanId {
+        let dependency_key = descriptor.key().cpu_direct_key();
+        self.reserve_gpu_indirect_scene_submission_with_dependencies(descriptor, dependency_key)
+    }
+
+    fn reserve_gpu_indirect_scene_submission_with_dependencies(
+        &mut self,
+        descriptor: GpuIndirectPlanDescriptor,
+        dependency_key: DrawPlanKey,
     ) -> SceneSubmissionPlanId {
         self.assert_topology_mutable();
-        for &dependency in dependencies.as_slice() {
+        for dependency in descriptor.referenced_resources() {
             assert!(
                 (dependency.index() as usize) < self.storage.resources.len(),
-                "scene-submission dependency belongs to another graph"
+                "GPU-indirect descriptor resource index is not registered in this graph"
             );
         }
+
+        let validate_storage = |node: BufferNodeId, role: &str| {
+            let resource = &self.storage.resources[node.index() as usize];
+            let desc = resource.kind.buffer_desc().unwrap_or_else(|| {
+                panic!(
+                    "GPU-indirect {role} resource '{}' is not a buffer",
+                    resource.name
+                )
+            });
+            assert!(
+                desc.usage.contains(wgpu::BufferUsages::STORAGE),
+                "GPU-indirect {role} buffer '{}' must include STORAGE usage",
+                resource.name
+            );
+            desc
+        };
+        validate_storage(descriptor.instance_table(), "instance-table");
+        validate_storage(descriptor.candidate_instances(), "candidate-instance");
+        validate_storage(descriptor.visible_instances(), "visible-instance");
+        let arguments = validate_storage(descriptor.indirect_arguments(), "argument");
+        assert!(
+            arguments.usage.contains(wgpu::BufferUsages::INDIRECT),
+            "GPU-indirect argument buffer must include INDIRECT usage"
+        );
+        assert_eq!(
+            descriptor.indirect_offset() % 4,
+            0,
+            "GPU-indirect first-active argument offset must be 4-byte aligned"
+        );
+        assert_eq!(
+            descriptor.indirect_window_start() % 4,
+            0,
+            "GPU-indirect argument window start must be 4-byte aligned"
+        );
+        assert!(
+            descriptor.indirect_span() != 0,
+            "GPU-indirect argument span must be non-zero"
+        );
+        assert_eq!(
+            descriptor.indirect_span() % GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+            0,
+            "GPU-indirect argument span must contain whole indexed indirect records"
+        );
+        let argument_end = descriptor
+            .checked_indirect_window_end()
+            .expect("GPU-indirect argument window overflowed");
+        assert!(
+            argument_end <= arguments.logical_size,
+            "GPU-indirect argument buffer must hold the complete indexed indirect argument window"
+        );
+        assert!(
+            descriptor.contains_indexed_argument(descriptor.indirect_offset()),
+            "GPU-indirect first-active argument record must lie on the reserved window grid"
+        );
+        assert!(
+            arguments.usage.contains(wgpu::BufferUsages::COPY_DST),
+            "GPU-indirect argument buffer must include COPY_DST for deterministic pre-dispatch clearing"
+        );
+        let dependencies = self.storage.draw_plans.texture_dependencies(dependency_key);
         self.storage
             .scene_submissions
-            .reserve_indirect_stub(stub_key, dependencies)
+            .reserve_gpu_indirect_with_textures(descriptor, dependencies)
+    }
+
+    /// Production reservation for one backend-neutral multi-bin GPU Scene
+    /// submission. `representative` is descriptor identity only; the complete
+    /// retained candidate set remains borrowed from the immutable table-set
+    /// plan by the coordinator/finalizer instead of being copied per view.
+    pub(crate) fn reserve_gpu_scene_multi_bin_submission(
+        &mut self,
+        key: SceneSubmissionKey,
+        representative: FrameSourceId,
+        instance_table: BufferNodeId,
+        candidate_instances: BufferNodeId,
+        visible_instances: BufferNodeId,
+        indirect_arguments: BufferNodeId,
+        first_active_indirect_offset: u64,
+        indirect_window_start: u64,
+        indirect_span: u64,
+    ) -> SceneSubmissionPlanId {
+        let descriptor = GpuIndirectPlanDescriptor::new_multi_bin(
+            key,
+            representative,
+            instance_table,
+            candidate_instances,
+            visible_instances,
+            indirect_arguments,
+            first_active_indirect_offset,
+            indirect_window_start,
+            indirect_span,
+        );
+        // Every GPU semantic pass inherits the canonical Opaque material
+        // dependency union. This roots the complete texture set without
+        // rebuilding per-view CPU draw queues or per-bin dependency metadata.
+        self.reserve_gpu_indirect_scene_submission_with_dependencies(
+            descriptor,
+            DrawPlanKey::Opaque,
+        )
     }
 
     /// Capture the sole logical Group 0 plan for this graph attempt.
@@ -2392,6 +2884,237 @@ impl<'a> RenderGraph<'a> {
         id
     }
 
+    /// Import one exact persistent-buffer plan as a lazy external, non-root
+    /// graph resource. No physical allocation or upload occurs during graph
+    /// construction; a live producer/consumer triggers the post-DPE barrier.
+    ///
+    /// Repeated imports in one graph must carry the complete same attempt,
+    /// generation, revision, specification, and validity state. Keeping that
+    /// identity in this side table prevents ResourceRecord from growing.
+    pub(crate) fn import_persistent_buffer(
+        &mut self,
+        name: &'static str,
+        plan: PersistentBufferPlan,
+    ) -> BufferNodeId {
+        self.assert_topology_mutable();
+        let buffer = plan.buffer;
+        if let Some(&existing) = self.storage.persistent_buffer_lookup.get(&buffer.id) {
+            assert_eq!(
+                existing.buffer, buffer,
+                "persistent Buffer {:?} imported with a stale or conflicting plan",
+                buffer.id
+            );
+            assert_eq!(
+                existing.valid, plan.valid,
+                "persistent Buffer {:?} imported with conflicting publication state",
+                buffer.id
+            );
+            return existing.node;
+        }
+
+        let node = ResourceNodeId::from_erased(self.register_resource_with_root(
+            name,
+            ResourceKind::persistent_buffer(buffer.spec.desc, buffer.id),
+            true,
+            false,
+            0,
+        ));
+        self.storage.persistent_buffer_lookup.insert(
+            buffer.id,
+            PersistentBufferImport {
+                node,
+                buffer,
+                valid: plan.valid,
+                commit_group: None,
+            },
+        );
+        node
+    }
+
+    /// Register one atomic persistent-buffer publication group.
+    ///
+    /// Registration adds no graph edge and never seeds DPE liveness. If any
+    /// writer in a group survives, every writer must survive; the exact
+    /// physical generations are acknowledged only after queue submission.
+    pub(crate) fn register_persistent_buffer_commit_group(
+        &mut self,
+        members: &[(PersistentBufferCommitToken, BufferNodeId)],
+    ) -> PersistentBufferCommitGroupId {
+        self.assert_topology_mutable();
+        assert!(
+            !members.is_empty(),
+            "persistent Buffer commit group requires writers"
+        );
+
+        for (index, &(token, node)) in members.iter().enumerate() {
+            assert!(
+                members[..index].iter().all(|(previous, previous_node)| {
+                    previous.buffer_id != token.buffer_id && previous_node != &node
+                }),
+                "persistent Buffer commit group contains duplicate members"
+            );
+            let resource = &self.storage.resources[node.index() as usize];
+            assert_eq!(
+                resource.persistent_buffer_id(),
+                Some(token.buffer_id),
+                "persistent Buffer commit output does not match its token"
+            );
+            let import = self
+                .storage
+                .persistent_buffer_lookup
+                .get(&token.buffer_id)
+                .expect("persistent Buffer commit output was not imported by this graph");
+            assert_eq!(
+                import.node, node,
+                "persistent Buffer token targets an alias"
+            );
+            assert!(
+                !import.valid,
+                "a published persistent Buffer plan is read-only"
+            );
+            assert!(
+                token.buffer_id == import.buffer.id
+                    && token.epoch == import.buffer.epoch
+                    && token.plan_generation == import.buffer.plan_generation
+                    && token.revision == import.buffer.revision
+                    && token.attempt_serial == import.buffer.attempt_serial,
+                "persistent Buffer commit token does not match its imported plan"
+            );
+            assert!(
+                import.commit_group.is_none(),
+                "persistent Buffer registered in multiple commit groups"
+            );
+        }
+
+        let attempt = self
+            .storage
+            .persistent_buffer_attempt_identity()
+            .unwrap_or_else(allocate_persistent_buffer_attempt_identity);
+        let group_index = u32::try_from(self.storage.persistent_buffer_commit_groups.len())
+            .expect("persistent Buffer commit-group index overflowed");
+        self.storage
+            .persistent_buffer_commit_groups
+            .push(PersistentBufferCommitGroup {
+                members: members
+                    .iter()
+                    .map(|&(token, node)| (token, node.erase()))
+                    .collect(),
+                attempt,
+                prepared_upload: None,
+                encoded_coverage: AtomicU8::new(0),
+                submission_issued: AtomicBool::new(false),
+            });
+        for &(token, _) in members {
+            self.storage
+                .persistent_buffer_lookup
+                .get_mut(&token.buffer_id)
+                .expect("persistent Buffer commit-group preflight lost its import")
+                .commit_group = Some(group_index);
+        }
+        PersistentBufferCommitGroupId {
+            attempt,
+            index: group_index,
+        }
+    }
+
+    #[inline]
+    fn persistent_buffer_live_writer_count(&self, group: &PersistentBufferCommitGroup) -> usize {
+        group
+            .members
+            .iter()
+            .filter(|(_, node)| {
+                self.storage.resources[node.index() as usize]
+                    .producer
+                    .is_some_and(|producer| self.storage.passes[producer].reference_count > 0)
+            })
+            .count()
+    }
+
+    fn preflight_persistent_buffer_encoding(&self) -> Result<(), PersistentBufferCommitFailure> {
+        if self.storage.persistent_buffer_commit_groups.is_empty() {
+            return Ok(());
+        }
+        for group in &self.storage.persistent_buffer_commit_groups {
+            let live_writers = self.persistent_buffer_live_writer_count(group);
+            if live_writers == 0 {
+                continue;
+            }
+            if live_writers != group.members.len() {
+                return Err(PersistentBufferCommitFailure::PartialLiveGroup);
+            }
+            let encoded_coverage = group.encoded_coverage.load(AtomicOrdering::Acquire);
+            if encoded_coverage == 0 {
+                return Err(PersistentBufferCommitFailure::LiveGroupNotEncoded);
+            }
+            let requires_full_initialization = group.members.iter().any(|(commit, _)| {
+                self.storage
+                    .persistent_buffer_materializations
+                    .get(&commit.buffer_id)
+                    .expect("live persistent Buffer commit member was not materialized")
+                    .requires_full_initialization
+            });
+            PersistentBufferCommitGroup::preflight_write_coverage(
+                encoded_coverage,
+                requires_full_initialization,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn has_persistent_buffer_imports(&self) -> bool {
+        !self.storage.persistent_buffer_lookup.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn has_persistent_buffer_commit_groups(&self) -> bool {
+        !self.storage.persistent_buffer_commit_groups.is_empty()
+    }
+
+    /// Narrow execute-phase facade for acknowledging exact persistent-Buffer
+    /// commit groups without exposing graph-owned transaction storage.
+    #[inline]
+    pub(crate) fn persistent_buffer_commit_tracker(&self) -> PersistentBufferCommitTracker<'_> {
+        PersistentBufferCommitTracker::new(
+            self.storage.persistent_buffer_attempt_identity(),
+            &self.storage.persistent_buffer_commit_groups,
+        )
+    }
+
+    /// Submit this graph's command buffer after proving that every DPE-live
+    /// persistent-Buffer writer group explicitly acknowledged complete
+    /// encoding. The returned receipt is one-shot and graph-attempt-bound.
+    #[inline]
+    pub(crate) fn submit_command_buffer(
+        &mut self,
+        queue: &wgpu::Queue,
+        command_buffer: wgpu::CommandBuffer,
+    ) -> Result<SubmittedGraphReceipt, PersistentBufferCommitFailure> {
+        assert!(
+            self.storage.compile_phase.topology_compiled(),
+            "a RenderGraph cannot submit before topology compilation"
+        );
+        if let Some(first_group) = self.storage.persistent_buffer_commit_groups.first() {
+            self.preflight_persistent_buffer_encoding()?;
+            if first_group
+                .submission_issued
+                .compare_exchange(
+                    false,
+                    true,
+                    AtomicOrdering::Release,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_err()
+            {
+                return Err(PersistentBufferCommitFailure::InvalidSubmissionReceipt);
+            }
+        }
+        queue.submit(Some(command_buffer));
+        Ok(SubmittedGraphReceipt {
+            persistent_buffer_attempt: self.storage.persistent_buffer_attempt_identity(),
+        })
+    }
+
     /// Finalize ordinary-cache rollback eligibility after DPE and before any
     /// persistent texture can be materialized for this attempt.
     ///
@@ -2490,6 +3213,109 @@ impl<'a> RenderGraph<'a> {
             );
             registry.materialize_texture(device, resource.name, id, import.spec);
         }
+    }
+
+    /// Materialize the exact physical generations required by DPE-live
+    /// persistent-buffer imports.
+    ///
+    /// Invalid contents are legal only behind a complete live commit group;
+    /// published contents are read-only. This validation happens before the
+    /// first buffer is materialized, so a partially culled multi-buffer patch
+    /// cannot enter Pass prepare or command recording.
+    pub(crate) fn materialize_live_persistent_buffers(
+        &mut self,
+        registry: &mut PersistentBufferRegistry,
+        device: &Device,
+    ) -> Result<(), PersistentBufferGraphMaterializationFailure> {
+        assert!(
+            self.storage.compile_phase.topology_compiled(),
+            "persistent Buffer materialization requires a compiled graph"
+        );
+        if self.storage.persistent_buffer_lookup.is_empty() {
+            debug_assert!(self.storage.persistent_buffer_commit_groups.is_empty());
+            debug_assert!(self.storage.persistent_buffer_materializations.is_empty());
+            return Ok(());
+        }
+
+        for group in &self.storage.persistent_buffer_commit_groups {
+            let live_writers = group
+                .members
+                .iter()
+                .filter(|(_, node)| {
+                    self.storage.resources[node.index() as usize]
+                        .producer
+                        .is_some_and(|producer| self.storage.passes[producer].reference_count > 0)
+                })
+                .count();
+            if live_writers != 0 && live_writers != group.members.len() {
+                return Err(PersistentBufferGraphMaterializationFailure::PartialCommitGroup);
+            }
+        }
+
+        let max_buffer_size = device.limits().max_buffer_size;
+        let mut preflights: SmallVec<
+            [(PersistentBufferId, PersistentBufferMaterializationPreflight); 4],
+        > = SmallVec::new();
+        for (&id, import) in &self.storage.persistent_buffer_lookup {
+            let resource = &self.storage.resources[import.node.index() as usize];
+            if resource.first_use == usize::MAX {
+                continue;
+            }
+            assert_eq!(
+                resource.buffer_desc(),
+                import.buffer.spec.desc,
+                "persistent Buffer {id:?} graph descriptor disagrees with its import spec"
+            );
+            let writer_is_live = resource
+                .producer
+                .is_some_and(|producer| self.storage.passes[producer].reference_count > 0);
+            if import.valid {
+                if writer_is_live {
+                    return Err(
+                        PersistentBufferGraphMaterializationFailure::PublishedBufferHasLiveWriter,
+                    );
+                }
+            } else if !writer_is_live || import.commit_group.is_none() {
+                return Err(
+                    PersistentBufferGraphMaterializationFailure::InvalidLiveBufferHasNoCommit,
+                );
+            }
+            preflights.push((
+                id,
+                registry.preflight_materialization(import.buffer, max_buffer_size)?,
+            ));
+        }
+
+        for (id, preflight) in preflights {
+            let import = self
+                .storage
+                .persistent_buffer_lookup
+                .get(&id)
+                .expect("persistent Buffer preflight lost its import");
+            let resource = &self.storage.resources[import.node.index() as usize];
+            let materialized =
+                registry.materialize_prevalidated(device, preflight, Some(resource.name))?;
+            if let Some(previous) = self.storage.persistent_buffer_materializations.get_mut(&id) {
+                assert_eq!(
+                    previous.token, materialized.token,
+                    "persistent Buffer materialized twice with conflicting physical identity"
+                );
+                assert_eq!(
+                    previous.allocation_size, materialized.allocation_size,
+                    "persistent Buffer materialized twice with conflicting retained capacity"
+                );
+                // Preserve the first call's create-and-swap fact across an
+                // idempotent repeated graph barrier. A later probe observes a
+                // reusable allocation but must not erase the patch node's
+                // requirement to rebuild all records this attempt.
+                previous.recreated |= materialized.recreated;
+            } else {
+                self.storage
+                    .persistent_buffer_materializations
+                    .insert(id, materialized);
+            }
+        }
+        Ok(())
     }
 
     /// Materialize only logical Asset Texture imports touched by the compiled
@@ -2753,6 +3579,10 @@ impl<'a> RenderGraph<'a> {
             "persistent textures cannot be versioned or mutated in place"
         );
         assert!(
+            root_res.persistent_buffer_id().is_none(),
+            "persistent buffers cannot be versioned or mutated in place"
+        );
+        assert!(
             root_res.scene_buffer_import_id().is_none(),
             "scene buffer imports cannot be versioned or mutated in place"
         );
@@ -2963,6 +3793,70 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
+    /// Publish exact persistent-buffer revisions after queue submission.
+    ///
+    /// A group with no live writer is ignored. A partially live group is an
+    /// invariant violation that should already have terminated the attempt at
+    /// the post-DPE materialization barrier. Registry preflight keeps each
+    /// live group atomic even if a token was retired or superseded between
+    /// graph construction and publication.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "consuming one-shot submission authority prevents accidental reuse"
+    )]
+    pub(crate) fn commit_submitted_persistent_buffers(
+        &self,
+        registry: &mut PersistentBufferRegistry,
+        receipt: SubmittedGraphReceipt,
+    ) -> Result<(), PersistentBufferCommitFailure> {
+        if receipt.persistent_buffer_attempt != self.storage.persistent_buffer_attempt_identity()
+            || (!self.storage.persistent_buffer_commit_groups.is_empty()
+                && !self.storage.persistent_buffer_commit_groups[0]
+                    .submission_issued
+                    .load(AtomicOrdering::Acquire))
+        {
+            return Err(PersistentBufferCommitFailure::InvalidSubmissionReceipt);
+        }
+        if self.storage.persistent_buffer_commit_groups.is_empty() {
+            return Ok(());
+        }
+        self.preflight_persistent_buffer_encoding()?;
+
+        // Preflight every live group before publishing the first one. This
+        // retains atomic fail-closed behavior across the complete graph while
+        // iterating canonical group storage directly without temporary heap
+        // allocation.
+        for group in &self.storage.persistent_buffer_commit_groups {
+            let live_writers = self.persistent_buffer_live_writer_count(group);
+            if live_writers == 0 {
+                continue;
+            }
+            registry.preflight_commit_batch(group.members.iter().map(|&(commit, _)| {
+                let physical = self
+                    .storage
+                    .persistent_buffer_materializations
+                    .get(&commit.buffer_id)
+                    .expect("submitted persistent Buffer writer was not materialized");
+                PersistentBufferCommitRequest::new(commit, physical.token)
+            }))?;
+        }
+
+        for group in &self.storage.persistent_buffer_commit_groups {
+            if self.persistent_buffer_live_writer_count(group) == 0 {
+                continue;
+            }
+            registry.publish_preflighted_batch(group.members.iter().map(|&(commit, _)| {
+                let physical = *self
+                    .storage
+                    .persistent_buffer_materializations
+                    .get(&commit.buffer_id)
+                    .expect("submitted persistent Buffer writer was not materialized");
+                PersistentBufferCommitRequest::new(commit, physical.token)
+            }));
+        }
+        Ok(())
+    }
+
     /// Publish every eligible persistent resource after command submission.
     ///
     /// History behavior is intentionally delegated to the existing API. Cache
@@ -3086,6 +3980,12 @@ impl<'a> RenderGraph<'a> {
                 .is_some()
                 || self.storage.resources[dst_root_idx]
                     .persistent_texture_id()
+                    .is_some()
+                || self.storage.resources[src_root_idx]
+                    .persistent_buffer_id()
+                    .is_some()
+                || self.storage.resources[dst_root_idx]
+                    .persistent_buffer_id()
                     .is_some()
                 || self.storage.resources[src_root_idx]
                     .asset_texture_import_id()
@@ -3677,6 +4577,171 @@ mod tests {
         )
     }
 
+    fn empty_persistent_buffer_commit_group(
+        attempt: PersistentBufferAttemptIdentity,
+    ) -> PersistentBufferCommitGroup {
+        PersistentBufferCommitGroup {
+            members: SmallVec::new(),
+            attempt,
+            prepared_upload: None,
+            encoded_coverage: AtomicU8::new(0),
+            submission_issued: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn persistent_buffer_transaction_owns_staging_and_rejects_stale_ids() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let mut storage = GraphStorage::new();
+        let first_attempt = allocate_persistent_buffer_attempt_identity();
+        let first = PersistentBufferCommitGroupId {
+            attempt: first_attempt,
+            index: 0,
+        };
+        storage
+            .persistent_buffer_commit_groups
+            .push(empty_persistent_buffer_commit_group(first_attempt));
+        let staging = wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("persistent Buffer transaction staging test"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        PersistentBufferUploadPreparer::new(&mut storage.persistent_buffer_commit_groups)
+            .stage_buffer(first, staging, PersistentBufferWriteCoverage::Full);
+
+        let tracker = PersistentBufferCommitTracker::new(
+            storage.persistent_buffer_attempt_identity(),
+            &storage.persistent_buffer_commit_groups,
+        );
+        assert_eq!(tracker.resolve_staging(first).size(), 16);
+        tracker.mark_encoded_with_coverage(first, PersistentBufferWriteCoverage::Full);
+        assert_eq!(
+            PersistentBufferCommitGroup::preflight_write_coverage(
+                PersistentBufferWriteCoverage::Full as u8,
+                true,
+            ),
+            Ok(())
+        );
+
+        let mut delta_group = vec![empty_persistent_buffer_commit_group(first_attempt)];
+        let delta_staging = wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("persistent Buffer delta staging test"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        PersistentBufferUploadPreparer::new(&mut delta_group).stage_buffer(
+            first,
+            delta_staging,
+            PersistentBufferWriteCoverage::Delta,
+        );
+        let delta_tracker = PersistentBufferCommitTracker::new(Some(first_attempt), &delta_group);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                delta_tracker.mark_encoded_with_coverage(first, PersistentBufferWriteCoverage::Full)
+            }))
+            .is_err(),
+            "execute coverage must agree with the staged upload"
+        );
+        delta_tracker.mark_encoded_with_coverage(first, PersistentBufferWriteCoverage::Delta);
+        assert_eq!(
+            PersistentBufferCommitGroup::preflight_write_coverage(
+                PersistentBufferWriteCoverage::Delta as u8,
+                true,
+            ),
+            Err(PersistentBufferCommitFailure::FullInitializationRequired)
+        );
+        assert_eq!(
+            PersistentBufferCommitGroup::preflight_write_coverage(
+                PersistentBufferWriteCoverage::Delta as u8,
+                false,
+            ),
+            Ok(())
+        );
+
+        let foreign = PersistentBufferCommitGroupId {
+            attempt: allocate_persistent_buffer_attempt_identity(),
+            index: 0,
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracker.resolve_staging(foreign)
+            }))
+            .is_err(),
+            "foreign commit-group IDs must fail closed"
+        );
+        let out_of_range = PersistentBufferCommitGroupId {
+            attempt: first_attempt,
+            index: 1,
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracker.resolve_staging(out_of_range)
+            }))
+            .is_err(),
+            "out-of-range commit-group IDs must fail closed"
+        );
+
+        storage.release_frame_owners();
+        assert!(storage.persistent_buffer_commit_groups.is_empty());
+        storage.clear();
+
+        let next_attempt = allocate_persistent_buffer_attempt_identity();
+        storage
+            .persistent_buffer_commit_groups
+            .push(empty_persistent_buffer_commit_group(next_attempt));
+        let next_tracker = PersistentBufferCommitTracker::new(
+            storage.persistent_buffer_attempt_identity(),
+            &storage.persistent_buffer_commit_groups,
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                next_tracker.resolve_staging(first)
+            }))
+            .is_err(),
+            "a released attempt ID must not alias a reused group index"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "staged more than one upload")]
+    fn persistent_buffer_transaction_rejects_duplicate_staging() {
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let attempt = allocate_persistent_buffer_attempt_identity();
+        let id = PersistentBufferCommitGroupId { attempt, index: 0 };
+        let mut groups = vec![empty_persistent_buffer_commit_group(attempt)];
+        let first = wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("first upload"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let duplicate = wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("duplicate upload"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mut preparer = PersistentBufferUploadPreparer::new(&mut groups);
+        preparer.stage_buffer(id, first, PersistentBufferWriteCoverage::Full);
+        preparer.stage_buffer(id, duplicate, PersistentBufferWriteCoverage::Full);
+    }
+
     #[test]
     fn retained_capacity_categories_partition_the_total_and_keep_mipmaps_out_of_topology() {
         let mut storage = GraphStorage::new();
@@ -4142,8 +5207,8 @@ mod tests {
             graph
                 .storage
                 .scene_submissions
-                .live_backend_counts()
-                .cpu_direct,
+                .backend_counts()
+                .live_cpu_direct,
             2
         );
         let live: Vec<_> = graph
@@ -4211,38 +5276,64 @@ mod tests {
             graph
                 .storage
                 .scene_submissions
-                .live_backend_counts()
-                .cpu_direct,
+                .backend_counts()
+                .live_cpu_direct,
             1,
             "the CpuDirect adapter must synchronize live submission state"
         );
     }
 
     #[test]
-    fn scene_submission_mixed_dependencies_preserve_first_occurrence_order() {
+    fn gpu_indirect_dependencies_preserve_first_occurrence_order() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture_a = graph.register_texture("Submission_Texture_A", dummy_desc(), false);
-        let buffer = graph.register_buffer(
-            "Submission_Buffer",
+        let buffer_a = graph.register_buffer(
+            "Submission_Buffer_A",
             BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
             false,
         );
-        let texture_b = graph.register_texture("Submission_Texture_B", dummy_desc(), false);
-
-        let first_submission = graph.reserve_indirect_scene_submission_for_test(
-            11,
-            &SceneSubmissionDependencies::new()
-                .with_texture(texture_a)
-                .with_buffer(buffer),
+        let shared = graph.register_buffer(
+            "Submission_Shared",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
         );
-        let mut second_dependencies = SceneSubmissionDependencies::new()
-            .with_texture(texture_b)
-            .with_buffer(buffer);
-        second_dependencies.read_texture(texture_b);
+        let args_a = graph.register_buffer(
+            "Submission_Args_A",
+            BufferDesc::new(
+                64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+        let buffer_b = graph.register_buffer(
+            "Submission_Buffer_B",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let args_b = graph.register_buffer(
+            "Submission_Args_B",
+            BufferDesc::new(
+                64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+
+        let first_submission = graph.reserve_gpu_indirect_scene_submission(
+            GpuIndirectPlanDescriptor::new(SceneSubmissionKey::Opaque, buffer_a, shared, args_a),
+        );
         let second_submission =
-            graph.reserve_indirect_scene_submission_for_test(12, &second_dependencies);
+            graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+                SceneSubmissionKey::Transparent,
+                buffer_b,
+                shared,
+                args_b,
+            ));
         let pass_index = graph.storage.passes.len();
 
         graph.add_pass("Mixed_Submission_Consumer", |builder| {
@@ -4258,8 +5349,300 @@ mod tests {
         );
         assert_eq!(
             graph.storage.pass_reads(pass_index),
-            &[texture_b.erase(), buffer.erase(), texture_a.erase()],
-            "texture and buffer dependencies must share one ordered dedup domain"
+            &[
+                buffer_b.erase(),
+                shared.erase(),
+                args_b.erase(),
+                buffer_a.erase(),
+                args_a.erase(),
+            ],
+            "draw-visible GPU-indirect buffers must share one ordered dedup domain"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "resource index is not registered in this graph")]
+    fn gpu_indirect_candidate_metadata_rejects_an_unregistered_resource_index() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let visible = graph.register_buffer(
+            "Submission_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let arguments = graph.register_buffer(
+            "Submission_Arguments",
+            BufferDesc::new(
+                64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+
+        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+            SceneSubmissionKey::Opaque,
+            BufferNodeId::new(99, 0),
+            visible,
+            arguments,
+        ));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "GPU-indirect instance-table resource 'Not_A_Buffer' is not a buffer"
+    )]
+    fn gpu_indirect_descriptor_rejects_a_forged_buffer_class() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.register_texture("Not_A_Buffer", dummy_desc(), false);
+        let visible = graph.register_buffer(
+            "Submission_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let arguments = graph.register_buffer(
+            "Submission_Arguments",
+            BufferDesc::new(
+                64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+
+        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+            SceneSubmissionKey::Opaque,
+            BufferNodeId::new(texture.index(), texture.version()),
+            visible,
+            arguments,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "GPU-indirect argument buffer must include INDIRECT usage")]
+    fn gpu_indirect_argument_buffer_requires_indirect_usage() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let candidate = graph.register_buffer(
+            "Submission_Candidate",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let visible = graph.register_buffer(
+            "Submission_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let arguments = graph.register_buffer(
+            "Submission_Arguments",
+            BufferDesc::new(
+                GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                wgpu::BufferUsages::STORAGE,
+            ),
+            false,
+        );
+
+        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+            SceneSubmissionKey::Opaque,
+            candidate,
+            visible,
+            arguments,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must hold the complete indexed indirect argument window")]
+    fn gpu_indirect_argument_buffer_rejects_an_undersized_record() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let candidate = graph.register_buffer(
+            "Submission_Candidate",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let visible = graph.register_buffer(
+            "Submission_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let arguments = graph.register_buffer(
+            "Submission_Arguments",
+            BufferDesc::new(
+                GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE - 1,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+
+        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+            SceneSubmissionKey::Opaque,
+            candidate,
+            visible,
+            arguments,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must hold the complete indexed indirect argument window")]
+    fn gpu_multi_bin_reservation_rejects_a_later_batch_out_of_bounds_during_build() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let table = graph.register_buffer(
+            "Multi_Instance_Table",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let active = graph.register_buffer(
+            "Multi_Active_Batches",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let visible = graph.register_buffer(
+            "Multi_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        // The first 20-byte record fits; the second record's final byte does
+        // not. Reservation must reject the complete window before DPE.
+        let arguments = graph.register_buffer(
+            "Multi_Arguments",
+            BufferDesc::new(
+                2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE - 1,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+
+        graph.reserve_gpu_scene_multi_bin_submission(
+            SceneSubmissionKey::Opaque,
+            FrameSourceId::from_index(0),
+            table,
+            active,
+            visible,
+            arguments,
+            0,
+            0,
+            2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+        );
+    }
+
+    #[test]
+    fn gpu_multi_bin_shadow_inherits_the_canonical_opaque_texture_union() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let texture = graph.register_texture("Opaque_Texture", dummy_desc(), false);
+        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
+        let table = graph.register_buffer(
+            "Inherited_Table",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let active = graph.register_buffer(
+            "Inherited_Active",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let visible = graph.register_buffer(
+            "Inherited_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let arguments = graph.register_buffer(
+            "Inherited_Arguments",
+            BufferDesc::new(
+                2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+
+        let submission = graph.reserve_gpu_scene_multi_bin_submission(
+            SceneSubmissionKey::Shadow {
+                light_id: 7,
+                layer_index: 2,
+            },
+            FrameSourceId::from_index(0),
+            table,
+            active,
+            visible,
+            arguments,
+            GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+            0,
+            2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+        );
+
+        assert_eq!(
+            graph.storage.scene_submissions.dependencies(submission),
+            Some(
+                &[
+                    table.erase(),
+                    visible.erase(),
+                    arguments.erase(),
+                    texture.erase(),
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting descriptor")]
+    fn duplicate_multi_bin_semantic_reservation_rejects_a_conflicting_window() {
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let table = graph.register_buffer(
+            "Conflict_Table",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let visible = graph.register_buffer(
+            "Conflict_Visible",
+            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            false,
+        );
+        let arguments = graph.register_buffer(
+            "Conflict_Arguments",
+            BufferDesc::new(
+                64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            false,
+        );
+        let reserve = |graph: &mut RenderGraph<'_>, span| {
+            graph.reserve_gpu_scene_multi_bin_submission(
+                SceneSubmissionKey::Opaque,
+                FrameSourceId::from_index(0),
+                table,
+                table,
+                visible,
+                arguments,
+                0,
+                0,
+                span,
+            )
+        };
+
+        reserve(&mut graph, GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE);
+        reserve(
+            &mut graph,
+            2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
         );
     }
 
@@ -4278,16 +5661,20 @@ mod tests {
             let buffer = builder.create_buffer(
                 "Dead_Indirect_Args",
                 BufferDesc::new(
-                    16,
-                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                    GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                    wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
                 ),
             );
             (MockExec, buffer)
         });
-        let indirect = graph.reserve_indirect_scene_submission_for_test(
-            1,
-            &SceneSubmissionDependencies::new().with_buffer(indirect_dependency),
-        );
+        let indirect = graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+            SceneSubmissionKey::Transparent,
+            indirect_dependency,
+            indirect_dependency,
+            indirect_dependency,
+        ));
         graph.add_pass("Dead_Submission_Consumer", |builder| {
             builder.demand_scene_submission(submission);
             builder.demand_scene_submission(indirect);
@@ -4299,15 +5686,17 @@ mod tests {
         assert!(graph.storage.execution_queue.is_empty());
         assert!(!graph.storage.scene_submissions.is_live(submission));
         assert!(!graph.storage.scene_submissions.is_live(indirect));
-        assert_eq!(
-            graph.storage.scene_submissions.live_backend_counts(),
-            super::super::scene_submission::LiveSceneSubmissionCounts::default()
-        );
+        assert!(!graph.storage.scene_submissions.has_live_gpu_plan());
+        let counts = graph.storage.scene_submissions.backend_counts();
+        assert_eq!(counts.reserved_cpu_direct, 1);
+        assert_eq!(counts.reserved_gpu_indirect, 1);
+        assert_eq!(counts.live_cpu_direct, 0);
+        assert_eq!(counts.live_gpu_indirect, 0);
         assert_eq!(graph.storage.draw_plans.live_keys().count(), 0);
     }
 
     #[test]
-    fn indirect_stub_buffers_are_ordinary_ordered_dpe_dependencies() {
+    fn gpu_indirect_buffers_are_ordinary_ordered_dpe_dependencies() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
@@ -4317,30 +5706,31 @@ mod tests {
                 (MockExec, buffer)
             })
         };
-        let instance = make_buffer(
+        let candidates = make_buffer(
             &mut graph,
-            "Indirect_Instance_Producer",
-            "Indirect_Instances",
+            "Indirect_Candidate_Producer",
+            "Indirect_Candidates",
             wgpu::BufferUsages::STORAGE,
         );
-        let args = make_buffer(
-            &mut graph,
-            "Indirect_Args_Producer",
-            "Indirect_Args",
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
-        );
-        let count = make_buffer(
-            &mut graph,
-            "Indirect_Count_Producer",
-            "Indirect_Count",
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
-        );
-        let submission = graph.reserve_indirect_scene_submission_for_test(
-            7,
-            &SceneSubmissionDependencies::new()
-                .with_buffer(instance)
-                .with_buffer(args)
-                .with_buffer(count),
+        let (visible, args) = graph.add_pass("Indirect_Cull", |builder| {
+            builder.read_buffer(candidates);
+            let visible = builder.create_buffer(
+                "Indirect_Visible",
+                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+            );
+            let args = builder.create_buffer(
+                "Indirect_Args",
+                BufferDesc::new(
+                    64,
+                    wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                ),
+            );
+            (MockExec, (visible, args))
+        });
+        let submission = graph.reserve_gpu_indirect_scene_submission(
+            GpuIndirectPlanDescriptor::new(SceneSubmissionKey::Opaque, candidates, visible, args),
         );
         let consumer_index = graph.storage.passes.len();
         graph.add_pass("Indirect_Submission_Consumer", |builder| {
@@ -4352,21 +5742,29 @@ mod tests {
 
         assert_eq!(
             graph.storage.pass_reads(consumer_index),
-            &[instance.erase(), args.erase(), count.erase()]
+            &[candidates.erase(), visible.erase(), args.erase()]
         );
         graph.compile_topology();
 
         assert!(graph.storage.scene_submissions.is_live(submission));
-        let counts = graph.storage.scene_submissions.live_backend_counts();
-        assert_eq!(counts.cpu_direct, 0);
-        assert_eq!(counts.indirect_stub, 1);
+        assert!(graph.storage.scene_submissions.has_live_gpu_plan());
+        let counts = graph.storage.scene_submissions.backend_counts();
+        assert_eq!(counts.live_cpu_direct, 0);
+        assert_eq!(counts.live_gpu_indirect, 1);
+        let live = graph
+            .storage
+            .scene_submissions
+            .live_gpu_indirect_plans()
+            .next()
+            .expect("live GPU-indirect projection missing");
+        assert_eq!(live.submission, submission);
         assert!(
             graph
                 .storage
                 .scene_submissions
                 .resolve_stream(submission, &graph.storage.draw_plans)
                 .is_none(),
-            "a topology-only indirect recipe must not invent a finalized stream"
+            "M7.0 must fail closed until a GPU-indirect execute resolver exists"
         );
         let execution_names = graph
             .storage
@@ -4377,9 +5775,8 @@ mod tests {
         assert_eq!(
             execution_names,
             [
-                "Indirect_Instance_Producer",
-                "Indirect_Args_Producer",
-                "Indirect_Count_Producer",
+                "Indirect_Candidate_Producer",
+                "Indirect_Cull",
                 "Indirect_Submission_Consumer",
             ]
         );
@@ -6242,6 +7639,178 @@ mod tests {
         assert_eq!(names, ["Present"]);
         assert!(
             graph.storage.resources[asset.index() as usize]
+                .alias_of
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pure_forwarding_does_not_contract_a_persistent_buffer_source() {
+        use crate::graph::core::persistent_buffer::PersistentBufferSpec;
+
+        let desc = BufferDesc::new(
+            256,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let mut registry = PersistentBufferRegistry::new();
+        let id = registry.create_buffer();
+        let plan = registry
+            .plan_buffer(id, 1, 1, PersistentBufferSpec::new(desc, 1, 16))
+            .unwrap();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let persistent = graph.import_persistent_buffer("Persistent_Source", plan);
+        let output = graph.register_buffer("Buffer_Output", desc, true);
+
+        graph.add_pass("Persistent_Patch", |builder| {
+            builder.write_buffer(persistent);
+            (MockExec, ())
+        });
+        graph.add_pass("Persistent_Forward", |builder| {
+            builder.read_buffer(persistent);
+            builder.write_buffer(output);
+            builder.mark_pure_forwarding();
+            (MockExec, ())
+        });
+        graph.register_persistent_buffer_commit_group(&[(
+            plan.commit
+                .expect("new persistent Buffer needs publication"),
+            persistent,
+        )]);
+        graph.compile_topology();
+
+        let names: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(names, ["Persistent_Patch", "Persistent_Forward"]);
+        assert!(
+            graph.storage.resources[persistent.index() as usize]
+                .alias_of
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn submitted_unrelated_work_does_not_publish_a_dpe_dead_persistent_buffer_group() {
+        use crate::graph::core::persistent_buffer::PersistentBufferSpec;
+
+        let wgpu = pollster::block_on(WgpuContext::new_headless(
+            &RendererInitConfig::default(),
+            &RendererSettings::default(),
+            8,
+            8,
+            None,
+        ))
+        .expect("headless GPU context required");
+        let desc = BufferDesc::new(
+            256,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let mut registry = PersistentBufferRegistry::new();
+        let id = registry.create_buffer();
+        let plan = registry
+            .plan_buffer(id, 1, 1, PersistentBufferSpec::new(desc, 1, 16))
+            .unwrap();
+        let publication = plan.buffer;
+
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let persistent = graph.import_persistent_buffer("Dead_Persistent", plan);
+        graph.add_pass("Dead_Persistent_Patch", |builder| {
+            builder.write_buffer(persistent);
+            (MockExec, ())
+        });
+        graph.register_persistent_buffer_commit_group(&[(
+            plan.commit
+                .expect("new persistent Buffer needs publication"),
+            persistent,
+        )]);
+        graph.add_pass("Unrelated_Live_Work", |builder| {
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.compile_topology();
+        assert_eq!(
+            graph
+                .storage
+                .execution_queue
+                .iter()
+                .map(|&index| graph.storage.passes[index].name)
+                .collect::<Vec<_>>(),
+            ["Unrelated_Live_Work"]
+        );
+
+        let encoder = wgpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("DPE-dead persistent Buffer submission test"),
+            });
+        let receipt = graph
+            .submit_command_buffer(&wgpu.queue, encoder.finish())
+            .expect("unrelated live graph must submit");
+        graph
+            .commit_submitted_persistent_buffers(&mut registry, receipt)
+            .expect("zero-live commit groups are valid no-ops");
+        assert!(
+            !registry.is_published(publication),
+            "a submitted graph must not publish a DPE-dead commit group"
+        );
+    }
+
+    #[test]
+    fn pure_forwarding_does_not_contract_a_persistent_buffer_destination() {
+        use crate::graph::core::persistent_buffer::PersistentBufferSpec;
+
+        let desc = BufferDesc::new(
+            256,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let mut registry = PersistentBufferRegistry::new();
+        let id = registry.create_buffer();
+        let plan = registry
+            .plan_buffer(id, 1, 1, PersistentBufferSpec::new(desc, 2, 16))
+            .unwrap();
+        let mut storage = GraphStorage::new();
+        let arena = FrameArena::new();
+        let mut graph = begin_test_frame(&mut storage, &arena);
+        let persistent = graph.import_persistent_buffer("Persistent_Destination", plan);
+        let source = graph.add_pass("Transient_Producer", |builder| {
+            let source = builder.create_buffer("Transient_Source", desc);
+            (MockExec, source)
+        });
+        graph.add_pass("Persistent_Copy", |builder| {
+            builder.read_buffer(source);
+            builder.write_buffer(persistent);
+            builder.mark_pure_forwarding();
+            builder.mark_side_effect();
+            (MockExec, ())
+        });
+        graph.register_persistent_buffer_commit_group(&[(
+            plan.commit
+                .expect("new persistent Buffer needs publication"),
+            persistent,
+        )]);
+        graph.compile_topology();
+
+        let names: Vec<_> = graph
+            .storage
+            .execution_queue
+            .iter()
+            .map(|&index| graph.storage.passes[index].name)
+            .collect();
+        assert_eq!(names, ["Transient_Producer", "Persistent_Copy"]);
+        assert!(
+            graph.storage.resources[source.index() as usize]
+                .alias_of
+                .is_none()
+        );
+        assert!(
+            graph.storage.resources[persistent.index() as usize]
                 .alias_of
                 .is_none()
         );

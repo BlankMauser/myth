@@ -178,6 +178,35 @@ impl Default for ClusteredShadingMode {
 }
 
 // ---------------------------------------------------------------------------
+// GpuDrivenMode
+// ---------------------------------------------------------------------------
+
+/// Selects the scene-submission backend policy.
+///
+/// This setting describes policy only. Adapter capabilities are captured by
+/// [`crate::core::GpuDrivenCapabilities`], and backend selection must use that
+/// immutable snapshot rather than querying `wgpu` objects during a frame.
+///
+/// [`Off`](Self::Off) remains the default so applications opt in explicitly.
+/// [`Auto`](Self::Auto) and [`Required`](Self::Required) are evaluated before
+/// GPU Scene synchronization or RDG topology emission, preserving a clean
+/// CPU-direct fallback boundary.
+#[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GpuDrivenMode {
+    /// Always use the CPU-direct submission backend.
+    #[default]
+    Off,
+    /// Request GPU-driven submission when the active device and workload
+    /// support it, otherwise fall back to CPU-direct submission.
+    Auto,
+    /// Require GPU-driven submission. An unsupported device, workload, or
+    /// scene domain fails the frame with a typed diagnostic instead of
+    /// silently selecting CPU-direct submission.
+    Required,
+}
+
+// ---------------------------------------------------------------------------
 // RendererSettings
 // ---------------------------------------------------------------------------
 
@@ -301,6 +330,12 @@ pub struct RendererSettings {
     /// passes for the current frame or falls back to the classic forward
     /// light loop for small-light-count scenes.
     pub clustered_shading: ClusteredShadingMode,
+
+    /// Runtime policy for GPU-driven scene submission.
+    ///
+    /// The default remains [`GpuDrivenMode::Off`], preserving CPU-direct
+    /// behavior until an application explicitly opts into the GPU backend.
+    pub gpu_driven: GpuDrivenMode,
 }
 
 impl Default for RendererSettings {
@@ -310,13 +345,14 @@ impl Default for RendererSettings {
             vsync: true,
             anisotropy_clamp: 1,
             clustered_shading: ClusteredShadingMode::default(),
+            gpu_driven: GpuDrivenMode::default(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusteredShadingMode, RendererSettings};
+    use super::{ClusteredShadingMode, GpuDrivenMode, RendererSettings};
 
     #[test]
     fn clustered_auto_threshold_switches_at_threshold() {
@@ -338,5 +374,10 @@ mod tests {
             RendererSettings::default().clustered_shading,
             ClusteredShadingMode::Auto { threshold: 32 }
         );
+    }
+
+    #[test]
+    fn renderer_settings_default_gpu_driven_mode_preserves_cpu_direct() {
+        assert_eq!(RendererSettings::default().gpu_driven, GpuDrivenMode::Off);
     }
 }

@@ -9,6 +9,7 @@ pub mod equirect_to_cube;
 pub mod fxaa;
 #[cfg(feature = "3dgs")]
 pub mod gaussian_splatting;
+pub(crate) mod gpu_scene;
 pub mod hiz_build;
 pub mod ibl_compute;
 pub mod light_merge;

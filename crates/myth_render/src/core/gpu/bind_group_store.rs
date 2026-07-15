@@ -27,6 +27,13 @@ impl BindingInterfaceId {
         Self(NonZeroU64::new(generate_gpu_resource_id()).expect("GPU resource IDs are non-zero"))
     }
 
+    /// Allocate a stable identity for a fixed engine-owned binding ABI that
+    /// does not flow through the generated ResourceBuilder interner.
+    #[inline]
+    pub(crate) fn allocate_static() -> Self {
+        Self::new()
+    }
+
     #[cfg(any(test, feature = "rdg_bench_support"))]
     #[inline]
     pub(crate) fn from_raw(value: u64) -> Self {

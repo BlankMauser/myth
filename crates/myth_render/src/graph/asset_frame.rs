@@ -876,7 +876,6 @@ impl<'a> GeometryFrameResolver<'a> {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn geometry_id(
         self,
@@ -1113,9 +1112,18 @@ mod tests {
             material: MaterialHandle::null(),
             geometry_asset_version: asset_version,
             geometry_asset_identity: asset_identity,
+            geometry_structure_version: 1,
+            geometry_layout_version: 1,
+            geometry_topology: wgpu::PrimitiveTopology::TriangleList,
+            geometry_index_format: Some(wgpu::IndexFormat::Uint32),
+            geometry_index_count: 3,
+            geometry_has_morph_targets: false,
+            geometry_has_vertex_attributes: true,
+            geometry_has_instanced_attributes: false,
             material_asset_version: 0,
             material_asset_identity: 0,
             material_version: 0,
+            material_gpu_scene_compatible: true,
             material_index: 0,
             material_classification: MaterialClassification::empty(),
             skeleton: None,

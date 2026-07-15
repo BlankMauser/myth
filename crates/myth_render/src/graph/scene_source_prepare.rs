@@ -123,6 +123,10 @@ pub(crate) struct SceneSourcePrepareStore {
     live_source_stamps: Vec<u32>,
     live_source_generation: u32,
     live_source_active_domain_len: usize,
+    /// GPU fixed-state representatives that were absent from every live
+    /// CpuDirect plan. Geometry/Material preparation includes them, while the
+    /// per-object model allocator and dynamic Group 2 path skip them.
+    gpu_only_sources: Vec<FrameSourceId>,
     recipes: Vec<SceneSourceRecipe>,
     source_domain_len: usize,
     skeleton_lookup: FxHashSet<SkeletonKey>,
@@ -146,6 +150,7 @@ impl SceneSourcePrepareStore {
             live_source_stamps: Vec::with_capacity(SCENE_SOURCE_RECIPE_BASELINE),
             live_source_generation: 1,
             live_source_active_domain_len: 0,
+            gpu_only_sources: Vec::new(),
             recipes: Vec::with_capacity(SCENE_SOURCE_RECIPE_BASELINE),
             source_domain_len: 0,
             skeleton_lookup: FxHashSet::default(),
@@ -162,10 +167,27 @@ impl SceneSourcePrepareStore {
     /// O(unique-live log unique-live), and no allocation occurs once the live
     /// shape reaches its retained high-water mark. In particular, a dead graph
     /// never sizes scratch to the pre-DPE frame-source domain.
+    #[cfg_attr(
+        not(any(test, feature = "rdg_bench_support")),
+        allow(dead_code, reason = "CPU-only harness adapter")
+    )]
     pub(crate) fn select_live_sources(
         &mut self,
         render_lists: &RenderLists,
         live_keys: impl IntoIterator<Item = DrawPlanKey>,
+    ) {
+        self.select_live_sources_with_gpu(
+            render_lists,
+            live_keys,
+            std::iter::empty::<FrameSourceId>(),
+        );
+    }
+
+    pub(crate) fn select_live_sources_with_gpu(
+        &mut self,
+        render_lists: &RenderLists,
+        live_keys: impl IntoIterator<Item = DrawPlanKey>,
+        gpu_representatives: impl IntoIterator<Item = FrameSourceId>,
     ) {
         assert_eq!(
             self.phase,
@@ -179,7 +201,16 @@ impl SceneSourcePrepareStore {
         for key in live_keys {
             render_lists.for_each_source_for_key(key, |source| self.mark_live_source(source));
         }
+        for source in gpu_representatives {
+            let already_direct = source.index() < self.live_source_stamps.len()
+                && self.live_source_stamps[source.index()] == self.live_source_generation;
+            self.mark_live_source(source);
+            if !already_direct {
+                self.gpu_only_sources.push(source);
+            }
+        }
         self.live_sources.sort_unstable();
+        self.gpu_only_sources.sort_unstable();
         self.phase = SceneSourcePreparePhase::SourcesSelected;
     }
 
@@ -232,6 +263,9 @@ impl SceneSourcePrepareStore {
         let mut geometry_cursor = geometry_frames.monotonic_cursor();
         for live_index in 0..self.live_sources.len() {
             let frame_source = self.live_sources[live_index];
+            if self.gpu_only_sources.binary_search(&frame_source).is_ok() {
+                continue;
+            }
             assert!(
                 previous.is_none_or(|previous| previous < frame_source),
                 "live frame source IDs must be sorted and deduplicated"
@@ -469,6 +503,7 @@ impl SceneSourcePrepareStore {
         self.skeleton_lookup.clear();
         self.recipes.clear();
         self.live_sources.clear();
+        self.gpu_only_sources.clear();
         self.source_domain_len = 0;
         self.live_source_active_domain_len = 0;
         self.advance_live_source_generation();
@@ -488,6 +523,7 @@ impl SceneSourcePrepareStore {
     #[must_use]
     pub(crate) fn capacity_usage(&self) -> CapacityUsage {
         vec_footprint(&self.live_sources, SCENE_SOURCE_RECIPE_BASELINE)
+            + vec_footprint(&self.gpu_only_sources, 0)
             + live_source_join_footprint(
                 self.live_source_active_domain_len,
                 &self.live_source_stamps,
@@ -510,6 +546,7 @@ impl SceneSourcePrepareStore {
             target_bytes,
             retained_bytes,
         );
+        shrink_vec_by_family_ratio(&mut self.gpu_only_sources, 0, target_bytes, retained_bytes);
         trim_live_source_join(&mut self.live_source_stamps, target_bytes, retained_bytes);
         shrink_vec_by_family_ratio(
             &mut self.recipes,
@@ -548,6 +585,7 @@ impl SceneSourcePrepareStore {
     pub(crate) fn is_empty(&self) -> bool {
         self.phase == SceneSourcePreparePhase::Empty
             && self.live_sources.is_empty()
+            && self.gpu_only_sources.is_empty()
             && self.live_source_active_domain_len == 0
             && self.recipes.is_empty()
             && self.source_domain_len == 0
@@ -676,6 +714,30 @@ mod tests {
         store.clear();
         assert_eq!(store.live_source_generation, 1);
         assert!(store.live_source_stamps.iter().all(|&stamp| stamp == 0));
+    }
+
+    #[test]
+    fn multiple_gpu_bin_representatives_join_the_exact_live_source_union() {
+        let mut lists = RenderLists::new();
+        let direct = lists.append_gpu_opaque_representative(ExtractedSourceId::from_index(7));
+        let gpu_only = lists.append_gpu_opaque_representative(ExtractedSourceId::from_index(19));
+        assert_eq!(
+            lists.append_gpu_opaque_representative(ExtractedSourceId::from_index(7)),
+            direct,
+            "one semantic bin representative must be idempotent"
+        );
+        lists.opaque.push(render_intent(direct));
+
+        let mut store = SceneSourcePrepareStore::new();
+        store.select_live_sources_with_gpu(
+            &lists,
+            [DrawPlanKey::Opaque],
+            lists.gpu_opaque_representatives(),
+        );
+
+        assert_eq!(store.live_sources(), [direct, gpu_only]);
+        assert_eq!(store.gpu_only_sources, [gpu_only]);
+        assert_eq!(store.source_domain_len, 2);
     }
 
     #[test]

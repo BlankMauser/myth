@@ -103,6 +103,31 @@ impl FrameArena {
         self.bump.alloc_slice_copy(src)
     }
 
+    /// Allocates and initializes a POD slice directly on the arena.
+    ///
+    /// Unlike building a temporary `Vec`/`SmallVec` and copying it into the
+    /// arena, this performs one frame-scoped allocation and writes every
+    /// element in place. `T: Copy` preserves the arena's no-Drop contract.
+    #[inline]
+    pub fn alloc_slice_fill_with<T: Copy>(
+        &self,
+        len: usize,
+        fill: impl FnMut(usize) -> T,
+    ) -> &mut [T] {
+        self.bump.alloc_slice_fill_with(len, fill)
+    }
+
+    /// Allocates a POD slice filled with one copied value.
+    ///
+    /// The mutable result is useful when the final length is known before all
+    /// values can be reserved. Callers may seed the slice with a valid first
+    /// value, then overwrite the remaining elements in place without a
+    /// temporary heap container.
+    #[inline]
+    pub fn alloc_slice_fill_copy<T: Copy>(&self, len: usize, value: T) -> &mut [T] {
+        self.bump.alloc_slice_fill_copy(len, value)
+    }
+
     /// Returns the total bytes allocated in the current frame
     /// (including alignment padding).
     #[inline]

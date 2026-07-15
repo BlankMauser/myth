@@ -52,7 +52,8 @@ use crate::core::gpu::{
     AssetTextureSnapshot, BufferUploadContext, CubeSourceType, GlobalStateKey,
     GlobalStatePhysicalFailure, GlobalStateResolver, MipmapRequestResolver, Tracked,
 };
-use crate::core::{ResourceManager, WgpuContext};
+use crate::core::view::ViewTarget;
+use crate::core::{GpuDrivenCapabilities, ResourceManager, WgpuContext};
 use crate::graph::ExtractedScene;
 use crate::graph::RdgSurfaceAcquireFailure;
 use crate::graph::RenderState;
@@ -62,20 +63,40 @@ use crate::graph::core::GraphStorage;
 use crate::graph::core::RdgDetailPhase;
 #[cfg(feature = "3dgs")]
 use crate::graph::core::gaussian::GaussianFrameResolver;
-use crate::graph::core::graph::FrameConfig;
-use crate::graph::core::scene_submission::SceneSubmissionResolver;
+use crate::graph::core::graph::{
+    FrameConfig, PersistentBufferGraphMaterializationFailure, PersistentBufferUploadPreparer,
+};
+use crate::graph::core::scene_submission::{
+    SceneSubmissionKey, SceneSubmissionPlanId, SceneSubmissionResolver,
+};
 use crate::graph::core::{
     BufferDesc, BufferNodeId, ExecuteContext, FrameArena, GlobalStateMaterializationFailure,
-    GlobalStateSources, GraphBlackboard, HistoryRegistry, HookStage, PrepareContext,
-    RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgFramePhase, RdgRenderTargetKind,
-    RdgResourceMaterializationFailure, RenderGraph, SceneBufferMaterializationFailure,
-    SceneBufferSources, SceneDrawPrepareContext, TextureDesc, TransientPool, ViewResolver,
+    GlobalStateSources, GraphBlackboard, HistoryRegistry, HookStage, PersistentBufferRegistry,
+    PersistentBufferResolver, PrepareContext, RdgCommandEncodingFailure, RdgComposerAttemptGuard,
+    RdgDiagnosticsRecorder, RdgFramePhase, RdgGpuDrivenFailure, RdgPostSubmitPublicationFailure,
+    RdgRenderTargetKind, RdgResourceMaterializationFailure, RenderGraph,
+    SceneBufferMaterializationFailure, SceneBufferSources, SceneDrawPrepareContext, TextureDesc,
+    TransientPool, ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
-use crate::graph::frame::RenderLists;
+use crate::graph::frame::{RenderLists, ShadowLightInstance};
+use crate::graph::gpu_scene::{
+    GPU_SCENE_INSTANCE_CASTS_SHADOW, GpuScene, GpuSceneMultiBinCommitFailure,
+    GpuSceneMultiBinPreflightFailure, GpuSceneMultiBinProjection, GpuSceneSelectionRejection,
+};
+use crate::graph::gpu_scene_submission::{
+    GpuSceneMultiBinFamilyPreparePlan, GpuSceneRenderFeature, GpuSceneSubmissionFinalizeFailure,
+    GpuSceneSubmissionTarget, finalize_gpu_scene_multi_bin_family,
+};
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
+use crate::graph::passes::gpu_scene::{
+    GPU_SCENE_CULL_WORKGROUP_SIZE, GPU_SCENE_INDEXED_ARGUMENT_SIZE,
+    GPU_SCENE_VISIBLE_INSTANCE_SIZE, GpuSceneCullFeature, GpuSceneCullViewDescriptor,
+    GpuSceneMultiBinCullDescriptor, GpuSceneTableSetPatchOutput, add_gpu_scene_table_set_patch,
+};
 use crate::graph::passes::ibl_compute::EnvironmentCacheSnapshot;
+use crate::graph::passes::shadow::ShadowSubmissions;
 use crate::graph::passes::skybox::{ProceduralSkyboxInputs, TextureSkyboxInput};
 use crate::graph::passes::utils::add_msaa_resolve_pass;
 use crate::graph::passes::{
@@ -87,12 +108,14 @@ use crate::graph::passes::{
 };
 use crate::pipeline::{PipelineCache, ShaderCompilationOptions, ShaderManager, ShaderSource};
 use crate::renderer::FrameTime;
-use crate::settings::RendererSettings;
+use crate::settings::{GpuDrivenMode, RendererSettings};
 use myth_assets::AssetServer;
 use myth_resources::texture::TextureSource;
 use myth_scene::Scene;
 use myth_scene::background::BackgroundMapping;
 use myth_scene::camera::RenderCamera;
+use myth_scene::light::LightKind;
+use smallvec::SmallVec;
 
 fn present_then_reconfigure_if_needed<T>(
     output: T,
@@ -132,6 +155,10 @@ pub struct ComposerContext<'a> {
     pub(crate) rdg_diagnostics: &'a RdgDiagnosticsRecorder,
     pub transient_pool: &'a mut TransientPool,
     pub history_registry: &'a mut HistoryRegistry,
+    pub(crate) persistent_buffer_registry: &'a mut PersistentBufferRegistry,
+    pub(crate) gpu_scene: &'a mut GpuScene,
+    pub(crate) gpu_scene_cull: &'a mut GpuSceneCullFeature,
+    pub(crate) gpu_scene_render: &'a mut GpuSceneRenderFeature,
     // pub sampler_registry: &'a mut SamplerRegistry,
     pub frame_arena: &'a FrameArena,
 
@@ -401,6 +428,338 @@ fn render_target_metadata_matches_desc(
         && format_matches
 }
 
+#[inline]
+fn gpu_scene_binding_sized_buffer_supported(
+    limits: &wgpu::Limits,
+    size: Option<u64>,
+    max_binding_size: u64,
+) -> bool {
+    size.is_some_and(|size| size != 0 && size <= limits.max_buffer_size && size <= max_binding_size)
+}
+
+/// Device-independent workload facts for one M7.4 multi-bin view family.
+///
+/// The four table sizes are the exact logical images requested from the
+/// persistent-buffer registry. `visible_view_stride_bytes` is the authority's
+/// already storage-aligned packed partition span for one view. Keeping this
+/// hand-off `Copy` lets capability selection stay a pure preflight: it neither
+/// mutates the GPU Scene authority nor allocates graph resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GpuSceneMultiBinWorkloadFacts {
+    pub(crate) instance_table_bytes: u64,
+    pub(crate) geometry_table_bytes: u64,
+    pub(crate) material_table_bytes: u64,
+    pub(crate) batch_table_bytes: u64,
+    pub(crate) instance_slot_span: u32,
+    pub(crate) batch_slot_span: u32,
+    pub(crate) active_bin_count: u32,
+    pub(crate) visible_view_stride_bytes: u64,
+    pub(crate) view_count: u32,
+}
+
+// These are the fixed CPU/WGSL records consumed by the M7.4 Cull layout.
+// Keep the constants beside the capability contract until the production
+// composer owns the descriptor and can source them from the shared ABI types.
+const GPU_SCENE_MULTI_BIN_ACTIVE_BATCH_SIZE: u64 = 16;
+const GPU_SCENE_MULTI_BIN_VIEW_PARAM_SIZE: u64 = 96;
+const GPU_SCENE_MULTI_BIN_DOMAIN_UNIFORM_SIZE: u64 = 32;
+const GPU_SCENE_MULTI_BIN_BINDING_COUNT: u32 = 7;
+const GPU_SCENE_MULTI_BIN_STORAGE_BINDING_COUNT: u32 = 6;
+
+/// Validate the complete portable M7.4 Cull/Draw resource envelope without
+/// creating a buffer, node, pipeline, or authority revision.
+///
+/// All four persistent tables are storage-table ABIs, so each member must be
+/// legal both as a physical buffer and as one storage binding. The current Cull
+/// shader binds Instance and Batch directly; applying the same contract to
+/// Geometry and Material preserves a coherent four-table capability tier for
+/// their downstream consumers.
+#[inline]
+pub(crate) fn gpu_scene_multi_bin_workload_supported(
+    capabilities: &GpuDrivenCapabilities,
+    facts: GpuSceneMultiBinWorkloadFacts,
+) -> bool {
+    if !capabilities.supports_indirect_primitives()
+        || facts.instance_slot_span == 0
+        || facts.batch_slot_span == 0
+        || facts.active_bin_count == 0
+        || facts.active_bin_count > facts.batch_slot_span
+        || facts.view_count == 0
+        || facts.visible_view_stride_bytes == 0
+        || facts.visible_view_stride_bytes > u64::from(u32::MAX)
+    {
+        return false;
+    }
+
+    let limits = capabilities.device_limits();
+    let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment);
+    if storage_alignment == 0
+        || !facts
+            .visible_view_stride_bytes
+            .is_multiple_of(storage_alignment)
+        || !facts
+            .visible_view_stride_bytes
+            .is_multiple_of(GPU_SCENE_VISIBLE_INSTANCE_SIZE)
+    {
+        return false;
+    }
+
+    // Use the same u32 index domain as WGSL before widening to bytes. This
+    // rejects a view-major sparse argument index that would wrap even if its
+    // eventual u64 allocation happened to fit the device limit.
+    let Some(argument_record_count) = facts.batch_slot_span.checked_mul(facts.view_count) else {
+        return false;
+    };
+    let Some(visible_bytes) = facts
+        .visible_view_stride_bytes
+        .checked_mul(u64::from(facts.view_count))
+    else {
+        return false;
+    };
+    let Some(argument_bytes) =
+        u64::from(argument_record_count).checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
+    else {
+        return false;
+    };
+    let Some(active_batch_bytes) =
+        u64::from(facts.active_bin_count).checked_mul(GPU_SCENE_MULTI_BIN_ACTIVE_BATCH_SIZE)
+    else {
+        return false;
+    };
+    let Some(view_param_bytes) =
+        u64::from(facts.view_count).checked_mul(GPU_SCENE_MULTI_BIN_VIEW_PARAM_SIZE)
+    else {
+        return false;
+    };
+    let workgroups_x = facts
+        .instance_slot_span
+        .max(facts.active_bin_count)
+        .div_ceil(GPU_SCENE_CULL_WORKGROUP_SIZE);
+
+    let max_storage_binding = limits.max_storage_buffer_binding_size;
+    let max_uniform_binding = limits.max_uniform_buffer_binding_size;
+    let persistent_table_bytes = [
+        facts.instance_table_bytes,
+        facts.geometry_table_bytes,
+        facts.material_table_bytes,
+        facts.batch_table_bytes,
+    ];
+    // The coherent Patch transaction uses one concatenated mapped staging
+    // buffer so its four member copies share one publication gate. Validate
+    // that physical allocation here; checking each destination alone would
+    // allow prepare to exceed `max_buffer_size` on a cold/full replay.
+    let Some(coherent_patch_bytes) = persistent_table_bytes
+        .iter()
+        .try_fold(0u64, |total, &size| total.checked_add(size))
+    else {
+        return false;
+    };
+    if coherent_patch_bytes > limits.max_buffer_size {
+        return false;
+    }
+    let transient_storage_bytes = [
+        visible_bytes,
+        argument_bytes,
+        active_batch_bytes,
+        view_param_bytes,
+    ];
+
+    // Portable multi-bin indirect records always keep `first_instance = 0`.
+    // Exact visible subranges are selected through Group 2 instead, so this
+    // tier deliberately has no `INDIRECT_FIRST_INSTANCE` feature dependency.
+    persistent_table_bytes.into_iter().all(|size| {
+        gpu_scene_binding_sized_buffer_supported(limits, Some(size), max_storage_binding)
+    }) && transient_storage_bytes.into_iter().all(|size| {
+        gpu_scene_binding_sized_buffer_supported(limits, Some(size), max_storage_binding)
+    }) && gpu_scene_binding_sized_buffer_supported(
+        limits,
+        Some(GPU_SCENE_MULTI_BIN_DOMAIN_UNIFORM_SIZE),
+        max_uniform_binding,
+    ) && limits.max_bind_groups >= 4
+        && limits.max_bindings_per_bind_group >= GPU_SCENE_MULTI_BIN_BINDING_COUNT
+        && limits.max_storage_buffers_per_shader_stage >= GPU_SCENE_MULTI_BIN_STORAGE_BINDING_COUNT
+        && limits.max_uniform_buffers_per_shader_stage >= 1
+        && limits.max_compute_invocations_per_workgroup >= GPU_SCENE_CULL_WORKGROUP_SIZE
+        && limits.max_compute_workgroup_size_x >= GPU_SCENE_CULL_WORKGROUP_SIZE
+        && limits.max_compute_workgroup_size_y >= 1
+        && limits.max_compute_workgroup_size_z >= 1
+        && workgroups_x <= limits.max_compute_workgroups_per_dimension
+        && facts.view_count <= limits.max_compute_workgroups_per_dimension
+}
+
+#[inline]
+fn gpu_scene_multi_bin_family_supported(
+    capabilities: &GpuDrivenCapabilities,
+    projection: GpuSceneMultiBinProjection,
+    view_count: usize,
+) -> bool {
+    if view_count == 0 {
+        return true;
+    }
+    let Ok(view_count) = u32::try_from(view_count) else {
+        return false;
+    };
+    let tables = projection.table_set;
+    gpu_scene_multi_bin_workload_supported(
+        capabilities,
+        GpuSceneMultiBinWorkloadFacts {
+            instance_table_bytes: tables.instance_logical_bytes,
+            geometry_table_bytes: tables.geometry_logical_bytes,
+            material_table_bytes: tables.material_logical_bytes,
+            batch_table_bytes: tables.batch_logical_bytes,
+            instance_slot_span: tables.instance_slot_span,
+            batch_slot_span: tables.batch_slot_span,
+            active_bin_count: projection.bin_count,
+            visible_view_stride_bytes: tables.visible_view_stride,
+            view_count,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GpuSceneShadowFamilyWorkload {
+    d2_view_count: usize,
+    cube_view_count: usize,
+}
+
+/// Count the exact packed Cull families without allocating a Shadow snapshot.
+/// The point-light classification intentionally mirrors `ShadowFeature::extract`.
+fn gpu_scene_shadow_family_workload(
+    render_lists: &RenderLists,
+    extracted_scene: &ExtractedScene,
+) -> GpuSceneShadowFamilyWorkload {
+    let mut workload = GpuSceneShadowFamilyWorkload::default();
+    for view in &render_lists.active_views {
+        let ViewTarget::ShadowLight { light_id, .. } = view.target else {
+            continue;
+        };
+        let is_point = extracted_scene
+            .lights
+            .get(view.light_buffer_index)
+            .is_some_and(|light| light.id == light_id && matches!(light.kind, LightKind::Point(_)));
+        if is_point {
+            workload.cube_view_count += 1;
+        } else {
+            workload.d2_view_count += 1;
+        }
+    }
+    workload
+}
+
+#[inline]
+fn resolve_gpu_scene_shadow_ownership(
+    mode: GpuDrivenMode,
+    has_shadow_work: bool,
+    covers_complete_domain: bool,
+    workload_supported: bool,
+) -> Result<bool, RdgGpuDrivenFailure> {
+    if mode == GpuDrivenMode::Off || !has_shadow_work {
+        return Ok(false);
+    }
+    if !covers_complete_domain {
+        return if mode == GpuDrivenMode::Required {
+            Err(RdgGpuDrivenFailure::UnsupportedShadowDomain)
+        } else {
+            Ok(false)
+        };
+    }
+    if !workload_supported {
+        return if mode == GpuDrivenMode::Required {
+            Err(RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits)
+        } else {
+            Ok(false)
+        };
+    }
+    Ok(true)
+}
+
+const fn selection_failure_reason(reason: GpuSceneSelectionRejection) -> RdgGpuDrivenFailure {
+    match reason {
+        GpuSceneSelectionRejection::Skinned => RdgGpuDrivenFailure::SkinnedGeometry,
+        GpuSceneSelectionRejection::MorphTargets => RdgGpuDrivenFailure::MorphTargets,
+        GpuSceneSelectionRejection::InstancedVertexAttributes => {
+            RdgGpuDrivenFailure::InstancedVertexAttributes
+        }
+        GpuSceneSelectionRejection::IncompatibleMaterial => {
+            RdgGpuDrivenFailure::IncompatibleMaterial
+        }
+        GpuSceneSelectionRejection::NonIndexed => RdgGpuDrivenFailure::NonIndexedGeometry,
+        GpuSceneSelectionRejection::EmptyIndexBuffer => RdgGpuDrivenFailure::EmptyIndexBuffer,
+        GpuSceneSelectionRejection::EmptyVertexBuffers => RdgGpuDrivenFailure::EmptyVertexBuffers,
+        GpuSceneSelectionRejection::UnsupportedTopology => RdgGpuDrivenFailure::UnsupportedTopology,
+        GpuSceneSelectionRejection::NonFiniteTransform => RdgGpuDrivenFailure::NonFiniteTransform,
+        GpuSceneSelectionRejection::NonInvertibleTransform => {
+            RdgGpuDrivenFailure::NonInvertibleTransform
+        }
+        GpuSceneSelectionRejection::NonFiniteBounds => RdgGpuDrivenFailure::NonFiniteBounds,
+        GpuSceneSelectionRejection::ConflictingGeometryEpoch => {
+            RdgGpuDrivenFailure::ConflictingGeometryEpoch
+        }
+        GpuSceneSelectionRejection::ConflictingMaterialEpoch => {
+            RdgGpuDrivenFailure::ConflictingMaterialEpoch
+        }
+        GpuSceneSelectionRejection::GenerationExhausted => RdgGpuDrivenFailure::GenerationExhausted,
+        GpuSceneSelectionRejection::DuplicateInstance => RdgGpuDrivenFailure::DuplicateInstance,
+        #[cfg(test)]
+        GpuSceneSelectionRejection::MixedFixedState => RdgGpuDrivenFailure::MixedFixedState,
+        GpuSceneSelectionRejection::TooManyCandidates => RdgGpuDrivenFailure::TooManyCandidates,
+    }
+}
+
+#[inline]
+const fn multi_bin_preflight_failure_reason(
+    reason: GpuSceneMultiBinPreflightFailure,
+) -> RdgGpuDrivenFailure {
+    match reason {
+        GpuSceneMultiBinPreflightFailure::Domain(reason) => selection_failure_reason(reason),
+        GpuSceneMultiBinPreflightFailure::InvalidVisibleStride
+        | GpuSceneMultiBinPreflightFailure::InvalidStorageAlignment
+        | GpuSceneMultiBinPreflightFailure::LayoutOverflow => {
+            RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits
+        }
+    }
+}
+
+#[inline]
+const fn multi_bin_commit_failure_reason(
+    reason: GpuSceneMultiBinCommitFailure,
+) -> RdgGpuDrivenFailure {
+    match reason {
+        GpuSceneMultiBinCommitFailure::StalePreflight
+        | GpuSceneMultiBinCommitFailure::SceneDrift => {
+            RdgGpuDrivenFailure::SubmissionDescriptorDrift
+        }
+    }
+}
+
+const fn finalize_failure_reason(reason: GpuSceneSubmissionFinalizeFailure) -> RdgGpuDrivenFailure {
+    match reason {
+        GpuSceneSubmissionFinalizeFailure::DescriptorDrift => {
+            RdgGpuDrivenFailure::SubmissionDescriptorDrift
+        }
+        GpuSceneSubmissionFinalizeFailure::RepresentativeDrift => {
+            RdgGpuDrivenFailure::RepresentativeDrift
+        }
+        GpuSceneSubmissionFinalizeFailure::GeometryUnavailable => {
+            RdgGpuDrivenFailure::GeometryUnavailable
+        }
+        GpuSceneSubmissionFinalizeFailure::GeometryDrift => RdgGpuDrivenFailure::GeometryDrift,
+        GpuSceneSubmissionFinalizeFailure::MaterialUnavailable => {
+            RdgGpuDrivenFailure::MaterialUnavailable
+        }
+        GpuSceneSubmissionFinalizeFailure::MaterialDrift => RdgGpuDrivenFailure::MaterialDrift,
+        GpuSceneSubmissionFinalizeFailure::GlobalStateUnavailable => {
+            RdgGpuDrivenFailure::GlobalStateUnavailable
+        }
+        GpuSceneSubmissionFinalizeFailure::UnsupportedMaterialState => {
+            RdgGpuDrivenFailure::UnsupportedMaterialState
+        }
+        GpuSceneSubmissionFinalizeFailure::BatchPublicationRejected => {
+            RdgGpuDrivenFailure::ImmutableBatchPublicationRejected
+        }
+    }
+}
+
 impl<'a> FrameComposer<'a> {
     /// Creates a new frame composer.
     pub(crate) fn new(ctx: ComposerContext<'a>, size: (u32, u32)) -> Self {
@@ -533,14 +892,150 @@ impl<'a> FrameComposer<'a> {
         // ━━━ 1. Build CPU-only Logical RDG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         rdg_diagnostics.enter_phase(RdgFramePhase::Cull);
 
-        // ━━━ 2a. Collect CPU-only central draw intents ━━━━━━━━━━━━━━━━━━
+        // ━━━ 2a. Select backend ownership, then collect CPU intents ━━━━━━
         //
-        // Intent collection determines topology-affecting transmission and
-        // per-view source membership without touching WGPU resources.
+        // Reset retained intent/interner state before the pre-frustum
+        // selector publishes its fixed-state representative. A selected GPU
+        // batch then skips duplicate CPU opaque culling and source capture;
+        // transparent and independently-fallback Shadow intents remain CPU-owned.
+        self.ctx.render_lists.begin_intent_collection();
+
+        // M7.4 performs a mutation-free, all-or-nothing preflight over the
+        // complete pre-frustum opaque domain. Capability and packed-shadow
+        // decisions are finished before the stable four-table authority is
+        // touched, so `Auto` can still fall back without a dirty journal.
+        let (gpu_scene_preflight, gpu_scene_owns_shadows) =
+            match self.ctx.renderer_settings.gpu_driven {
+                // `Off` is also the CPU baseline contract: it must not scan scene
+                // items, active shadow views, device limits, or GPU Scene state.
+                GpuDrivenMode::Off => (None, false),
+                mode => {
+                    let capabilities = self.ctx.wgpu_ctx.gpu_driven_capabilities();
+                    let (preflight, has_shadow_casters) = if capabilities
+                        .supports_indirect_primitives()
+                    {
+                        let storage_alignment = u64::from(
+                            capabilities
+                                .device_limits()
+                                .min_storage_buffer_offset_alignment,
+                        );
+                        match self.ctx.gpu_scene.preflight_multi_bin_scene(
+                            self.ctx.extracted_scene,
+                            GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                            storage_alignment,
+                        ) {
+                            Ok(None) => (None, self.ctx.gpu_scene.preflight_has_shadow_casters()),
+                            Ok(Some(preflight))
+                                if gpu_scene_multi_bin_family_supported(
+                                    capabilities,
+                                    preflight.projection,
+                                    1,
+                                ) =>
+                            {
+                                (
+                                    Some(preflight),
+                                    self.ctx.gpu_scene.preflight_has_shadow_casters(),
+                                )
+                            }
+                            Ok(Some(_)) => {
+                                if mode == GpuDrivenMode::Required {
+                                    rdg_diagnostics.mark_gpu_driven_failed(
+                                        RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
+                                    );
+                                    return;
+                                }
+                                (None, false)
+                            }
+                            Err(reason) => {
+                                if mode == GpuDrivenMode::Required {
+                                    rdg_diagnostics.mark_gpu_driven_failed(
+                                        multi_bin_preflight_failure_reason(reason),
+                                    );
+                                    return;
+                                }
+                                (None, false)
+                            }
+                        }
+                    } else {
+                        if mode == GpuDrivenMode::Required {
+                            rdg_diagnostics
+                                .mark_gpu_driven_failed(RdgGpuDrivenFailure::UnsupportedDevice);
+                            return;
+                        }
+                        (None, false)
+                    };
+
+                    let shadow_workload = if has_shadow_casters {
+                        gpu_scene_shadow_family_workload(
+                            self.ctx.render_lists,
+                            self.ctx.extracted_scene,
+                        )
+                    } else {
+                        GpuSceneShadowFamilyWorkload::default()
+                    };
+                    let has_shadow_work = has_shadow_casters
+                        && (shadow_workload.d2_view_count != 0
+                            || shadow_workload.cube_view_count != 0);
+                    let (covers_complete_shadow_domain, shadow_workload_supported) =
+                        if has_shadow_work && let Some(preflight) = preflight {
+                            let covers_complete_domain =
+                                preflight.projection.covers_complete_shadow_domain;
+                            let workload_supported = covers_complete_domain
+                                && gpu_scene_multi_bin_family_supported(
+                                    capabilities,
+                                    preflight.projection,
+                                    shadow_workload.d2_view_count,
+                                )
+                                && gpu_scene_multi_bin_family_supported(
+                                    capabilities,
+                                    preflight.projection,
+                                    shadow_workload.cube_view_count,
+                                );
+                            (covers_complete_domain, workload_supported)
+                        } else {
+                            (false, false)
+                        };
+                    let owns_shadows = match resolve_gpu_scene_shadow_ownership(
+                        mode,
+                        has_shadow_work,
+                        covers_complete_shadow_domain,
+                        shadow_workload_supported,
+                    ) {
+                        Ok(owns_shadows) => owns_shadows,
+                        Err(reason) => {
+                            rdg_diagnostics.mark_gpu_driven_failed(reason);
+                            return;
+                        }
+                    };
+                    (preflight, owns_shadows)
+                }
+            };
+
+        // This is the first persistent GPU Scene mutation. Main and Shadow
+        // capability gates have already passed, and the retained preflight is
+        // consumed exactly once into the shared four-table revision.
+        let gpu_scene_projection = gpu_scene_preflight.map(|preflight| preflight.projection);
+        let gpu_scene_selected = if let Some(preflight) = gpu_scene_preflight {
+            if let Err(reason) = self.ctx.gpu_scene.commit_multi_bin_selection(
+                self.ctx.extracted_scene,
+                preflight,
+                f64::from(self.ctx.frame_time.time),
+                self.ctx.render_lists,
+            ) {
+                rdg_diagnostics.mark_gpu_driven_failed(multi_bin_commit_failure_reason(reason));
+                return;
+            }
+            true
+        } else {
+            false
+        };
+
         crate::graph::culling::collect_draw_intents(
             self.ctx.extracted_scene,
             self.ctx.render_lists,
             &self.ctx.camera,
+            gpu_scene_selected,
+            gpu_scene_owns_shadows,
         );
 
         rdg_diagnostics.enter_phase(RdgFramePhase::BuildGraph);
@@ -582,6 +1077,52 @@ impl<'a> FrameComposer<'a> {
             geometry_eligibility,
             &mut graph.storage.asset_texture_plans,
         );
+
+        let mut gpu_scene_publication_probe = None;
+        let mut gpu_scene_publication_acknowledger = None;
+        let gpu_scene_topology = if gpu_scene_selected {
+            let Ok((tables, acknowledger)) = self.ctx.gpu_scene.plan_table_set_with_acknowledger(
+                self.ctx.persistent_buffer_registry,
+                self.ctx.resource_manager.frame_index(),
+            ) else {
+                rdg_diagnostics.mark_gpu_driven_failed(RdgGpuDrivenFailure::PersistentPlanRejected);
+                return;
+            };
+            gpu_scene_publication_acknowledger = Some(acknowledger);
+            let (patched, publication_probe) = add_gpu_scene_table_set_patch(&mut graph, &tables);
+            gpu_scene_publication_probe = Some(publication_probe);
+            let projection =
+                gpu_scene_projection.expect("selected GPU Scene lost its mutation-free projection");
+            debug_assert_eq!(
+                patched.instance_slot_span,
+                projection.table_set.instance_slot_span
+            );
+            debug_assert_eq!(
+                patched.batch_slot_span,
+                projection.table_set.batch_slot_span
+            );
+            let frustum_planes =
+                std::array::from_fn(|index| self.ctx.camera.frustum.planes()[index].to_array());
+            let views = graph.alloc_slice(&[GpuSceneCullViewDescriptor::new(frustum_planes)]);
+            let culled = self.ctx.gpu_scene_cull.add_multi_bin_to_graph(
+                &mut graph,
+                patched.instances,
+                patched.batches,
+                "GpuScene_Cull",
+                GpuSceneMultiBinCullDescriptor::new(
+                    self.ctx.extracted_scene.scene_id,
+                    patched.instance_slot_span,
+                    patched.batch_slot_span,
+                    projection.storage_alignment,
+                    projection.table_set.visible_view_stride,
+                    views,
+                    patched.active_batches,
+                ),
+            );
+            Some((patched, culled))
+        } else {
+            None
+        };
 
         let surface_desc = TextureDesc::new_2d(
             self.frame_config.width,
@@ -943,6 +1484,11 @@ impl<'a> FrameComposer<'a> {
         // both the graph and its late-bound view have been explicitly dropped.
         let surface_output;
         let mut reconfigure_after_present = false;
+        // Exactly four semantic families can exist in one frame: Main,
+        // Prepass, Shadow2D, and ShadowCube. Variable per-view submissions
+        // live in the FrameArena rather than spilling this fixed family list.
+        let mut gpu_scene_family_prepare_plans =
+            SmallVec::<[GpuSceneMultiBinFamilyPreparePlan<'a>; 4]>::new();
         {
             let scene_id = self.ctx.scene.id();
             let scene_gpu_environment = has_active_environment
@@ -1121,6 +1667,80 @@ impl<'a> FrameComposer<'a> {
                 .material_plans
                 .recycle_topology_recipes(draw_texture_dependencies);
 
+            // Texture producers are registered before the GPU submission so
+            // its logical descriptor inherits the exact normalized Opaque
+            // material dependency set, just like the CpuDirect backend.
+            let gpu_opaque_submission = gpu_scene_topology.as_ref().map(|(patched, culled)| {
+                let first = culled
+                    .view_batch(0, 0)
+                    .expect("selected GPU Scene Cull lost its first batch");
+                let indirect_span = u64::from(patched.batch_slot_span)
+                    .checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
+                    .expect("GPU Scene main argument window overflowed");
+                let submission = graph_ctx.graph.reserve_gpu_scene_multi_bin_submission(
+                    SceneSubmissionKey::Opaque,
+                    patched.candidates[0].representative,
+                    patched.instances,
+                    patched.instances,
+                    culled.visible_instances,
+                    culled.indirect_arguments,
+                    first.indirect_offset,
+                    0,
+                    indirect_span,
+                );
+                let submissions = graph_ctx.graph.alloc_slice(&[submission]);
+                gpu_scene_family_prepare_plans.push(GpuSceneMultiBinFamilyPreparePlan {
+                    submissions,
+                    candidates: patched.candidates,
+                    instance_table: patched.instances,
+                    culled: *culled,
+                    target: GpuSceneSubmissionTarget::Main { global_state_key },
+                });
+                submission
+            });
+            let gpu_prepass_submission = if is_high_fidelity {
+                gpu_scene_topology.as_ref().map(|(patched, culled)| {
+                    let key = SceneSubmissionKey::Prepass {
+                        needs_normal,
+                        needs_feature_id,
+                        needs_velocity,
+                    };
+                    let first = culled
+                        .view_batch(0, 0)
+                        .expect("selected GPU Scene Cull lost its first batch");
+                    let indirect_span = u64::from(patched.batch_slot_span)
+                        .checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
+                        .expect("GPU Scene prepass argument window overflowed");
+                    let submission = graph_ctx.graph.reserve_gpu_scene_multi_bin_submission(
+                        key,
+                        patched.candidates[0].representative,
+                        patched.instances,
+                        patched.instances,
+                        culled.visible_instances,
+                        culled.indirect_arguments,
+                        first.indirect_offset,
+                        0,
+                        indirect_span,
+                    );
+                    let submissions = graph_ctx.graph.alloc_slice(&[submission]);
+                    gpu_scene_family_prepare_plans.push(GpuSceneMultiBinFamilyPreparePlan {
+                        submissions,
+                        candidates: patched.candidates,
+                        instance_table: patched.instances,
+                        culled: *culled,
+                        target: GpuSceneSubmissionTarget::Prepass {
+                            global_state_key,
+                            needs_normal,
+                            needs_feature_id,
+                            needs_velocity,
+                        },
+                    });
+                    submission
+                })
+            } else {
+                None
+            };
+
             if let Some((_, source)) = texture_skybox_plan {
                 texture_skybox_input = Some(match source {
                     TextureSkyboxSourcePlan::Asset {
@@ -1249,7 +1869,41 @@ impl<'a> FrameComposer<'a> {
                     self.ctx.extracted_scene,
                     self.ctx.frame_arena,
                 );
-                graph_ctx.with_group("Shadow", |c| self.ctx.shadow_pass.add_to_graph(c, snapshot))
+                let gpu_shadow_submissions = if gpu_scene_owns_shadows {
+                    let (patched, _) = gpu_scene_topology
+                        .as_ref()
+                        .expect("GPU Shadow ownership lost the selected GPU Scene topology");
+                    let projection = gpu_scene_projection
+                        .expect("GPU Shadow ownership lost its workload projection");
+                    let d2 = add_gpu_scene_shadow_family(
+                        graph_ctx.graph,
+                        self.ctx.gpu_scene_cull,
+                        snapshot.d2_lights,
+                        patched,
+                        projection,
+                        self.ctx.extracted_scene.scene_id,
+                        "GpuScene_Shadow_2D_Cull",
+                        &mut gpu_scene_family_prepare_plans,
+                    );
+                    let cube = add_gpu_scene_shadow_family(
+                        graph_ctx.graph,
+                        self.ctx.gpu_scene_cull,
+                        snapshot.cube_lights,
+                        patched,
+                        projection,
+                        self.ctx.extracted_scene.scene_id,
+                        "GpuScene_Shadow_Cube_Cull",
+                        &mut gpu_scene_family_prepare_plans,
+                    );
+                    Some(ShadowSubmissions { d2, cube })
+                } else {
+                    None
+                };
+                graph_ctx.with_group("Shadow", |c| {
+                    self.ctx
+                        .shadow_pass
+                        .add_to_graph(c, snapshot, gpu_shadow_submissions)
+                })
             } else {
                 crate::graph::passes::shadow::ShadowOutput {
                     shadow_2d: None,
@@ -1360,8 +2014,17 @@ impl<'a> FrameComposer<'a> {
                         }
 
                         // 1. Prepass
+                        let prepass_submission = gpu_prepass_submission.unwrap_or_else(|| {
+                            c.graph
+                                .reserve_scene_submission(SceneSubmissionKey::Prepass {
+                                    needs_normal,
+                                    needs_feature_id,
+                                    needs_velocity,
+                                })
+                        });
                         let prepass_out = self.ctx.prepass.add_to_graph(
                             c,
+                            prepass_submission,
                             prepass_snapshot
                                 .expect("HighFidelity path must capture a Prepass snapshot"),
                         );
@@ -1395,8 +2058,12 @@ impl<'a> FrameComposer<'a> {
                         };
 
                         // 3. Opaque
+                        let opaque_submission = gpu_opaque_submission.unwrap_or_else(|| {
+                            c.graph.reserve_scene_submission(SceneSubmissionKey::Opaque)
+                        });
                         let opaque_out = self.ctx.opaque_pass.add_to_graph(
                             c,
+                            opaque_submission,
                             global_state_key,
                             scene_depth,
                             self.ctx.extracted_scene.background.clear_color(),
@@ -1830,8 +2497,12 @@ impl<'a> FrameComposer<'a> {
                     } else {
                         None
                     };
+                    let opaque_submission = gpu_opaque_submission.unwrap_or_else(|| {
+                        c.graph.reserve_scene_submission(SceneSubmissionKey::Opaque)
+                    });
                     self.ctx.simple_forward_pass.add_to_graph(
                         c,
+                        opaque_submission,
                         global_state_key,
                         self.ctx.extracted_scene.background.clear_color(),
                         skybox,
@@ -2074,6 +2745,39 @@ impl<'a> FrameComposer<'a> {
                     &self.ctx.wgpu_ctx.device,
                 );
             }
+            let persistent_buffers = if graph.has_persistent_buffer_imports() {
+                #[cfg(feature = "rdg_bench_support")]
+                let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::PersistentBuffers);
+                graph.materialize_live_persistent_buffers(
+                    self.ctx.persistent_buffer_registry,
+                    &self.ctx.wgpu_ctx.device,
+                )
+            } else {
+                Ok(())
+            };
+            if let Err(reason) = persistent_buffers {
+                let reason = match reason {
+                    PersistentBufferGraphMaterializationFailure::Registry(
+                        crate::graph::core::PersistentBufferMaterializationFailure::CapacityOverflow,
+                    ) => RdgResourceMaterializationFailure::PersistentBufferCapacityOverflow,
+                    PersistentBufferGraphMaterializationFailure::Registry(
+                        crate::graph::core::PersistentBufferMaterializationFailure::ExceedsDeviceLimit,
+                    ) => RdgResourceMaterializationFailure::PersistentBufferExceedsDeviceLimit,
+                    PersistentBufferGraphMaterializationFailure::PartialCommitGroup
+                    | PersistentBufferGraphMaterializationFailure::InvalidLiveBufferHasNoCommit => {
+                        RdgResourceMaterializationFailure::PersistentBufferIncompleteWriteBatch
+                    }
+                    PersistentBufferGraphMaterializationFailure::Registry(
+                        crate::graph::core::PersistentBufferMaterializationFailure::UnknownOrRetired
+                        | crate::graph::core::PersistentBufferMaterializationFailure::StalePlan,
+                    )
+                    | PersistentBufferGraphMaterializationFailure::PublishedBufferHasLiveWriter => {
+                        RdgResourceMaterializationFailure::PersistentBufferStateDrift
+                    }
+                };
+                rdg_diagnostics.mark_resource_materialization_failed(reason);
+                return;
+            }
             {
                 #[cfg(feature = "rdg_bench_support")]
                 let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::AssetTexture);
@@ -2140,9 +2844,15 @@ impl<'a> FrameComposer<'a> {
                 #[cfg(feature = "rdg_bench_support")]
                 let _timing = rdg_diagnostics.detail_timer(RdgDetailPhase::LiveSourceUnion);
                 let storage = &mut *graph.storage;
-                storage
-                    .scene_source_prepare
-                    .select_live_sources(self.ctx.render_lists, storage.draw_plans.live_keys());
+                let any_gpu_submission_live = storage.scene_submissions.has_live_gpu_plan();
+                storage.scene_source_prepare.select_live_sources_with_gpu(
+                    self.ctx.render_lists,
+                    storage.draw_plans.live_keys(),
+                    self.ctx
+                        .render_lists
+                        .gpu_opaque_representatives()
+                        .filter(|_| any_gpu_submission_live),
+                );
             }
             {
                 #[cfg(feature = "rdg_bench_support")]
@@ -2224,6 +2934,10 @@ impl<'a> FrameComposer<'a> {
                         resources: &graph.storage.resources,
                         pool: self.ctx.transient_pool,
                         persistent_resources: self.ctx.history_registry,
+                        persistent_buffers: PersistentBufferResolver::new(
+                            self.ctx.persistent_buffer_registry,
+                            &graph.storage.persistent_buffer_materializations,
+                        ),
                         asset_textures: graph.storage.asset_texture_imports.resolver(),
                         scene_buffers: graph.storage.scene_buffer_imports.resolver(),
                     },
@@ -2248,7 +2962,7 @@ impl<'a> FrameComposer<'a> {
                         graph.storage.object_interfaces.resolver(),
                         self.ctx.wgpu_ctx.depth_format,
                         self.ctx.wgpu_ctx.pipeline_settings_version,
-                        &graph.storage.scene_submissions,
+                        &mut graph.storage.scene_submissions,
                         &mut graph.storage.scene_pipeline_prepare,
                         #[cfg(feature = "rdg_bench_support")]
                         rdg_diagnostics,
@@ -2267,6 +2981,9 @@ impl<'a> FrameComposer<'a> {
                     system_textures: &self.ctx.resource_manager.system_textures,
                     global_bind_group_cache: self.ctx.global_bind_group_cache,
                     prepared_bind_groups: &mut graph.storage.prepared_bind_groups,
+                    persistent_buffer_uploads: PersistentBufferUploadPreparer::new(
+                        &mut graph.storage.persistent_buffer_commit_groups,
+                    ),
                 };
 
                 for &pass_idx in &graph.storage.execution_queue {
@@ -2291,6 +3008,19 @@ impl<'a> FrameComposer<'a> {
                     self.ctx.wgpu_ctx,
                     &self.ctx.camera,
                 );
+                for plan in gpu_scene_family_prepare_plans {
+                    if let Err(reason) = finalize_gpu_scene_multi_bin_family(
+                        &mut prepare_ctx,
+                        &mut graph.storage.draw_plans,
+                        self.ctx.gpu_scene_render,
+                        plan,
+                        self.ctx.wgpu_ctx,
+                        &self.ctx.camera,
+                    ) {
+                        rdg_diagnostics.mark_gpu_driven_failed(finalize_failure_reason(reason));
+                        return;
+                    }
+                }
 
                 {
                     #[cfg(feature = "rdg_bench_support")]
@@ -2312,6 +3042,11 @@ impl<'a> FrameComposer<'a> {
                     prepare_ctx.finalize_scene_draws(&mut graph.storage.draw_plans);
                 }
             }
+
+            graph
+                .storage
+                .scene_submissions
+                .assert_all_live_finalized(&graph.storage.draw_plans);
 
             #[cfg(feature = "3dgs")]
             if let Some(snapshot) = gaussian_snapshot {
@@ -2337,11 +3072,21 @@ impl<'a> FrameComposer<'a> {
                     });
 
             {
+                // Pass storage is frozen from topology compilation through
+                // execution. Keep a direct pointer so the immutable execution
+                // facades may borrow their disjoint graph-owned stores while
+                // each arena-backed PassNode is visited mutably exactly once.
+                let passes = graph.storage.passes.as_mut_ptr();
                 let finalized_global_bind_group = graph.finalized_global_bind_group().cloned();
                 let mut execute_ctx = ExecuteContext {
                     resources: &graph.storage.resources,
                     pool: self.ctx.transient_pool,
                     persistent_resources: self.ctx.history_registry,
+                    persistent_buffers: PersistentBufferResolver::new(
+                        self.ctx.persistent_buffer_registry,
+                        &graph.storage.persistent_buffer_materializations,
+                    ),
+                    persistent_buffer_commits: graph.persistent_buffer_commit_tracker(),
                     asset_textures: graph.storage.asset_texture_imports.resolver(),
                     scene_buffers: graph.storage.scene_buffer_imports.resolver(),
                     device: &self.ctx.wgpu_ctx.device,
@@ -2354,7 +3099,8 @@ impl<'a> FrameComposer<'a> {
                     scene_submissions: SceneSubmissionResolver::new(
                         &graph.storage.scene_submissions,
                         &graph.storage.draw_plans,
-                    ),
+                    )
+                    .with_prepared_bind_groups(&graph.storage.prepared_bind_groups),
                     global_bind_group: finalized_global_bind_group.as_ref(),
                     wgpu_ctx: &*self.ctx.wgpu_ctx,
                     current_timeline_index: 0,
@@ -2363,12 +3109,14 @@ impl<'a> FrameComposer<'a> {
                 for (timeline_index, &pass_idx) in graph.storage.execution_queue.iter().enumerate()
                 {
                     execute_ctx.current_timeline_index = timeline_index;
+                    // SAFETY: topology compilation freezes `passes`; every
+                    // execution-queue index is valid and visited serially.
+                    let pass = unsafe { &mut *passes.add(pass_idx) };
                     #[cfg(debug_assertions)]
-                    encoder.push_debug_group(graph.storage.passes[pass_idx].name);
+                    encoder.push_debug_group(pass.name);
                     // SAFETY: The graph/arena remain alive for the complete
                     // execute phase and each queue entry is visited serially.
-                    unsafe { graph.storage.passes[pass_idx].get_pass_mut() }
-                        .execute(&execute_ctx, &mut encoder);
+                    unsafe { pass.get_pass_mut() }.execute(&execute_ctx, &mut encoder);
                     rdg_diagnostics.record_executed_pass();
                     #[cfg(debug_assertions)]
                     encoder.pop_debug_group();
@@ -2378,7 +3126,14 @@ impl<'a> FrameComposer<'a> {
             // ━━━ 4. Submit & Present ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             rdg_diagnostics.enter_phase(RdgFramePhase::Submit);
-            self.ctx.wgpu_ctx.queue.submit(Some(encoder.finish()));
+            let Ok(submission_receipt) =
+                graph.submit_command_buffer(&self.ctx.wgpu_ctx.queue, encoder.finish())
+            else {
+                rdg_diagnostics.mark_command_encoding_failed(
+                    RdgCommandEncodingFailure::PersistentBufferWriteBatchIncomplete,
+                );
+                return;
+            };
             rdg_diagnostics.mark_queue_submitted();
             rdg_diagnostics.enter_phase(RdgFramePhase::Publish);
             // Morph history is a submission result, not a begin-frame side
@@ -2391,6 +3146,19 @@ impl<'a> FrameComposer<'a> {
                 &graph.storage.draw_plans,
             );
             graph.commit_submitted_asset_texture_mipmaps();
+            let persistent_buffers_published = if graph.has_persistent_buffer_commit_groups() {
+                graph.commit_submitted_persistent_buffers(
+                    self.ctx.persistent_buffer_registry,
+                    submission_receipt,
+                )
+            } else {
+                Ok(())
+            };
+            if persistent_buffers_published.is_err() {
+                rdg_diagnostics.mark_post_submit_publication_failed(
+                    RdgPostSubmitPublicationFailure::PersistentBufferStateDrift,
+                );
+            }
             if let Some(batch) = mipmap_batch {
                 let committed = graph.commit_submitted_mipmap_batch(batch);
                 debug_assert!(
@@ -2404,13 +3172,25 @@ impl<'a> FrameComposer<'a> {
                 .environment_cache
                 .observe_publications(&cache_publications);
             graph.run_after_submit_hooks();
-        };
 
-        // Dropping the graph invalidates its arena-backed node slots, releases
-        // frame-attempt owners, and ends the raw external-view borrow before
-        // the tracked surface view is released.
-        drop(graph);
-        drop(surface_view_tracked);
+            // `ResourceKind::External` stores a raw pointer to this view.
+            // Make the unsafe lifetime contract explicit instead of relying on
+            // incidental local drop order, then release the view before present.
+            drop(graph);
+            if persistent_buffers_published.is_ok()
+                && let Some(probe) = gpu_scene_publication_probe
+            {
+                // Generic publication success means every *live* commit group
+                // was published; a fully DPE-dead group is intentionally
+                // skipped. The exact four-table probe is the authority for
+                // whether GPU Scene may drain its dirty/quarantine journals.
+                let _ = gpu_scene_publication_acknowledger
+                    .as_mut()
+                    .expect("GPU Scene publication probe lost its acknowledger")
+                    .acknowledge_if_published(self.ctx.persistent_buffer_registry, &probe);
+            }
+            drop(surface_view_tracked);
+        };
 
         if let Some(output) = surface_output {
             rdg_diagnostics.enter_phase(RdgFramePhase::Present);
@@ -2434,9 +3214,128 @@ impl<'a> FrameComposer<'a> {
     }
 }
 
+fn add_gpu_scene_shadow_family<'a>(
+    graph: &mut RenderGraph<'a>,
+    cull_feature: &'a GpuSceneCullFeature,
+    lights: &'a [ShadowLightInstance],
+    patched: &GpuSceneTableSetPatchOutput<'a>,
+    projection: GpuSceneMultiBinProjection,
+    active_scene_id: u32,
+    pass_name: &'static str,
+    prepare_plans: &mut SmallVec<[GpuSceneMultiBinFamilyPreparePlan<'a>; 4]>,
+) -> &'a [SceneSubmissionPlanId] {
+    if lights.is_empty() {
+        return graph.alloc_slice(&[]);
+    }
+
+    let views = graph.alloc_slice_fill_with(lights.len(), |light_index| {
+        let light = &lights[light_index];
+        let frustum_planes = std::array::from_fn(|index| light.frustum.planes()[index].to_array());
+        GpuSceneCullViewDescriptor::new(frustum_planes)
+    });
+
+    let culled = cull_feature.add_multi_bin_to_graph(
+        graph,
+        patched.instances,
+        patched.batches,
+        pass_name,
+        GpuSceneMultiBinCullDescriptor::new(
+            active_scene_id,
+            patched.instance_slot_span,
+            patched.batch_slot_span,
+            projection.storage_alignment,
+            projection.table_set.visible_view_stride,
+            views,
+            patched.active_batches,
+        )
+        .with_required_instance_flags(GPU_SCENE_INSTANCE_CASTS_SHADOW),
+    );
+    let indirect_span = u64::from(patched.batch_slot_span)
+        .checked_mul(GPU_SCENE_INDEXED_ARGUMENT_SIZE)
+        .expect("GPU Scene Shadow argument window overflowed");
+    let reserve_submission =
+        |graph: &mut RenderGraph<'a>, view_index: usize| -> SceneSubmissionPlanId {
+            let light = &lights[view_index];
+            let view_index = u32::try_from(view_index)
+                .expect("validated GPU Scene Shadow view index exceeds u32");
+            let first = culled
+                .view_batch(view_index, 0)
+                .expect("packed GPU Scene Shadow Cull lost its first batch");
+            let indirect_window_start = u64::from(view_index)
+                .checked_mul(indirect_span)
+                .expect("GPU Scene Shadow argument window base overflowed");
+            let key = SceneSubmissionKey::Shadow {
+                light_id: light.light_id,
+                layer_index: light.view_layer_index,
+            };
+            graph.reserve_gpu_scene_multi_bin_submission(
+                key,
+                patched.candidates[0].representative,
+                patched.instances,
+                patched.instances,
+                culled.visible_instances,
+                culled.indirect_arguments,
+                first.indirect_offset,
+                indirect_window_start,
+                indirect_span,
+            )
+        };
+
+    // Reserve view zero first, then initialize the exact-size arena slice
+    // with that valid ID before overwriting the remaining slots in place.
+    // This keeps arbitrary light counts off the heap while exposing the same
+    // contiguous submission slice expected by ShadowPass.
+    let first_submission = reserve_submission(graph, 0);
+    let submissions = graph.alloc_slice_fill_copy_mut(lights.len(), first_submission);
+    for (view_index, submission) in submissions.iter_mut().enumerate().skip(1) {
+        *submission = reserve_submission(graph, view_index);
+    }
+    let submissions: &'a [SceneSubmissionPlanId] = submissions;
+    prepare_plans.push(GpuSceneMultiBinFamilyPreparePlan {
+        submissions,
+        candidates: patched.candidates,
+        instance_table: patched.instances,
+        culled,
+        target: GpuSceneSubmissionTarget::Shadow,
+    });
+    submissions
+}
+
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    fn gpu_driven_capabilities(
+        limits: wgpu::Limits,
+        indirect_first_instance: bool,
+    ) -> GpuDrivenCapabilities {
+        let features = if indirect_first_instance {
+            wgpu::Features::INDIRECT_FIRST_INSTANCE
+        } else {
+            wgpu::Features::empty()
+        };
+        let downlevel = wgpu::DownlevelCapabilities {
+            flags: wgpu::DownlevelFlags::COMPUTE_SHADERS
+                | wgpu::DownlevelFlags::INDIRECT_EXECUTION
+                | wgpu::DownlevelFlags::VERTEX_STORAGE,
+            ..Default::default()
+        };
+        GpuDrivenCapabilities::from_parts(features, features, downlevel, limits.clone(), limits)
+    }
+
+    fn one_multi_bin_family() -> GpuSceneMultiBinWorkloadFacts {
+        GpuSceneMultiBinWorkloadFacts {
+            instance_table_bytes: 256,
+            geometry_table_bytes: 256,
+            material_table_bytes: 256,
+            batch_table_bytes: 256,
+            instance_slot_span: 1,
+            batch_slot_span: 1,
+            active_bin_count: 1,
+            visible_view_stride_bytes: 256,
+            view_count: 1,
+        }
+    }
 
     #[test]
     fn late_target_descriptor_enforces_shape_and_backend_format_contract() {
@@ -2514,6 +3413,199 @@ mod diagnostic_tests {
             desc,
             RenderTargetFormatContract::SurfaceViewFamily,
         ));
+    }
+
+    #[test]
+    fn multi_bin_preflight_accepts_one_complete_family() {
+        let capabilities = gpu_driven_capabilities(wgpu::Limits::default(), false);
+        assert!(gpu_scene_multi_bin_workload_supported(
+            &capabilities,
+            one_multi_bin_family(),
+        ));
+    }
+
+    #[test]
+    fn multi_bin_preflight_matches_exact_layout_and_dispatch_boundaries() {
+        let facts = GpuSceneMultiBinWorkloadFacts {
+            instance_table_bytes: 512,
+            geometry_table_bytes: 256,
+            material_table_bytes: 256,
+            batch_table_bytes: 512,
+            instance_slot_span: 65,
+            batch_slot_span: 3,
+            active_bin_count: 2,
+            visible_view_stride_bytes: 512,
+            view_count: 2,
+        };
+        let exact_limits = wgpu::Limits {
+            max_bind_groups: 4,
+            max_bindings_per_bind_group: 7,
+            max_storage_buffers_per_shader_stage: 6,
+            max_uniform_buffers_per_shader_stage: 1,
+            max_compute_invocations_per_workgroup: 64,
+            max_compute_workgroup_size_x: 64,
+            max_compute_workgroup_size_y: 1,
+            max_compute_workgroup_size_z: 1,
+            max_compute_workgroups_per_dimension: 2,
+            max_buffer_size: 1536,
+            max_storage_buffer_binding_size: 1024,
+            max_uniform_buffer_binding_size: 32,
+            min_storage_buffer_offset_alignment: 256,
+            ..wgpu::Limits::default()
+        };
+        assert!(gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(exact_limits.clone(), false),
+            facts,
+        ));
+
+        let below_buffer = wgpu::Limits {
+            max_buffer_size: 1535,
+            ..exact_limits.clone()
+        };
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(below_buffer, false),
+            facts,
+        ));
+        let below_storage_binding = wgpu::Limits {
+            max_storage_buffer_binding_size: 1023,
+            ..exact_limits.clone()
+        };
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(below_storage_binding, false),
+            facts,
+        ));
+        let below_uniform_binding = wgpu::Limits {
+            max_uniform_buffer_binding_size: 31,
+            ..exact_limits.clone()
+        };
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(below_uniform_binding, false),
+            facts,
+        ));
+        let below_layout = wgpu::Limits {
+            max_bindings_per_bind_group: 6,
+            ..exact_limits.clone()
+        };
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(below_layout, false),
+            facts,
+        ));
+        let below_storage_slots = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 5,
+            ..exact_limits.clone()
+        };
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(below_storage_slots, false),
+            facts,
+        ));
+        let below_group_2_contract = wgpu::Limits {
+            max_bind_groups: 3,
+            ..exact_limits.clone()
+        };
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(below_group_2_contract, false),
+            facts,
+        ));
+        let below_dispatch = wgpu::Limits {
+            max_compute_workgroups_per_dimension: 1,
+            ..exact_limits
+        };
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &gpu_driven_capabilities(below_dispatch, false),
+            facts,
+        ));
+    }
+
+    #[test]
+    fn multi_bin_preflight_rejects_overflow_and_an_oversized_table_member() {
+        let limits = wgpu::Limits {
+            max_buffer_size: 4096,
+            max_storage_buffer_binding_size: 4096,
+            ..wgpu::Limits::default()
+        };
+        let capabilities = gpu_driven_capabilities(limits, false);
+
+        let mut overflow = one_multi_bin_family();
+        overflow.batch_slot_span = u32::MAX;
+        overflow.view_count = 2;
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &capabilities,
+            overflow,
+        ));
+
+        for member in 0..4 {
+            let mut oversized = one_multi_bin_family();
+            match member {
+                0 => oversized.instance_table_bytes = 4097,
+                1 => oversized.geometry_table_bytes = 4097,
+                2 => oversized.material_table_bytes = 4097,
+                3 => oversized.batch_table_bytes = 4097,
+                _ => unreachable!(),
+            }
+            assert!(!gpu_scene_multi_bin_workload_supported(
+                &capabilities,
+                oversized,
+            ));
+        }
+
+        let mut aggregate_oversized = one_multi_bin_family();
+        aggregate_oversized.instance_table_bytes = 1025;
+        aggregate_oversized.geometry_table_bytes = 1024;
+        aggregate_oversized.material_table_bytes = 1024;
+        aggregate_oversized.batch_table_bytes = 1024;
+        assert!(
+            [
+                aggregate_oversized.instance_table_bytes,
+                aggregate_oversized.geometry_table_bytes,
+                aggregate_oversized.material_table_bytes,
+                aggregate_oversized.batch_table_bytes,
+            ]
+            .into_iter()
+            .all(|size| size <= 4096),
+            "the aggregate regression must keep every destination individually legal"
+        );
+        assert!(!gpu_scene_multi_bin_workload_supported(
+            &capabilities,
+            aggregate_oversized,
+        ));
+    }
+
+    #[test]
+    fn portable_multi_view_shadow_does_not_require_indirect_first_instance() {
+        let mut facts = one_multi_bin_family();
+        facts.instance_slot_span = 1024;
+        facts.batch_slot_span = 8;
+        facts.active_bin_count = 6;
+        facts.visible_view_stride_bytes = 8192;
+        facts.view_count = 6;
+
+        let portable = gpu_driven_capabilities(wgpu::Limits::default(), false);
+        assert!(!portable.supports_indirect_first_instance());
+        assert!(gpu_scene_multi_bin_workload_supported(&portable, facts));
+    }
+
+    #[test]
+    fn shadow_preflight_fallback_is_scoped_and_required_is_typed() {
+        assert_eq!(
+            resolve_gpu_scene_shadow_ownership(GpuDrivenMode::Auto, true, true, false),
+            Ok(false),
+        );
+        assert_eq!(
+            resolve_gpu_scene_shadow_ownership(GpuDrivenMode::Required, true, true, false),
+            Err(RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits),
+        );
+        assert_eq!(
+            resolve_gpu_scene_shadow_ownership(GpuDrivenMode::Auto, true, false, false),
+            Ok(false),
+        );
+        assert_eq!(
+            resolve_gpu_scene_shadow_ownership(GpuDrivenMode::Required, true, false, false),
+            Err(RdgGpuDrivenFailure::UnsupportedShadowDomain),
+        );
+        assert_eq!(
+            resolve_gpu_scene_shadow_ownership(GpuDrivenMode::Required, false, false, false),
+            Ok(false),
+        );
     }
 }
 

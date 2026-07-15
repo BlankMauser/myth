@@ -122,14 +122,15 @@ pub mod render {
     pub use myth_render::graph::{FrameComposer, RenderState};
     pub use myth_render::renderer::Renderer;
     pub use myth_render::settings::{
-        ClusteredShadingMode, RenderPath, RendererInitConfig, RendererSettings,
+        ClusteredShadingMode, GpuDrivenMode, RenderPath, RendererInitConfig, RendererSettings,
     };
 
     /// Low-level GPU context access.
     pub mod core {
-        pub use myth_render::core::ResourceManager;
-        pub use myth_render::core::WgpuContext;
         pub use myth_render::core::{BindingResource, Bindings, ResourceBuilder};
+        pub use myth_render::core::{
+            GpuDrivenCapabilities, GpuDrivenTier, ResourceManager, WgpuContext,
+        };
         pub use myth_render::core::{ReadbackError, ReadbackFrame, ReadbackStream};
     }
 }
@@ -189,7 +190,8 @@ pub mod prelude {
     // Renderer
     pub use myth_render::graph::FrameComposer;
     pub use myth_render::settings::{
-        AntiAliasingMode, ClusteredShadingMode, RenderPath, RendererInitConfig, RendererSettings,
+        AntiAliasingMode, ClusteredShadingMode, GpuDrivenMode, RenderPath, RendererInitConfig,
+        RendererSettings,
     };
     #[cfg(feature = "debug_view")]
     pub use myth_scene::{DebugViewMode, DebugViewSettings};
@@ -206,6 +208,7 @@ pub use myth_app::{AppHandler, Window};
 pub use myth_app::{Engine, FrameState};
 pub use myth_macros::main;
 pub use myth_render::ClusteredShadingMode;
+pub use myth_render::{GpuDrivenCapabilities, GpuDrivenMode, GpuDrivenTier};
 
 // Scene
 pub use myth_core::{NodeHandle, Transform};

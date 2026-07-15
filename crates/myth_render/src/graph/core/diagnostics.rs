@@ -29,10 +29,22 @@ pub enum RdgAttemptOutcome {
     SurfaceAcquisitionFailed(RdgSurfaceAcquireFailure),
     /// Neither a window surface nor a headless target was configured.
     NoRenderTarget,
+    /// GPU-driven submission was required, or an already selected live GPU
+    /// topology could no longer be finalized coherently. No commands were
+    /// submitted and the renderer never silently substitutes missing draws.
+    GpuDrivenFailed(RdgGpuDrivenFailure),
     /// A DPE-live logical resource could not be materialized from the exact
     /// CPU/GPU state captured for this graph attempt. No commands were
     /// prepared, submitted, or presented.
     ResourceMaterializationFailed(RdgResourceMaterializationFailure),
+    /// Pass execution finished, but the command stream failed an explicit
+    /// pre-submit completeness contract. No commands were submitted or
+    /// presented.
+    CommandEncodingFailed(RdgCommandEncodingFailure),
+    /// Queue submission succeeded, but exact publication bookkeeping rejected
+    /// a stale or conflicting post-submit token. GPU work is not rolled back;
+    /// the affected logical state remains invalid for deterministic retry.
+    PostSubmitPublicationFailed(RdgPostSubmitPublicationFailure),
     /// The attempt ended before queue submission.
     Abandoned,
     /// Queue submission succeeded, but a later frame stage did not finish.
@@ -64,6 +76,77 @@ pub enum RdgResourceMaterializationFailure {
     /// The live Group 0 batch had already failed or could not publish a
     /// complete graph-attempt-owned physical set.
     IncompleteGlobalStateBatch,
+    /// A DPE-live persistent Buffer plan, writer group, or exact physical
+    /// generation drifted before the post-DPE materialization barrier.
+    PersistentBufferStateDrift,
+    /// A DPE-live persistent Buffer write batch was incomplete or did not
+    /// match the imported publication contract.
+    PersistentBufferIncompleteWriteBatch,
+    /// Rounding a persistent Buffer's logical size to its retained physical
+    /// capacity overflowed `u64` before any member was allocated.
+    PersistentBufferCapacityOverflow,
+    /// A persistent Buffer's required retained capacity exceeds the selected
+    /// device's maximum Buffer size.
+    PersistentBufferExceedsDeviceLimit,
+}
+
+/// Stable, allocation-free classification of GPU-driven selection and
+/// finalization failures. Unsupported `Auto` candidates fall back before GPU
+/// topology and therefore do not terminate an attempt; these reasons describe
+/// `Required` failures and post-DPE drift after a backend was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgGpuDrivenFailure {
+    UnsupportedRenderPath,
+    UnsupportedDevice,
+    WorkloadExceedsDeviceLimits,
+    SkinnedGeometry,
+    MorphTargets,
+    InstancedVertexAttributes,
+    IncompatibleMaterial,
+    NonIndexedGeometry,
+    EmptyIndexBuffer,
+    EmptyVertexBuffers,
+    UnsupportedTopology,
+    NonFiniteTransform,
+    NonInvertibleTransform,
+    NonFiniteBounds,
+    ConflictingGeometryEpoch,
+    ConflictingMaterialEpoch,
+    GenerationExhausted,
+    DuplicateInstance,
+    #[cfg(test)]
+    MixedFixedState,
+    TooManyCandidates,
+    UnsupportedShadowDomain,
+    PersistentPlanRejected,
+    SubmissionDescriptorDrift,
+    RepresentativeDrift,
+    GeometryUnavailable,
+    GeometryDrift,
+    MaterialUnavailable,
+    MaterialDrift,
+    GlobalStateUnavailable,
+    UnsupportedMaterialState,
+    ImmutableBatchPublicationRejected,
+}
+
+/// Stable classification of failures detected after execute but before the
+/// queue accepts the graph's command buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgCommandEncodingFailure {
+    /// At least one DPE-live persistent Buffer patch group did not explicitly
+    /// acknowledge that every member write was encoded.
+    PersistentBufferWriteBatchIncomplete,
+}
+
+/// Stable classification of publication failures discovered only after the
+/// queue has accepted a command buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgPostSubmitPublicationFailure {
+    PersistentBufferStateDrift,
 }
 
 /// Stable engine-level classification of `wgpu` surface acquisition failures.
@@ -181,6 +264,7 @@ pub enum RdgDetailPhase {
     SceneBuffers,
     GlobalBuffers,
     PersistentTextures,
+    PersistentBuffers,
     AssetTexture,
     GlobalBindGroup,
     LiveSourceUnion,
@@ -198,13 +282,14 @@ pub enum RdgDetailPhase {
 
 #[cfg(feature = "rdg_bench_support")]
 impl RdgDetailPhase {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 18;
 
     pub const ALL: [Self; Self::COUNT] = [
         Self::TransientResources,
         Self::SceneBuffers,
         Self::GlobalBuffers,
         Self::PersistentTextures,
+        Self::PersistentBuffers,
         Self::AssetTexture,
         Self::GlobalBindGroup,
         Self::LiveSourceUnion,
@@ -226,19 +311,20 @@ impl RdgDetailPhase {
             Self::SceneBuffers => 1,
             Self::GlobalBuffers => 2,
             Self::PersistentTextures => 3,
-            Self::AssetTexture => 4,
-            Self::GlobalBindGroup => 5,
-            Self::LiveSourceUnion => 6,
-            Self::MaterialPlan => 7,
-            Self::Geometry => 8,
-            Self::SourceGather => 9,
-            Self::SourcePlan => 10,
-            Self::SourceMaterialize => 11,
-            Self::SourceFinalize => 12,
-            Self::PipelineGather => 13,
-            Self::PipelineCoordinate => 14,
-            Self::PipelineFeatureFinalize => 15,
-            Self::PipelineFinalize => 16,
+            Self::PersistentBuffers => 4,
+            Self::AssetTexture => 5,
+            Self::GlobalBindGroup => 6,
+            Self::LiveSourceUnion => 7,
+            Self::MaterialPlan => 8,
+            Self::Geometry => 9,
+            Self::SourceGather => 10,
+            Self::SourcePlan => 11,
+            Self::SourceMaterialize => 12,
+            Self::SourceFinalize => 13,
+            Self::PipelineGather => 14,
+            Self::PipelineCoordinate => 15,
+            Self::PipelineFeatureFinalize => 16,
+            Self::PipelineFinalize => 17,
         }
     }
 }
@@ -581,6 +667,12 @@ impl RdgDiagnosticsRecorder {
         should_report
     }
 
+    /// Terminates a GPU-driven attempt at either its required-policy selection
+    /// gate or its immutable post-DPE batch publication gate.
+    pub(crate) fn mark_gpu_driven_failed(&self, reason: RdgGpuDrivenFailure) {
+        self.request_outcome(RdgAttemptOutcome::GpuDrivenFailed(reason));
+    }
+
     /// Terminates an attempt cleanly before prepare when an exact post-DPE
     /// resource recipe can no longer be satisfied.
     pub(crate) fn mark_resource_materialization_failed(
@@ -588,6 +680,12 @@ impl RdgDiagnosticsRecorder {
         reason: RdgResourceMaterializationFailure,
     ) {
         self.request_outcome(RdgAttemptOutcome::ResourceMaterializationFailed(reason));
+    }
+
+    pub(crate) fn mark_command_encoding_failed(&self, reason: RdgCommandEncodingFailure) {
+        self.assert_active();
+        debug_assert!(!self.flag(FLAG_QUEUE_SUBMITTED));
+        self.request_outcome(RdgAttemptOutcome::CommandEncodingFailed(reason));
     }
 
     pub(crate) fn mark_queue_submitted(&self) {
@@ -600,6 +698,15 @@ impl RdgDiagnosticsRecorder {
         };
         debug_assert_eq!(self.prepared_passes.get(), live);
         debug_assert_eq!(self.executed_passes.get(), live);
+    }
+
+    pub(crate) fn mark_post_submit_publication_failed(
+        &self,
+        reason: RdgPostSubmitPublicationFailure,
+    ) {
+        self.assert_active();
+        debug_assert!(self.flag(FLAG_QUEUE_SUBMITTED));
+        self.request_outcome(RdgAttemptOutcome::PostSubmitPublicationFailed(reason));
     }
 
     pub(crate) fn mark_presented(&self) {
@@ -1016,6 +1123,28 @@ mod tests {
         assert!(post_submit.queue_submitted());
         assert_eq!(post_submit.phase(), RdgFramePhase::Publish);
 
+        // A failed post-submit publication remains typed even after the
+        // independent frame work reaches completion.
+        recorder.start_standalone_attempt();
+        recorder.record_compiled_live_passes(0);
+        recorder.mark_queue_submitted();
+        recorder.enter_phase(RdgFramePhase::Publish);
+        recorder.mark_post_submit_publication_failed(
+            RdgPostSubmitPublicationFailure::PersistentBufferStateDrift,
+        );
+        recorder.mark_completed();
+        recorder.finish_standalone_attempt();
+
+        let publication_failure = recorder.latest().unwrap();
+        assert_eq!(
+            publication_failure.outcome(),
+            RdgAttemptOutcome::PostSubmitPublicationFailed(
+                RdgPostSubmitPublicationFailure::PersistentBufferStateDrift
+            )
+        );
+        assert!(publication_failure.queue_submitted());
+        assert_eq!(publication_failure.phase(), RdgFramePhase::Complete);
+
         // Materialization failure is a clean pre-prepare terminal state.
         recorder.start_renderer_attempt(3);
         let guard = RdgComposerAttemptGuard::new(&recorder);
@@ -1040,6 +1169,33 @@ mod tests {
         assert!(!snapshot.queue_submitted());
         assert!(!snapshot.presented());
         assert!(!snapshot.panicked());
+
+        // Encoding may fail after prepare/execute bookkeeping but before the
+        // command buffer becomes externally visible to the queue.
+        recorder.start_renderer_attempt(4);
+        let guard = RdgComposerAttemptGuard::new(&recorder);
+        recorder.record_declared_pass();
+        recorder.record_compiled_live_passes(1);
+        recorder.record_prepared_pass();
+        recorder.record_executed_pass();
+        recorder.enter_phase(RdgFramePhase::Submit);
+        recorder.mark_command_encoding_failed(
+            RdgCommandEncodingFailure::PersistentBufferWriteBatchIncomplete,
+        );
+        drop(guard);
+
+        let encoding_failure = recorder.latest().expect("terminal snapshot missing");
+        assert_eq!(
+            encoding_failure.outcome(),
+            RdgAttemptOutcome::CommandEncodingFailed(
+                RdgCommandEncodingFailure::PersistentBufferWriteBatchIncomplete
+            )
+        );
+        assert_eq!(encoding_failure.phase(), RdgFramePhase::Submit);
+        assert_eq!(encoding_failure.prepared_passes(), 1);
+        assert_eq!(encoding_failure.executed_passes(), 1);
+        assert!(!encoding_failure.queue_submitted());
+        assert!(!encoding_failure.presented());
     }
 
     #[test]

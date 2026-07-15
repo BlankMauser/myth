@@ -13,14 +13,18 @@ use crate::graph::core::arena::FrameArena;
 use crate::graph::core::graph::{GraphStorage, RdgRetainedCapacityStats};
 use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
 use crate::graph::core::{
-    HistoryRegistry, RdgDiagnosticsRecorder, RdgFrameDiagnostics, RdgFramePhase,
-    RdgRendererAttemptGuard,
+    HistoryRegistry, PersistentBufferRegistry, RdgDiagnosticsRecorder, RdgFrameDiagnostics,
+    RdgFramePhase, RdgRendererAttemptGuard,
 };
 use crate::graph::frame::{RenderFrameFeatureConfig, RenderLists};
+use crate::graph::gpu_scene::GpuScene;
+use crate::graph::gpu_scene_capacity::GpuSceneCapacityLedger;
+use crate::graph::gpu_scene_submission::GpuSceneRenderFeature;
 #[cfg(feature = "debug_view")]
 use crate::graph::passes::DebugViewFeature;
 #[cfg(feature = "3dgs")]
 use crate::graph::passes::GaussianSplattingFeature;
+use crate::graph::passes::gpu_scene::GpuSceneCullFeature;
 use crate::graph::passes::{
     AtmosphereFeature, BloomFeature, CasFeature, ClusteredLightingFeature, EnvironmentCacheFeature,
     EquirectToCubeFeature, FxaaFeature, HiZFeature, IblComputeFeature, MipmapFeature,
@@ -35,7 +39,7 @@ use myth_scene::Scene;
 use myth_scene::background::BackgroundMode;
 use myth_scene::camera::RenderCamera;
 
-use crate::core::{ResourceManager, WgpuContext};
+use crate::core::{GpuDrivenCapabilities, ResourceManager, WgpuContext};
 use crate::graph::extracted::SceneFeatures;
 use crate::graph::{FrameComposer, RenderFrame};
 use crate::pipeline::{
@@ -43,7 +47,9 @@ use crate::pipeline::{
     MultisampleKey, PipelineCache, RenderPipelineId, ShaderCompilationOptions, ShaderManager,
     ShaderSource,
 };
-use crate::settings::{ClusteredShadingMode, RenderPath, RendererInitConfig, RendererSettings};
+use crate::settings::{
+    ClusteredShadingMode, GpuDrivenMode, RenderPath, RendererInitConfig, RendererSettings,
+};
 
 fn build_pipeline_layout(
     device: &wgpu::Device,
@@ -117,6 +123,13 @@ struct RendererState {
     // pub(crate) sampler_registry: SamplerRegistry,
     pub(crate) transient_pool: TransientPool,
     pub(crate) history_registry: HistoryRegistry,
+    pub(crate) persistent_buffer_registry: PersistentBufferRegistry,
+    pub(crate) gpu_scene_capacity: GpuSceneCapacityLedger,
+    /// Persistent CPU authority and static backend state for the first
+    /// executable GPU-driven scene-submission slice.
+    pub(crate) gpu_scene: GpuScene,
+    pub(crate) gpu_scene_cull: GpuSceneCullFeature,
+    pub(crate) gpu_scene_render: GpuSceneRenderFeature,
     pub(crate) frame_arena: FrameArena,
 
     // Post-processing passes
@@ -302,6 +315,11 @@ impl Renderer {
             graph_storage: GraphStorage::new(),
             transient_pool: TransientPool::new(),
             history_registry: HistoryRegistry::new(),
+            persistent_buffer_registry: PersistentBufferRegistry::new(),
+            gpu_scene_capacity: GpuSceneCapacityLedger::new(),
+            gpu_scene: GpuScene::new(),
+            gpu_scene_cull: GpuSceneCullFeature::new(),
+            gpu_scene_render: GpuSceneRenderFeature::new(),
             frame_arena: FrameArena::new(),
             fxaa_pass: FxaaFeature::new(),
             taa_pass: TaaFeature::new(),
@@ -400,7 +418,12 @@ impl Renderer {
             .rdg_diagnostics
             .start_renderer_attempt(frame_time.frame_count);
         let frame_attempt = RdgRendererAttemptGuard::new(&state.rdg_diagnostics);
+        // Invalidate every arena node before GPU Scene maintenance can clear
+        // or shrink slices borrowed by the previous graph's pass payloads.
         state.graph_storage.clear();
+        state
+            .gpu_scene_capacity
+            .maintain(&mut state.gpu_scene, &mut state.gpu_scene_render);
         // Reset the arena in O(1) — all previous PassNodes are trivially
         // forgotten (no Drop needed).
         state.frame_arena.reset();
@@ -512,6 +535,10 @@ impl Renderer {
             rdg_diagnostics: &state.rdg_diagnostics,
             transient_pool: &mut state.transient_pool,
             history_registry: &mut state.history_registry,
+            persistent_buffer_registry: &mut state.persistent_buffer_registry,
+            gpu_scene: &mut state.gpu_scene,
+            gpu_scene_cull: &mut state.gpu_scene_cull,
+            gpu_scene_render: &mut state.gpu_scene_render,
             // sampler_registry: &mut state.sampler_registry,
             frame_arena: &state.frame_arena,
             fxaa_pass: &mut state.fxaa_pass,
@@ -670,6 +697,13 @@ impl Renderer {
                     self.settings.clustered_shading
                 );
             }
+
+            if old.gpu_driven != self.settings.gpu_driven {
+                log::info!(
+                    "GPU-driven scene-submission policy changed to {:?}",
+                    self.settings.gpu_driven
+                );
+            }
         }
     }
 
@@ -678,6 +712,15 @@ impl Renderer {
         if self.settings.clustered_shading != mode {
             let mut new = self.settings.clone();
             new.clustered_shading = mode;
+            self.update_settings(new);
+        }
+    }
+
+    /// Sets the GPU-driven scene-submission policy.
+    pub fn set_gpu_driven_mode(&mut self, mode: GpuDrivenMode) {
+        if self.settings.gpu_driven != mode {
+            let mut new = self.settings.clone();
+            new.gpu_driven = mode;
             self.update_settings(new);
         }
     }
@@ -751,6 +794,16 @@ impl Renderer {
         self.context.as_ref().map(|s| &s.wgpu_ctx)
     }
 
+    /// Returns the immutable GPU-driven capability snapshot captured during
+    /// device initialization, or `None` before initialization.
+    #[inline]
+    #[must_use]
+    pub fn gpu_driven_capabilities(&self) -> Option<&GpuDrivenCapabilities> {
+        self.context
+            .as_ref()
+            .map(|state| state.wgpu_ctx.gpu_driven_capabilities())
+    }
+
     /// Returns a reference to the GPU resource manager.
     pub fn resource_manager(&self) -> Option<&ResourceManager> {
         self.context.as_ref().map(|s| &s.resource_manager)
@@ -787,22 +840,34 @@ impl Renderer {
     }
 
     /// Returns the accounted CPU backing capacity retained by the RDG between
-    /// attempts, including topology, compile scratch, and attempt stores.
-    /// Hash-table bytes are stable estimates rather than allocator-exact data.
+    /// attempts, including topology, attempt stores, and renderer-owned GPU
+    /// Scene authority/finalization storage. Hash-table bytes are stable
+    /// estimates rather than allocator-exact data.
     #[must_use]
     pub fn rdg_retained_capacity_stats(&self) -> Option<RdgRetainedCapacityStats> {
-        self.context
-            .as_ref()
-            .map(|state| state.graph_storage.retained_capacity_stats())
+        self.context.as_ref().map(|state| {
+            state
+                .graph_storage
+                .retained_capacity_stats()
+                .with_gpu_scene_capacity(
+                    GpuSceneCapacityLedger::authority_usage(&state.gpu_scene),
+                    GpuSceneCapacityLedger::scratch_usage(
+                        &state.gpu_scene,
+                        &state.gpu_scene_render,
+                    ),
+                    state.gpu_scene_capacity.stats(),
+                )
+        })
     }
 
-    /// Requests one pressure-driven retained-capacity trim. The largest
-    /// eligible family is selected, but deallocation is deferred until the
-    /// earliest safe `GraphStorage::clear` boundary after any active global
-    /// trim cooldown has elapsed.
+    /// Requests pressure-driven retained-capacity maintenance. GraphStorage
+    /// and renderer-owned GPU Scene storage each select at most one eligible
+    /// family under the same hysteretic policy; deallocation is deferred to
+    /// their shared next-frame maintenance boundary.
     pub fn request_rdg_retained_capacity_trim(&mut self) {
         if let Some(state) = &mut self.context {
             state.graph_storage.request_retained_capacity_trim();
+            state.gpu_scene_capacity.request_trim();
         }
     }
 
@@ -1170,23 +1235,39 @@ mod tests {
     use crate::graph::core::scene_submission::SceneSubmissionPlanId;
     use crate::graph::core::{
         ExecuteContext, GraphBlackboard, HookStage, PassNode, RdgAttemptOutcome, RdgFramePhase,
-        RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure, TextureDesc,
+        RdgGpuDrivenFailure, RdgResourceMaterializationFailure, RdgSurfaceAcquireFailure,
+        TextureDesc,
     };
     use crate::test_support::SharedTestContext;
-    use glam::{Affine3A, Quat, Vec3, Vec4};
-    use myth_assets::{AssetServer, MaterialHandle, SceneExt};
+    use glam::{Affine3A, Mat4, Quat, Vec3, Vec4};
+    use myth_assets::{AssetServer, MaterialHandle, SceneExt, TextureHandle};
     use myth_core::NodeHandle;
     #[cfg(feature = "3dgs")]
     use myth_resources::gaussian_splat::{GaussianCloud, GaussianSHCoefficients, GaussianSplat};
     use myth_resources::geometry::{Attribute, Geometry, VertexFormat};
     use myth_resources::image::{ColorSpace, Image, ImageDimension, PixelFormat};
-    use myth_resources::material::{PhysicalFeatures, PhysicalMaterial};
+    use myth_resources::material::{PhysicalFeatures, PhysicalMaterial, UnlitMaterial};
     use myth_resources::texture::{Texture, TextureSource};
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
     use myth_scene::light::Light;
     use myth_scene::skeleton::Skeleton;
-    use myth_scene::{BindMode, Scene};
+    use myth_scene::{BindMode, Light, Scene};
+
+    #[test]
+    fn gpu_driven_mode_setter_only_updates_the_frozen_policy_before_init() {
+        let mut renderer =
+            Renderer::new(RendererInitConfig::default(), RendererSettings::default());
+
+        assert_eq!(renderer.settings().gpu_driven, GpuDrivenMode::Off);
+        assert!(renderer.gpu_driven_capabilities().is_none());
+
+        renderer.set_gpu_driven_mode(GpuDrivenMode::Auto);
+
+        assert_eq!(renderer.settings().gpu_driven, GpuDrivenMode::Auto);
+        assert!(renderer.context.is_none());
+        assert!(renderer.gpu_driven_capabilities().is_none());
+    }
 
     struct DepthOnlyTestRoot;
 
@@ -1285,6 +1366,34 @@ mod tests {
         renderer
     }
 
+    fn init_headless_gpu_renderer(path: RenderPath, mode: GpuDrivenMode) -> Renderer {
+        init_headless_gpu_renderer_with_features(path, mode, wgpu::Features::empty())
+    }
+
+    fn init_headless_gpu_renderer_with_features(
+        path: RenderPath,
+        mode: GpuDrivenMode,
+        required_features: wgpu::Features,
+    ) -> Renderer {
+        let mut renderer = Renderer::new(
+            RendererInitConfig {
+                required_features,
+                ..RendererInitConfig::default()
+            },
+            RendererSettings {
+                path,
+                gpu_driven: mode,
+                ..RendererSettings::default()
+            },
+        );
+        pollster::block_on(renderer.init_headless(128, 128, None))
+            .expect("headless GPU-driven renderer init failed");
+        renderer
+    }
+
+    fn init_headless_basic_forward_gpu_renderer(mode: GpuDrivenMode) -> Renderer {
+        init_headless_gpu_renderer(RenderPath::BasicForward, mode)
+    }
     fn init_headless_renderer_with_model_capacity(initial_capacity: usize) -> Renderer {
         let mut renderer = init_headless_renderer();
         let anisotropy_clamp = renderer.settings.anisotropy_clamp;
@@ -1302,6 +1411,121 @@ mod tests {
         let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
         camera.update_view_projection(&Affine3A::from_translation(Vec3::new(0.0, 0.0, 5.0)));
         camera.extract_render_camera()
+    }
+
+    fn make_shadow_camera() -> RenderCamera {
+        let eye = Vec3::new(4.5, 3.5, 6.5);
+        let target = Vec3::new(0.0, -0.35, 0.0);
+        let world = Mat4::look_at_rh(eye, target, Vec3::Y).inverse();
+        let mut camera = Camera::new_perspective(45.0, 1.0, 0.1);
+        camera.update_view_projection(&Affine3A::from_mat4(world));
+        camera.extract_render_camera()
+    }
+
+    /// Build a two-bin shadowed scene. Receiver and caster deliberately use
+    /// distinct Geometry/Material identities so Main, Prepass, 2D Shadow and
+    /// Cube Shadow all exercise the M7.4 multi-bin stream.
+    fn make_gpu_scene_shadow_fixture(cast_shadows: bool) -> (AssetServer, Scene) {
+        let assets = AssetServer::new();
+        let receiver_geometry = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
+        let receiver_material = assets
+            .materials
+            .add(PhysicalMaterial::new(Vec4::new(0.72, 0.64, 0.55, 1.0)));
+        let caster_geometry = assets.geometries.add(Geometry::new_box(0.9, 1.45, 0.9));
+        let caster_material = assets
+            .materials
+            .add(PhysicalMaterial::new(Vec4::new(0.42, 0.55, 0.78, 1.0)));
+        let mut scene = Scene::new();
+
+        let receiver = scene.spawn(receiver_geometry, receiver_material, &assets);
+        scene
+            .node(&receiver)
+            .set_position(0.0, -1.0, 0.0)
+            .set_scale_xyz(6.0, 0.12, 6.0)
+            .set_cast_shadows(false)
+            .set_receive_shadows(true);
+
+        let caster = scene.spawn(caster_geometry, caster_material, &assets);
+        scene
+            .node(&caster)
+            .set_position(-0.35, -0.15, 0.0)
+            .set_scale_xyz(1.0, 1.0, 1.0)
+            .set_cast_shadows(cast_shadows)
+            .set_receive_shadows(true);
+
+        let mut directional = Light::new_directional(Vec3::new(1.0, 0.94, 0.86), 1.0);
+        directional.cast_shadows = cast_shadows;
+        if let Some(shadow) = directional.shadow.as_mut() {
+            shadow.map_size = 256;
+            shadow.normal_bias = 0.0;
+        }
+        let directional = scene.add_light(directional);
+        scene
+            .node(&directional)
+            .set_position(-4.0, 6.0, -4.0)
+            .look_at(Vec3::new(-0.2, -0.8, 0.0));
+
+        // Keep a real cube-family producer in the graph without filling the
+        // receiver's directional shadow with a second direct-light term.
+        let mut point = Light::new_point(Vec3::new(0.55, 0.72, 1.0), 0.0, 9.0);
+        point.cast_shadows = cast_shadows;
+        if let Some(shadow) = point.shadow.as_mut() {
+            shadow.map_size = 32;
+            shadow.normal_bias = 0.0;
+        }
+        let point = scene.add_light(point);
+        scene.node(&point).set_position(-2.0, 1.8, 2.4);
+        scene.update_matrix_world();
+
+        (assets, scene)
+    }
+
+    /// Two distinct textured bins whose solid texels make both material
+    /// bindings observable in a headless readback.
+    fn make_gpu_scene_textured_fixture() -> (AssetServer, Scene, [TextureHandle; 2]) {
+        let assets = AssetServer::new();
+        let mut textures = Vec::with_capacity(2);
+        for (label, rgba) in [
+            ("GPU Scene Red", [224, 24, 16, 255]),
+            ("GPU Scene Blue", [16, 48, 224, 255]),
+        ] {
+            let image = assets.images.add(Image::new(
+                8,
+                8,
+                1,
+                ImageDimension::D2,
+                PixelFormat::Rgba8Unorm,
+                Some(rgba.repeat(8 * 8)),
+            ));
+            let mut texture = Texture::new_2d(Some(label), image);
+            texture.color_space = ColorSpace::Linear;
+            texture.generate_mipmaps = true;
+            textures.push(assets.textures.add(texture));
+        }
+        let textures: [TextureHandle; 2] = textures
+            .try_into()
+            .expect("textured GPU Scene fixture must create two textures");
+
+        let mut scene = Scene::new();
+        let left = scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            UnlitMaterial::new(Vec4::ONE).with_map(textures[0]),
+            &assets,
+        );
+        scene.node(&left).set_position(-0.7, 0.0, 0.0);
+        let right = scene.spawn_box(
+            0.75,
+            1.25,
+            0.8,
+            UnlitMaterial::new(Vec4::ONE).with_map(textures[1]),
+            &assets,
+        );
+        scene.node(&right).set_position(0.7, 0.0, 0.0);
+        scene.update_matrix_world();
+
+        (assets, scene, textures)
     }
 
     fn spawn_test_morph_box(scene: &mut Scene, assets: &AssetServer) -> NodeHandle {
@@ -3394,5 +3618,450 @@ mod tests {
             .get_gpu_buffer_by_cpu_id(logical_id)
             .expect("model buffer must be recreated before the next prepare");
         assert_ne!(recreated.id, resized_physical_id);
+    }
+
+    #[test]
+    fn gpu_driven_basic_forward_closes_patch_cull_indirect_and_warm_publication() {
+        let mut renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        if !renderer
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            return;
+        }
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let color = Vec4::new(0.7, 0.2, 0.1, 1.0);
+        scene.spawn_box(1.0, 1.0, 1.0, UnlitMaterial::new(color), &assets);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            assert_eq!(
+                renderer.latest_rdg_diagnostics().unwrap().outcome(),
+                RdgAttemptOutcome::Submitted
+            );
+            assert!(execution_contains_pass(state, "GpuScene_Patch"));
+            assert!(execution_contains_pass(state, "GpuScene_Cull"));
+            assert!(execution_contains_pass(state, "SimpleForward_Pass"));
+        }
+
+        // The exact submitted table revision is acknowledged in the same
+        // frame. A stable warm frame imports it read-only but still executes
+        // Cull and the indirect draw.
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        assert!(!execution_contains_pass(state, "GpuScene_Patch"));
+        assert!(execution_contains_pass(state, "GpuScene_Cull"));
+        let gpu_pixels = renderer
+            .readback_pixels()
+            .expect("GPU-driven headless readback failed");
+
+        // Keep the original CpuDirect path as the executable oracle. The
+        // single rigid instance must be raster-identical after the warm-frame
+        // publication path switches to a read-only persistent import.
+        let cpu_assets = AssetServer::new();
+        let mut cpu_scene = Scene::new();
+        cpu_scene.spawn_box(1.0, 1.0, 1.0, UnlitMaterial::new(color), &cpu_assets);
+        let mut cpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Off);
+        render_frame(
+            &mut cpu_renderer,
+            &mut cpu_scene,
+            make_camera(),
+            &cpu_assets,
+            0,
+        );
+        let cpu_pixels = cpu_renderer
+            .readback_pixels()
+            .expect("CpuDirect headless readback failed");
+        assert_eq!(gpu_pixels, cpu_pixels);
+    }
+
+    #[test]
+    fn gpu_driven_high_fidelity_prepass_and_opaque_share_visibility_and_match_cpu() {
+        let mut gpu_renderer =
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Auto);
+        if !gpu_renderer
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            return;
+        }
+        let color = Vec4::new(0.15, 0.65, 0.3, 1.0);
+        let gpu_assets = AssetServer::new();
+        let mut gpu_scene = Scene::new();
+        gpu_scene.spawn_box(1.0, 1.0, 1.0, UnlitMaterial::new(color), &gpu_assets);
+
+        render_frame(
+            &mut gpu_renderer,
+            &mut gpu_scene,
+            make_camera(),
+            &gpu_assets,
+            0,
+        );
+        {
+            let state = gpu_renderer
+                .context
+                .as_ref()
+                .expect("renderer state missing");
+            assert!(execution_contains_pass(state, "GpuScene_Patch"));
+            assert!(execution_contains_pass(state, "GpuScene_Cull"));
+            assert!(execution_contains_pass(state, "Pre_Pass"));
+            assert!(execution_contains_pass(state, "Opaque_Pass"));
+        }
+        let gpu_pixels = gpu_renderer
+            .readback_pixels()
+            .expect("HighFidelity GPU-driven readback failed");
+
+        let cpu_assets = AssetServer::new();
+        let mut cpu_scene = Scene::new();
+        cpu_scene.spawn_box(1.0, 1.0, 1.0, UnlitMaterial::new(color), &cpu_assets);
+        let mut cpu_renderer =
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Off);
+        render_frame(
+            &mut cpu_renderer,
+            &mut cpu_scene,
+            make_camera(),
+            &cpu_assets,
+            0,
+        );
+        let cpu_pixels = cpu_renderer
+            .readback_pixels()
+            .expect("HighFidelity CpuDirect readback failed");
+        assert_eq!(gpu_pixels, cpu_pixels);
+    }
+
+    #[test]
+    fn gpu_driven_packed_shadow_families_match_cpu_and_change_lit_pixels() {
+        // The portable tier binds each visible partition as an exact Group 2
+        // range and keeps every indirect `first_instance` at zero.
+        let mut gpu_renderer =
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Auto);
+        if !gpu_renderer
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            return;
+        }
+        let (gpu_assets, mut gpu_scene) = make_gpu_scene_shadow_fixture(true);
+
+        render_frame(
+            &mut gpu_renderer,
+            &mut gpu_scene,
+            make_shadow_camera(),
+            &gpu_assets,
+            0,
+        );
+        {
+            let state = gpu_renderer
+                .context
+                .as_ref()
+                .expect("renderer state missing");
+            assert_eq!(
+                gpu_renderer.latest_rdg_diagnostics().unwrap().outcome(),
+                RdgAttemptOutcome::Submitted
+            );
+            assert!(execution_contains_pass(state, "GpuScene_Patch"));
+            assert!(execution_contains_pass(state, "GpuScene_Cull"));
+            assert!(execution_contains_pass(state, "GpuScene_Shadow_2D_Cull"));
+            assert!(execution_contains_pass(state, "GpuScene_Shadow_Cube_Cull"));
+            assert!(execution_contains_pass(state, "Shadow_2D_Pass"));
+            assert!(execution_contains_pass(state, "Shadow_Cube_Pass"));
+            assert_eq!(state.gpu_scene.active_batch_descriptors().len(), 2);
+            assert_eq!(
+                state
+                    .graph_storage
+                    .passes
+                    .iter()
+                    .filter(|pass| pass.name == "GpuScene_Shadow_2D_Cull")
+                    .count(),
+                1,
+                "all directional/spot views must share one packed 2D-family Cull"
+            );
+            assert_eq!(
+                state
+                    .graph_storage
+                    .passes
+                    .iter()
+                    .filter(|pass| pass.name == "GpuScene_Shadow_Cube_Cull")
+                    .count(),
+                1,
+                "all point-light faces must share one packed cube-family Cull"
+            );
+        }
+        let gpu_pixels = gpu_renderer
+            .readback_pixels()
+            .expect("GPU-driven shadow readback failed");
+
+        // The retained CpuDirect renderer remains the executable oracle for
+        // both shadow-map rasterization and final shadow sampling.
+        let mut cpu_renderer =
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Off);
+        let (cpu_assets, mut cpu_scene) = make_gpu_scene_shadow_fixture(true);
+        render_frame(
+            &mut cpu_renderer,
+            &mut cpu_scene,
+            make_shadow_camera(),
+            &cpu_assets,
+            0,
+        );
+        let cpu_pixels = cpu_renderer
+            .readback_pixels()
+            .expect("CpuDirect shadow readback failed");
+        assert_eq!(gpu_pixels, cpu_pixels);
+
+        // Prove that the fixture observes projected shadowing rather than
+        // merely executing equivalent but visually unused shadow passes.
+        let mut unshadowed_renderer =
+            init_headless_gpu_renderer(RenderPath::HighFidelity, GpuDrivenMode::Off);
+        let (unshadowed_assets, mut unshadowed_scene) = make_gpu_scene_shadow_fixture(false);
+        render_frame(
+            &mut unshadowed_renderer,
+            &mut unshadowed_scene,
+            make_shadow_camera(),
+            &unshadowed_assets,
+            0,
+        );
+        let unshadowed_pixels = unshadowed_renderer
+            .readback_pixels()
+            .expect("unshadowed oracle readback failed");
+        let changed_pixels = cpu_pixels
+            .chunks_exact(4)
+            .zip(unshadowed_pixels.chunks_exact(4))
+            .filter(|(shadowed, unshadowed)| shadowed[..3] != unshadowed[..3])
+            .count();
+        assert!(
+            changed_pixels >= 32,
+            "shadow-enabled fixture changed only {changed_pixels} pixels"
+        );
+    }
+
+    #[test]
+    fn gpu_driven_multi_bin_geometry_material_stream_matches_cpu() {
+        let gpu_assets = AssetServer::new();
+        let mut gpu_scene = Scene::new();
+        let left = gpu_scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            UnlitMaterial::new(Vec4::new(0.85, 0.12, 0.08, 1.0)),
+            &gpu_assets,
+        );
+        gpu_scene.node(&left).set_position(-0.7, 0.0, 0.0);
+        let right = gpu_scene.spawn_box(
+            0.75,
+            1.25,
+            0.8,
+            UnlitMaterial::new(Vec4::new(0.08, 0.35, 0.9, 1.0)),
+            &gpu_assets,
+        );
+        gpu_scene.node(&right).set_position(0.7, 0.0, 0.0);
+
+        let mut gpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        if !gpu_renderer
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            return;
+        }
+        render_frame(
+            &mut gpu_renderer,
+            &mut gpu_scene,
+            make_camera(),
+            &gpu_assets,
+            0,
+        );
+        let gpu_state = gpu_renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing");
+        assert!(execution_contains_pass(gpu_state, "GpuScene_Patch"));
+        assert!(execution_contains_pass(gpu_state, "GpuScene_Cull"));
+        assert_eq!(gpu_state.gpu_scene.active_batch_descriptors().len(), 2);
+        assert_eq!(
+            gpu_state.render_lists.gpu_opaque_representatives().count(),
+            2
+        );
+        assert_eq!(
+            gpu_state
+                .graph_storage
+                .passes
+                .iter()
+                .filter(|pass| pass.name == "GpuScene_Cull")
+                .count(),
+            1
+        );
+        assert_eq!(
+            gpu_renderer.latest_rdg_diagnostics().unwrap().outcome(),
+            RdgAttemptOutcome::Submitted
+        );
+        let gpu_pixels = gpu_renderer
+            .readback_pixels()
+            .expect("multi-bin GPU Scene readback failed");
+
+        let cpu_assets = AssetServer::new();
+        let mut cpu_scene = Scene::new();
+        let left = cpu_scene.spawn_box(
+            1.0,
+            1.0,
+            1.0,
+            UnlitMaterial::new(Vec4::new(0.85, 0.12, 0.08, 1.0)),
+            &cpu_assets,
+        );
+        cpu_scene.node(&left).set_position(-0.7, 0.0, 0.0);
+        let right = cpu_scene.spawn_box(
+            0.75,
+            1.25,
+            0.8,
+            UnlitMaterial::new(Vec4::new(0.08, 0.35, 0.9, 1.0)),
+            &cpu_assets,
+        );
+        cpu_scene.node(&right).set_position(0.7, 0.0, 0.0);
+        let mut cpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Off);
+        render_frame(
+            &mut cpu_renderer,
+            &mut cpu_scene,
+            make_camera(),
+            &cpu_assets,
+            0,
+        );
+        let cpu_pixels = cpu_renderer
+            .readback_pixels()
+            .expect("multi-bin CpuDirect readback failed");
+        assert_eq!(gpu_pixels, cpu_pixels);
+    }
+
+    #[test]
+    fn gpu_driven_multi_bin_textures_retain_all_producers_and_match_cpu() {
+        let mut gpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        if !gpu_renderer
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            return;
+        }
+        let (gpu_assets, mut gpu_scene, gpu_textures) = make_gpu_scene_textured_fixture();
+
+        render_frame(
+            &mut gpu_renderer,
+            &mut gpu_scene,
+            make_camera(),
+            &gpu_assets,
+            0,
+        );
+        let gpu_state = gpu_renderer
+            .context
+            .as_ref()
+            .expect("renderer state missing");
+        assert!(execution_contains_pass(gpu_state, "GpuScene_Patch"));
+        assert!(execution_contains_pass(gpu_state, "GpuScene_Cull"));
+        assert_eq!(gpu_state.gpu_scene.active_batch_descriptors().len(), 2);
+        assert_eq!(
+            gpu_state.render_lists.gpu_opaque_representatives().count(),
+            2
+        );
+        for texture in gpu_textures {
+            let image = gpu_state
+                .resource_manager
+                .get_texture_image(texture)
+                .expect("every live GPU-driven material texture must be resident");
+            assert_eq!(image.mip_level_count, 4);
+            assert!(image.mipmaps_submitted());
+        }
+        let execution_names: Vec<_> = gpu_state
+            .graph_storage
+            .execution_queue
+            .iter()
+            .map(|&index| gpu_state.graph_storage.passes[index].name)
+            .collect();
+        let forward = execution_names
+            .iter()
+            .position(|&name| name == "SimpleForward_Pass")
+            .expect("GPU-driven forward consumer missing");
+        let mipmap_positions: Vec<_> = execution_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &name)| {
+                (name == "Asset_Texture_Mipmap_Generation").then_some(index)
+            })
+            .collect();
+        assert_eq!(mipmap_positions.len(), 2);
+        assert!(mipmap_positions.into_iter().all(|index| index < forward));
+        let gpu_pixels = gpu_renderer
+            .readback_pixels()
+            .expect("textured multi-bin GPU Scene readback failed");
+        let red_pixels = gpu_pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > pixel[1].saturating_add(48) && pixel[0] > pixel[2])
+            .count();
+        let blue_pixels = gpu_pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[2] > pixel[1].saturating_add(48) && pixel[2] > pixel[0])
+            .count();
+        assert!(
+            red_pixels >= 32,
+            "red texture affected only {red_pixels} pixels"
+        );
+        assert!(
+            blue_pixels >= 32,
+            "blue texture affected only {blue_pixels} pixels"
+        );
+
+        let mut cpu_renderer = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Off);
+        let (cpu_assets, mut cpu_scene, _) = make_gpu_scene_textured_fixture();
+        render_frame(
+            &mut cpu_renderer,
+            &mut cpu_scene,
+            make_camera(),
+            &cpu_assets,
+            0,
+        );
+        let cpu_pixels = cpu_renderer
+            .readback_pixels()
+            .expect("textured multi-bin CpuDirect readback failed");
+        assert_eq!(gpu_pixels, cpu_pixels);
+    }
+
+    #[test]
+    fn gpu_driven_auto_falls_back_before_topology_and_required_is_typed() {
+        let auto_assets = AssetServer::new();
+        let mut auto_scene = Scene::new();
+        spawn_test_morph_box(&mut auto_scene, &auto_assets);
+        let mut auto = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Auto);
+        render_frame(&mut auto, &mut auto_scene, make_camera(), &auto_assets, 0);
+        let auto_state = auto.context.as_ref().expect("renderer state missing");
+        assert!(!graph_contains_pass(auto_state, "GpuScene_Patch"));
+        assert!(!graph_contains_pass(auto_state, "GpuScene_Cull"));
+        assert_eq!(
+            auto.latest_rdg_diagnostics().unwrap().outcome(),
+            RdgAttemptOutcome::Submitted
+        );
+
+        let required_assets = AssetServer::new();
+        let mut required_scene = Scene::new();
+        spawn_test_morph_box(&mut required_scene, &required_assets);
+        let mut required = init_headless_basic_forward_gpu_renderer(GpuDrivenMode::Required);
+        render_frame(
+            &mut required,
+            &mut required_scene,
+            make_camera(),
+            &required_assets,
+            0,
+        );
+        let outcome = required.latest_rdg_diagnostics().unwrap().outcome();
+        if required
+            .gpu_driven_capabilities()
+            .is_some_and(GpuDrivenCapabilities::supports_indirect_primitives)
+        {
+            assert_eq!(
+                outcome,
+                RdgAttemptOutcome::GpuDrivenFailed(RdgGpuDrivenFailure::MorphTargets)
+            );
+        } else {
+            assert_eq!(
+                outcome,
+                RdgAttemptOutcome::GpuDrivenFailed(RdgGpuDrivenFailure::UnsupportedDevice)
+            );
+        }
     }
 }
