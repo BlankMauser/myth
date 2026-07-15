@@ -7103,7 +7103,7 @@ mod tests {
 
     #[test]
     fn live_reader_of_an_invalid_replacement_forfeits_rollback() {
-        let context = pollster::block_on(crate::core::WgpuContext::new_headless(
+        let context = pollster::block_on(WgpuContext::new_headless(
             &crate::settings::RendererInitConfig::default(),
             &crate::settings::RendererSettings::default(),
             2,
