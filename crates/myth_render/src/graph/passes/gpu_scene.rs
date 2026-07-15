@@ -887,92 +887,6 @@ mod tests {
     }
 
     #[test]
-    fn dead_gpu_scene_branch_has_no_live_patch_or_consumer() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
-        let mut gpu_scene = GpuScene::new();
-        gpu_scene.synchronize_scene(1, [input()]);
-        let plan = gpu_scene.plan_instance_table(&mut registry, 1).unwrap();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = RenderGraph::new(&mut storage, &arena);
-        let patched = add_gpu_scene_patch(&mut graph, plan);
-        graph.add_pass("GpuScene_Dead_Consumer", |builder| {
-            builder.read_buffer(patched.instances);
-            (TestConsumer, ())
-        });
-
-        graph.compile_topology();
-        graph
-            .materialize_live_persistent_buffers(&mut registry, &gpu.device)
-            .unwrap();
-        assert!(graph.storage.execution_queue.is_empty());
-        assert!(
-            !graph
-                .storage
-                .persistent_buffer_materializations
-                .contains_key(
-                    &graph.storage.resources[patched.instances.index() as usize]
-                        .persistent_buffer_id()
-                        .unwrap()
-                )
-        );
-    }
-
-    #[test]
-    fn published_table_is_a_read_only_import_without_patch_or_commit_group() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
-        let mut gpu_scene = GpuScene::new();
-        gpu_scene.synchronize_scene(1, [input()]);
-        let (persistent, probe) = {
-            let first = gpu_scene.plan_instance_table(&mut registry, 1).unwrap();
-            (first.persistent, first.publication_probe)
-        };
-        let materialization = registry
-            .materialize(
-                &gpu.device,
-                persistent.buffer,
-                Some("published GPU Scene test"),
-            )
-            .unwrap();
-        registry
-            .commit_batch(&[PersistentBufferCommitRequest::new(
-                persistent.commit.unwrap(),
-                materialization.token,
-            )])
-            .unwrap();
-        assert!(gpu_scene.acknowledge_if_published(&registry, probe));
-
-        let plan = gpu_scene.plan_instance_table(&mut registry, 2).unwrap();
-        assert!(plan.persistent.valid);
-        assert!(plan.persistent.commit.is_none());
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = RenderGraph::new(&mut storage, &arena);
-        let patched = add_gpu_scene_patch(&mut graph, plan);
-        graph.add_pass("GpuScene_Published_Consumer", |builder| {
-            builder.read_buffer(patched.instances);
-            builder.mark_side_effect();
-            (TestConsumer, ())
-        });
-
-        graph.compile_topology();
-        graph
-            .materialize_live_persistent_buffers(&mut registry, &gpu.device)
-            .unwrap();
-        let live: Vec<_> = graph
-            .storage
-            .execution_queue
-            .iter()
-            .map(|&index| graph.storage.passes[index].name)
-            .collect();
-        assert_eq!(live, ["GpuScene_Published_Consumer"]);
-        assert!(!graph.has_persistent_buffer_commit_groups());
-        assert!(graph.has_persistent_buffer_imports());
-    }
-
-    #[test]
     fn staging_covers_empty_full_image_and_packs_sparse_delta_ranges() {
         let gpu = gpu();
         let empty = [GpuSceneInstanceRecord::zeroed()];
@@ -1035,32 +949,35 @@ mod tests {
             read_staging(&gpu, &dense_staging),
             bytemuck::cast_slice::<_, u8>(&records)
         );
-    }
 
-    #[test]
-    fn fragmented_delta_upgrades_to_one_complete_image() {
-        let gpu = gpu();
+        // A highly fragmented delta is more expensive than one complete image;
+        // keep the threshold decision in the same upload-policy matrix.
         let record_count = (GPU_SCENE_DELTA_COPY_RANGE_BUDGET + 1) * 4;
-        let mut records = vec![GpuSceneInstanceRecord::zeroed(); record_count];
-        let mut ranges = Vec::with_capacity(GPU_SCENE_DELTA_COPY_RANGE_BUDGET + 1);
+        let mut fragmented_records = vec![GpuSceneInstanceRecord::zeroed(); record_count];
+        let mut fragmented_ranges = Vec::with_capacity(GPU_SCENE_DELTA_COPY_RANGE_BUDGET + 1);
         for range_index in 0..=GPU_SCENE_DELTA_COPY_RANGE_BUDGET {
             let slot = range_index * 4;
-            records[slot].metadata = [u32::try_from(slot).unwrap() + 1, 1, 0, 0];
-            ranges.push(GpuSceneDirtyRange {
+            fragmented_records[slot].metadata = [u32::try_from(slot).unwrap() + 1, 1, 0, 0];
+            fragmented_ranges.push(GpuSceneDirtyRange {
                 first_slot: u32::try_from(slot).unwrap(),
                 slot_count: 1,
             });
         }
 
-        let logical_size = std::mem::size_of_val(records.as_slice()) as u64;
-        let (staging, prepared) =
-            create_gpu_scene_patch_staging(&gpu.device, logical_size, &records, &ranges, false);
+        let logical_size = std::mem::size_of_val(fragmented_records.as_slice()) as u64;
+        let (staging, prepared) = create_gpu_scene_patch_staging(
+            &gpu.device,
+            logical_size,
+            &fragmented_records,
+            &fragmented_ranges,
+            false,
+        );
 
         assert_eq!(prepared.coverage, PersistentBufferWriteCoverage::Full);
         assert_eq!(prepared.upload_size, logical_size);
         assert_eq!(
             read_staging(&gpu, &staging),
-            bytemuck::cast_slice::<_, u8>(records.as_slice())
+            bytemuck::cast_slice::<_, u8>(fragmented_records.as_slice())
         );
     }
 

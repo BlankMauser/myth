@@ -4638,6 +4638,22 @@ mod tests {
         }
     }
 
+    fn assert_panics_with(expected: &str, action: impl FnOnce()) {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
+            .expect_err("operation must reject the invalid contract");
+        let message = if let Some(message) = panic.downcast_ref::<String>() {
+            message.as_str()
+        } else if let Some(message) = panic.downcast_ref::<&str>() {
+            message
+        } else {
+            "<non-string panic>"
+        };
+        assert!(
+            message.contains(expected),
+            "panic `{message}` did not contain expected reason `{expected}`"
+        );
+    }
+
     #[test]
     fn persistent_buffer_transaction_owns_staging_and_rejects_stale_ids() {
         let wgpu = pollster::block_on(WgpuContext::new_headless(
@@ -4758,19 +4774,9 @@ mod tests {
             .is_err(),
             "a released attempt ID must not alias a reused group index"
         );
-    }
 
-    #[test]
-    #[should_panic(expected = "staged more than one upload")]
-    fn persistent_buffer_transaction_rejects_duplicate_staging() {
-        let wgpu = pollster::block_on(WgpuContext::new_headless(
-            &RendererInitConfig::default(),
-            &RendererSettings::default(),
-            8,
-            8,
-            None,
-        ))
-        .expect("headless GPU context required");
+        // Duplicate staging is part of the same attempt-ownership contract;
+        // keep its precise failure reason alongside the stale-ID matrix.
         let attempt = allocate_persistent_buffer_attempt_identity();
         let id = PersistentBufferCommitGroupId { attempt, index: 0 };
         let mut groups = vec![empty_persistent_buffer_commit_group(attempt)];
@@ -4786,9 +4792,11 @@ mod tests {
             usage: wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let mut preparer = PersistentBufferUploadPreparer::new(&mut groups);
-        preparer.stage_buffer(id, first, PersistentBufferWriteCoverage::Full);
-        preparer.stage_buffer(id, duplicate, PersistentBufferWriteCoverage::Full);
+        assert_panics_with("staged more than one upload", || {
+            let mut preparer = PersistentBufferUploadPreparer::new(&mut groups);
+            preparer.stage_buffer(id, first, PersistentBufferWriteCoverage::Full);
+            preparer.stage_buffer(id, duplicate, PersistentBufferWriteCoverage::Full);
+        });
     }
 
     #[test]
@@ -5410,181 +5418,199 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "resource index is not registered in this graph")]
-    fn gpu_indirect_candidate_metadata_rejects_an_unregistered_resource_index() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let visible = graph.register_buffer(
-            "Submission_Visible",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let arguments = graph.register_buffer(
-            "Submission_Arguments",
-            BufferDesc::new(
-                64,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST,
-            ),
-            false,
+    fn gpu_indirect_descriptor_validation_reports_precise_failures() {
+        assert_panics_with("resource index is not registered in this graph", || {
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let visible = graph.register_buffer(
+                "Submission_Visible",
+                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                false,
+            );
+            let arguments = graph.register_buffer(
+                "Submission_Arguments",
+                BufferDesc::new(
+                    64,
+                    wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                ),
+                false,
+            );
+            graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+                SceneSubmissionKey::Opaque,
+                BufferNodeId::new(99, 0),
+                visible,
+                arguments,
+            ));
+        });
+
+        assert_panics_with(
+            "GPU-indirect instance-table resource 'Not_A_Buffer' is not a buffer",
+            || {
+                let mut storage = GraphStorage::new();
+                let arena = FrameArena::new();
+                let mut graph = begin_test_frame(&mut storage, &arena);
+                let texture = graph.register_texture("Not_A_Buffer", dummy_desc(), false);
+                let visible = graph.register_buffer(
+                    "Submission_Visible",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                    false,
+                );
+                let arguments = graph.register_buffer(
+                    "Submission_Arguments",
+                    BufferDesc::new(
+                        64,
+                        wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::INDIRECT
+                            | wgpu::BufferUsages::COPY_DST,
+                    ),
+                    false,
+                );
+                graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+                    SceneSubmissionKey::Opaque,
+                    BufferNodeId::new(texture.index(), texture.version()),
+                    visible,
+                    arguments,
+                ));
+            },
         );
 
-        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            BufferNodeId::new(99, 0),
-            visible,
-            arguments,
-        ));
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "GPU-indirect instance-table resource 'Not_A_Buffer' is not a buffer"
-    )]
-    fn gpu_indirect_descriptor_rejects_a_forged_buffer_class() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.register_texture("Not_A_Buffer", dummy_desc(), false);
-        let visible = graph.register_buffer(
-            "Submission_Visible",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let arguments = graph.register_buffer(
-            "Submission_Arguments",
-            BufferDesc::new(
-                64,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST,
-            ),
-            false,
-        );
-
-        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            BufferNodeId::new(texture.index(), texture.version()),
-            visible,
-            arguments,
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "GPU-indirect argument buffer must include INDIRECT usage")]
-    fn gpu_indirect_argument_buffer_requires_indirect_usage() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let candidate = graph.register_buffer(
-            "Submission_Candidate",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let visible = graph.register_buffer(
-            "Submission_Visible",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let arguments = graph.register_buffer(
-            "Submission_Arguments",
-            BufferDesc::new(
+        for (size, usage, expected) in [
+            (
                 GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
                 wgpu::BufferUsages::STORAGE,
+                "GPU-indirect argument buffer must include INDIRECT usage",
             ),
-            false,
-        );
-
-        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            candidate,
-            visible,
-            arguments,
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "must hold the complete indexed indirect argument window")]
-    fn gpu_indirect_argument_buffer_rejects_an_undersized_record() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let candidate = graph.register_buffer(
-            "Submission_Candidate",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let visible = graph.register_buffer(
-            "Submission_Visible",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let arguments = graph.register_buffer(
-            "Submission_Arguments",
-            BufferDesc::new(
+            (
                 GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE - 1,
                 wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::INDIRECT
                     | wgpu::BufferUsages::COPY_DST,
+                "must hold the complete indexed indirect argument window",
             ),
-            false,
-        );
-
-        graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            candidate,
-            visible,
-            arguments,
-        ));
+        ] {
+            assert_panics_with(expected, || {
+                let mut storage = GraphStorage::new();
+                let arena = FrameArena::new();
+                let mut graph = begin_test_frame(&mut storage, &arena);
+                let candidate = graph.register_buffer(
+                    "Submission_Candidate",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                    false,
+                );
+                let visible = graph.register_buffer(
+                    "Submission_Visible",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                    false,
+                );
+                let arguments = graph.register_buffer(
+                    "Submission_Arguments",
+                    BufferDesc::new(size, usage),
+                    false,
+                );
+                graph.reserve_gpu_indirect_scene_submission(GpuIndirectPlanDescriptor::new(
+                    SceneSubmissionKey::Opaque,
+                    candidate,
+                    visible,
+                    arguments,
+                ));
+            });
+        }
     }
 
     #[test]
-    #[should_panic(expected = "must hold the complete indexed indirect argument window")]
-    fn gpu_multi_bin_reservation_rejects_a_later_batch_out_of_bounds_during_build() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let table = graph.register_buffer(
-            "Multi_Instance_Table",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let active = graph.register_buffer(
-            "Multi_Active_Batches",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let visible = graph.register_buffer(
-            "Multi_Visible",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        // The first 20-byte record fits; the second record's final byte does
-        // not. Reservation must reject the complete window before DPE.
-        let arguments = graph.register_buffer(
-            "Multi_Arguments",
-            BufferDesc::new(
-                2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE - 1,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST,
-            ),
-            false,
+    fn gpu_multi_bin_reservations_reject_invalid_windows_precisely() {
+        assert_panics_with(
+            "must hold the complete indexed indirect argument window",
+            || {
+                let mut storage = GraphStorage::new();
+                let arena = FrameArena::new();
+                let mut graph = begin_test_frame(&mut storage, &arena);
+                let table = graph.register_buffer(
+                    "Multi_Instance_Table",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                    false,
+                );
+                let active = graph.register_buffer(
+                    "Multi_Active_Batches",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                    false,
+                );
+                let visible = graph.register_buffer(
+                    "Multi_Visible",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                    false,
+                );
+                // The first record fits; the second record's final byte does not.
+                let arguments = graph.register_buffer(
+                    "Multi_Arguments",
+                    BufferDesc::new(
+                        2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE - 1,
+                        wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::INDIRECT
+                            | wgpu::BufferUsages::COPY_DST,
+                    ),
+                    false,
+                );
+                graph.reserve_gpu_scene_multi_bin_submission(
+                    SceneSubmissionKey::Opaque,
+                    FrameSourceId::from_index(0),
+                    table,
+                    active,
+                    visible,
+                    arguments,
+                    0,
+                    0,
+                    2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                );
+            },
         );
 
-        graph.reserve_gpu_scene_multi_bin_submission(
-            SceneSubmissionKey::Opaque,
-            FrameSourceId::from_index(0),
-            table,
-            active,
-            visible,
-            arguments,
-            0,
-            0,
-            2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-        );
+        assert_panics_with("conflicting descriptor", || {
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let table = graph.register_buffer(
+                "Conflict_Table",
+                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                false,
+            );
+            let visible = graph.register_buffer(
+                "Conflict_Visible",
+                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                false,
+            );
+            let arguments = graph.register_buffer(
+                "Conflict_Arguments",
+                BufferDesc::new(
+                    64,
+                    wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::COPY_DST,
+                ),
+                false,
+            );
+            let reserve = |graph: &mut RenderGraph<'_>, span| {
+                graph.reserve_gpu_scene_multi_bin_submission(
+                    SceneSubmissionKey::Opaque,
+                    FrameSourceId::from_index(0),
+                    table,
+                    table,
+                    visible,
+                    arguments,
+                    0,
+                    0,
+                    span,
+                )
+            };
+            reserve(&mut graph, GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE);
+            reserve(
+                &mut graph,
+                2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+            );
+        });
     }
 
     #[test]
@@ -5649,53 +5675,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "conflicting descriptor")]
-    fn duplicate_multi_bin_semantic_reservation_rejects_a_conflicting_window() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let table = graph.register_buffer(
-            "Conflict_Table",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let visible = graph.register_buffer(
-            "Conflict_Visible",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let arguments = graph.register_buffer(
-            "Conflict_Arguments",
-            BufferDesc::new(
-                64,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST,
-            ),
-            false,
-        );
-        let reserve = |graph: &mut RenderGraph<'_>, span| {
-            graph.reserve_gpu_scene_multi_bin_submission(
-                SceneSubmissionKey::Opaque,
-                FrameSourceId::from_index(0),
-                table,
-                table,
-                visible,
-                arguments,
-                0,
-                0,
-                span,
-            )
-        };
-
-        reserve(&mut graph, GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE);
-        reserve(
-            &mut graph,
-            2 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-        );
-    }
-
-    #[test]
     fn all_dead_scene_submission_demand_does_not_root_or_mark_backends_live() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
@@ -5745,164 +5724,105 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_submission_is_one_dpe_unit_and_dead_work_roots_neither_backend() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.add_pass("Dead_Hybrid_Texture", |builder| {
-            let texture = builder.create_texture("Dead_Hybrid_Texture_Out", dummy_desc());
-            (MockExec, texture)
-        });
-        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
-        let instances = graph.add_pass("Dead_Hybrid_Instances", |builder| {
-            let buffer = builder.create_buffer(
-                "Dead_Hybrid_Instance_Buffer",
-                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            );
-            (MockExec, buffer)
-        });
-        let (visible, arguments) = graph.add_pass("Dead_Hybrid_Cull", |builder| {
-            builder.read_buffer(instances);
-            let visible = builder.create_buffer(
-                "Dead_Hybrid_Visible",
-                BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            );
-            let arguments = builder.create_buffer(
-                "Dead_Hybrid_Arguments",
-                BufferDesc::new(
-                    GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-                    wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::INDIRECT
-                        | wgpu::BufferUsages::COPY_DST,
-                ),
-            );
-            (MockExec, (visible, arguments))
-        });
-        let hybrid = graph.reserve_hybrid_gpu_scene_multi_bin_submission(
-            SceneSubmissionKey::Opaque,
-            FrameSourceId::from_index(0),
-            instances,
-            instances,
-            visible,
-            arguments,
-            0,
-            0,
-            GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-        );
-        graph.add_pass("Dead_Hybrid_Consumer", |builder| {
-            builder.demand_scene_submission(hybrid);
-            (MockExec, ())
-        });
-
-        graph.compile_topology();
-
-        assert!(graph.storage.execution_queue.is_empty());
-        assert!(!graph.storage.scene_submissions.is_live(hybrid));
-        assert!(!graph.storage.scene_submissions.has_live_gpu_plan());
-        assert!(
-            graph
-                .storage
-                .scene_submissions
-                .live_cpu_direct_plans()
-                .next()
-                .is_none()
-        );
-        assert!(
-            graph
-                .storage
-                .scene_submissions
-                .live_gpu_indirect_plans()
-                .next()
-                .is_none()
-        );
-        let counts = graph.storage.scene_submissions.backend_counts();
-        assert_eq!(counts.reserved_hybrid, 1);
-        assert_eq!(counts.live_hybrid, 0);
-        assert_eq!(graph.storage.draw_plans.live_keys().count(), 0);
-    }
-
-    #[test]
-    fn live_hybrid_submission_unions_dependencies_and_projects_both_backends() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.register_texture("Hybrid_Texture", dummy_desc(), false);
-        graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
-        let instances = graph.register_buffer(
-            "Hybrid_Instances",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let visible = graph.register_buffer(
-            "Hybrid_Visible",
-            BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
-            false,
-        );
-        let arguments = graph.register_buffer(
-            "Hybrid_Arguments",
-            BufferDesc::new(
+    fn hybrid_submission_projects_both_backends_only_when_dpe_live() {
+        for live in [false, true] {
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let texture = graph.add_pass("Hybrid_Texture", |builder| {
+                let texture = builder.create_texture("Hybrid_Texture_Out", dummy_desc());
+                (MockExec, texture)
+            });
+            graph.set_scene_submission_texture_dependencies(SceneSubmissionKey::Opaque, [texture]);
+            let instances = graph.add_pass("Hybrid_Instances", |builder| {
+                let buffer = builder.create_buffer(
+                    "Hybrid_Instance_Buffer",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                );
+                (MockExec, buffer)
+            });
+            let (visible, arguments) = graph.add_pass("Hybrid_Cull", |builder| {
+                builder.read_buffer(instances);
+                let visible = builder.create_buffer(
+                    "Hybrid_Visible",
+                    BufferDesc::new(64, wgpu::BufferUsages::STORAGE),
+                );
+                let arguments = builder.create_buffer(
+                    "Hybrid_Arguments",
+                    BufferDesc::new(
+                        GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                        wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::INDIRECT
+                            | wgpu::BufferUsages::COPY_DST,
+                    ),
+                );
+                (MockExec, (visible, arguments))
+            });
+            let hybrid = graph.reserve_hybrid_gpu_scene_multi_bin_submission(
+                SceneSubmissionKey::Opaque,
+                FrameSourceId::from_index(0),
+                instances,
+                instances,
+                visible,
+                arguments,
+                0,
+                0,
                 GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST,
-            ),
-            false,
-        );
-        let hybrid = graph.reserve_hybrid_gpu_scene_multi_bin_submission(
-            SceneSubmissionKey::Opaque,
-            FrameSourceId::from_index(0),
-            instances,
-            instances,
-            visible,
-            arguments,
-            0,
-            0,
-            GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-        );
-        let consumer = graph.storage.passes.len();
-        graph.add_pass("Live_Hybrid_Consumer", |builder| {
-            builder.demand_scene_submission(hybrid);
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
+            );
+            let consumer = graph.storage.passes.len();
+            graph.add_pass("Hybrid_Consumer", |builder| {
+                builder.demand_scene_submission(hybrid);
+                if live {
+                    builder.mark_side_effect();
+                }
+                (MockExec, ())
+            });
 
-        assert_eq!(
-            graph.storage.pass_reads(consumer),
-            &[
-                instances.erase(),
-                visible.erase(),
-                arguments.erase(),
-                texture.erase(),
-            ]
-        );
-        graph.compile_topology();
+            assert_eq!(
+                graph.storage.pass_reads(consumer),
+                &[
+                    instances.erase(),
+                    visible.erase(),
+                    arguments.erase(),
+                    texture.erase(),
+                ],
+                "hybrid dependencies must be the same DPE unit for live={live}"
+            );
+            graph.compile_topology();
 
-        assert!(graph.storage.scene_submissions.is_live(hybrid));
-        assert!(graph.storage.scene_submissions.has_live_gpu_plan());
-        assert_eq!(
-            graph
-                .storage
-                .scene_submissions
-                .live_cpu_direct_plans()
-                .count(),
-            1
-        );
-        assert_eq!(
-            graph
-                .storage
-                .scene_submissions
-                .live_gpu_indirect_plans()
-                .count(),
-            1
-        );
-        assert_eq!(
-            graph.storage.draw_plans.live_keys().collect::<Vec<_>>(),
-            vec![DrawPlanKey::Opaque]
-        );
-        let counts = graph.storage.scene_submissions.backend_counts();
-        assert_eq!(counts.live_hybrid, 1);
-        assert_eq!(counts.live_cpu_direct, 0);
-        assert_eq!(counts.live_gpu_indirect, 0);
+            assert_eq!(graph.storage.scene_submissions.is_live(hybrid), live);
+            assert_eq!(graph.storage.scene_submissions.has_live_gpu_plan(), live);
+            assert_eq!(
+                graph
+                    .storage
+                    .scene_submissions
+                    .live_cpu_direct_plans()
+                    .count(),
+                usize::from(live)
+            );
+            assert_eq!(
+                graph
+                    .storage
+                    .scene_submissions
+                    .live_gpu_indirect_plans()
+                    .count(),
+                usize::from(live)
+            );
+            assert_eq!(
+                graph.storage.draw_plans.live_keys().collect::<Vec<_>>(),
+                if live {
+                    vec![DrawPlanKey::Opaque]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert_eq!(graph.storage.execution_queue.is_empty(), !live);
+            let counts = graph.storage.scene_submissions.backend_counts();
+            assert_eq!(counts.reserved_hybrid, 1);
+            assert_eq!(counts.live_hybrid, u32::from(live));
+            assert_eq!(counts.live_cpu_direct, 0);
+            assert_eq!(counts.live_gpu_indirect, 0);
+        }
     }
 
     #[test]
@@ -7855,53 +7775,91 @@ mod tests {
     }
 
     #[test]
-    fn pure_forwarding_does_not_contract_a_persistent_buffer_source() {
+    fn pure_forwarding_preserves_persistent_buffer_endpoints() {
         use crate::graph::core::persistent_buffer::PersistentBufferSpec;
 
-        let desc = BufferDesc::new(
-            256,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        );
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let plan = registry
-            .plan_buffer(id, 1, 1, PersistentBufferSpec::new(desc, 1, 16))
-            .unwrap();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let persistent = graph.import_persistent_buffer("Persistent_Source", plan);
-        let output = graph.register_buffer("Buffer_Output", desc, true);
+        for persistent_is_source in [true, false] {
+            let desc = BufferDesc::new(
+                256,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let mut registry = PersistentBufferRegistry::new();
+            let id = registry.create_buffer();
+            let plan = registry
+                .plan_buffer(
+                    id,
+                    1,
+                    1,
+                    PersistentBufferSpec::new(desc, if persistent_is_source { 1 } else { 2 }, 16),
+                )
+                .unwrap();
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let persistent = graph.import_persistent_buffer("Persistent", plan);
 
-        graph.add_pass("Persistent_Patch", |builder| {
-            builder.write_buffer(persistent);
-            (MockExec, ())
-        });
-        graph.add_pass("Persistent_Forward", |builder| {
-            builder.read_buffer(persistent);
-            builder.write_buffer(output);
-            builder.mark_pure_forwarding();
-            (MockExec, ())
-        });
-        graph.register_persistent_buffer_commit_group(&[(
-            plan.commit
-                .expect("new persistent Buffer needs publication"),
-            persistent,
-        )]);
-        graph.compile_topology();
+            let transient = if persistent_is_source {
+                graph.register_buffer("Buffer_Output", desc, true)
+            } else {
+                graph.add_pass("Transient_Producer", |builder| {
+                    let source = builder.create_buffer("Transient_Source", desc);
+                    (MockExec, source)
+                })
+            };
+            if persistent_is_source {
+                graph.add_pass("Persistent_Patch", |builder| {
+                    builder.write_buffer(persistent);
+                    (MockExec, ())
+                });
+                graph.add_pass("Persistent_Forward", |builder| {
+                    builder.read_buffer(persistent);
+                    builder.write_buffer(transient);
+                    builder.mark_pure_forwarding();
+                    (MockExec, ())
+                });
+            } else {
+                graph.add_pass("Persistent_Copy", |builder| {
+                    builder.read_buffer(transient);
+                    builder.write_buffer(persistent);
+                    builder.mark_pure_forwarding();
+                    builder.mark_side_effect();
+                    (MockExec, ())
+                });
+            }
+            graph.register_persistent_buffer_commit_group(&[(
+                plan.commit
+                    .expect("new persistent Buffer needs publication"),
+                persistent,
+            )]);
+            graph.compile_topology();
 
-        let names: Vec<_> = graph
-            .storage
-            .execution_queue
-            .iter()
-            .map(|&index| graph.storage.passes[index].name)
-            .collect();
-        assert_eq!(names, ["Persistent_Patch", "Persistent_Forward"]);
-        assert!(
-            graph.storage.resources[persistent.index() as usize]
-                .alias_of
-                .is_none()
-        );
+            let names: Vec<_> = graph
+                .storage
+                .execution_queue
+                .iter()
+                .map(|&index| graph.storage.passes[index].name)
+                .collect();
+            assert_eq!(
+                names,
+                if persistent_is_source {
+                    vec!["Persistent_Patch", "Persistent_Forward"]
+                } else {
+                    vec!["Transient_Producer", "Persistent_Copy"]
+                }
+            );
+            assert!(
+                graph.storage.resources[persistent.index() as usize]
+                    .alias_of
+                    .is_none()
+            );
+            if !persistent_is_source {
+                assert!(
+                    graph.storage.resources[transient.index() as usize]
+                        .alias_of
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]
@@ -7969,60 +7927,6 @@ mod tests {
         assert!(
             !registry.is_published(publication),
             "a submitted graph must not publish a DPE-dead commit group"
-        );
-    }
-
-    #[test]
-    fn pure_forwarding_does_not_contract_a_persistent_buffer_destination() {
-        use crate::graph::core::persistent_buffer::PersistentBufferSpec;
-
-        let desc = BufferDesc::new(
-            256,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        );
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let plan = registry
-            .plan_buffer(id, 1, 1, PersistentBufferSpec::new(desc, 2, 16))
-            .unwrap();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let persistent = graph.import_persistent_buffer("Persistent_Destination", plan);
-        let source = graph.add_pass("Transient_Producer", |builder| {
-            let source = builder.create_buffer("Transient_Source", desc);
-            (MockExec, source)
-        });
-        graph.add_pass("Persistent_Copy", |builder| {
-            builder.read_buffer(source);
-            builder.write_buffer(persistent);
-            builder.mark_pure_forwarding();
-            builder.mark_side_effect();
-            (MockExec, ())
-        });
-        graph.register_persistent_buffer_commit_group(&[(
-            plan.commit
-                .expect("new persistent Buffer needs publication"),
-            persistent,
-        )]);
-        graph.compile_topology();
-
-        let names: Vec<_> = graph
-            .storage
-            .execution_queue
-            .iter()
-            .map(|&index| graph.storage.passes[index].name)
-            .collect();
-        assert_eq!(names, ["Transient_Producer", "Persistent_Copy"]);
-        assert!(
-            graph.storage.resources[source.index() as usize]
-                .alias_of
-                .is_none()
-        );
-        assert!(
-            graph.storage.resources[persistent.index() as usize]
-                .alias_of
-                .is_none()
         );
     }
 

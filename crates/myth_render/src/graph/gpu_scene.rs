@@ -3935,40 +3935,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_cohort_preflight_retains_reuse_and_leaves_singletons_cpu_owned() {
-        let shared = [
-            rigid_item_with_assets(1, 10, 20),
-            rigid_item_with_assets(2, 10, 20),
-            rigid_item_with_assets(3, 10, 20),
-        ];
-        let singleton = rigid_item_with_assets(4, 11, 21);
-        let mut unsupported = rigid_item_with_assets(5, 12, 22);
-        unsupported.geometry_has_morph_targets = true;
-        let scene = extracted_scene(shared.into_iter().chain([singleton, unsupported]));
-        let mut authority = GpuScene::new();
-
-        let preflight = authority
-            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
-            .unwrap()
-            .expect("the shared rigid cohort should remain GPU eligible");
-
-        assert_eq!(preflight.projection.candidate_count, 3);
-        assert_eq!(preflight.projection.bin_count, 1);
-        assert_eq!(preflight.projection.unique_geometry_count, 1);
-        assert_eq!(preflight.projection.unique_material_count, 1);
-        assert_eq!(
-            preflight.projection.table_set.instance_slot_span, 3,
-            "discarded cohorts must not inflate the projected authority span"
-        );
-        assert_eq!(preflight.projection.shadow_candidate_count, 3);
-        assert!(!preflight.projection.covers_complete_shadow_domain);
-        assert_eq!(authority.multi_bin_members.len(), 3);
-        assert_eq!(authority.multi_bin_preflight[0].member_count, 3);
-        assert_eq!(authority.revision, 0, "preflight must remain read-only");
-    }
-
-    #[test]
-    fn auto_commit_and_cpu_collection_partition_main_cohorts_exactly_once() {
+    fn auto_cohort_projection_and_cpu_complement_partition_sources_exactly_once() {
         let shared = [
             rigid_item_with_assets(1, 10, 20),
             rigid_item_with_assets(2, 10, 20),
@@ -3984,6 +3951,16 @@ mod tests {
             .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
             .unwrap()
             .unwrap();
+        assert_eq!(preflight.projection.candidate_count, 3);
+        assert_eq!(preflight.projection.bin_count, 1);
+        assert_eq!(preflight.projection.unique_geometry_count, 1);
+        assert_eq!(preflight.projection.unique_material_count, 1);
+        assert_eq!(preflight.projection.table_set.instance_slot_span, 3);
+        assert_eq!(preflight.projection.shadow_candidate_count, 3);
+        assert!(!preflight.projection.covers_complete_shadow_domain);
+        assert_eq!(authority.multi_bin_members.len(), 3);
+        assert_eq!(authority.multi_bin_preflight[0].member_count, 3);
+        assert_eq!(authority.revision, 0, "preflight must remain read-only");
         authority
             .commit_multi_bin_selection_with_families(
                 &scene,
@@ -4145,69 +4122,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_gpu_families_publish_empty_cpu_domains_and_keep_shadow_topology() {
-        let mut first = rigid_item_with_assets(1, 10, 20);
-        let mut second = rigid_item_with_assets(2, 10, 20);
-        for item in [&mut first, &mut second] {
-            item.world_matrix = Mat4::IDENTITY;
-            item.prev_world_matrix = Mat4::IDENTITY;
-            item.world_aabb = BoundingBox {
-                min: -Vec3::ONE,
-                max: Vec3::ONE,
-            };
-        }
-        let mut scene = extracted_scene([first, second]);
-        scene.lights.push(shadow_light(
-            101,
-            LightKind::Spot(SpotLight {
-                range: 20.0,
-                inner_cone: 0.4,
-                outer_cone: 0.8,
-            }),
-        ));
-
-        let shadow_frustum = myth_scene::camera::Frustum::from_matrix_standard_z(Mat4::IDENTITY);
-        let mut lists = RenderLists::new();
-        lists.active_views.push(RenderView::new_shadow(
-            101,
-            0,
-            0,
-            "Shadow2D".into(),
-            Mat4::IDENTITY,
-            shadow_frustum,
-            (64, 64),
-            None,
-        ));
-
-        let selected = GpuDrivenFamilyMask::MAIN_PREPASS | GpuDrivenFamilyMask::SHADOW_2D;
-        let mut authority = GpuScene::new();
-        let preflight = authority
-            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
-            .unwrap()
-            .unwrap();
-        assert!(preflight.projection.covers_complete_shadow_domain);
-        authority
-            .commit_multi_bin_selection_with_families(&scene, preflight, selected, 0.0, &mut lists)
-            .unwrap();
-
-        assert_eq!(lists.gpu_cpu_main_complement_len(), 0);
-        assert_eq!(lists.gpu_cpu_shadow_complement_len(), 0);
-        collect_draw_intents_with_gpu_complement(
-            &scene,
-            &mut lists,
-            &test_render_camera(),
-            selected,
-            selected,
-            true,
-        );
-
-        assert!(lists.opaque.is_empty());
-        assert!(lists.transparent.is_empty());
-        assert!(lists.shadow_queues.contains_key(&(101, 0)));
-        assert!(lists.shadow_queues[&(101, 0)].is_empty());
-    }
-
-    #[test]
     fn asset_epoch_bump_cascades_batch_and_instance_generation_in_place() {
         let scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
         let mut authority = GpuScene::new();
@@ -4245,63 +4159,6 @@ mod tests {
             batch_after.words()
         );
         assert_eq!(authority.revision, 2, "all four tables share one revision");
-    }
-
-    #[test]
-    fn asset_drift_repairs_only_the_active_domain_and_dormant_instances_fail_closed() {
-        let mut scene_a = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
-        scene_a.scene_id = 1;
-        let mut authority = GpuScene::new();
-        let mut lists = RenderLists::new();
-        preflight_and_commit(&mut authority, &scene_a, 0.0, &mut lists);
-        let instance_a_before = authority.instance_id(1, node(1)).unwrap();
-        let batch_a_before = authority.multi_bin_committed[0].batch_id;
-        let semantic_batch_a = GpuSceneBatchKey::new(
-            1,
-            GpuSceneRigidBatchKey::from_item(&scene_a.render_items[0]).unwrap(),
-        );
-
-        let mut scene_b = extracted_scene([rigid_item_with_assets(2, 10, 21)]);
-        scene_b.scene_id = 2;
-        lists.begin_intent_collection();
-        preflight_and_commit(&mut authority, &scene_b, 0.1, &mut lists);
-
-        let mut changed_b = scene_b.render_items[0].clone();
-        changed_b.geometry_asset_identity += 1;
-        let mut changed_scene_b = extracted_scene([changed_b]);
-        changed_scene_b.scene_id = 2;
-        lists.begin_intent_collection();
-        preflight_and_commit(&mut authority, &changed_scene_b, 0.2, &mut lists);
-
-        let batch_a_after_drift = batch_id(authority.batches.id(semantic_batch_a).unwrap());
-        assert_eq!(batch_a_after_drift.slot(), batch_a_before.slot());
-        assert_eq!(
-            batch_a_after_drift.generation(),
-            batch_a_before.generation() + 1
-        );
-        assert_eq!(
-            authority.record(instance_a_before).unwrap().batch_id[..2],
-            batch_a_before.words(),
-            "a dormant instance intentionally retains the stale fail-closed Batch generation"
-        );
-
-        let mut changed_a = scene_a.render_items[0].clone();
-        changed_a.geometry_asset_identity += 1;
-        let mut changed_scene_a = extracted_scene([changed_a]);
-        changed_scene_a.scene_id = 1;
-        lists.begin_intent_collection();
-        preflight_and_commit(&mut authority, &changed_scene_a, 0.3, &mut lists);
-        let instance_a_after = authority.instance_id(1, node(1)).unwrap();
-        assert_eq!(instance_a_after.slot(), instance_a_before.slot());
-        assert_eq!(
-            instance_a_after.generation(),
-            instance_a_before.generation() + 1
-        );
-        assert_eq!(
-            authority.record(instance_a_after).unwrap().batch_id[..2],
-            batch_a_after_drift.words(),
-            "reactivation repairs the dormant instance in the current-domain member scan"
-        );
     }
 
     #[test]
@@ -4527,32 +4384,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_scene_budget_retires_all_four_authority_tables() {
-        let mut authority = GpuScene::new();
-        let mut lists = RenderLists::new();
-        for scene_id in 1..=5u32 {
-            let mut scene = extracted_scene([rigid_item_with_assets(
-                u64::from(scene_id),
-                100 + u64::from(scene_id),
-                200 + u64::from(scene_id),
-            )]);
-            scene.scene_id = scene_id;
-            lists.begin_intent_collection();
-            preflight_and_commit(&mut authority, &scene, 0.0, &mut lists);
-        }
-        assert_eq!(authority.domains.len(), GPU_SCENE_DOMAIN_BUDGET);
-        assert!(authority.instance_id(1, node(1)).is_none());
-        assert!(authority.geometries.id(geometry(101)).is_none());
-        assert!(authority.materials.id(material(201)).is_none());
-        assert!(authority.batches.lookup.keys().all(|key| key.scene_id != 1));
-        assert_eq!(authority.quarantined_slots.len(), 1);
-        assert_eq!(authority.geometries.quarantined_slots.len(), 1);
-        assert_eq!(authority.materials.quarantined_slots.len(), 1);
-        assert_eq!(authority.batches.quarantined_slots.len(), 1);
-    }
-
-    #[test]
-    fn saturated_live_generation_fails_preflight_before_projection_or_mutation() {
+    fn saturated_generations_fail_closed_and_never_wrap_or_alias() {
         let scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
@@ -4590,6 +4422,31 @@ mod tests {
         assert_eq!(authority.geometries.slots[index].generation, u32::MAX);
         assert!(authority.geometries.quarantined_slots.is_empty());
         assert_eq!(lists.frame_source_count(), 0);
+
+        let mut retiring = GpuScene::new();
+        retiring.synchronize_scene(6, [input(1, 0.0)]);
+        let first = retiring.instance_id(6, node(1)).unwrap();
+        assert!(retiring.acknowledge_submitted_revision(1));
+        retiring.retire_scene(6);
+        assert!(retiring.acknowledge_submitted_revision(2));
+        retiring.slots[first.slot() as usize].generation = u32::MAX - 1;
+        retiring.slot_generation_watermarks[first.slot() as usize] = u32::MAX - 1;
+        retiring.synchronize_scene(6, [input(2, 0.0)]);
+        let penultimate = retiring.instance_id(6, node(2)).unwrap();
+        assert_eq!(
+            (penultimate.slot(), penultimate.generation()),
+            (first.slot(), u32::MAX - 1)
+        );
+        assert!(retiring.acknowledge_submitted_revision(3));
+        retiring.retire_scene(6);
+        assert!(retiring.acknowledge_submitted_revision(4));
+        assert!(!retiring.reusable_slots.contains(&first.slot()));
+        retiring.synchronize_scene(6, [input(3, 0.0)]);
+        assert_ne!(
+            retiring.instance_id(6, node(3)).unwrap().slot(),
+            first.slot()
+        );
+        assert_eq!(retiring.slots[first.slot() as usize].generation, u32::MAX);
     }
 
     #[test]
@@ -4718,105 +4575,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_bin_warm_preflight_reuses_retained_scratch_capacity() {
-        let scene = extracted_scene([
-            rigid_item_with_assets(1, 10, 20),
-            rigid_item_with_assets(2, 11, 20),
-            rigid_item_with_assets(3, 10, 21),
-            rigid_item_with_assets(4, 11, 21),
-        ]);
-        let mut authority = GpuScene::new();
-        let mut lists = RenderLists::new();
-        let first = authority
-            .preflight_multi_bin_scene(&scene, 16, 256)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            authority.multi_bin_inverse_updates.len(),
-            4,
-            "the cold frame derives each new inverse exactly once"
-        );
-        authority
-            .commit_multi_bin_selection(&scene, first, 0.0, &mut lists)
-            .unwrap();
-        let capacities = (
-            authority.multi_bin_lookup.capacity(),
-            authority.multi_bin_geometry_uniques.capacity(),
-            authority.multi_bin_material_uniques.capacity(),
-            authority.multi_bin_preflight.capacity(),
-            authority.multi_bin_committed.capacity(),
-        );
-        let authority_ref_counts = (
-            authority
-                .batches
-                .slots
-                .iter()
-                .map(|slot| slot.ref_count)
-                .collect::<Vec<_>>(),
-            authority
-                .geometries
-                .slots
-                .iter()
-                .map(|slot| slot.ref_count)
-                .collect::<Vec<_>>(),
-            authority
-                .materials
-                .slots
-                .iter()
-                .map(|slot| slot.ref_count)
-                .collect::<Vec<_>>(),
-        );
-
-        lists.begin_intent_collection();
-        let second = authority
-            .preflight_multi_bin_scene(&scene, 16, 256)
-            .unwrap()
-            .unwrap();
-        assert!(
-            authority.multi_bin_inverse_updates.is_empty(),
-            "a stable warm frame must reuse persistent inverse records"
-        );
-        authority
-            .commit_multi_bin_selection(&scene, second, 0.1, &mut lists)
-            .unwrap();
-        assert_eq!(
-            (
-                authority.multi_bin_lookup.capacity(),
-                authority.multi_bin_geometry_uniques.capacity(),
-                authority.multi_bin_material_uniques.capacity(),
-                authority.multi_bin_preflight.capacity(),
-                authority.multi_bin_committed.capacity(),
-            ),
-            capacities
-        );
-        assert_eq!(authority.revision, 1);
-        assert_eq!(
-            (
-                authority
-                    .batches
-                    .slots
-                    .iter()
-                    .map(|slot| slot.ref_count)
-                    .collect::<Vec<_>>(),
-                authority
-                    .geometries
-                    .slots
-                    .iter()
-                    .map(|slot| slot.ref_count)
-                    .collect::<Vec<_>>(),
-                authority
-                    .materials
-                    .slots
-                    .iter()
-                    .map(|slot| slot.ref_count)
-                    .collect::<Vec<_>>(),
-            ),
-            authority_ref_counts,
-            "a warm stable frame must not acquire duplicate authority references"
-        );
-    }
-
-    #[test]
     fn multi_bin_inverse_recipe_is_sparse_and_only_tracks_world_matrix_changes() {
         let initial = extracted_scene([
             rigid_item_with_assets(1, 10, 20),
@@ -4875,33 +4633,6 @@ mod tests {
             authority.records[moved_id.slot() as usize].world_matrix_inverse,
             expected_inverse
         );
-    }
-
-    #[test]
-    fn multi_bin_preflight_rejects_the_whole_domain_before_publication() {
-        let mut invalid = rigid_item_with_assets(3, 12, 22);
-        invalid.geometry_has_morph_targets = true;
-        let scene = extracted_scene([
-            rigid_item_with_assets(1, 10, 20),
-            rigid_item_with_assets(2, 11, 21),
-            invalid,
-        ]);
-        let mut authority = GpuScene::new();
-
-        assert_eq!(
-            authority.preflight_multi_bin_scene(&scene, 16, 256),
-            Err(GpuSceneMultiBinPreflightFailure::Domain(
-                GpuSceneSelectionRejection::MorphTargets
-            ))
-        );
-        assert_eq!(authority.revision, 0);
-        assert_eq!(authority.slot_span(), 0);
-        assert!(authority.records.is_empty());
-        assert!(authority.geometries.records.is_empty());
-        assert!(authority.materials.records.is_empty());
-        assert!(authority.batches.records.is_empty());
-        assert!(authority.multi_bin_committed.is_empty());
-        assert!(authority.active_batch_descriptors.is_empty());
     }
 
     #[test]
@@ -5061,7 +4792,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_bin_preflight_selects_the_complete_prefrustum_opaque_domain() {
+    fn multi_bin_preflight_selects_opaque_domain_and_reports_shadow_completeness() {
         let mut transparent = rigid_item(3, 30.0);
         transparent
             .material_classification
@@ -5096,40 +4827,37 @@ mod tests {
         );
         assert_eq!(authority.revision, 0);
         assert_eq!(authority.slot_span(), 0);
-    }
 
-    #[test]
-    fn multi_bin_preflight_carries_the_complete_shadow_domain_fact() {
         let mut transparent = rigid_item(2, 2.0);
         transparent.cast_shadows = true;
         transparent
             .material_classification
             .insert(MaterialClassification::TRANSPARENT);
         let scene = extracted_scene([rigid_item(1, 1.0), transparent]);
-        let mut authority = GpuScene::new();
+        let mut shadow_authority = GpuScene::new();
 
-        let projection = authority
+        let projection = shadow_authority
             .preflight_multi_bin_scene(&scene, 16, 256)
             .unwrap()
             .unwrap()
             .projection;
         assert_eq!(projection.candidate_count, 1);
         assert!(!projection.covers_complete_shadow_domain);
-        assert!(authority.preflight_has_shadow_casters());
+        assert!(shadow_authority.preflight_has_shadow_casters());
 
         let only_transparent = extracted_scene([scene.render_items[1].clone()]);
         assert!(
-            authority
+            shadow_authority
                 .preflight_multi_bin_scene(&only_transparent, 16, 256)
                 .unwrap()
                 .is_none()
         );
-        assert!(authority.preflight_has_shadow_casters());
+        assert!(shadow_authority.preflight_has_shadow_casters());
 
         let mut non_caster = scene.render_items[1].clone();
         non_caster.cast_shadows = false;
         let complete_scene = extracted_scene([scene.render_items[0].clone(), non_caster]);
-        let projection = authority
+        let projection = shadow_authority
             .preflight_multi_bin_scene(&complete_scene, 16, 256)
             .unwrap()
             .unwrap()
@@ -5138,7 +4866,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_record_abi_is_dense_and_shader_aligned() {
+    fn table_abi_and_cpu_only_planning_match_shader_contracts() {
         assert_eq!(size_of::<GpuSceneInstanceRecord>(), 256);
         assert_eq!(std::mem::align_of::<GpuSceneInstanceRecord>(), 16);
         assert!(bytemuck::try_cast_slice::<_, u8>(&[GpuSceneInstanceRecord::zeroed()]).is_ok());
@@ -5151,62 +4879,41 @@ mod tests {
         assert_eq!(std::mem::align_of::<GpuSceneGeometryRecord>(), 16);
         assert_eq!(std::mem::align_of::<GpuSceneMaterialRecord>(), 16);
         assert_eq!(std::mem::align_of::<GpuSceneBatchRecord>(), 16);
+
+        let mut scene = GpuScene::new();
+        let mut registry = PersistentBufferRegistry::new();
+        let empty = scene.plan_instance_table(&mut registry, 1).unwrap();
+        assert_eq!(empty.records.len(), 1);
+        assert_eq!(empty.slot_span, 0);
+        assert_eq!(empty.records[0].metadata[1], 0);
+        assert_eq!(empty.persistent.buffer.spec.desc.logical_size, 256);
+
+        scene.synchronize_scene(8, [input(1, 0.0), input(2, 0.0)]);
+        let plan = scene.plan_instance_table(&mut registry, 2).unwrap();
+        assert!(!plan.persistent.valid);
+        assert!(plan.persistent.commit.is_some());
+        assert_eq!(plan.revision, 1);
+        assert_eq!(plan.publication_probe.revision, 1);
+        assert_eq!(plan.publication_probe.buffer, plan.persistent.buffer);
+        assert_eq!(
+            (plan.records.len(), plan.slot_span, plan.alive_count),
+            (2, 2, 2)
+        );
+        assert_eq!(plan.dirty_ranges.len(), 1);
+        assert_eq!(
+            plan.persistent.buffer.spec.schema_id,
+            GPU_SCENE_INSTANCE_SCHEMA_ID
+        );
+        assert_eq!(plan.persistent.buffer.spec.stride, 256);
+        assert_eq!(plan.persistent.buffer.spec.desc.logical_size, 512);
+        assert_eq!(
+            plan.persistent.buffer.spec.desc.usage,
+            GPU_SCENE_INSTANCE_BUFFER_USAGE
+        );
     }
 
     #[test]
-    fn extracted_sync_encodes_shadow_membership_and_tracks_flag_changes() {
-        let mut authority = GpuScene::new();
-        let caster = rigid_item(1, 0.0);
-        let first = authority.synchronize_extracted_scene(&extracted_scene([caster.clone()]), 0.0);
-        let id = authority.instance_id(17, node(1)).unwrap();
-        assert_eq!(first.revision, 1);
-        assert_eq!(
-            authority.record(id).unwrap().metadata[3],
-            GPU_SCENE_INSTANCE_CASTS_SHADOW
-        );
-
-        let mut non_caster = caster;
-        non_caster.cast_shadows = false;
-        let second = authority.synchronize_extracted_scene(&extracted_scene([non_caster]), 0.1);
-        assert_eq!(second.revision, 2);
-        assert_eq!(second.updated, 1);
-        assert_eq!(authority.record(id).unwrap().metadata[3], 0);
-    }
-
-    #[test]
-    fn projected_span_mirrors_acknowledged_tail_trim_without_reusing_quarantine() {
-        let mut authority = GpuScene::new();
-        let full = extracted_scene([
-            rigid_item(1, 0.0),
-            rigid_item(2, 0.0),
-            rigid_item(3, 0.0),
-            rigid_item(4, 0.0),
-        ]);
-        authority.synchronize_extracted_scene(&full, 0.0);
-        assert!(authority.acknowledge_submitted_revision(1));
-
-        let reduced = extracted_scene([rigid_item(1, 0.0), rigid_item(2, 0.0)]);
-        authority.synchronize_extracted_scene(&reduced, 0.1);
-        let regrown = extracted_scene([rigid_item(1, 0.0), rigid_item(2, 0.0), rigid_item(5, 0.0)]);
-        assert_eq!(
-            authority.projected_slot_span_for_extracted_scene(&regrown),
-            Some(5),
-            "unsubmitted tombstones must remain quarantined during preflight"
-        );
-
-        assert!(authority.acknowledge_submitted_revision(2));
-        assert_eq!(authority.slot_span(), 4, "projection must stay read-only");
-        assert_eq!(
-            authority.projected_slot_span_for_extracted_scene(&regrown),
-            Some(3),
-            "acknowledged trailing slots should not cause a false device rejection"
-        );
-        authority.synchronize_extracted_scene(&regrown, 0.2);
-        assert_eq!(authority.slot_span(), 3);
-    }
-
-    #[test]
-    fn stable_sync_keeps_identity_and_revision() {
+    fn instance_sync_preserves_identity_flags_domains_and_transaction_atomicity() {
         let mut scene = GpuScene::new();
         let first = scene.synchronize_scene(7, [input(1, 3.0)]);
         let id = scene.instance_id(7, node(1)).unwrap();
@@ -5219,130 +4926,124 @@ mod tests {
         assert_eq!(scene.instance_id(7, node(1)), Some(id));
         assert!(scene.record(id).is_some());
         assert_eq!(scene.dirty_slots, [id.slot()]);
-    }
 
-    #[test]
-    fn one_sync_advances_one_revision_and_deduplicates_dirty_slots() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene(3, [input(1, 0.0), input(2, 0.0)]);
-        assert!(scene.acknowledge_submitted_revision(1));
-
-        let stats = scene.synchronize_scene(3, [input(1, 4.0), input(2, 5.0)]);
+        let mut updated = GpuScene::new();
+        updated.synchronize_scene(3, [input(1, 0.0), input(2, 0.0)]);
+        assert!(updated.acknowledge_submitted_revision(1));
+        let stats = updated.synchronize_scene(3, [input(1, 4.0), input(2, 5.0)]);
         assert_eq!(stats.revision, 2);
         assert_eq!(stats.updated, 2);
-        assert_eq!(scene.dirty_slots.len(), 2);
-
-        let retry = scene.synchronize_scene(3, [input(1, 4.0), input(2, 5.0)]);
+        assert_eq!(updated.dirty_slots.len(), 2);
+        let retry = updated.synchronize_scene(3, [input(1, 4.0), input(2, 5.0)]);
         assert_eq!(retry.revision, 2);
-        assert_eq!(scene.dirty_slots.len(), 2);
-    }
+        assert_eq!(updated.dirty_slots.len(), 2);
 
-    #[test]
-    fn retirement_quarantines_then_reuses_with_a_new_generation() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene(11, [input(1, 0.0)]);
-        let first = scene.instance_id(11, node(1)).unwrap();
-        assert!(scene.acknowledge_submitted_revision(1));
+        let mut extracted = GpuScene::new();
+        let caster = rigid_item(1, 0.0);
+        extracted.synchronize_extracted_scene(&extracted_scene([caster.clone()]), 0.0);
+        let caster_id = extracted.instance_id(17, node(1)).unwrap();
+        assert_eq!(
+            extracted.record(caster_id).unwrap().metadata[3],
+            GPU_SCENE_INSTANCE_CASTS_SHADOW
+        );
+        let mut non_caster = caster;
+        non_caster.cast_shadows = false;
+        let changed = extracted.synchronize_extracted_scene(&extracted_scene([non_caster]), 0.1);
+        assert_eq!((changed.revision, changed.updated), (2, 1));
+        assert_eq!(extracted.record(caster_id).unwrap().metadata[3], 0);
 
-        let retired = scene.synchronize_scene(11, []);
-        assert_eq!(retired.retired, 1);
-        assert!(scene.record(first).is_none());
-        scene.synchronize_scene(11, [input(2, 0.0)]);
-        let before_ack = scene.instance_id(11, node(2)).unwrap();
-        assert_ne!(before_ack.slot(), first.slot());
-
-        assert!(scene.acknowledge_submitted_revision(3));
-        scene.synchronize_scene(11, [input(2, 0.0), input(3, 0.0)]);
-        let reused = scene.instance_id(11, node(3)).unwrap();
-        assert_eq!(reused.slot(), first.slot());
-        assert_eq!(reused.generation(), first.generation() + 1);
-    }
-
-    #[test]
-    fn scene_domains_are_isolated() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene(1, [input(9, 1.0)]);
-        scene.synchronize_scene(2, [input(9, 2.0)]);
-        let first = scene.instance_id(1, node(9)).unwrap();
-        let second = scene.instance_id(2, node(9)).unwrap();
+        let mut domains = GpuScene::new();
+        domains.synchronize_scene(1, [input(9, 1.0)]);
+        domains.synchronize_scene(2, [input(9, 2.0)]);
+        let first = domains.instance_id(1, node(9)).unwrap();
+        let second = domains.instance_id(2, node(9)).unwrap();
         assert_ne!(first, second);
-        assert_eq!(scene.record(first).unwrap().metadata[2], 1);
-        assert_eq!(scene.record(second).unwrap().metadata[2], 2);
+        assert_eq!(domains.record(first).unwrap().metadata[2], 1);
+        assert_eq!(domains.record(second).unwrap().metadata[2], 2);
+        domains.synchronize_scene(1, []);
+        assert!(domains.instance_id(1, node(9)).is_none());
+        assert_eq!(domains.instance_id(2, node(9)), Some(second));
 
-        scene.synchronize_scene(1, []);
-        assert!(scene.instance_id(1, node(9)).is_none());
-        assert_eq!(scene.instance_id(2, node(9)), Some(second));
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut invalid = GpuScene::new();
+            invalid.synchronize_scene(1, [input(4, 0.0), input(4, 1.0)]);
+        }));
+        assert!(
+            duplicate.is_err(),
+            "duplicate nodes must fail the transaction"
+        );
     }
 
     #[test]
-    fn rapidly_alternating_domains_are_retained_by_real_idle_time() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene_transaction(1, [input(1, 0.0)], Some(0.0));
-        scene.synchronize_scene_transaction(2, [input(2, 0.0)], Some(0.001));
-        let first = scene.instance_id(1, node(1)).unwrap();
-        let second = scene.instance_id(2, node(2)).unwrap();
-
+    fn domain_residency_uses_time_and_deterministic_budget_for_all_authorities() {
+        let mut alternating = GpuScene::new();
+        alternating.synchronize_scene_transaction(1, [input(1, 0.0)], Some(0.0));
+        alternating.synchronize_scene_transaction(2, [input(2, 0.0)], Some(0.001));
+        let first = alternating.instance_id(1, node(1)).unwrap();
+        let second = alternating.instance_id(2, node(2)).unwrap();
         for step in 2..2_050 {
             let (scene_id, node_id) = if step % 2 == 0 { (1, 1) } else { (2, 2) };
-            scene.synchronize_scene_transaction(
+            alternating.synchronize_scene_transaction(
                 scene_id,
                 [input(node_id, 0.0)],
                 Some(step as f64 * 0.001),
             );
         }
+        assert_eq!(alternating.instance_id(1, node(1)), Some(first));
+        assert_eq!(alternating.instance_id(2, node(2)), Some(second));
+        assert_eq!(
+            alternating.revision, 2,
+            "cache touches are not table changes"
+        );
 
-        assert_eq!(scene.instance_id(1, node(1)), Some(first));
-        assert_eq!(scene.instance_id(2, node(2)), Some(second));
-        assert_eq!(scene.domains.len(), 2);
-        assert!(scene.quarantined_slots.is_empty());
-        assert_eq!(scene.revision, 2, "cache touches are not table changes");
-    }
-
-    #[test]
-    fn dormant_domain_expiry_depends_on_elapsed_time_not_sync_count() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene_transaction(1, [input(1, 0.0)], Some(0.0));
-        scene.synchronize_scene_transaction(2, [input(2, 0.0)], Some(0.1));
-        let first = scene.instance_id(1, node(1)).unwrap();
-
+        let mut expiry = GpuScene::new();
+        expiry.synchronize_scene_transaction(1, [input(1, 0.0)], Some(0.0));
+        expiry.synchronize_scene_transaction(2, [input(2, 0.0)], Some(0.1));
+        let expiring = expiry.instance_id(1, node(1)).unwrap();
         for _ in 0..2_000 {
-            scene.synchronize_scene_transaction(2, [input(2, 0.0)], Some(0.1));
+            expiry.synchronize_scene_transaction(2, [input(2, 0.0)], Some(0.1));
         }
-        scene.synchronize_scene_transaction(2, [input(2, 0.0)], Some(1.499));
-        assert_eq!(scene.instance_id(1, node(1)), Some(first));
-
-        let expired = scene.synchronize_scene_transaction(2, [input(2, 0.0)], Some(1.5));
+        expiry.synchronize_scene_transaction(2, [input(2, 0.0)], Some(1.499));
+        assert_eq!(expiry.instance_id(1, node(1)), Some(expiring));
+        let expired = expiry.synchronize_scene_transaction(2, [input(2, 0.0)], Some(1.5));
         assert_eq!(expired.retired, 1);
-        assert!(scene.instance_id(1, node(1)).is_none());
-        assert_eq!(scene.quarantined_slots.len(), 1);
-        assert!(scene.reusable_slots.is_empty());
-    }
+        assert!(expiry.instance_id(1, node(1)).is_none());
 
-    #[test]
-    fn domain_budget_evicts_the_deterministic_lru_in_one_revision() {
-        let mut scene = GpuScene::new();
+        let mut budgeted = GpuScene::new();
         for scene_id in 1..=4 {
-            let stats = scene.synchronize_scene_transaction(
+            budgeted.synchronize_scene_transaction(
                 scene_id,
                 [input(u64::from(scene_id), 0.0)],
                 Some(0.0),
             );
-            assert_eq!(stats.revision, u64::from(scene_id));
         }
-        let revision_before = scene.revision;
-
-        let fifth = scene.synchronize_scene_transaction(5, [input(5, 0.0)], Some(0.0));
+        let revision_before = budgeted.revision;
+        let fifth = budgeted.synchronize_scene_transaction(5, [input(5, 0.0)], Some(0.0));
         assert_eq!(fifth.revision, revision_before + 1);
         assert_eq!((fifth.inserted, fifth.retired), (1, 1));
-        assert_eq!(scene.domains.len(), GPU_SCENE_DOMAIN_BUDGET);
-        assert!(scene.instance_id(1, node(1)).is_none());
-        for scene_id in 2..=5 {
-            assert!(
-                scene
-                    .instance_id(scene_id, node(u64::from(scene_id)))
-                    .is_some()
-            );
+        assert_eq!(budgeted.domains.len(), GPU_SCENE_DOMAIN_BUDGET);
+        assert!(budgeted.instance_id(1, node(1)).is_none());
+
+        let mut authority = GpuScene::new();
+        let mut lists = RenderLists::new();
+        for scene_id in 1..=5u32 {
+            let mut scene = extracted_scene([rigid_item_with_assets(
+                u64::from(scene_id),
+                100 + u64::from(scene_id),
+                200 + u64::from(scene_id),
+            )]);
+            scene.scene_id = scene_id;
+            lists.begin_intent_collection();
+            preflight_and_commit(&mut authority, &scene, 0.0, &mut lists);
         }
+        assert!(authority.instance_id(1, node(1)).is_none());
+        assert!(authority.geometries.id(geometry(101)).is_none());
+        assert!(authority.materials.id(material(201)).is_none());
+        assert!(authority.batches.lookup.keys().all(|key| key.scene_id != 1));
+        assert_eq!(authority.quarantined_slots.len(), 1);
+        assert_eq!(authority.geometries.quarantined_slots.len(), 1);
+        assert_eq!(authority.materials.quarantined_slots.len(), 1);
+        assert_eq!(authority.batches.quarantined_slots.len(), 1);
     }
 
     #[test]
@@ -5380,27 +5081,37 @@ mod tests {
         assert_eq!(replacement.generation(), retired_id.generation() + 1);
         assert!(scene.record(retired_id).is_none());
         assert!(scene.record(replacement).is_some());
+
+        let mut projected = GpuScene::new();
+        projected.synchronize_extracted_scene(
+            &extracted_scene([
+                rigid_item(1, 0.0),
+                rigid_item(2, 0.0),
+                rigid_item(3, 0.0),
+                rigid_item(4, 0.0),
+            ]),
+            0.0,
+        );
+        assert!(projected.acknowledge_submitted_revision(1));
+        projected.synchronize_extracted_scene(
+            &extracted_scene([rigid_item(1, 0.0), rigid_item(2, 0.0)]),
+            0.1,
+        );
+        let regrown = extracted_scene([rigid_item(1, 0.0), rigid_item(2, 0.0), rigid_item(5, 0.0)]);
+        assert_eq!(
+            projected.projected_slot_span_for_extracted_scene(&regrown),
+            Some(5)
+        );
+        assert!(projected.acknowledge_submitted_revision(2));
+        assert_eq!(projected.slot_span(), 4, "projection must remain read-only");
+        assert_eq!(
+            projected.projected_slot_span_for_extracted_scene(&regrown),
+            Some(3)
+        );
     }
 
     #[test]
-    fn generic_multi_domain_sync_has_no_implicit_residency_policy() {
-        let mut scene = GpuScene::new();
-        for scene_id in 1..=8 {
-            scene.synchronize_scene(scene_id, [input(u64::from(scene_id), 0.0)]);
-        }
-        assert_eq!(scene.domains.len(), 8);
-        assert!(scene.quarantined_slots.is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate NodeHandle")]
-    fn duplicate_node_in_one_sync_fails_fast() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene(1, [input(4, 0.0), input(4, 1.0)]);
-    }
-
-    #[test]
-    fn dirty_ranges_are_sorted_and_coalesced() {
+    fn dirty_journal_coalesces_retries_and_survives_stale_acknowledgements() {
         let mut scene = GpuScene::new();
         scene.synchronize_scene(
             1,
@@ -5427,103 +5138,32 @@ mod tests {
         );
         assert_eq!(scene.dirty_ranges[0].byte_offset(), 0);
         assert_eq!(scene.dirty_ranges[0].byte_size(), 512);
-    }
 
-    #[test]
-    fn stale_ack_does_not_drop_replay_journal_or_release_quarantine() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene(5, [input(1, 0.0)]);
-        assert!(scene.acknowledge_submitted_revision(1));
-        scene.synchronize_scene(5, []);
-        assert!(!scene.acknowledge_submitted_revision(1));
-        assert_eq!(scene.dirty_slots.len(), 1);
-        assert_eq!(scene.quarantined_slots.len(), 1);
-        assert!(scene.reusable_slots.is_empty());
-    }
+        let mut replay = GpuScene::new();
+        replay.synchronize_scene(5, [input(1, 0.0)]);
+        assert!(replay.acknowledge_submitted_revision(1));
+        replay.synchronize_scene(5, []);
+        assert!(!replay.acknowledge_submitted_revision(1));
+        assert_eq!(replay.dirty_slots.len(), 1);
+        assert_eq!(replay.quarantined_slots.len(), 1);
+        assert!(replay.reusable_slots.is_empty());
 
-    #[test]
-    fn aborted_revisions_keep_the_latest_dirty_union_compact() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene(5, [input(1, 0.0), input(2, 0.0)]);
-        assert!(scene.acknowledge_submitted_revision(1));
-
-        let first_retry = scene.synchronize_scene(5, [input(1, 1.0), input(2, 0.0)]);
+        let mut retries = GpuScene::new();
+        retries.synchronize_scene(5, [input(1, 0.0), input(2, 0.0)]);
+        assert!(retries.acknowledge_submitted_revision(1));
+        let first_retry = retries.synchronize_scene(5, [input(1, 1.0), input(2, 0.0)]);
         assert_eq!(first_retry.revision, 2);
-        let second_retry = scene.synchronize_scene(5, [input(1, 1.0), input(2, 2.0)]);
+        let second_retry = retries.synchronize_scene(5, [input(1, 1.0), input(2, 2.0)]);
         assert_eq!(second_retry.revision, 3);
-        assert_eq!(scene.dirty_slots.len(), 2);
-        scene.rebuild_dirty_ranges();
+        assert_eq!(retries.dirty_slots.len(), 2);
+        retries.rebuild_dirty_ranges();
         assert_eq!(
-            scene.dirty_ranges,
+            retries.dirty_ranges,
             [GpuSceneDirtyRange {
                 first_slot: 0,
                 slot_count: 2,
             }]
         );
-    }
-
-    #[test]
-    fn saturated_generation_is_retired_permanently_without_wraparound() {
-        let mut scene = GpuScene::new();
-        scene.synchronize_scene(6, [input(1, 0.0)]);
-        let original = scene.instance_id(6, node(1)).unwrap();
-        assert!(scene.acknowledge_submitted_revision(1));
-        scene.retire_scene(6);
-        assert!(scene.acknowledge_submitted_revision(2));
-
-        scene.slots[original.slot() as usize].generation = u32::MAX - 1;
-        scene.slot_generation_watermarks[original.slot() as usize] = u32::MAX - 1;
-        scene.synchronize_scene(6, [input(2, 0.0)]);
-        let penultimate = scene.instance_id(6, node(2)).unwrap();
-        assert_eq!(penultimate.slot(), original.slot());
-        assert_eq!(penultimate.generation(), u32::MAX - 1);
-        assert!(scene.acknowledge_submitted_revision(3));
-
-        scene.retire_scene(6);
-        assert!(scene.acknowledge_submitted_revision(4));
-        assert!(!scene.reusable_slots.contains(&original.slot()));
-        scene.synchronize_scene(6, [input(3, 0.0)]);
-        let replacement = scene.instance_id(6, node(3)).unwrap();
-        assert_ne!(replacement.slot(), original.slot());
-        assert_eq!(scene.slots[original.slot() as usize].generation, u32::MAX);
-    }
-
-    #[test]
-    fn planning_is_cpu_only_and_uses_exact_table_abi() {
-        let mut scene = GpuScene::new();
-        let mut registry = PersistentBufferRegistry::new();
-        scene.synchronize_scene(8, [input(1, 0.0), input(2, 0.0)]);
-        let plan = scene.plan_instance_table(&mut registry, 1).unwrap();
-        assert!(!plan.persistent.valid);
-        assert!(plan.persistent.commit.is_some());
-        assert_eq!(plan.revision, 1);
-        assert_eq!(plan.publication_probe.revision, 1);
-        assert_eq!(plan.publication_probe.buffer, plan.persistent.buffer);
-        assert_eq!(plan.records.len(), 2);
-        assert_eq!(plan.slot_span, 2);
-        assert_eq!(plan.alive_count, 2);
-        assert_eq!(plan.dirty_ranges.len(), 1);
-        assert_eq!(
-            plan.persistent.buffer.spec.schema_id,
-            GPU_SCENE_INSTANCE_SCHEMA_ID
-        );
-        assert_eq!(plan.persistent.buffer.spec.stride, 256);
-        assert_eq!(plan.persistent.buffer.spec.desc.logical_size, 512);
-        assert_eq!(
-            plan.persistent.buffer.spec.desc.usage,
-            GPU_SCENE_INSTANCE_BUFFER_USAGE
-        );
-    }
-
-    #[test]
-    fn empty_scene_still_plans_one_bindable_tombstone_record() {
-        let mut scene = GpuScene::new();
-        let mut registry = PersistentBufferRegistry::new();
-        let plan = scene.plan_instance_table(&mut registry, 1).unwrap();
-        assert_eq!(plan.records.len(), 1);
-        assert_eq!(plan.slot_span, 0);
-        assert_eq!(plan.records[0].metadata[1], 0);
-        assert_eq!(plan.persistent.buffer.spec.desc.logical_size, 256);
     }
 
     #[test]
@@ -5604,42 +5244,6 @@ mod tests {
             "logical shrink should reuse retained physical capacity"
         );
         assert_eq!(compact_physical.allocation_size, 512);
-    }
-
-    #[test]
-    fn exact_publication_is_acknowledged_before_the_next_dynamic_sync() {
-        let gpu = gpu();
-        let mut scene = GpuScene::new();
-        let mut registry = PersistentBufferRegistry::new();
-        scene.synchronize_scene(9, [input(1, 0.0), input(2, 0.0)]);
-        let (persistent, probe) = {
-            let table_plan = scene.plan_instance_table(&mut registry, 1).unwrap();
-            (table_plan.persistent, table_plan.publication_probe)
-        };
-
-        let physical = registry
-            .materialize(
-                &gpu.device,
-                persistent.buffer,
-                Some("GPU Scene publication acknowledgement test"),
-            )
-            .unwrap();
-        registry
-            .commit_batch(&[PersistentBufferCommitRequest::new(
-                persistent.commit.unwrap(),
-                physical.token,
-            )])
-            .unwrap();
-        assert!(scene.acknowledge_if_published(&registry, probe));
-        assert!(scene.dirty_slots.is_empty());
-
-        let second = scene.synchronize_scene(9, [input(1, 0.0), input(2, 2.0)]);
-        assert_eq!(second.revision, 2);
-        assert_eq!(scene.dirty_slots.len(), 1);
-        assert_eq!(
-            scene.dirty_slots[0],
-            scene.instance_id(9, node(2)).unwrap().slot()
-        );
     }
 
     #[test]

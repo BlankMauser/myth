@@ -8,6 +8,10 @@
 //! - Multiple geometry types (box, sphere, plane)
 use myth::prelude::*;
 use myth::render::core::ReadbackStream;
+use myth::renderer::graph::{
+    RdgAttemptOutcome, RdgFrameDiagnostics, RdgGpuDrivenFailure, RdgSceneSubmissionBackend,
+    RdgSceneSubmissionFamily, RdgSceneSubmissionSelectionReason,
+};
 use myth::scene::light::LIGHT_FLAG_IS_SUN;
 
 // Integration tests for synchronous headless readback.
@@ -231,6 +235,198 @@ fn mean_rgb_abs_delta(a: &[u8], b: &[u8]) -> f32 {
     }
 
     total_delta as f32 / channel_count as f32
+}
+
+fn render_and_observe_rdg(engine: &mut Engine, stage: &str) -> RdgFrameDiagnostics {
+    engine.update(1.0 / 60.0);
+    assert!(engine.render_active_scene(), "{stage}: render failed");
+    let diagnostics = engine
+        .renderer
+        .latest_rdg_diagnostics()
+        .unwrap_or_else(|| panic!("{stage}: diagnostics missing"));
+    assert_eq!(
+        (diagnostics.outcome(), diagnostics.queue_submitted()),
+        (RdgAttemptOutcome::Submitted, true),
+        "{stage}: frame was not submitted"
+    );
+    diagnostics
+}
+
+fn assert_main_submission_backend(
+    diagnostics: &RdgFrameDiagnostics,
+    stage: &str,
+    expected: RdgSceneSubmissionBackend,
+) {
+    let main = diagnostics.scene_submission_family(RdgSceneSubmissionFamily::MainPrepass);
+    assert_eq!(
+        (main.selected_backend(), main.live_backend()),
+        (expected, expected),
+        "{stage}: backend mismatch; reason={:?}, policy={:?}",
+        main.selection_reason(),
+        diagnostics.gpu_driven_policy()
+    );
+}
+
+/// Exercises the public runtime policy boundary against one long-lived scene
+/// and renderer. A successful live GPU backend plus a non-empty readback is an
+/// end-to-end contract: compute culling produced indirect arguments and the
+/// raster pass consumed them with `DrawIndirect` before queue submission.
+#[test]
+fn gpu_driven_runtime_switches_are_publicly_observable_and_raster_equivalent() {
+    const SIDE: usize = 16;
+    const AUTO_WAIT_LIMIT: usize = 8;
+
+    let (mut engine, expected_bytes) = setup_headless_with_settings(
+        160,
+        160,
+        RendererSettings {
+            path: RenderPath::HighFidelity,
+            gpu_driven: GpuDrivenMode::Auto,
+            ..RendererSettings::default()
+        },
+    );
+    let geometry = engine
+        .assets
+        .geometries
+        .add(Geometry::new_box(0.46, 0.46, 0.46));
+    let material = engine.assets.materials.add(
+        PhysicalMaterial::new(Vec4::new(0.12, 0.72, 0.34, 1.0))
+            .with_roughness(0.72)
+            .with_metalness(0.0),
+    );
+
+    let scene = engine.scene_manager.create_active();
+    let first = scene.add_mesh(Mesh::new(geometry, material));
+    scene.node(&first).set_position(-4.5, 0.0, -4.5);
+
+    let mut sun = Light::new_directional(Vec3::ONE, 2.5);
+    sun.cast_shadows = true;
+    if let Some(shadow) = sun.shadow.as_mut() {
+        shadow.map_size = 256;
+        shadow.cascade_count = 2;
+    }
+    let sun = scene.add_light(sun);
+    scene
+        .node(&sun)
+        .set_position(8.0, 12.0, 6.0)
+        .look_at(Vec3::ZERO);
+
+    let camera = scene.add_camera(Camera::new_perspective(48.0, 1.0, 0.1));
+    scene
+        .node(&camera)
+        .set_position(0.0, 11.5, 16.0)
+        .look_at(Vec3::ZERO);
+    scene.active_camera = Some(camera);
+
+    let tiny = render_and_observe_rdg(&mut engine, "tiny-auto");
+    assert_main_submission_backend(&tiny, "tiny-auto", RdgSceneSubmissionBackend::CpuDirect);
+    assert_eq!(
+        tiny.scene_submission_family(RdgSceneSubmissionFamily::MainPrepass)
+            .selection_reason(),
+        RdgSceneSubmissionSelectionReason::AutoSmallWorkload
+    );
+
+    // Grow the same scene to a dense cohort while retaining one Geometry and
+    // one Material identity across all 256 instances.
+    {
+        let scene = engine
+            .scene_manager
+            .active_scene_mut()
+            .expect("dense GPU-driven scene is missing");
+        for index in 1..SIDE * SIDE {
+            let x = index % SIDE;
+            let z = index / SIDE;
+            let node = scene.add_mesh(Mesh::new(geometry, material));
+            scene
+                .node(&node)
+                .set_position(x as f32 * 0.6 - 4.5, 0.0, z as f32 * 0.6 - 4.5);
+        }
+    }
+
+    let supports_gpu_driven = engine
+        .renderer
+        .gpu_driven_capabilities()
+        .is_some_and(|capabilities| capabilities.supports_indirect_primitives());
+    if !supports_gpu_driven {
+        let unsupported = render_and_observe_rdg(&mut engine, "dense-auto-unsupported");
+        assert_main_submission_backend(
+            &unsupported,
+            "dense-auto-unsupported",
+            RdgSceneSubmissionBackend::CpuDirect,
+        );
+        assert_eq!(
+            unsupported
+                .scene_submission_family(RdgSceneSubmissionFamily::MainPrepass)
+                .selection_reason(),
+            RdgSceneSubmissionSelectionReason::Unsupported(RdgGpuDrivenFailure::UnsupportedDevice,)
+        );
+        return;
+    }
+
+    let auto_entered_gpu = (0..AUTO_WAIT_LIMIT).any(|attempt| {
+        let stage = format!("dense-auto-{attempt}");
+        let diagnostics = render_and_observe_rdg(&mut engine, &stage);
+        let main = diagnostics.scene_submission_family(RdgSceneSubmissionFamily::MainPrepass);
+        assert_eq!(
+            main.selected_backend(),
+            main.live_backend(),
+            "{stage}: selected and live Auto backends diverged"
+        );
+        main.live_backend() == RdgSceneSubmissionBackend::GpuDriven
+    });
+    assert!(
+        auto_entered_gpu,
+        "dense Auto workload did not enter GPU-driven submission within {AUTO_WAIT_LIMIT} submitted frames"
+    );
+
+    let (hf, basic) = (RenderPath::HighFidelity, RenderPath::BasicForward);
+    let (required, off) = (GpuDrivenMode::Required, GpuDrivenMode::Off);
+    let (gpu, cpu) = (
+        RdgSceneSubmissionBackend::GpuDriven,
+        RdgSceneSubmissionBackend::CpuDirect,
+    );
+    let stages = [
+        ("high-fidelity-csm-required", hf, required, true, gpu),
+        ("high-fidelity-csm-off", hf, off, true, cpu),
+        ("high-fidelity-unshadowed", hf, required, false, gpu),
+        ("basic-required", basic, required, false, gpu),
+        ("basic-off", basic, off, false, cpu),
+        ("high-fidelity-csm-reentry", hf, required, true, gpu),
+    ];
+    let mut basic_required_pixels = None;
+    for (stage, path, mode, shadows, expected) in stages {
+        engine.renderer.set_render_path(path);
+        engine.renderer.set_gpu_driven_mode(mode);
+        engine
+            .scene_manager
+            .active_scene_mut()
+            .and_then(|scene| scene.get_light_mut(sun))
+            .expect("GPU-driven sun is missing")
+            .cast_shadows = shadows;
+        let diagnostics = render_and_observe_rdg(&mut engine, stage);
+        assert_main_submission_backend(&diagnostics, stage, expected);
+        if shadows {
+            assert_eq!(
+                diagnostics
+                    .scene_submission_family(RdgSceneSubmissionFamily::Shadow2D)
+                    .live_backend(),
+                expected,
+                "{stage}: CSM submission used a different live backend"
+            );
+        }
+        if path == RenderPath::BasicForward {
+            let pixels = engine
+                .readback_pixels()
+                .expect("BasicForward readback failed");
+            if mode == GpuDrivenMode::Required {
+                assert_eq!(pixels.len(), expected_bytes);
+                assert_not_black(&pixels, stage);
+                basic_required_pixels = Some(pixels);
+            } else {
+                assert_eq!(basic_required_pixels.as_ref(), Some(&pixels));
+            }
+        }
+    }
 }
 
 // ── Physical Material Tests ──────────────────────────────────────────────

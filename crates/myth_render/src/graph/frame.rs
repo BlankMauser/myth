@@ -2627,15 +2627,23 @@ mod draw_plan_tests {
                 .all(|&stamp| stamp == 0),
             "only generation wrap may zero-fill the retained ownership table"
         );
-    }
 
-    #[test]
-    #[should_panic(expected = "cannot have two GPU owners")]
-    fn gpu_family_ownership_rejects_duplicate_family_claims() {
-        let mut lists = RenderLists::new();
+        let mut duplicate_lists = RenderLists::new();
         let selected = ExtractedSourceId::from_index(3);
-        lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::SHADOW_CUBE);
-        lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::SHADOW_CUBE);
+        duplicate_lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::SHADOW_CUBE);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            duplicate_lists.claim_gpu_family_ownership(selected, GpuDrivenFamilyMask::SHADOW_CUBE);
+        }))
+        .expect_err("one family cannot have two GPU owners");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic>");
+        assert!(
+            message.contains("cannot have two GPU owners"),
+            "unexpected duplicate-owner failure: {message}"
+        );
     }
 
     #[test]
@@ -2676,26 +2684,23 @@ mod draw_plan_tests {
             populated_capacity,
             "frame reset must retain representative-bin allocation"
         );
-    }
 
-    #[test]
-    fn gpu_opaque_representative_generation_wrap_is_the_only_stamp_fill() {
-        let mut lists = RenderLists::new();
-        lists.gpu_opaque_representative_stamps = vec![u32::MAX; 32];
-        lists.gpu_opaque_representative_generation = u32::MAX;
+        let mut wrap_lists = RenderLists::new();
+        wrap_lists.gpu_opaque_representative_stamps = vec![u32::MAX; 32];
+        wrap_lists.gpu_opaque_representative_generation = u32::MAX;
 
-        lists.begin_intent_collection();
+        wrap_lists.begin_intent_collection();
 
-        assert_eq!(lists.gpu_opaque_representative_generation, 1);
+        assert_eq!(wrap_lists.gpu_opaque_representative_generation, 1);
         assert!(
-            lists
+            wrap_lists
                 .gpu_opaque_representative_stamps
                 .iter()
                 .all(|&stamp| stamp == 0)
         );
-        let source = lists.append_gpu_opaque_representative(ExtractedSourceId::from_index(31));
+        let source = wrap_lists.append_gpu_opaque_representative(ExtractedSourceId::from_index(31));
         assert_eq!(source, FrameSourceId::from_index(0));
-        assert_eq!(lists.gpu_opaque_representative_stamps[0], 1);
+        assert_eq!(wrap_lists.gpu_opaque_representative_stamps[0], 1);
     }
 
     #[test]

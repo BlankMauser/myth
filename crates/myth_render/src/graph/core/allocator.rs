@@ -555,10 +555,10 @@ impl TransientPool {
 #[cfg(test)]
 mod tests {
     use super::{TransientPool, buffer_allocation_is_available};
-    use crate::core::WgpuContext;
     use crate::core::gpu::Tracked;
     use crate::graph::core::{BufferDesc, TextureDesc};
     use crate::settings::{RendererInitConfig, RendererSettings};
+    use crate::test_support::SharedTestContext as WgpuContext;
 
     #[test]
     fn copy_dst_buffer_can_reuse_a_previous_frame_allocation() {

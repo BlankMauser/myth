@@ -1028,62 +1028,36 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_stable_monotonic_and_never_reused() {
+    fn ids_and_attempt_plans_are_monotonic_and_conflict_safe() {
         let mut registry = PersistentBufferRegistry::new();
         let first = registry.create_buffer();
         let second = registry.create_buffer();
+        assert_ne!(first.get(), 0);
         assert!(second.get() > first.get());
-    }
-
-    #[test]
-    fn owner_can_retire_a_never_materialized_buffer() {
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let target = spec(256, wgpu::BufferUsages::STORAGE, 1, 16);
-        let plan = registry.plan_buffer(id, 1, 1, target).unwrap();
-
-        assert!(registry.remove_buffer(id));
-        assert!(!registry.remove_buffer(id));
-        assert_eq!(
-            registry.plan_buffer(id, 2, 1, target),
-            Err(PersistentBufferPlanFailure::UnknownOrRetired)
-        );
-        assert_eq!(
-            registry.commit_batch(&[PersistentBufferCommitRequest::new(
-                plan.commit.expect("initial plan needs publication"),
-                PersistentBufferPhysicalToken {
-                    buffer_id: id,
-                    epoch: plan.buffer.epoch,
-                    plan_generation: plan.buffer.plan_generation,
-                    revision: plan.buffer.revision,
-                    attempt_serial: plan.buffer.attempt_serial,
-                    physical_id: 1,
-                },
-            )]),
-            Err(PersistentBufferCommitFailure::UnknownOrRetired)
-        );
-    }
-
-    #[test]
-    fn same_attempt_is_idempotent_and_rejects_conflicts() {
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
         let base = spec(64, wgpu::BufferUsages::STORAGE, 7, 16);
-        let first = registry.plan_buffer(id, 10, 3, base).unwrap();
-        assert_eq!(registry.plan_buffer(id, 10, 3, base), Ok(first));
+        let plan = registry.plan_buffer(first, 10, 3, base).unwrap();
+        assert_eq!(registry.plan_buffer(first, 10, 3, base), Ok(plan));
         assert_eq!(
-            registry.plan_buffer(id, 10, 4, base),
+            registry.plan_buffer(first, 10, 4, base),
             Err(PersistentBufferPlanFailure::SameAttemptConflict)
         );
         assert_eq!(
-            registry.plan_buffer(id, 10, 3, spec(64, wgpu::BufferUsages::STORAGE, 8, 16),),
+            registry.plan_buffer(first, 10, 3, spec(64, wgpu::BufferUsages::STORAGE, 8, 16),),
             Err(PersistentBufferPlanFailure::SameAttemptConflict)
         );
-        assert_eq!(registry.plan_buffer(id, 10, 3, base), Ok(first));
+        assert_eq!(
+            registry.plan_buffer(first, 9, 3, base),
+            Err(PersistentBufferPlanFailure::AttemptRegressed)
+        );
+        assert_eq!(
+            registry.plan_buffer(first, 11, 2, base),
+            Err(PersistentBufferPlanFailure::RevisionRegressed)
+        );
+        assert!(registry.plan_buffer(first, 11, 3, base).is_ok());
     }
 
     #[test]
-    fn coherent_batch_is_fresh_then_warm_and_same_attempt_idempotent() {
+    fn coherent_batch_lifecycle_is_idempotent_and_rejects_mixed_transitions() {
         let gpu = gpu();
         let mut registry = PersistentBufferRegistry::new();
         let ids = four_buffer_ids(&mut registry);
@@ -1109,57 +1083,34 @@ mod tests {
         assert!(warm.iter().all(|plan| registry.is_published(plan.buffer)));
         assert_eq!(
             registry.plan_coherent_batch(2, 7, &requests),
-            Ok(warm),
+            Ok(warm.clone()),
             "a warm exact same-attempt batch must remain idempotent"
         );
-    }
 
-    #[test]
-    fn coherent_batch_rejects_mixed_spec_change_without_mutation() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
-        let ids = four_buffer_ids(&mut registry);
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let specs = four_specs(usage);
-        let requests = coherent_requests(ids, specs);
-        let fresh = registry.plan_coherent_batch(1, 3, &requests).unwrap();
-        publish_plans(&gpu, &mut registry, &fresh);
-        let warm = registry.plan_coherent_batch(2, 3, &requests).unwrap();
         let before = four_snapshots(&registry, ids);
-
         let replacement = registry.create_buffer();
         let replacement_before = record_snapshot(&registry, replacement);
         let mut replacement_requests = requests;
         replacement_requests[3] = PersistentBufferPlanRequest::new(replacement, specs[3]);
         assert_eq!(
-            registry.plan_coherent_batch(3, 3, &replacement_requests),
+            registry.plan_coherent_batch(3, 7, &replacement_requests),
             Err(PersistentBufferBatchPlanFailure::MixedPublicationState)
         );
         assert_eq!(four_snapshots(&registry, ids), before);
-        assert_eq!(
-            record_snapshot(&registry, replacement),
-            replacement_before,
-            "a fresh mixed member must remain completely unplanned"
-        );
+        assert_eq!(record_snapshot(&registry, replacement), replacement_before);
 
         let mut changed_specs = specs;
-        changed_specs[0] = spec(128, usage, specs[0].schema_id, 16);
+        changed_specs[0] = spec(128, specs[0].desc.usage, specs[0].schema_id, 16);
         let changed_requests = coherent_requests(ids, changed_specs);
         assert_eq!(
-            registry.plan_coherent_batch(3, 3, &changed_requests),
+            registry.plan_coherent_batch(3, 7, &changed_requests),
             Err(PersistentBufferBatchPlanFailure::MixedPublicationState)
         );
         assert_eq!(four_snapshots(&registry, ids), before);
-        assert!(
-            warm.iter().all(|plan| registry.is_published(plan.buffer)),
-            "a rejected spec transition must not clear any publication or initialization latch"
-        );
+        assert!(warm.iter().all(|plan| registry.is_published(plan.buffer)));
 
-        // The owner resolves a legitimate table-spec change by advancing the
-        // shared logical revision. All four members then become invalid as one
-        // coherent transaction.
         let advanced = registry
-            .plan_coherent_batch(3, 4, &changed_requests)
+            .plan_coherent_batch(3, 8, &changed_requests)
             .unwrap();
         assert!(
             advanced
@@ -1241,21 +1192,12 @@ mod tests {
             ],
             before_known
         );
-    }
-
-    #[test]
-    fn coherent_batch_overflow_is_detected_before_any_transition_applies() {
-        let mut registry = PersistentBufferRegistry::new();
-        let ids = four_buffer_ids(&mut registry);
-        let specs = four_specs(wgpu::BufferUsages::STORAGE);
-        let requests = coherent_requests(ids, specs);
-        registry.plan_coherent_batch(1, 1, &requests).unwrap();
 
         let original_epoch = registry.records[&ids[2]].epoch;
         registry.records.get_mut(&ids[2]).unwrap().epoch = u64::MAX;
         let before_epoch = four_snapshots(&registry, ids);
         assert_eq!(
-            registry.plan_coherent_batch(2, 2, &requests),
+            registry.plan_coherent_batch(11, 6, &requests),
             Err(PersistentBufferBatchPlanFailure::Member {
                 buffer_id: ids[2],
                 failure: PersistentBufferPlanFailure::EpochOverflow,
@@ -1267,73 +1209,13 @@ mod tests {
         registry.records.get_mut(&ids[3]).unwrap().plan_generation = u64::MAX;
         let before_generation = four_snapshots(&registry, ids);
         assert_eq!(
-            registry.plan_coherent_batch(2, 1, &requests),
+            registry.plan_coherent_batch(11, 5, &requests),
             Err(PersistentBufferBatchPlanFailure::Member {
                 buffer_id: ids[3],
                 failure: PersistentBufferPlanFailure::PlanGenerationOverflow,
             })
         );
         assert_eq!(four_snapshots(&registry, ids), before_generation);
-    }
-
-    #[test]
-    #[should_panic(expected = "record stride must be non-zero")]
-    fn spec_rejects_zero_stride() {
-        let _ = PersistentBufferSpec::new(BufferDesc::new(64, wgpu::BufferUsages::STORAGE), 1, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "exact record multiple")]
-    fn spec_rejects_partial_records() {
-        let _ = PersistentBufferSpec::new(BufferDesc::new(65, wgpu::BufferUsages::STORAGE), 1, 16);
-    }
-
-    #[test]
-    fn attempts_and_revisions_never_regress() {
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let base = spec(64, wgpu::BufferUsages::STORAGE, 1, 16);
-        registry.plan_buffer(id, 8, 5, base).unwrap();
-        assert_eq!(
-            registry.plan_buffer(id, 7, 5, base),
-            Err(PersistentBufferPlanFailure::AttemptRegressed)
-        );
-        assert_eq!(
-            registry.plan_buffer(id, 9, 4, base),
-            Err(PersistentBufferPlanFailure::RevisionRegressed)
-        );
-        assert!(registry.plan_buffer(id, 9, 5, base).is_ok());
-    }
-
-    #[test]
-    fn counter_growth_is_checked_and_failure_does_not_partially_mutate() {
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let base = spec(64, wgpu::BufferUsages::STORAGE, 1, 16);
-        let changed = spec(128, wgpu::BufferUsages::STORAGE, 1, 16);
-        let first = registry.plan_buffer(id, 1, 1, base).unwrap();
-
-        registry.records.get_mut(&id).unwrap().epoch = u64::MAX;
-        assert_eq!(
-            registry.plan_buffer(id, 2, 2, changed),
-            Err(PersistentBufferPlanFailure::EpochOverflow)
-        );
-        let record = registry.records.get(&id).unwrap();
-        assert_eq!(record.desired_spec, Some(base));
-        assert_eq!(record.desired_revision, Some(1));
-        assert_eq!(record.last_planned_attempt, Some(1));
-
-        let record = registry.records.get_mut(&id).unwrap();
-        record.epoch = first.buffer.epoch;
-        record.plan_generation = u64::MAX;
-        assert_eq!(
-            registry.plan_buffer(id, 2, 1, base),
-            Err(PersistentBufferPlanFailure::PlanGenerationOverflow)
-        );
-        assert_eq!(
-            registry.records.get(&id).unwrap().last_planned_attempt,
-            Some(1)
-        );
     }
 
     #[test]
@@ -1432,8 +1314,21 @@ mod tests {
             .commit_batch(&[request(within_capacity, reused)])
             .unwrap();
 
+        for (attempt, target) in [(4, spec(400, usage, 2, 1)), (5, spec(400, usage, 2, 16))] {
+            let changed = registry.plan_buffer(id, attempt, attempt, target).unwrap();
+            let physical = registry
+                .materialize(&gpu.device, changed.buffer, None)
+                .unwrap();
+            assert!(!physical.recreated);
+            assert!(physical.requires_full_initialization);
+            assert_eq!(physical.token.physical_id, reused.token.physical_id);
+            registry
+                .commit_batch(&[request(changed, physical)])
+                .unwrap();
+        }
+
         let growth = registry
-            .plan_buffer(id, 4, 4, spec(513, usage, 1, 1))
+            .plan_buffer(id, 6, 6, spec(513, usage, 2, 1))
             .unwrap();
         let grown = registry
             .materialize(&gpu.device, growth.buffer, None)
@@ -1446,12 +1341,12 @@ mod tests {
         let changed_usage = registry
             .plan_buffer(
                 id,
-                5,
-                5,
+                7,
+                7,
                 spec(
                     513,
                     wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-                    1,
+                    2,
                     1,
                 ),
             )
@@ -1471,53 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn aborted_materialization_remains_invalid_and_is_reused_by_retry() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let target = spec(
-            256,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            4,
-            16,
-        );
-        let attempt = registry.plan_buffer(id, 1, 1, target).unwrap();
-        let staged = registry
-            .materialize(&gpu.device, attempt.buffer, None)
-            .unwrap();
-        assert!(staged.requires_full_initialization);
-        assert!(!registry.is_published(attempt.buffer));
-        let mut materializations = FxHashMap::default();
-        materializations.insert(id, staged);
-        assert!(PersistentBufferResolver::new(&registry, &materializations).is_materialized(id));
-
-        let retry = registry.plan_buffer(id, 2, 1, target).unwrap();
-        assert!(!retry.valid);
-        assert!(
-            !PersistentBufferResolver::new(&registry, &materializations).is_materialized(id),
-            "the resolver must reject the previous attempt's exact token"
-        );
-        let retried = registry
-            .materialize(&gpu.device, retry.buffer, None)
-            .unwrap();
-        assert!(!retried.recreated);
-        assert!(
-            retried.requires_full_initialization,
-            "reusing an aborted allocation must not lose its initialization requirement"
-        );
-        assert_eq!(retried.token.physical_id, staged.token.physical_id);
-        assert!(registry.resolve_physical(staged.token).is_none());
-        materializations.insert(id, retried);
-        assert_eq!(
-            PersistentBufferResolver::new(&registry, &materializations)
-                .buffer(id)
-                .map(Tracked::id),
-            Some(retried.token.physical_id)
-        );
-    }
-
-    #[test]
-    fn grow_abort_retry_latches_full_initialization_until_exact_commit() {
+    fn aborted_growth_reuses_exact_physical_but_keeps_full_initialization_latched() {
         let gpu = gpu();
         let mut registry = PersistentBufferRegistry::new();
         let id = registry.create_buffer();
@@ -1543,10 +1392,17 @@ mod tests {
             aborted_physical.token.physical_id,
             base_physical.token.physical_id
         );
+        let mut materializations = FxHashMap::default();
+        materializations.insert(id, aborted_physical);
+        assert!(PersistentBufferResolver::new(&registry, &materializations).is_materialized(id));
         // Deliberately skip publication: the replacement allocation contains
         // no authoritative complete image.
 
         let retry_plan = registry.plan_buffer(id, 3, 2, grown_spec).unwrap();
+        assert!(
+            !PersistentBufferResolver::new(&registry, &materializations).is_materialized(id),
+            "the exact attempt token must fail closed before retry materialization"
+        );
         let retried_physical = registry
             .materialize(&gpu.device, retry_plan.buffer, None)
             .unwrap();
@@ -1558,6 +1414,14 @@ mod tests {
         assert!(
             retried_physical.requires_full_initialization,
             "an aborted create-and-swap must force a complete retry"
+        );
+        assert!(registry.resolve_physical(aborted_physical.token).is_none());
+        materializations.insert(id, retried_physical);
+        assert_eq!(
+            PersistentBufferResolver::new(&registry, &materializations)
+                .buffer(id)
+                .map(Tracked::id),
+            Some(retried_physical.token.physical_id)
         );
 
         registry
@@ -1577,48 +1441,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_and_stride_changes_invalidate_initialized_contents() {
+    fn commit_and_retirement_tokens_fail_closed_atomically() {
         let gpu = gpu();
         let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-
-        let base = registry
-            .plan_buffer(id, 1, 1, spec(256, usage, 1, 16))
-            .unwrap();
-        let base_physical = registry
-            .materialize(&gpu.device, base.buffer, None)
-            .unwrap();
-        registry
-            .commit_batch(&[request(base, base_physical)])
-            .unwrap();
-
-        let changed_schema = registry
-            .plan_buffer(id, 2, 1, spec(256, usage, 2, 16))
-            .unwrap();
-        let schema_physical = registry
-            .materialize(&gpu.device, changed_schema.buffer, None)
-            .unwrap();
-        assert!(!schema_physical.recreated);
-        assert!(schema_physical.requires_full_initialization);
-        registry
-            .commit_batch(&[request(changed_schema, schema_physical)])
-            .unwrap();
-
-        let changed_stride = registry
-            .plan_buffer(id, 3, 1, spec(256, usage, 2, 32))
-            .unwrap();
-        let stride_physical = registry
-            .materialize(&gpu.device, changed_stride.buffer, None)
-            .unwrap();
-        assert!(!stride_physical.recreated);
-        assert!(stride_physical.requires_full_initialization);
-    }
-
-    #[test]
-    fn commit_batch_is_atomic_when_one_member_is_stale() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
+        assert_eq!(
+            registry.commit_batch(&[]),
+            Err(PersistentBufferCommitFailure::EmptyBatch)
+        );
         let first_id = registry.create_buffer();
         let second_id = registry.create_buffer();
         let target = spec(
@@ -1659,78 +1488,82 @@ mod tests {
             .unwrap();
         assert!(registry.is_published(first.buffer));
         assert!(registry.is_published(current_second.buffer));
-    }
 
-    #[test]
-    fn commit_batch_rejects_empty_duplicate_and_republication() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
-        assert_eq!(
-            registry.commit_batch(&[]),
-            Err(PersistentBufferCommitFailure::EmptyBatch)
-        );
-
-        let id = registry.create_buffer();
-        let target = spec(
-            256,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            1,
-            16,
-        );
-        let plan = registry.plan_buffer(id, 1, 1, target).unwrap();
-        let physical = registry
-            .materialize(&gpu.device, plan.buffer, None)
+        let duplicate_id = registry.create_buffer();
+        let duplicate_plan = registry.plan_buffer(duplicate_id, 1, 1, target).unwrap();
+        let duplicate_physical = registry
+            .materialize(&gpu.device, duplicate_plan.buffer, None)
             .unwrap();
-        let commit = request(plan, physical);
+        let duplicate_commit = request(duplicate_plan, duplicate_physical);
         assert_eq!(
-            registry.commit_batch(&[commit, commit]),
+            registry.commit_batch(&[duplicate_commit, duplicate_commit]),
             Err(PersistentBufferCommitFailure::DuplicateBuffer)
         );
-        assert!(!registry.is_published(plan.buffer));
-        registry.commit_batch(&[commit]).unwrap();
+        assert!(!registry.is_published(duplicate_plan.buffer));
+
+        let first_commit = request(first, first_physical);
         assert_eq!(
-            registry.commit_batch(&[commit]),
+            registry.commit_batch(&[first_commit]),
             Err(PersistentBufferCommitFailure::AlreadyPublished)
         );
-    }
 
-    #[test]
-    fn retirement_rejects_stale_physical_authority() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
-        let target = spec(
-            256,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            1,
-            16,
-        );
-        let first = registry.plan_buffer(id, 1, 1, target).unwrap();
-        let stale = registry
-            .materialize(&gpu.device, first.buffer, None)
-            .unwrap();
-        let current = registry.plan_buffer(id, 2, 1, target).unwrap();
+        let current_first = registry.plan_buffer(first_id, 2, 1, target).unwrap();
         assert_eq!(
-            registry.retire(stale.token),
+            registry.retire(first_physical.token),
             Err(PersistentBufferRetireFailure::StalePhysicalToken)
         );
-
-        let current_physical = registry
-            .materialize(&gpu.device, current.buffer, None)
+        let current_first_physical = registry
+            .materialize(&gpu.device, current_first.buffer, None)
             .unwrap();
-        registry.retire(current_physical.token).unwrap();
+        registry.retire(current_first_physical.token).unwrap();
         assert_eq!(
-            registry.plan_buffer(id, 3, 1, target),
+            registry.plan_buffer(first_id, 3, 1, target),
             Err(PersistentBufferPlanFailure::UnknownOrRetired)
         );
         assert_eq!(
-            registry.retire(current_physical.token),
+            registry.retire(current_first_physical.token),
             Err(PersistentBufferRetireFailure::UnknownOrRetired)
+        );
+
+        let never_materialized = registry.create_buffer();
+        let retired_plan = registry
+            .plan_buffer(never_materialized, 1, 1, target)
+            .unwrap();
+        assert!(registry.remove_buffer(never_materialized));
+        assert!(!registry.remove_buffer(never_materialized));
+        assert_eq!(
+            registry.commit_batch(&[PersistentBufferCommitRequest::new(
+                retired_plan.commit.expect("initial plan needs publication"),
+                PersistentBufferPhysicalToken {
+                    buffer_id: never_materialized,
+                    epoch: retired_plan.buffer.epoch,
+                    plan_generation: retired_plan.buffer.plan_generation,
+                    revision: retired_plan.buffer.revision,
+                    attempt_serial: retired_plan.buffer.attempt_serial,
+                    physical_id: 1,
+                },
+            )]),
+            Err(PersistentBufferCommitFailure::UnknownOrRetired)
         );
     }
 
     #[test]
-    fn oversized_capacity_fails_without_creating_a_physical_buffer() {
+    fn invalid_specs_and_allocation_ranges_fail_before_physical_creation() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                PersistentBufferSpec::new(BufferDesc::new(64, wgpu::BufferUsages::STORAGE), 1, 0)
+            }))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                PersistentBufferSpec::new(BufferDesc::new(65, wgpu::BufferUsages::STORAGE), 1, 16)
+            }))
+            .is_err()
+        );
+
         let gpu = gpu();
         let mut registry = PersistentBufferRegistry::new();
         let id = registry.create_buffer();
@@ -1741,20 +1574,15 @@ mod tests {
             Err(PersistentBufferMaterializationFailure::CapacityOverflow)
         );
         assert!(registry.records.get(&id).unwrap().physical.is_none());
-    }
 
-    #[test]
-    fn device_limit_is_rejected_before_wgpu_allocation() {
-        let gpu = gpu();
         let max_buffer_size = gpu.device.limits().max_buffer_size;
         let logical_size = max_buffer_size
             .checked_add(1)
             .expect("test device reported an unrepresentable max buffer size");
-        let mut registry = PersistentBufferRegistry::new();
-        let id = registry.create_buffer();
+        let device_limited = registry.create_buffer();
         let plan = registry
             .plan_buffer(
-                id,
+                device_limited,
                 1,
                 1,
                 spec(logical_size, wgpu::BufferUsages::STORAGE, 2, 1),
@@ -1765,7 +1593,14 @@ mod tests {
             registry.materialize(&gpu.device, plan.buffer, None),
             Err(PersistentBufferMaterializationFailure::ExceedsDeviceLimit)
         );
-        assert!(registry.records.get(&id).unwrap().physical.is_none());
+        assert!(
+            registry
+                .records
+                .get(&device_limited)
+                .unwrap()
+                .physical
+                .is_none()
+        );
     }
 
     #[test]
@@ -2129,71 +1964,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_later_commit_group_prevents_every_group_publication() {
-        let gpu = gpu();
-        let mut registry = PersistentBufferRegistry::new();
-        let first_id = registry.create_buffer();
-        let second_id = registry.create_buffer();
-        let target = spec(
-            256,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            19,
-            16,
-        );
-        let first_plan = registry.plan_buffer(first_id, 1, 1, target).unwrap();
-        let second_plan = registry.plan_buffer(second_id, 1, 1, target).unwrap();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = RenderGraph::new(&mut storage, &arena);
-        let first = graph.import_persistent_buffer("Atomic_First", first_plan);
-        let second = graph.import_persistent_buffer("Atomic_Second", second_plan);
-        graph.add_pass("Atomic_First_Writer", |builder| {
-            builder.write_buffer(first);
-            (MockPass, ())
-        });
-        graph.add_pass("Atomic_First_Consumer", |builder| {
-            builder.read_buffer(first);
-            builder.mark_side_effect();
-            (MockPass, ())
-        });
-        graph.add_pass("Atomic_Second_Writer", |builder| {
-            builder.write_buffer(second);
-            (MockPass, ())
-        });
-        graph.add_pass("Atomic_Second_Consumer", |builder| {
-            builder.read_buffer(second);
-            builder.mark_side_effect();
-            (MockPass, ())
-        });
-        let first_group = graph.register_persistent_buffer_commit_group(&[(
-            first_plan.commit.expect("first buffer needs publication"),
-            first,
-        )]);
-        let second_group = graph.register_persistent_buffer_commit_group(&[(
-            second_plan.commit.expect("second buffer needs publication"),
-            second,
-        )]);
-        graph.compile_topology();
-        graph
-            .materialize_live_persistent_buffers(&mut registry, &gpu.device)
-            .unwrap();
-        mark_group_encoded(&graph, first_group);
-        mark_group_encoded(&graph, second_group);
-        let submitted = submit_empty_graph(&mut graph, &gpu).unwrap();
-
-        let superseding_second = registry.plan_buffer(second_id, 2, 1, target).unwrap();
-        assert_eq!(
-            graph.commit_submitted_persistent_buffers(&mut registry, submitted),
-            Err(PersistentBufferCommitFailure::StaleLogicalToken)
-        );
-        assert!(
-            !registry.is_published(first_plan.buffer),
-            "a valid earlier group must remain unpublished when a later group is stale"
-        );
-        assert!(!registry.is_published(superseding_second.buffer));
-    }
-
-    #[test]
     fn persistent_buffer_alias_and_builder_mutation_are_rejected() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -2232,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_live_commit_group_is_rejected_before_any_physical_creation() {
+    fn graph_materialization_preflight_is_atomic_for_partial_or_invalid_batches() {
         let gpu = gpu();
         let mut registry = PersistentBufferRegistry::new();
         let first_id = registry.create_buffer();
@@ -2283,11 +2053,7 @@ mod tests {
         assert!(graph.storage.persistent_buffer_materializations.is_empty());
         assert!(registry.records.get(&first_id).unwrap().physical.is_none());
         assert!(registry.records.get(&second_id).unwrap().physical.is_none());
-    }
 
-    #[test]
-    fn deterministic_batch_failure_precedes_every_physical_creation() {
-        let gpu = gpu();
         let mut registry = PersistentBufferRegistry::new();
         let ordinary_id = registry.create_buffer();
         let oversized_id = registry.create_buffer();

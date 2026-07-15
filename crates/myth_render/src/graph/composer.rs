@@ -3934,16 +3934,13 @@ mod diagnostic_tests {
     }
 
     #[test]
-    fn multi_bin_preflight_accepts_one_complete_family() {
+    fn multi_bin_preflight_accepts_boundaries_and_rejects_invalid_families() {
         let capabilities = gpu_driven_capabilities(wgpu::Limits::default(), false);
         assert!(gpu_scene_multi_bin_workload_supported(
             &capabilities,
             one_multi_bin_family(),
         ));
-    }
 
-    #[test]
-    fn multi_bin_preflight_matches_exact_layout_and_dispatch_boundaries() {
         let facts = GpuSceneMultiBinWorkloadFacts {
             instance_table_bytes: 512,
             geometry_table_bytes: 256,
@@ -4032,22 +4029,19 @@ mod diagnostic_tests {
             &gpu_driven_capabilities(below_dispatch, false),
             facts,
         ));
-    }
 
-    #[test]
-    fn multi_bin_preflight_rejects_overflow_and_an_oversized_table_member() {
         let limits = wgpu::Limits {
             max_buffer_size: 4096,
             max_storage_buffer_binding_size: 4096,
             ..wgpu::Limits::default()
         };
-        let capabilities = gpu_driven_capabilities(limits, false);
+        let bounded_capabilities = gpu_driven_capabilities(limits, false);
 
         let mut overflow = one_multi_bin_family();
         overflow.batch_slot_span = u32::MAX;
         overflow.view_count = 2;
         assert!(!gpu_scene_multi_bin_workload_supported(
-            &capabilities,
+            &bounded_capabilities,
             overflow,
         ));
 
@@ -4061,7 +4055,7 @@ mod diagnostic_tests {
                 _ => unreachable!(),
             }
             assert!(!gpu_scene_multi_bin_workload_supported(
-                &capabilities,
+                &bounded_capabilities,
                 oversized,
             ));
         }
@@ -4083,7 +4077,7 @@ mod diagnostic_tests {
             "the aggregate regression must keep every destination individually legal"
         );
         assert!(!gpu_scene_multi_bin_workload_supported(
-            &capabilities,
+            &bounded_capabilities,
             aggregate_oversized,
         ));
     }

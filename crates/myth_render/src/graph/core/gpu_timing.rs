@@ -225,9 +225,7 @@ impl RdgGpuTimingRecorder {
 
     fn publish_mapped(&mut self, slot: &GpuTimingSlot, current_frame: u64) -> bool {
         let byte_size = u64::from(slot.query_count) * TIMESTAMP_SIZE;
-        let Ok(mapped) = slot.readback_buffer.slice(0..byte_size).get_mapped_range() else {
-            return false;
-        };
+        let mapped = slot.readback_buffer.slice(0..byte_size).get_mapped_range();
         let timestamps = bytemuck::cast_slice::<u8, u64>(&mapped);
         debug_assert_eq!(timestamps.len(), slot.pass_names.len() + 1);
         if self

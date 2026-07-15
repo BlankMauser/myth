@@ -2030,15 +2030,12 @@ mod tests {
     }
 
     #[test]
-    fn cull_abi_is_stable() {
+    fn cull_abi_and_parameter_payload_contract_are_stable() {
         assert_eq!(size_of::<GpuSceneCullParams>(), 128);
         assert_eq!(std::mem::align_of::<GpuSceneCullParams>(), 16);
         assert_eq!(size_of::<GpuSceneVisibleInstance>(), 8);
         assert_eq!(GPU_SCENE_INDEXED_ARGUMENT_SIZE, 20);
-    }
 
-    #[test]
-    fn multi_bin_parameter_layout_aligns_each_exact_binding_range() {
         let layout = gpu_scene_multi_bin_cull_parameter_layout(3, 2, 64, 256).unwrap();
         assert_eq!(
             layout,
@@ -2072,10 +2069,7 @@ mod tests {
         assert!(gpu_scene_multi_bin_cull_parameter_layout(1, 0, 64, 256).is_none());
         assert!(gpu_scene_multi_bin_cull_parameter_layout(1, 1, 48, 256).is_none());
         assert!(checked_align_up(u64::MAX, 256).is_none());
-    }
 
-    #[test]
-    fn multi_bin_parameter_upload_is_one_zero_padded_contiguous_payload() {
         let active_batches = [
             GpuSceneMultiBinCullActiveBatch { id: [1, 2, 3, 4] },
             GpuSceneMultiBinCullActiveBatch { id: [5, 6, 7, 8] },
@@ -2125,94 +2119,97 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "GPU Scene visible view stride is not storage-aligned")]
-    fn multi_bin_descriptor_rejects_wrong_visible_record_stride() {
-        let views = [GpuSceneCullViewDescriptor::new([[0.0; 4]; 6])];
-        let bins = [cull_bin(0, 1, 0, GPU_SCENE_VISIBLE_INSTANCE_SIZE)];
-        validate_multi_bin_descriptor(GpuSceneMultiBinCullDescriptor::new_untrusted(
-            7, 1, 1, 8, 12, &views, &bins,
-        ));
-    }
+    fn multi_bin_descriptor_rejects_invalid_alignment_indexing_and_partitions() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    #[test]
-    #[should_panic(expected = "visible view-major index space exceeds WGSL u32 indexing")]
-    fn multi_bin_descriptor_rejects_visible_view_major_index_overflow() {
-        let views = [GpuSceneCullViewDescriptor::new([[0.0; 4]; 6]); 9];
-        let bins = [cull_bin(0, 1, 0, GPU_SCENE_VISIBLE_INSTANCE_SIZE)];
-        let visible_view_stride = u64::from(u32::MAX) & !(GPU_SCENE_VISIBLE_INSTANCE_SIZE - 1);
-        validate_multi_bin_descriptor(GpuSceneMultiBinCullDescriptor::new_untrusted(
-            7,
-            1,
-            1,
-            GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-            visible_view_stride,
-            &views,
-            &bins,
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "argument view-major index space exceeds WGSL u32 indexing")]
-    fn multi_bin_descriptor_rejects_argument_view_major_index_overflow() {
-        let views = [GpuSceneCullViewDescriptor::new([[0.0; 4]; 6]); 2];
-        let bins = [cull_bin(0, 1, 0, GPU_SCENE_VISIBLE_INSTANCE_SIZE)];
-        validate_multi_bin_descriptor(GpuSceneMultiBinCullDescriptor::new_untrusted(
-            7,
-            1,
-            u32::MAX,
-            GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-            GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-            &views,
-            &bins,
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "GPU Scene active batch slot was duplicated")]
-    fn multi_bin_descriptor_rejects_duplicate_active_slot() {
-        let views = [GpuSceneCullViewDescriptor::new([[0.0; 4]; 6])];
-        let bins = [
-            cull_bin(0, 1, 0, GPU_SCENE_VISIBLE_INSTANCE_SIZE),
-            cull_bin(
-                0,
-                2,
-                GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-                GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+        let invalid_cases = [
+            // Misaligned visible records.
+            (
+                1,
+                1,
+                8,
+                12,
+                vec![cull_bin(0, 1, 0, 8)],
+                "GPU Scene visible view stride is not storage-aligned",
             ),
-        ];
-        validate_multi_bin_descriptor(GpuSceneMultiBinCullDescriptor::new_untrusted(
-            7,
-            1,
-            1,
-            GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-            2 * GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-            &views,
-            &bins,
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "GPU Scene visible partitions overlap")]
-    fn multi_bin_descriptor_rejects_overlapping_partitions() {
-        let views = [GpuSceneCullViewDescriptor::new([[0.0; 4]; 6])];
-        let bins = [
-            cull_bin(0, 1, 0, 2 * GPU_SCENE_VISIBLE_INSTANCE_SIZE),
-            cull_bin(
+            // Visible view-major indexing overflow.
+            (
+                9,
+                1,
+                GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                u64::from(u32::MAX) & !(GPU_SCENE_VISIBLE_INSTANCE_SIZE - 1),
+                vec![cull_bin(0, 1, 0, GPU_SCENE_VISIBLE_INSTANCE_SIZE)],
+                "visible view-major index space exceeds WGSL u32 indexing",
+            ),
+            // Argument view-major indexing overflow.
+            (
+                2,
+                u32::MAX,
+                GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                vec![cull_bin(0, 1, 0, GPU_SCENE_VISIBLE_INSTANCE_SIZE)],
+                "argument view-major index space exceeds WGSL u32 indexing",
+            ),
+            // Duplicate active slot.
+            (
                 1,
                 1,
                 GPU_SCENE_VISIBLE_INSTANCE_SIZE,
                 2 * GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                vec![
+                    cull_bin(0, 1, 0, GPU_SCENE_VISIBLE_INSTANCE_SIZE),
+                    cull_bin(
+                        0,
+                        2,
+                        GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                        GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                    ),
+                ],
+                "GPU Scene active batch slot was duplicated",
+            ),
+            // Overlapping partitions.
+            (
+                1,
+                2,
+                GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                3 * GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                vec![
+                    cull_bin(0, 1, 0, 2 * GPU_SCENE_VISIBLE_INSTANCE_SIZE),
+                    cull_bin(
+                        1,
+                        1,
+                        GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                        2 * GPU_SCENE_VISIBLE_INSTANCE_SIZE,
+                    ),
+                ],
+                "GPU Scene visible partitions overlap",
             ),
         ];
-        validate_multi_bin_descriptor(GpuSceneMultiBinCullDescriptor::new_untrusted(
-            7,
-            1,
-            2,
-            GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-            3 * GPU_SCENE_VISIBLE_INSTANCE_SIZE,
-            &views,
-            &bins,
-        ));
+
+        for (view_count, batch_span, alignment, view_stride, bins, expected) in invalid_cases {
+            let views = vec![GpuSceneCullViewDescriptor::new([[0.0; 4]; 6]); view_count];
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                validate_multi_bin_descriptor(GpuSceneMultiBinCullDescriptor::new_untrusted(
+                    7,
+                    1,
+                    batch_span,
+                    alignment,
+                    view_stride,
+                    &views,
+                    &bins,
+                ))
+            }))
+            .expect_err("invalid multi-bin descriptor was accepted");
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .expect("descriptor validation panic had no string payload");
+            assert!(
+                message.contains(expected),
+                "unexpected validation failure: {message}"
+            );
+        }
     }
 
     #[test]
@@ -2334,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_bin_member_count_truncates_ghost_instances_before_partition_padding() {
+    fn multi_bin_member_count_and_stride_limits_fail_closed() {
         let gpu = gpu();
         let alignment = u64::from(gpu.device.limits().min_storage_buffer_offset_alignment)
             .max(GPU_SCENE_VISIBLE_INSTANCE_SIZE);
@@ -2355,42 +2352,23 @@ mod tests {
         assert_eq!(args, [[12, 1, 0, 0, 0]]);
         assert!(visible[0].slot < instances.len() as u32);
         assert_eq!(visible[0].generation, visible[0].slot + 1);
-    }
 
-    #[test]
-    fn multi_bin_wrong_visible_record_stride_fails_closed() {
-        let gpu = gpu();
-        let alignment = u64::from(gpu.device.limits().min_storage_buffer_offset_alignment)
-            .max(GPU_SCENE_VISIBLE_INSTANCE_SIZE);
-        let views = [GpuSceneCullViewDescriptor::new([[0.0; 4]; 6])];
-        let bins = [cull_bin(0, 11, 0, alignment)];
-        let descriptor = GpuSceneMultiBinCullDescriptor::new_untrusted(
+        let one_instance = [test_multi_bin_instance(1, 7, 0, 0, 11, 0.0)];
+        let one_descriptor = GpuSceneMultiBinCullDescriptor::new_untrusted(
             7, 1, 1, alignment, alignment, &views, &bins,
         );
-        let instances = [test_multi_bin_instance(1, 7, 0, 0, 11, 0.0)];
-        let mut batches = [test_multi_bin_batch(11, 7, 1, 0, alignment, 12)];
-        batches[0].draw_state[1] =
+        let mut wrong_stride = [test_multi_bin_batch(11, 7, 1, 0, alignment, 12)];
+        wrong_stride[0].draw_state[1] =
             u32::try_from(alignment / (2 * GPU_SCENE_VISIBLE_INSTANCE_SIZE)).unwrap();
-
-        let (args, _) = run_multi_bin_cull(&gpu, &instances, &batches, descriptor);
+        let (args, _) = run_multi_bin_cull(&gpu, &one_instance, &wrong_stride, one_descriptor);
         assert_eq!(args, [[0; 5]]);
-    }
 
-    #[test]
-    fn multi_bin_member_count_exceeding_capacity_fails_closed() {
-        let gpu = gpu();
-        let alignment = u64::from(gpu.device.limits().min_storage_buffer_offset_alignment)
-            .max(GPU_SCENE_VISIBLE_INSTANCE_SIZE);
         let capacity = u32::try_from(alignment / GPU_SCENE_VISIBLE_INSTANCE_SIZE).unwrap();
-        let views = [GpuSceneCullViewDescriptor::new([[0.0; 4]; 6])];
-        let bins = [cull_bin(0, 11, 0, alignment)];
-        let descriptor = GpuSceneMultiBinCullDescriptor::new_untrusted(
+        let overflow_descriptor = GpuSceneMultiBinCullDescriptor::new_untrusted(
             7, 1, 1, alignment, alignment, &views, &bins,
         );
-        let instances = [test_multi_bin_instance(1, 7, 0, 0, 11, 0.0)];
-        let batches = [test_multi_bin_batch(11, 7, capacity + 1, 0, alignment, 12)];
-
-        let (args, _) = run_multi_bin_cull(&gpu, &instances, &batches, descriptor);
+        let overflow = [test_multi_bin_batch(11, 7, capacity + 1, 0, alignment, 12)];
+        let (args, _) = run_multi_bin_cull(&gpu, &one_instance, &overflow, overflow_descriptor);
         assert_eq!(args, [[0; 5]]);
     }
 
@@ -2613,7 +2591,7 @@ mod tests {
     }
 
     #[test]
-    fn cull_is_an_ordered_non_rooting_patch_consumer() {
+    fn cull_graph_is_ordered_non_rooting_and_indirect_capable() {
         let mut registry = crate::graph::core::PersistentBufferRegistry::new();
         let mut gpu_scene = GpuScene::new();
         gpu_scene.synchronize_scene(7, [input(1)]);
@@ -2655,31 +2633,30 @@ mod tests {
         assert!(args_desc.usage.contains(wgpu::BufferUsages::COPY_DST));
         assert!(args_desc.usage.contains(wgpu::BufferUsages::INDIRECT));
         assert!(args_desc.usage.contains(wgpu::BufferUsages::STORAGE));
-    }
 
-    #[test]
-    fn dead_cull_branch_does_not_root_patch_or_cull() {
-        let mut registry = crate::graph::core::PersistentBufferRegistry::new();
-        let mut gpu_scene = GpuScene::new();
-        gpu_scene.synchronize_scene(7, [input(1)]);
-        let plan = gpu_scene.plan_instance_table(&mut registry, 1).unwrap();
+        let mut dead_registry = crate::graph::core::PersistentBufferRegistry::new();
+        let mut dead_gpu_scene = GpuScene::new();
+        dead_gpu_scene.synchronize_scene(7, [input(1)]);
+        let dead_plan = dead_gpu_scene
+            .plan_instance_table(&mut dead_registry, 1)
+            .unwrap();
         let feature = GpuSceneCullFeature::new();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = RenderGraph::new(&mut storage, &arena);
-        let patched = super::super::add_gpu_scene_patch(&mut graph, plan);
+        let mut dead_storage = GraphStorage::new();
+        let dead_arena = FrameArena::new();
+        let mut dead_graph = RenderGraph::new(&mut dead_storage, &dead_arena);
+        let patched = super::super::add_gpu_scene_patch(&mut dead_graph, dead_plan);
         let _ = feature.add_to_graph(
-            &mut graph,
+            &mut dead_graph,
             patched.instances,
             GpuSceneCullDescriptor::new(7, patched.slot_span, cube_planes(), 36, 0, 0),
         );
 
-        graph.compile_topology();
-        assert!(graph.storage.execution_queue.is_empty());
+        dead_graph.compile_topology();
+        assert!(dead_graph.storage.execution_queue.is_empty());
     }
 
     #[test]
-    fn sparse_high_slot_and_all_domain_filters_are_honored() {
+    fn gpu_cull_oracle_covers_sparse_filters_zero_work_and_non_finite_bounds() {
         let gpu = gpu();
         let mut records = vec![GpuSceneInstanceRecord::zeroed(); 130];
         records[0].metadata = [1, 0, 7, 0];
@@ -2706,11 +2683,7 @@ mod tests {
                 generation: 9,
             }]
         );
-    }
 
-    #[test]
-    fn zero_visible_is_valid_and_clear_prevents_count_accumulation() {
-        let gpu = gpu();
         let mut record = GpuSceneInstanceRecord::zeroed();
         record.metadata = [4, 1, 99, 0];
         let result = run_cull(
@@ -2720,11 +2693,7 @@ mod tests {
             3,
         );
         assert_eq!(result.args, [12, 0, 3, 5, 0]);
-    }
 
-    #[test]
-    fn empty_slot_span_clears_the_entire_argument_record_without_dispatch() {
-        let gpu = gpu();
         let result = run_cull(
             &gpu,
             &[],
@@ -2732,11 +2701,7 @@ mod tests {
             1,
         );
         assert_eq!(result.args, [0; 5]);
-    }
 
-    #[test]
-    fn non_finite_bounds_are_conservatively_retained() {
-        let gpu = gpu();
         let mut record = GpuSceneInstanceRecord::zeroed();
         record.metadata = [5, 1, 7, 0];
         record.bounds_min = [f32::NAN, 1000.0, 1000.0, 0.0];

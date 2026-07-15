@@ -60,14 +60,6 @@ pub(crate) struct GpuIndirectPlanId {
     index: u32,
 }
 
-/// Attempt-scoped identity of one coordinator-published immutable GPU batch.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct GpuIndexedIndirectBatchId {
-    attempt_token: u64,
-    index: u32,
-}
-
 /// Attempt-scoped contiguous range of coordinator-published GPU batches.
 ///
 /// The range is private to the backend and becomes observable only after all
@@ -1108,26 +1100,6 @@ impl SceneSubmissionStore {
         Some(range)
     }
 
-    /// Compatibility facade for the original one-batch GPU Scene finalizer.
-    ///
-    /// The batch still enters storage through the transactional stream gate;
-    /// the returned ID merely addresses its sole record for legacy callers.
-    #[cfg(test)]
-    pub(crate) fn publish_gpu_indexed_indirect_batch(
-        &mut self,
-        submission: SceneSubmissionPlanId,
-        plan: GpuIndirectPlanId,
-        input: GpuIndexedIndirectBatchInput<'_>,
-    ) -> Option<GpuIndexedIndirectBatchId> {
-        let range =
-            self.publish_gpu_indexed_indirect_stream(submission, plan, std::iter::once(input))?;
-        debug_assert_eq!(range.end - range.start, 1);
-        Some(GpuIndexedIndirectBatchId {
-            attempt_token: self.attempt_token,
-            index: range.start,
-        })
-    }
-
     #[must_use]
     pub(crate) fn live_gpu_plan_for_submission(
         &self,
@@ -1270,16 +1242,6 @@ impl SceneSubmissionStore {
     fn gpu_indirect_record(&self, id: GpuIndirectPlanId) -> Option<&GpuIndirectPlanRecord> {
         self.validate_gpu_indirect_plan(id)
             .then(|| self.gpu_indirect_plans.get(id.index as usize))
-            .flatten()
-    }
-
-    #[cfg(test)]
-    fn gpu_indirect_batch_record(
-        &self,
-        id: GpuIndexedIndirectBatchId,
-    ) -> Option<&GpuIndexedIndirectBatchRecord> {
-        (id.attempt_token == self.attempt_token)
-            .then(|| self.gpu_indirect_batches.get(id.index as usize))
             .flatten()
     }
 
@@ -1504,63 +1466,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_resolver_returns_the_original_command_slice() {
-        let mut draw_plans = DrawPlanStore::new();
-        let draw_plan = finalized_direct(&mut draw_plans, Some(73));
-        let original = draw_plans
-            .resolve_plan(draw_plan)
-            .expect("direct plan was finalized");
-        let original_ptr = original.as_ptr();
-
-        let mut store = SceneSubmissionStore::new();
-        let plan =
-            store.reserve_cpu_direct(&draw_plans, draw_plan, &SceneSubmissionDependencies::new());
-        store.mark_live(plan);
-        let resolver = SceneSubmissionResolver::new(&store, &draw_plans);
-        let stream = resolver.stream(plan);
-        let commands = resolver.commands(stream);
-
-        assert_eq!(commands.as_ptr(), original_ptr);
-        assert_eq!(commands.len(), original.len());
-        assert_eq!(commands[0].sort_key, 73);
-    }
-
-    #[test]
-    fn stale_and_foreign_plan_and_stream_ids_fail_closed() {
-        let mut draw_plans = DrawPlanStore::new();
-        let draw_plan = finalized_direct(&mut draw_plans, None);
-        let mut first = SceneSubmissionStore::new();
+    fn cpu_direct_state_matrix_preserves_empty_finalization_and_zero_copy() {
         let dependencies = SceneSubmissionDependencies::new();
-        let plan = first.reserve_cpu_direct(&draw_plans, draw_plan, &dependencies);
-        first.mark_live(plan);
-        let stream = first
-            .resolve_stream(plan, &draw_plans)
-            .expect("finalized direct stream missing");
-        let plan_capacity = first.plans.capacity();
-        let dependency_capacity = first.dependencies.capacity();
-        let lookup_capacity = first.lookup.capacity();
 
-        let second = SceneSubmissionStore::new();
-        assert!(!second.validate_reserved(plan));
-        assert!(!second.validate_stream(stream));
-
-        first.clear();
-        assert!(first.is_empty());
-        assert_eq!(first.plans.capacity(), plan_capacity);
-        assert_eq!(first.dependencies.capacity(), dependency_capacity);
-        assert_eq!(first.lookup.capacity(), lookup_capacity);
-        assert!(!first.validate_reserved(plan));
-        assert!(!first.validate_stream(stream));
-        assert!(first.cpu_direct_stream(stream).is_none());
-    }
-
-    #[test]
-    fn dead_live_and_finalized_empty_plans_obey_one_submission_state_machine() {
         let mut draw_plans = DrawPlanStore::new();
         let first_draw = draw_plans.reserve_plan(DrawPlanKey::Opaque);
         let second_draw = draw_plans.reserve_plan(DrawPlanKey::Transparent);
         let mut store = SceneSubmissionStore::new();
-        let dependencies = SceneSubmissionDependencies::new();
         let dead = store.reserve_cpu_direct(&draw_plans, first_draw, &dependencies);
         let live = store.reserve_cpu_direct(&draw_plans, second_draw, &dependencies);
 
@@ -1593,33 +1505,121 @@ mod tests {
 
         // Re-reservation is idempotent and does not duplicate the record.
         assert_eq!(
-            store.reserve_cpu_direct(
-                &draw_plans,
-                second_draw,
-                &SceneSubmissionDependencies::new(),
-            ),
+            store.reserve_cpu_direct(&draw_plans, second_draw, &dependencies),
             live
         );
         assert_eq!(store.plan_count(), 2);
         assert_eq!(store.reserved_index(live), Some(1));
+
+        draw_plans.mark_live(first_draw);
+        let start = draw_plans.begin_finalize(first_draw);
+        draw_plans.push_test_command(73);
+        draw_plans.finish_finalize(first_draw, start);
+        let original = draw_plans
+            .resolve_plan(first_draw)
+            .expect("direct plan was finalized");
+        let original_ptr = original.as_ptr();
+        store.mark_live(dead);
+        let resolver = SceneSubmissionResolver::new(&store, &draw_plans);
+        let commands = resolver.commands(resolver.stream(dead));
+        assert_eq!(commands.as_ptr(), original_ptr);
+        assert_eq!(commands.len(), original.len());
+        assert_eq!(commands[0].sort_key, 73);
     }
 
     #[test]
-    fn gpu_live_summary_is_false_for_all_dead_and_true_for_one_live_plan() {
-        let descriptor = GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            BufferNodeId::new(3, 0),
-            BufferNodeId::new(7, 0),
-            BufferNodeId::new(11, 0),
-        );
-        let mut store = SceneSubmissionStore::new();
-        let submission = store.reserve_gpu_indirect(descriptor);
+    fn plan_stream_and_gpu_ids_are_attempt_local_and_clear_retains_capacity() {
+        let mut draw_plans = DrawPlanStore::new();
+        let direct = finalized_direct(&mut draw_plans, None);
+        let descriptor = test_gpu_descriptor();
+        let vertices = [test_buffer_slot()];
+        let mut first = SceneSubmissionStore::new();
 
-        assert!(!store.has_live_gpu_plan());
-        store.mark_live(submission);
-        assert!(store.has_live_gpu_plan());
-        store.reset_live();
-        assert!(!store.has_live_gpu_plan());
+        let direct_submission =
+            first.reserve_cpu_direct(&draw_plans, direct, &SceneSubmissionDependencies::new());
+        first.mark_live(direct_submission);
+        let direct_stream = first
+            .resolve_stream(direct_submission, &draw_plans)
+            .expect("finalized direct stream missing");
+
+        let gpu_submission = first.reserve_gpu_indirect(descriptor);
+        assert!(!first.has_live_gpu_plan());
+        first.mark_live(gpu_submission);
+        assert!(first.has_live_gpu_plan());
+        first.reset_live();
+        assert!(!first.has_live_gpu_plan());
+        first.mark_live(gpu_submission);
+        let gpu_plan = first
+            .live_gpu_plan_for_submission(gpu_submission)
+            .expect("live GPU plan missing")
+            .plan;
+        let gpu_range = first
+            .publish_gpu_indexed_indirect_stream(
+                gpu_submission,
+                gpu_plan,
+                std::iter::once(gpu_batch_input(1, 0, &vertices)),
+            )
+            .expect("valid GPU stream was rejected");
+        let gpu_stream = first
+            .resolve_stream(gpu_submission, &draw_plans)
+            .expect("published GPU stream did not resolve");
+
+        let capacities = (
+            first.plans.capacity(),
+            first.dependencies.capacity(),
+            first.lookup.capacity(),
+            first.gpu_indirect_plans.capacity(),
+            first.gpu_indirect_batches.capacity(),
+        );
+        let second = SceneSubmissionStore::new();
+        for submission in [direct_submission, gpu_submission] {
+            assert!(!second.validate_reserved(submission));
+        }
+        for stream in [direct_stream, gpu_stream] {
+            assert!(!second.validate_stream(stream));
+        }
+        assert!(!second.validate_gpu_indirect_plan(gpu_plan));
+        assert!(!second.validate_gpu_indirect_stream(gpu_range));
+
+        first.clear();
+        assert!(first.is_empty());
+        assert_eq!(
+            (
+                first.plans.capacity(),
+                first.dependencies.capacity(),
+                first.lookup.capacity(),
+                first.gpu_indirect_plans.capacity(),
+                first.gpu_indirect_batches.capacity(),
+            ),
+            capacities
+        );
+        for submission in [direct_submission, gpu_submission] {
+            assert!(!first.validate_reserved(submission));
+        }
+        for stream in [direct_stream, gpu_stream] {
+            assert!(!first.validate_stream(stream));
+        }
+        assert!(first.cpu_direct_stream(direct_stream).is_none());
+        assert!(!first.validate_gpu_indirect_plan(gpu_plan));
+        assert!(!first.validate_gpu_indirect_stream(gpu_range));
+        assert!(
+            first
+                .publish_gpu_indexed_indirect_stream(
+                    gpu_submission,
+                    gpu_plan,
+                    std::iter::once(gpu_batch_input(1, 0, &vertices)),
+                )
+                .is_none()
+        );
+
+        let replacement = first.reserve_gpu_indirect(descriptor);
+        first.mark_live(replacement);
+        let replacement_plan = first
+            .live_gpu_plan_for_submission(replacement)
+            .expect("replacement GPU plan missing")
+            .plan;
+        assert_ne!(replacement, gpu_submission);
+        assert_ne!(replacement_plan, gpu_plan);
     }
 
     #[test]
@@ -1670,25 +1670,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot be wrapped by two submission backends")]
-    fn one_gpu_plan_rejects_pure_and_hybrid_double_wrapping() {
-        let mut draw_plans = DrawPlanStore::new();
-        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
-        let descriptor = test_gpu_descriptor();
-        let mut store = SceneSubmissionStore::new();
-        store.reserve_gpu_indirect(descriptor);
-        store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
-    }
+    fn one_physical_plan_cannot_be_wrapped_by_pure_and_hybrid_backends() {
+        for claim_gpu_first in [false, true] {
+            let mut draw_plans = DrawPlanStore::new();
+            let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+            let descriptor = test_gpu_descriptor();
+            let mut store = SceneSubmissionStore::new();
+            if claim_gpu_first {
+                store.reserve_gpu_indirect(descriptor);
+            } else {
+                store.reserve_cpu_direct(&draw_plans, direct, &SceneSubmissionDependencies::new());
+            }
 
-    #[test]
-    #[should_panic(expected = "cannot be wrapped by two submission backends")]
-    fn one_cpu_plan_rejects_pure_and_hybrid_double_wrapping() {
-        let mut draw_plans = DrawPlanStore::new();
-        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
-        let descriptor = test_gpu_descriptor();
-        let mut store = SceneSubmissionStore::new();
-        store.reserve_cpu_direct(&draw_plans, direct, &SceneSubmissionDependencies::new());
-        store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
+            let conflict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
+            }));
+            assert!(
+                conflict.is_err(),
+                "{} physical plan accepted a second backend owner",
+                if claim_gpu_first { "GPU" } else { "CPU" }
+            );
+        }
     }
 
     #[test]
@@ -1743,10 +1745,34 @@ mod tests {
             gpu_indirect.batches().next().unwrap().pipeline,
             RenderPipelineId(7)
         );
+
+        // The inverse order must obey the same atomic state machine: a
+        // finalized CPU suffix cannot expose a stream before GPU publication.
+        let mut draw_plans = DrawPlanStore::new();
+        let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
+        let mut store = SceneSubmissionStore::new();
+        let hybrid = store.reserve_hybrid_with_textures(&draw_plans, direct, descriptor, &[]);
+        store.mark_live(hybrid);
+        draw_plans.mark_live(direct);
+        let start = draw_plans.begin_finalize(direct);
+        draw_plans.finish_finalize(direct, start);
+        assert!(store.resolve_stream(hybrid, &draw_plans).is_none());
+
+        let gpu = store
+            .live_gpu_plan_for_submission(hybrid)
+            .expect("live hybrid lost its GPU plan");
+        store
+            .publish_gpu_indexed_indirect_stream(
+                hybrid,
+                gpu.plan,
+                std::iter::once(gpu_batch_input(8, 0, &vertices)),
+            )
+            .expect("hybrid GPU stream publication failed");
+        assert!(store.resolve_stream(hybrid, &draw_plans).is_some());
     }
 
     #[test]
-    fn hybrid_stream_rejects_gpu_publication_while_dead_and_cpu_only_finalization() {
+    fn hybrid_stream_rejects_gpu_publication_while_dpe_dead() {
         let mut draw_plans = DrawPlanStore::new();
         let direct = draw_plans.reserve_plan(DrawPlanKey::Opaque);
         let descriptor = test_gpu_descriptor();
@@ -1768,19 +1794,10 @@ mod tests {
         assert!(store.gpu_indirect_batches.is_empty());
         assert!(store.live_cpu_direct_plans().next().is_none());
         assert!(store.live_gpu_indirect_plans().next().is_none());
-
-        store.mark_live(hybrid);
-        draw_plans.mark_live(direct);
-        let start = draw_plans.begin_finalize(direct);
-        draw_plans.finish_finalize(direct, start);
-        assert!(
-            store.resolve_stream(hybrid, &draw_plans).is_none(),
-            "a finalized CPU prefix must not make an unfinalized hybrid executable"
-        );
     }
 
     #[test]
-    fn gpu_indirect_descriptor_is_idempotent_and_projects_live_without_a_stream() {
+    fn gpu_descriptor_is_idempotent_but_conflicting_identity_is_rejected() {
         let candidates = BufferNodeId::new(3, 0);
         let visible = BufferNodeId::new(7, 1);
         let arguments = BufferNodeId::new(11, 2);
@@ -1818,157 +1835,137 @@ mod tests {
             store.resolve_stream(indirect, &draw_plans).is_none(),
             "M7.0 must not expose a GPU-indirect plan as a Direct draw stream"
         );
+
+        let conflict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.reserve_gpu_indirect(GpuIndirectPlanDescriptor::new(
+                SceneSubmissionKey::Opaque,
+                candidates,
+                visible,
+                BufferNodeId::new(13, 2),
+            ));
+        }));
+        assert!(conflict.is_err(), "conflicting descriptor was accepted");
     }
 
     #[test]
-    fn gpu_indirect_attempt_release_invalidates_the_private_plan() {
-        let descriptor = GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            BufferNodeId::new(3, 0),
-            BufferNodeId::new(7, 0),
-            BufferNodeId::new(11, 0),
-        );
-        let mut store = SceneSubmissionStore::new();
-        let submission = store.reserve_gpu_indirect(descriptor);
-        store.mark_live(submission);
-        let live = store
-            .live_gpu_indirect_plans()
-            .next()
-            .expect("live GPU-indirect projection missing");
-        let stale_plan = live.plan;
+    fn gpu_publication_validation_matrix_is_atomic_and_retryable() {
+        #[derive(Clone, Copy, Debug)]
+        enum InvalidPublication {
+            Empty,
+            MismatchedPlan,
+            InvalidMember,
+            OutsideReservedWindow,
+        }
 
-        store.clear();
-        assert!(!store.validate_reserved(submission));
-        assert!(!store.validate_gpu_indirect_plan(stale_plan));
-        let new_submission = store.reserve_gpu_indirect(descriptor);
-        store.mark_live(new_submission);
-        let new_plan = store
-            .live_gpu_indirect_plans()
-            .next()
-            .expect("new GPU-indirect projection missing")
-            .plan;
-        assert_ne!(new_plan, stale_plan);
-    }
-
-    #[test]
-    fn gpu_indirect_stream_rejects_empty_publication_without_mutation() {
-        let mut store = SceneSubmissionStore::new();
-        let (submission, plan) = live_gpu_plan(&mut store);
-        let batch_len = store.gpu_indirect_batches.len();
-        let vertex_len = store.gpu_indirect_vertex_buffers.len();
-
-        assert!(
-            store
-                .publish_gpu_indexed_indirect_stream(submission, plan, std::iter::empty())
-                .is_none()
-        );
-        assert_eq!(store.gpu_indirect_batches.len(), batch_len);
-        assert_eq!(store.gpu_indirect_vertex_buffers.len(), vertex_len);
-        assert!(
-            store
-                .gpu_indirect_record(plan)
-                .unwrap()
-                .finalized_stream
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn gpu_indirect_stream_rejects_a_mismatched_live_submission_in_constant_time() {
-        let mut store = SceneSubmissionStore::new();
-        let (first_submission, first_plan) = live_gpu_plan(&mut store);
-        let second_submission = store.reserve_gpu_indirect(GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Shadow {
-                light_id: 7,
-                layer_index: 0,
-            },
-            BufferNodeId::new(13, 0),
-            BufferNodeId::new(17, 0),
-            BufferNodeId::new(19, 0),
-        ));
-        store.mark_live(second_submission);
-        let second_plan = store
-            .live_gpu_plan_for_submission(second_submission)
-            .expect("second live GPU-indirect projection missing")
-            .plan;
-        let vertices = [test_buffer_slot()];
-        let input = [gpu_batch_input(1, 0, &vertices)];
-
-        assert!(
-            store
-                .publish_gpu_indexed_indirect_stream(
-                    first_submission,
-                    second_plan,
-                    input.into_iter(),
+        for case in [
+            InvalidPublication::Empty,
+            InvalidPublication::MismatchedPlan,
+            InvalidPublication::InvalidMember,
+            InvalidPublication::OutsideReservedWindow,
+        ] {
+            let mut store = SceneSubmissionStore::new();
+            let (submission, plan) = live_gpu_plan(&mut store);
+            let mismatched_plan = if matches!(case, InvalidPublication::MismatchedPlan) {
+                let other = store.reserve_gpu_indirect(GpuIndirectPlanDescriptor::new(
+                    SceneSubmissionKey::Shadow {
+                        light_id: 7,
+                        layer_index: 0,
+                    },
+                    BufferNodeId::new(13, 0),
+                    BufferNodeId::new(17, 0),
+                    BufferNodeId::new(19, 0),
+                ));
+                store.mark_live(other);
+                Some(
+                    store
+                        .live_gpu_plan_for_submission(other)
+                        .expect("second live GPU plan missing")
+                        .plan,
                 )
-                .is_none(),
-            "a live submission must not publish another live plan"
-        );
-        assert!(store.gpu_indirect_batches.is_empty());
-        assert!(store.gpu_indirect_vertex_buffers.is_empty());
-        assert!(
-            store
-                .gpu_indirect_record(first_plan)
-                .unwrap()
-                .finalized_stream
-                .is_none()
-        );
-        assert!(
-            store
-                .gpu_indirect_record(second_plan)
-                .unwrap()
-                .finalized_stream
-                .is_none()
-        );
+            } else {
+                None
+            };
+            let vertices = [test_buffer_slot()];
+            let capacities = (
+                store.gpu_indirect_batches.capacity(),
+                store.gpu_indirect_vertex_buffers.capacity(),
+            );
 
-        assert!(
-            store
-                .publish_gpu_indexed_indirect_stream(
-                    first_submission,
-                    first_plan,
-                    input.into_iter(),
-                )
-                .is_some(),
-            "a rejected mismatched pair must leave the valid plan retryable"
-        );
+            let rejected = match case {
+                InvalidPublication::Empty => store.publish_gpu_indexed_indirect_stream(
+                    submission,
+                    plan,
+                    std::iter::empty::<GpuIndexedIndirectBatchInput<'_>>(),
+                ),
+                InvalidPublication::MismatchedPlan => store.publish_gpu_indexed_indirect_stream(
+                    submission,
+                    mismatched_plan.expect("mismatched plan missing"),
+                    std::iter::once(gpu_batch_input(1, 0, &vertices)),
+                ),
+                InvalidPublication::InvalidMember => store.publish_gpu_indexed_indirect_stream(
+                    submission,
+                    plan,
+                    [
+                        gpu_batch_input(1, 0, &vertices),
+                        gpu_batch_input(2, 2, &vertices),
+                    ]
+                    .into_iter(),
+                ),
+                InvalidPublication::OutsideReservedWindow => store
+                    .publish_gpu_indexed_indirect_stream(
+                        submission,
+                        plan,
+                        std::iter::once(gpu_batch_input(
+                            1,
+                            4 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                            &vertices,
+                        )),
+                    ),
+            };
+
+            assert!(rejected.is_none(), "{case:?} publication was accepted");
+            assert!(store.gpu_indirect_batches.is_empty(), "{case:?}");
+            assert!(store.gpu_indirect_vertex_buffers.is_empty(), "{case:?}");
+            assert_eq!(
+                (
+                    store.gpu_indirect_batches.capacity(),
+                    store.gpu_indirect_vertex_buffers.capacity(),
+                ),
+                capacities,
+                "{case:?} changed retained capacity"
+            );
+            for rejected_plan in [Some(plan), mismatched_plan].into_iter().flatten() {
+                assert!(
+                    store
+                        .gpu_indirect_record(rejected_plan)
+                        .expect("validated plan disappeared")
+                        .finalized_stream
+                        .is_none(),
+                    "{case:?} exposed a partial stream"
+                );
+            }
+
+            let valid = [
+                gpu_batch_input(1, 0, &vertices),
+                gpu_batch_input(
+                    2,
+                    GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
+                    &vertices,
+                ),
+            ];
+            assert!(
+                store
+                    .publish_gpu_indexed_indirect_stream(submission, plan, valid.into_iter())
+                    .is_some(),
+                "{case:?} made the valid plan non-retryable"
+            );
+            assert_eq!(store.gpu_indirect_batches.len(), 2, "{case:?}");
+            assert_eq!(store.gpu_indirect_vertex_buffers.len(), 2, "{case:?}");
+        }
     }
 
     #[test]
-    fn gpu_indirect_stream_preserves_two_batch_order_through_resolver() {
-        let mut store = SceneSubmissionStore::new();
-        let (submission, plan) = live_gpu_plan(&mut store);
-        let first_vertices = [test_buffer_slot()];
-        let second_vertices = [test_buffer_slot(), test_buffer_slot()];
-        let inputs = [
-            gpu_batch_input(4, 20, &first_vertices),
-            gpu_batch_input(9, 60, &second_vertices),
-        ];
-
-        let range = store
-            .publish_gpu_indexed_indirect_stream(submission, plan, inputs.into_iter())
-            .expect("valid multi-batch stream was rejected");
-        assert_eq!(range.end - range.start, 2);
-        assert_eq!(store.gpu_indirect_batches.len(), 2);
-        assert_eq!(store.gpu_indirect_vertex_buffers.len(), 3);
-
-        let draw_plans = DrawPlanStore::new();
-        let resolver = SceneSubmissionResolver::new(&store, &draw_plans);
-        let ResolvedSceneSubmission::GpuIndexedIndirect(stream) = resolver.resolve(submission)
-        else {
-            panic!("GPU plan resolved as CPU direct");
-        };
-        assert_eq!(stream.len(), 2);
-        let batches = stream.batches().collect::<Vec<_>>();
-        assert_eq!(batches[0].pipeline, RenderPipelineId(4));
-        assert_eq!(batches[0].indirect_offset, 20);
-        assert_eq!(batches[0].vertex_buffers.len(), 1);
-        assert_eq!(batches[1].pipeline, RenderPipelineId(9));
-        assert_eq!(batches[1].indirect_offset, 60);
-        assert_eq!(batches[1].vertex_buffers.len(), 2);
-    }
-
-    #[test]
-    fn gpu_indirect_stream_accepts_cloneable_exact_mapped_flat_scratch() {
+    fn gpu_multibatch_mapped_flat_scratch_preserves_order_without_a_temporary_vec() {
         #[derive(Clone, Copy)]
         struct ScratchBatch {
             pipeline: u32,
@@ -2001,9 +1998,12 @@ mod tests {
                 &flat_vertices[batch.vertex_start..batch.vertex_end],
             )
         });
-        store
+        let range = store
             .publish_gpu_indexed_indirect_stream(submission, plan, inputs)
             .expect("mapped retained scratch stream was rejected");
+        assert_eq!(range.end - range.start, 2);
+        assert_eq!(store.gpu_indirect_batches.len(), 2);
+        assert_eq!(store.gpu_indirect_vertex_buffers.len(), 3);
 
         let draw_plans = DrawPlanStore::new();
         let resolver = SceneSubmissionResolver::new(&store, &draw_plans);
@@ -2014,127 +2014,11 @@ mod tests {
         let resolved = stream.batches().collect::<Vec<_>>();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].pipeline, RenderPipelineId(3));
+        assert_eq!(resolved[0].indirect_offset, 0);
         assert_eq!(resolved[0].vertex_buffers.len(), 1);
         assert_eq!(resolved[1].pipeline, RenderPipelineId(8));
+        assert_eq!(resolved[1].indirect_offset, 40);
         assert_eq!(resolved[1].vertex_buffers.len(), 2);
-    }
-
-    #[test]
-    fn gpu_indirect_stream_member_failure_is_atomic_and_retryable() {
-        let mut store = SceneSubmissionStore::new();
-        let (submission, plan) = live_gpu_plan(&mut store);
-        let vertices = [test_buffer_slot()];
-        let invalid = [
-            gpu_batch_input(1, 0, &vertices),
-            gpu_batch_input(2, 2, &vertices),
-        ];
-        let batch_capacity = store.gpu_indirect_batches.capacity();
-        let vertex_capacity = store.gpu_indirect_vertex_buffers.capacity();
-
-        assert!(
-            store
-                .publish_gpu_indexed_indirect_stream(submission, plan, invalid.into_iter())
-                .is_none()
-        );
-        assert!(store.gpu_indirect_batches.is_empty());
-        assert!(store.gpu_indirect_vertex_buffers.is_empty());
-        assert_eq!(store.gpu_indirect_batches.capacity(), batch_capacity);
-        assert_eq!(
-            store.gpu_indirect_vertex_buffers.capacity(),
-            vertex_capacity
-        );
-        assert!(
-            store
-                .gpu_indirect_record(plan)
-                .unwrap()
-                .finalized_stream
-                .is_none()
-        );
-
-        let valid = [
-            gpu_batch_input(1, 0, &vertices),
-            gpu_batch_input(2, 20, &vertices),
-        ];
-        assert!(
-            store
-                .publish_gpu_indexed_indirect_stream(submission, plan, valid.into_iter())
-                .is_some()
-        );
-        assert_eq!(store.gpu_indirect_batches.len(), 2);
-        assert_eq!(store.gpu_indirect_vertex_buffers.len(), 2);
-    }
-
-    #[test]
-    fn gpu_indirect_stream_rejects_a_batch_outside_the_reserved_window() {
-        let mut store = SceneSubmissionStore::new();
-        let (submission, plan) = live_gpu_plan(&mut store);
-        let vertices = [test_buffer_slot()];
-        let invalid = [gpu_batch_input(
-            1,
-            4 * GpuIndirectPlanDescriptor::INDEXED_ARGUMENT_SIZE,
-            &vertices,
-        )];
-
-        assert!(
-            store
-                .publish_gpu_indexed_indirect_stream(submission, plan, invalid.into_iter())
-                .is_none()
-        );
-        assert!(store.gpu_indirect_batches.is_empty());
-    }
-
-    #[test]
-    fn gpu_indirect_stream_and_plan_are_stale_after_attempt_clear() {
-        let mut store = SceneSubmissionStore::new();
-        let (submission, plan) = live_gpu_plan(&mut store);
-        let vertices = [test_buffer_slot()];
-        let input = [gpu_batch_input(1, 0, &vertices)];
-        let range = store
-            .publish_gpu_indexed_indirect_stream(submission, plan, input.into_iter())
-            .expect("valid stream was rejected");
-        let draw_plans = DrawPlanStore::new();
-        let stream = store
-            .resolve_stream(submission, &draw_plans)
-            .expect("published stream did not resolve");
-
-        store.clear();
-        assert!(!store.validate_reserved(submission));
-        assert!(!store.validate_stream(stream));
-        assert!(!store.validate_gpu_indirect_plan(plan));
-        assert!(!store.validate_gpu_indirect_stream(range));
-        assert!(
-            store
-                .publish_gpu_indexed_indirect_stream(submission, plan, input.into_iter())
-                .is_none()
-        );
-        assert!(store.gpu_indirect_batches.is_empty());
-        assert!(store.gpu_indirect_vertex_buffers.is_empty());
-    }
-
-    #[test]
-    fn single_batch_compatibility_facade_publishes_one_stream_record() {
-        let mut store = SceneSubmissionStore::new();
-        let (submission, plan) = live_gpu_plan(&mut store);
-        let vertices = [test_buffer_slot()];
-        let batch = store
-            .publish_gpu_indexed_indirect_batch(submission, plan, gpu_batch_input(6, 0, &vertices))
-            .expect("single-batch compatibility publication failed");
-        assert!(store.gpu_indirect_batch_record(batch).is_some());
-        let range = store
-            .gpu_indirect_record(plan)
-            .and_then(|record| record.finalized_stream)
-            .expect("single-batch facade did not finalize a stream");
-        assert_eq!(range.end - range.start, 1);
-
-        let draw_plans = DrawPlanStore::new();
-        let resolver = SceneSubmissionResolver::new(&store, &draw_plans);
-        let ResolvedSceneSubmission::GpuIndexedIndirect(stream) = resolver.resolve(submission)
-        else {
-            panic!("GPU plan resolved as CPU direct");
-        };
-        let resolved = stream.batches().next().expect("one batch missing");
-        assert_eq!(resolved.pipeline, RenderPipelineId(6));
-        assert_eq!(resolved.indirect_offset, 0);
     }
 
     #[test]
@@ -2164,23 +2048,5 @@ mod tests {
         store.trim_capacity(0, retained_bytes);
         assert!(store.gpu_indirect_plans.capacity() < plan_capacity);
         assert!(store.gpu_indirect_lookup.capacity() < lookup_capacity);
-    }
-
-    #[test]
-    #[should_panic(expected = "conflicting descriptor")]
-    fn one_gpu_indirect_semantic_plan_rejects_conflicting_descriptors() {
-        let mut store = SceneSubmissionStore::new();
-        store.reserve_gpu_indirect(GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            BufferNodeId::new(1, 0),
-            BufferNodeId::new(2, 0),
-            BufferNodeId::new(3, 0),
-        ));
-        store.reserve_gpu_indirect(GpuIndirectPlanDescriptor::new(
-            SceneSubmissionKey::Opaque,
-            BufferNodeId::new(1, 0),
-            BufferNodeId::new(2, 0),
-            BufferNodeId::new(4, 0),
-        ));
     }
 }
