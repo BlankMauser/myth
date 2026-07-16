@@ -128,26 +128,6 @@ impl Drop for TransformEditTransaction<'_> {
     }
 }
 
-fn node_covers(
-    nodes: &SlotMap<NodeHandle, Node>,
-    ancestor: NodeHandle,
-    descendant: NodeHandle,
-) -> bool {
-    let mut current = Some(descendant);
-    let mut remaining = nodes.len().saturating_add(1);
-    while let Some(node) = current {
-        if node == ancestor {
-            return true;
-        }
-        if remaining == 0 {
-            return false;
-        }
-        remaining -= 1;
-        current = nodes.get(node).and_then(Node::parent);
-    }
-    false
-}
-
 #[derive(Debug)]
 struct TransformUpdateState {
     full_traversal_required: bool,
@@ -285,17 +265,61 @@ impl TransformUpdateState {
         schedule_settle: bool,
     ) {
         if schedule_settle {
-            for &dirty_root in &self.dirty_roots {
-                if self
-                    .settle_roots
-                    .iter()
-                    .any(|&settle_root| node_covers(nodes, settle_root, dirty_root))
-                {
-                    continue;
+            // Both inputs are already disjoint internally. Build their union
+            // once, then discard every root whose ancestor is also present.
+            // The former incremental merge compared every dirty root against
+            // every retained settle root, making a flat animation frame O(k²).
+            // Reusing the retained dirty-root index keeps this O(k * depth)
+            // without a frame allocation.
+            self.dirty_root_set.clear();
+            let mut write = 0usize;
+            for read in 0..self.settle_roots.len() {
+                let root = self.settle_roots[read];
+                if self.dirty_root_set.insert(root) {
+                    self.settle_roots[write] = root;
+                    write += 1;
                 }
-                self.settle_roots
-                    .retain(|&settle_root| !node_covers(nodes, dirty_root, settle_root));
-                self.settle_roots.push(dirty_root);
+            }
+            self.settle_roots.truncate(write);
+            for &dirty_root in &self.dirty_roots {
+                if self.dirty_root_set.insert(dirty_root) {
+                    self.settle_roots.push(dirty_root);
+                }
+            }
+
+            let mut write = 0usize;
+            let mut hierarchy_drifted = false;
+            for read in 0..self.settle_roots.len() {
+                let root = self.settle_roots[read];
+                let mut ancestor = nodes.get(root).and_then(Node::parent);
+                let mut remaining = nodes.len().saturating_add(1);
+                let mut covered = false;
+                while let Some(parent) = ancestor {
+                    if remaining == 0 {
+                        hierarchy_drifted = true;
+                        break;
+                    }
+                    remaining -= 1;
+                    if self.dirty_root_set.contains(&parent) {
+                        covered = true;
+                        break;
+                    }
+                    ancestor = nodes.get(parent).and_then(Node::parent);
+                }
+                if hierarchy_drifted {
+                    break;
+                }
+                if !covered {
+                    self.settle_roots[write] = root;
+                    write += 1;
+                }
+            }
+
+            if hierarchy_drifted {
+                self.settle_roots.clear();
+                self.settle_full_traversal = true;
+            } else {
+                self.settle_roots.truncate(write);
             }
         }
         self.clear_dirty_roots();
@@ -772,32 +796,61 @@ impl Scene {
             log::warn!("Cannot attach node to itself!");
             return;
         }
-
-        // 1. Detach from old parent
-        if let Some(child_node) = self.nodes.get(child_handle) {
-            if let Some(old_parent) = child_node.parent {
-                if let Some(parent) = self.nodes.inner_mut_for(self.id).get_mut(old_parent) {
-                    parent.children.retain(|&h| h != child_handle);
-                }
-            } else {
-                self.root_nodes.retain(|&h| h != child_handle);
-            }
-        }
-
-        // 2. Attach to new parent
-        if let Some(parent) = self.nodes.inner_mut_for(self.id).get_mut(parent_handle) {
-            parent.children.push(child_handle);
-        } else {
+        let Some(child_parent) = self.nodes.get(child_handle).map(Node::parent) else {
+            log::error!("Child node not found during attach!");
+            return;
+        };
+        if !self.nodes.contains_key(parent_handle) {
             log::error!("Parent node not found during attach!");
-            self.root_nodes.push(child_handle);
+            return;
+        }
+        if child_parent == Some(parent_handle) {
             return;
         }
 
-        // 3. Update child
-        if let Some(child) = self.nodes.inner_mut_for(self.id).get_mut(child_handle) {
-            child.parent = Some(parent_handle);
-            child.transform.mark_dirty();
+        // The new parent must not already live below the child. Validate the
+        // complete parent chain before mutating either side so rejected or
+        // already-corrupt topology cannot detach a valid subtree halfway.
+        let mut ancestor = Some(parent_handle);
+        let mut remaining = self.nodes.len().saturating_add(1);
+        while let Some(handle) = ancestor {
+            if handle == child_handle {
+                log::warn!("Cannot attach a node below its own descendant!");
+                return;
+            }
+            if remaining == 0 {
+                log::error!("Cannot attach through a cyclic parent chain!");
+                return;
+            }
+            remaining -= 1;
+            ancestor = self.nodes.get(handle).and_then(Node::parent);
         }
+
+        // 1. Detach from old parent
+        if let Some(old_parent) = child_parent {
+            if let Some(parent) = self.nodes.inner_mut_for(self.id).get_mut(old_parent) {
+                parent.children.retain(|&h| h != child_handle);
+            }
+        } else {
+            self.root_nodes.retain(|&h| h != child_handle);
+        }
+
+        // 2. Attach to new parent
+        self.nodes
+            .inner_mut_for(self.id)
+            .get_mut(parent_handle)
+            .expect("validated parent node disappeared")
+            .children
+            .push(child_handle);
+
+        // 3. Update child
+        let child = self
+            .nodes
+            .inner_mut_for(self.id)
+            .get_mut(child_handle)
+            .expect("validated child node disappeared");
+        child.parent = Some(parent_handle);
+        child.transform.mark_dirty();
         self.record_render_mutation(
             child_handle,
             SceneMutationFlags::TOPOLOGY

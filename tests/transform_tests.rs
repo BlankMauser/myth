@@ -86,6 +86,30 @@ fn raw_node_storage_mutation_triggers_one_full_transform_fallback() {
 }
 
 #[test]
+fn scene_attach_rejects_invalid_hierarchy_without_partial_mutation() {
+    let mut scene = Scene::new();
+    let root = scene.add_node(Node::new());
+    let child = scene.add_to_parent(Node::new(), root);
+    scene.update_matrix_world();
+
+    scene.attach(root, child);
+
+    assert_eq!(scene.node(root).unwrap().parent(), None);
+    assert_eq!(scene.node(child).unwrap().parent(), Some(root));
+    let stats = scene.update_matrix_world();
+    assert_eq!(stats.visited_nodes, 0);
+    assert_eq!(scene.root_nodes(), &[root]);
+
+    let missing_parent = scene.create_node();
+    scene.remove_node(missing_parent);
+    scene.attach(child, missing_parent);
+
+    assert_eq!(scene.node(root).unwrap().parent(), None);
+    assert_eq!(scene.node(child).unwrap().parent(), Some(root));
+    assert_eq!(scene.root_nodes(), &[root]);
+}
+
+#[test]
 fn render_flush_updates_late_dirty_roots_without_settling_earlier_motion() {
     let mut scene = Scene::new();
     let earlier = scene.add_node(Node::new());
@@ -142,6 +166,62 @@ fn overlapping_settle_roots_stay_disjoint_across_a_render_flush() {
     scene.edit_node(parent).set_position_vec(Vec3::Y);
     assert_eq!(scene.flush_dirty_world_matrices().visited_nodes, 2);
     assert_eq!(scene.update_matrix_world().visited_nodes, 2);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+}
+
+#[test]
+fn render_flush_merges_many_independent_settle_roots_without_losing_work() {
+    const ROOT_COUNT: usize = 256;
+    const COHORT_SIZE: usize = ROOT_COUNT / 2;
+
+    let mut scene = Scene::new();
+    let roots = (0..ROOT_COUNT)
+        .map(|_| scene.add_node(Node::new()))
+        .collect::<Vec<_>>();
+    scene.update_matrix_world();
+
+    for &root in &roots[..COHORT_SIZE] {
+        scene.edit_node(root).set_position_vec(Vec3::Y);
+    }
+    assert_eq!(
+        scene.flush_dirty_world_matrices().visited_nodes,
+        COHORT_SIZE
+    );
+
+    // A disjoint second extraction-boundary update must union its roots with
+    // the pending first cohort, then settle every root exactly once at the
+    // next simulation boundary.
+    for &root in &roots[COHORT_SIZE..] {
+        scene.edit_node(root).set_position_vec(Vec3::Z);
+    }
+    assert_eq!(
+        scene.flush_dirty_world_matrices().visited_nodes,
+        COHORT_SIZE
+    );
+    assert_eq!(scene.update_matrix_world().visited_nodes, ROOT_COUNT);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+}
+
+#[test]
+fn pending_full_settlement_preserves_late_unattached_render_flush_roots() {
+    let mut scene = Scene::new();
+    let rooted = scene.add_node(Node::new());
+    scene.edit_node(rooted).set_position_vec(Vec3::X);
+
+    let initial = scene.update_matrix_world();
+    assert!(initial.full_traversal);
+    assert_eq!(initial.visited_nodes, 1);
+
+    // `create_node` deliberately creates an unattached node which is absent
+    // from `root_nodes` until a caller attaches it. A late render flush must
+    // retain its explicit settle root because the pending full settlement
+    // cannot reach it.
+    let unattached = scene.create_node();
+    scene.edit_node(unattached).set_position_vec(Vec3::Y);
+    assert_eq!(scene.flush_dirty_world_matrices().visited_nodes, 1);
+
+    assert_eq!(scene.update_matrix_world().visited_nodes, 1);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 1);
     assert_eq!(scene.update_matrix_world().visited_nodes, 0);
 }
 
