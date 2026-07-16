@@ -415,7 +415,7 @@ impl AppHandler for GltfViewer {
         let light = Light::new_directional(Vec3::new(1.0, 1.0, 1.0), 3.0);
 
         let light_node = scene.add_light(light);
-        if let Some(node) = scene.get_node_mut(light_node) {
+        if let Some(node) = scene.node_mut(light_node) {
             node.transform.position = Vec3::new(1.0, 1.0, 1.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -429,7 +429,7 @@ impl AppHandler for GltfViewer {
         ));
 
         let cam_node_id = scene.add_camera(camera);
-        if let Some(node) = scene.get_node_mut(cam_node_id) {
+        if let Some(node) = scene.node_mut(cam_node_id) {
             node.transform.position = Vec3::new(0.0, 1.0, 5.0);
             node.transform.look_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y);
         }
@@ -581,10 +581,10 @@ impl AppHandler for GltfViewer {
         }
 
         // 3. 相机控制
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if self.vignette_breathing {
             let bpm = 30.0;
@@ -813,17 +813,17 @@ impl GltfViewer {
         scene.update_subtree(gltf_node);
 
         // Fit camera to the model bounding box
-        if let Some(bbox) = scene.get_bbox_of_node(gltf_node, assets) {
+        if let Some(bbox) = scene.subtree_world_bounds(gltf_node, assets) {
             let center = bbox.center();
             let radius = bbox.size().length() * 0.5;
-            if let Some((_transform, camera)) = scene.query_main_camera_bundle() {
+            let _ = scene.edit_main_camera_bundle(|_transform, camera| {
                 camera.set_near(radius / 100.0);
                 self.controls.set_target(center);
                 // let distance = radius / (camera.fov / 2.0).tan();
                 // self.controls.set_position(center + Vec3::new(0.0, radius, distance * 1.25));
                 self.controls
                     .set_position(center + Vec3::new(0.0, radius, radius * 2.5));
-            }
+            });
         }
 
         // Collect Inspector data
@@ -975,12 +975,12 @@ impl GltfViewer {
         let mut stack = vec![root];
         while let Some(node_handle) = stack.pop() {
             // 收集子节点
-            if let Some(node) = scene.get_node(node_handle) {
+            if let Some(node) = scene.node(node_handle) {
                 stack.extend(node.children().iter().cloned());
             }
 
             // 收集 Mesh 的材质
-            if let Some(mesh) = scene.get_mesh(node_handle) {
+            if let Some(mesh) = scene.mesh(node_handle) {
                 let mat_handle = mesh.material;
 
                 if !visited_materials.contains(&mat_handle) {
@@ -1495,24 +1495,30 @@ impl GltfViewer {
 
                                 // --- Light 光源 ---
                                 ui.horizontal(|ui| {
-                                    if let Some(light_bundle) =
-                                        scene.get_light_bundle(self.light_node)
-                                    {
-                                        ui.checkbox(&mut light_bundle.1.visible, "Light");
-                                        if light_bundle.1.visible {
-                                            ui.add(
-                                                egui::Slider::new(
-                                                    &mut light_bundle.0.intensity,
-                                                    0.1..=5.0,
-                                                )
-                                                .step_by(0.1)
-                                                .logarithmic(true),
-                                            );
-                                            ui.checkbox(
-                                                &mut light_bundle.0.cast_shadows,
-                                                "Cast Shadows",
-                                            );
-                                        }
+                                    let mut visible = scene
+                                        .node(self.light_node)
+                                        .is_some_and(|node| node.visible);
+                                    if ui.checkbox(&mut visible, "Light").changed() {
+                                        scene.edit_node(self.light_node).set_visible(visible);
+                                    }
+                                    if visible {
+                                        let _ = scene.edit_light_bundle(
+                                            self.light_node,
+                                            |_transform, light| {
+                                                ui.add(
+                                                    egui::Slider::new(
+                                                        &mut light.intensity,
+                                                        0.1..=5.0,
+                                                    )
+                                                    .step_by(0.1)
+                                                    .logarithmic(true),
+                                                );
+                                                ui.checkbox(
+                                                    &mut light.cast_shadows,
+                                                    "Cast Shadows",
+                                                );
+                                            },
+                                        );
                                     }
                                 });
                             });
@@ -2218,7 +2224,7 @@ impl GltfViewer {
 
                                     // Apply debug view settings to camera.
                                     if let Some(cam_node) = scene.active_camera {
-                                        if let Some(cam) = scene.get_camera_mut(cam_node) {
+                                        if let Some(cam) = scene.camera_mut(cam_node) {
                                             cam.debug_view = self.debug_view;
                                         }
                                     }
@@ -2372,21 +2378,21 @@ impl GltfViewer {
         node: NodeHandle,
         depth: usize,
     ) {
-        let Some(node_data) = scene.get_node(node) else {
+        let Some(node_data) = scene.node(node) else {
             return;
         };
 
         let name = scene
-            .get_name(node)
+            .name(node)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("Node_{:?}", node));
 
         // 确定节点图标
-        let icon = if scene.get_mesh(node).is_some() {
+        let icon = if scene.mesh(node).is_some() {
             "🧊"
-        } else if scene.get_camera(node).is_some() {
+        } else if scene.camera(node).is_some() {
             "📷"
-        } else if scene.get_light(node).is_some() {
+        } else if scene.light(node).is_some() {
             "💡"
         } else {
             "📁"
@@ -2424,12 +2430,12 @@ impl GltfViewer {
         node: NodeHandle,
         assets: &AssetServer,
     ) {
-        let Some(node_data) = scene.get_node(node) else {
+        let Some(node_data) = scene.node(node) else {
             ui.label("Node not found");
             return;
         };
 
-        let name = scene.get_name(node).unwrap_or("Unnamed");
+        let name = scene.name(node).unwrap_or("Unnamed");
         ui.heading(format!("📦 {}", name));
         ui.separator();
 
@@ -2473,7 +2479,7 @@ impl GltfViewer {
             });
 
         // Mesh 信息
-        if let Some(mesh) = scene.get_mesh(node) {
+        if let Some(mesh) = scene.mesh(node) {
             ui.separator();
             ui.label("Mesh:");
 

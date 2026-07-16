@@ -389,6 +389,198 @@ impl RdgGpuDrivenPolicySnapshot {
     }
 }
 
+/// Typed reason why the persistent Render World rejected its incremental
+/// fast path for this attempt.
+///
+/// The reasons are deliberately coarse and allocation-free. Detailed mutable
+/// journal state remains private to the Scene/Render World boundary while this
+/// stable taxonomy makes an unexpected O(N) fallback visible to profilers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdgRenderWorldRebuildReason {
+    InitialMaterialization,
+    ExplicitInvalidation,
+    MutationOverflow,
+    UntrackedSceneStorage,
+    UntrackedHierarchy,
+    SceneIdentityDrift,
+    MutationCursorDrift,
+    TopologyChanged,
+    AssetAuthorityDrift,
+    AssetEpochChanged,
+    GpuFactProfileChanged,
+    ConsumerRevisionGap,
+    ConsumerJournalOverflow,
+    InvariantDrift,
+}
+
+/// Fixed-width observability for the incremental Scene -> Render World -> GPU
+/// Scene frontend of one Renderer attempt.
+///
+/// Shipping builds update this snapshot only from facts already produced by
+/// the synchronization transactions. No timer reads, allocation, hashing, or
+/// additional scene traversal is performed for diagnostics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RdgRenderWorldSnapshot {
+    pub(crate) scene_id: Option<u32>,
+    pub(crate) revision: u64,
+    pub(crate) resident_scene_count: u32,
+    pub(crate) mutation_count: u32,
+    pub(crate) hierarchy_dirty_roots_examined: u32,
+    pub(crate) hierarchy_dirty_parent_links_examined: u32,
+    pub(crate) hierarchy_nodes_visited: u32,
+    pub(crate) hierarchy_nodes_updated: u32,
+    pub(crate) hierarchy_full_traversal: bool,
+    pub(crate) render_item_count: u32,
+    pub(crate) render_items_reused: u32,
+    pub(crate) render_items_examined: u32,
+    pub(crate) render_items_added: u32,
+    pub(crate) render_items_updated: u32,
+    pub(crate) render_items_removed: u32,
+    pub(crate) render_items_rebuilt: u32,
+    pub(crate) gpu_members_reused: u32,
+    pub(crate) gpu_members_examined: u32,
+    pub(crate) gpu_members_updated: u32,
+    pub(crate) gpu_members_rebuilt: u32,
+    pub(crate) shadow_casters_examined: u32,
+    pub(crate) shadow_aggregate_rebuilt: bool,
+    pub(crate) submitted_history_settled: u32,
+    pub(crate) retained_bytes: u64,
+    pub(crate) rebuild_reason: Option<RdgRenderWorldRebuildReason>,
+}
+
+impl RdgRenderWorldSnapshot {
+    #[must_use]
+    pub const fn scene_id(self) -> Option<u32> {
+        self.scene_id
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn resident_scene_count(self) -> u32 {
+        self.resident_scene_count
+    }
+
+    #[must_use]
+    pub const fn mutation_count(self) -> u32 {
+        self.mutation_count
+    }
+
+    /// Dirty transform candidates considered while coalescing overlapping
+    /// hierarchy updates into disjoint roots.
+    #[must_use]
+    pub const fn hierarchy_dirty_roots_examined(self) -> u32 {
+        self.hierarchy_dirty_roots_examined
+    }
+
+    /// Parent links followed by the dirty-root coalescer. Together with
+    /// [`Self::hierarchy_dirty_roots_examined`], this exposes accidental
+    /// quadratic hierarchy work without requiring profiler-only traversal.
+    #[must_use]
+    pub const fn hierarchy_dirty_parent_links_examined(self) -> u32 {
+        self.hierarchy_dirty_parent_links_examined
+    }
+
+    #[must_use]
+    pub const fn hierarchy_nodes_visited(self) -> u32 {
+        self.hierarchy_nodes_visited
+    }
+
+    #[must_use]
+    pub const fn hierarchy_nodes_updated(self) -> u32 {
+        self.hierarchy_nodes_updated
+    }
+
+    #[must_use]
+    pub const fn hierarchy_full_traversal(self) -> bool {
+        self.hierarchy_full_traversal
+    }
+
+    #[must_use]
+    pub const fn render_item_count(self) -> u32 {
+        self.render_item_count
+    }
+
+    #[must_use]
+    pub const fn render_items_reused(self) -> u32 {
+        self.render_items_reused
+    }
+
+    #[must_use]
+    pub const fn render_items_examined(self) -> u32 {
+        self.render_items_examined
+    }
+
+    #[must_use]
+    pub const fn render_items_added(self) -> u32 {
+        self.render_items_added
+    }
+
+    #[must_use]
+    pub const fn render_items_updated(self) -> u32 {
+        self.render_items_updated
+    }
+
+    #[must_use]
+    pub const fn render_items_removed(self) -> u32 {
+        self.render_items_removed
+    }
+
+    #[must_use]
+    pub const fn render_items_rebuilt(self) -> u32 {
+        self.render_items_rebuilt
+    }
+
+    #[must_use]
+    pub const fn gpu_members_reused(self) -> u32 {
+        self.gpu_members_reused
+    }
+
+    #[must_use]
+    pub const fn gpu_members_examined(self) -> u32 {
+        self.gpu_members_examined
+    }
+
+    #[must_use]
+    pub const fn gpu_members_updated(self) -> u32 {
+        self.gpu_members_updated
+    }
+
+    #[must_use]
+    pub const fn gpu_members_rebuilt(self) -> u32 {
+        self.gpu_members_rebuilt
+    }
+
+    #[must_use]
+    pub const fn shadow_casters_examined(self) -> u32 {
+        self.shadow_casters_examined
+    }
+
+    #[must_use]
+    pub const fn shadow_aggregate_rebuilt(self) -> bool {
+        self.shadow_aggregate_rebuilt
+    }
+
+    #[must_use]
+    pub const fn submitted_history_settled(self) -> u32 {
+        self.submitted_history_settled
+    }
+
+    #[must_use]
+    pub const fn retained_bytes(self) -> u64 {
+        self.retained_bytes
+    }
+
+    #[must_use]
+    pub const fn rebuild_reason(self) -> Option<RdgRenderWorldRebuildReason> {
+        self.rebuild_reason
+    }
+}
+
 /// Last phase entered by a Render Graph attempt.
 ///
 /// The phase is useful for abandoned attempts: counters from later phases are
@@ -575,6 +767,7 @@ pub struct RdgFrameDiagnostics {
     executed_passes: usize,
     scene_submission_families: [RdgSceneSubmissionFamilySnapshot; RdgSceneSubmissionFamily::COUNT],
     gpu_driven_policy: RdgGpuDrivenPolicySnapshot,
+    render_world: RdgRenderWorldSnapshot,
     target: Option<RdgRenderTargetKind>,
     flags: u8,
     #[cfg(feature = "rdg_bench_support")]
@@ -598,6 +791,7 @@ impl RdgFrameDiagnostics {
             scene_submission_families: [RdgSceneSubmissionFamilySnapshot::default();
                 RdgSceneSubmissionFamily::COUNT],
             gpu_driven_policy: RdgGpuDrivenPolicySnapshot::default(),
+            render_world: RdgRenderWorldSnapshot::default(),
             target: None,
             flags: 0,
             #[cfg(feature = "rdg_bench_support")]
@@ -673,6 +867,14 @@ impl RdgFrameDiagnostics {
     #[must_use]
     pub const fn gpu_driven_policy(&self) -> RdgGpuDrivenPolicySnapshot {
         self.gpu_driven_policy
+    }
+
+    /// Incremental frontend facts for this attempt. Standalone RenderGraphs
+    /// and attempts which never reached Scene extraction return the all-zero
+    /// default snapshot.
+    #[must_use]
+    pub const fn render_world(&self) -> RdgRenderWorldSnapshot {
+        self.render_world
     }
 
     #[must_use]
@@ -754,6 +956,7 @@ pub(crate) struct RdgDiagnosticsRecorder {
     scene_submission_families:
         [Cell<RdgSceneSubmissionFamilySnapshot>; RdgSceneSubmissionFamily::COUNT],
     gpu_driven_policy: Cell<RdgGpuDrivenPolicySnapshot>,
+    render_world: Cell<RdgRenderWorldSnapshot>,
     target: Cell<Option<RdgRenderTargetKind>>,
     flags: Cell<u8>,
     latest: Cell<Option<RdgFrameDiagnostics>>,
@@ -783,6 +986,7 @@ impl Default for RdgDiagnosticsRecorder {
                 Cell::new(RdgSceneSubmissionFamilySnapshot::default())
             }),
             gpu_driven_policy: Cell::new(RdgGpuDrivenPolicySnapshot::default()),
+            render_world: Cell::new(RdgRenderWorldSnapshot::default()),
             target: Cell::new(None),
             flags: Cell::new(0),
             latest: Cell::new(None),
@@ -833,6 +1037,7 @@ impl RdgDiagnosticsRecorder {
         }
         self.gpu_driven_policy
             .set(RdgGpuDrivenPolicySnapshot::default());
+        self.render_world.set(RdgRenderWorldSnapshot::default());
         self.target.set(None);
         self.flags.set(0);
         #[cfg(feature = "rdg_bench_support")]
@@ -923,6 +1128,25 @@ impl RdgDiagnosticsRecorder {
     pub(crate) fn record_gpu_driven_policy(&self, snapshot: RdgGpuDrivenPolicySnapshot) {
         self.assert_active();
         self.gpu_driven_policy.set(snapshot);
+    }
+
+    /// Overwrite the fixed-width incremental frontend snapshot with facts
+    /// already produced by the current transaction.
+    #[inline]
+    pub(crate) fn record_render_world(&self, snapshot: RdgRenderWorldSnapshot) {
+        self.assert_active();
+        self.render_world.set(snapshot);
+    }
+
+    /// Mutate the current fixed-width snapshot without exposing the recorder's
+    /// interior storage. Callers must only merge counters they already own;
+    /// diagnostics never request additional Scene/GPU Scene work.
+    #[inline]
+    pub(crate) fn update_render_world(&self, update: impl FnOnce(&mut RdgRenderWorldSnapshot)) {
+        self.assert_active();
+        let mut snapshot = self.render_world.get();
+        update(&mut snapshot);
+        self.render_world.set(snapshot);
     }
 
     /// Add post-DPE semantic submissions that reached one concrete backend.
@@ -1131,6 +1355,7 @@ impl RdgDiagnosticsRecorder {
                 self.scene_submission_families[index].get()
             }),
             gpu_driven_policy: self.gpu_driven_policy.get(),
+            render_world: self.render_world.get(),
             target: self.target.get(),
             flags: self.flags.get() | if panicked { FLAG_PANICKED } else { 0 },
             #[cfg(feature = "rdg_bench_support")]
@@ -1536,6 +1761,30 @@ mod tests {
             exact_evaluated: true,
         };
         recorder.record_gpu_driven_policy(policy);
+        let render_world = RdgRenderWorldSnapshot {
+            scene_id: Some(7),
+            revision: 12,
+            mutation_count: 2,
+            hierarchy_dirty_roots_examined: 2,
+            hierarchy_dirty_parent_links_examined: 1,
+            hierarchy_nodes_visited: 3,
+            hierarchy_nodes_updated: 2,
+            render_item_count: 10_000,
+            render_items_reused: 9_998,
+            render_items_examined: 2,
+            render_items_updated: 2,
+            gpu_members_reused: 8_000,
+            gpu_members_examined: 2,
+            gpu_members_updated: 2,
+            retained_bytes: 4 * 1024 * 1024,
+            ..RdgRenderWorldSnapshot::default()
+        };
+        recorder.record_render_world(render_world);
+        recorder.update_render_world(|snapshot| {
+            snapshot.shadow_casters_examined = 1;
+            snapshot.shadow_aggregate_rebuilt = true;
+            snapshot.rebuild_reason = Some(RdgRenderWorldRebuildReason::AssetEpochChanged);
+        });
         let active = recorder.current().expect("active snapshot missing");
         assert_eq!(
             active
@@ -1544,6 +1793,22 @@ mod tests {
             u32::MAX
         );
         assert_eq!(active.gpu_driven_policy(), policy);
+        assert_eq!(active.render_world().scene_id(), Some(7));
+        assert_eq!(active.render_world().hierarchy_dirty_roots_examined(), 2);
+        assert_eq!(
+            active
+                .render_world()
+                .hierarchy_dirty_parent_links_examined(),
+            1
+        );
+        assert_eq!(active.render_world().render_items_examined(), 2);
+        assert_eq!(active.render_world().gpu_members_updated(), 2);
+        assert_eq!(active.render_world().shadow_casters_examined(), 1);
+        assert!(active.render_world().shadow_aggregate_rebuilt());
+        assert_eq!(
+            active.render_world().rebuild_reason(),
+            Some(RdgRenderWorldRebuildReason::AssetEpochChanged)
+        );
 
         recorder.start_renderer_attempt(61);
         assert_eq!(
@@ -1552,6 +1817,13 @@ mod tests {
                 .expect("replacement snapshot missing")
                 .gpu_driven_policy(),
             RdgGpuDrivenPolicySnapshot::default()
+        );
+        assert_eq!(
+            recorder
+                .current()
+                .expect("replacement snapshot missing")
+                .render_world(),
+            RdgRenderWorldSnapshot::default()
         );
         for family in RdgSceneSubmissionFamily::ALL {
             assert_eq!(

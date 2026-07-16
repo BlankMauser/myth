@@ -62,7 +62,7 @@ fn add_box_to_parent(
 ) -> NodeHandle {
     let node = scene.add_mesh_to_parent(Mesh::new(geometry, material), parent);
     scene
-        .node(&node)
+        .edit_node(node)
         .set_position_vec(position)
         .set_scale_xyz(scale.x, scale.y, scale.z)
         .set_shadows(cast_shadows, receive_shadows);
@@ -242,18 +242,18 @@ impl AppHandler for SineScrollerDemo {
 
         let floor = scene.add_mesh(Mesh::new(box_geo, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.12, 0.0)
             .set_scale_xyz(16.0, 0.24, 10.0)
             .set_shadows(false, true);
 
         let panel_root = scene.create_node_with_name("SineScrollerPanel");
         scene.push_root_node(panel_root);
-        scene.node(&panel_root).set_position(0.0, 2.0, -0.4);
+        scene.edit_node(panel_root).set_position(0.0, 2.0, -0.4);
 
         let screen = scene.add_mesh_to_parent(Mesh::new(plane_geo, screen_material), panel_root);
         scene
-            .node(&screen)
+            .edit_node(screen)
             .set_scale_xyz(7.4, 3.2, 1.0)
             .set_cast_shadows(false)
             .set_receive_shadows(false);
@@ -302,7 +302,7 @@ impl AppHandler for SineScrollerDemo {
         for offset in [-2.6, 0.0, 2.6] {
             let tube = scene.add_mesh_to_parent(Mesh::new(box_geo, tube_material), panel_root);
             scene
-                .node(&tube)
+                .edit_node(tube)
                 .set_position(offset, -2.1, 0.0)
                 .set_scale_xyz(1.6, 0.10, 0.32)
                 .set_cast_shadows(false)
@@ -310,13 +310,13 @@ impl AppHandler for SineScrollerDemo {
         }
 
         let left_light = scene.add_light(Light::new_point(Vec3::new(0.30, 0.9, 1.0), 1.5, 20.0));
-        scene.node(&left_light).set_position(-4.0, 2.2, 2.8);
+        scene.edit_node(left_light).set_position(-4.0, 2.2, 2.8);
         let right_light = scene.add_light(Light::new_point(Vec3::new(1.0, 0.48, 0.75), 1.2, 20.0));
-        scene.node(&right_light).set_position(4.0, 1.4, 2.5);
+        scene.edit_node(right_light).set_position(4.0, 1.4, 2.5);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 2.0, 8.2)
             .look_at(Vec3::new(0.0, 2.0, -0.4));
         scene.active_camera = Some(cam);
@@ -357,17 +357,19 @@ impl AppHandler for SineScrollerDemo {
             return;
         };
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
-        scene.node(&self.panel_root).set_rotation(Quat::from_euler(
-            EulerRot::XYZ,
-            0.0,
-            (self.phase * 0.01).sin() * 0.03,
-            0.0,
-        ));
+        scene
+            .edit_node(self.panel_root)
+            .set_rotation(Quat::from_euler(
+                EulerRot::XYZ,
+                0.0,
+                (self.phase * 0.01).sin() * 0.03,
+                0.0,
+            ));
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Sine Scroller + Copper Bars | FPS: {:.1}", fps));

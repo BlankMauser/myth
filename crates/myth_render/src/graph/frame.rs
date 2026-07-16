@@ -44,6 +44,7 @@ use super::extracted::{ExtractedScene, SceneFeatures};
 use super::gpu_driven_policy::GpuDrivenFamilyMask;
 use super::material_plan::MaterialFrameId;
 use super::render_state::RenderState;
+use super::render_world::RenderWorldSyncStats;
 use super::shadow_utils;
 
 // ============================================================================
@@ -1437,11 +1438,11 @@ pub struct RenderLists {
     /// source. Masks are generation-stamped, so an ordinary debug frame reset
     /// remains O(1). Release collection consumes the dense complements below
     /// and carries no scene-width mask/stamp storage or publication scan.
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(test)]
     gpu_family_ownership_masks: Vec<GpuDrivenFamilyMask>,
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(test)]
     gpu_family_ownership_stamps: Vec<u32>,
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(test)]
     gpu_family_ownership_generation: u32,
 
     /// Dense CPU complement of the current committed GPU Main/Prepass recipe.
@@ -1481,11 +1482,11 @@ impl RenderLists {
             frame_source_generation: 1,
             // GPU ownership is cold when the default mode is Off. Let the
             // first Auto/Required selection own this allocation.
-            #[cfg(any(debug_assertions, test))]
+            #[cfg(test)]
             gpu_family_ownership_masks: Vec::new(),
-            #[cfg(any(debug_assertions, test))]
+            #[cfg(test)]
             gpu_family_ownership_stamps: Vec::new(),
-            #[cfg(any(debug_assertions, test))]
+            #[cfg(test)]
             gpu_family_ownership_generation: 1,
             gpu_cpu_main_complement: Vec::new(),
             gpu_cpu_shadow_complement: Vec::new(),
@@ -1515,7 +1516,7 @@ impl RenderLists {
         self.gpu_opaque_representatives.clear();
         self.advance_gpu_opaque_representative_generation();
         self.advance_frame_source_generation();
-        #[cfg(any(debug_assertions, test))]
+        #[cfg(test)]
         self.advance_gpu_family_ownership_generation();
         self.use_transmission = false;
     }
@@ -1549,7 +1550,7 @@ impl RenderLists {
         }
     }
 
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(test)]
     fn advance_gpu_family_ownership_generation(&mut self) {
         self.gpu_family_ownership_generation = self.gpu_family_ownership_generation.wrapping_add(1);
         if self.gpu_family_ownership_generation == 0 {
@@ -1561,7 +1562,7 @@ impl RenderLists {
     /// Assign one or more disjoint scene-submission families to GPU Scene for
     /// an exact extracted source. Repeating an already-owned family is a
     /// construction bug: it would make two GPU submissions render one cohort.
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(test)]
     pub(crate) fn claim_gpu_family_ownership(
         &mut self,
         extracted: ExtractedSourceId,
@@ -1886,6 +1887,7 @@ impl RenderKey {
 pub struct RenderFrame {
     pub(crate) render_state: RenderState,
     pub(crate) extracted_scene: ExtractedScene,
+    last_render_world_sync_stats: RenderWorldSyncStats,
 }
 
 impl Default for RenderFrame {
@@ -1900,6 +1902,7 @@ impl RenderFrame {
         Self {
             render_state: RenderState::new(),
             extracted_scene: ExtractedScene::with_capacity(1024),
+            last_render_world_sync_stats: RenderWorldSyncStats::default(),
         }
     }
 
@@ -1913,6 +1916,11 @@ impl RenderFrame {
     #[inline]
     pub fn extracted_scene(&self) -> &ExtractedScene {
         &self.extracted_scene
+    }
+
+    #[inline]
+    pub(crate) const fn last_render_world_sync_stats(&self) -> RenderWorldSyncStats {
+        self.last_render_world_sync_stats
     }
 
     /// Extract scene data and build shadow views without physical GPU work.
@@ -1958,10 +1966,11 @@ impl RenderFrame {
         resource_manager.next_frame();
 
         // ── 1. Extract ─────────────────────────────────────────────────
-        self.extracted_scene.extract_into(
+        let render_world_stats = self.extracted_scene.extract_into(
             scene,
             camera,
             assets,
+            f64::from(frame_time.time),
             max_extracted_lights,
             feature_config.gpu_driven != GpuDrivenMode::Off,
         );
@@ -1991,18 +2000,16 @@ impl RenderFrame {
             surface_size,
         ));
 
-        let shadow_views = Self::build_shadow_views(
+        Self::append_shadow_views(
             &self.extracted_scene,
             camera,
-            render_lists.active_views.len(),
+            &mut render_lists.active_views,
         );
 
         // ── 5. Shadow map allocation is deferred to RDG ─────────────────
         // The physical shadow texture is now a transient RDG resource,
         // allocated by the graph compiler after topology compilation.
         // No `ensure_shadow_maps()` call is needed here.
-
-        render_lists.active_views.extend(shadow_views);
 
         // ── 6. Update light storage buffer with shadow metadata ────────
         Self::update_light_shadow_metadata(&render_lists.active_views, &mut self.extracted_scene);
@@ -2015,6 +2022,8 @@ impl RenderFrame {
             resource_manager.frame_index(),
             surface_size,
         );
+
+        self.last_render_world_sync_stats = render_world_stats;
     }
 
     fn resolve_scene_feature_variants(
@@ -2065,36 +2074,34 @@ impl RenderFrame {
 
     /// Build [`RenderView`]s for all shadow-casting lights.
     ///
-    /// Returns a `Vec` of shadow views. Each directional light may produce
-    /// multiple cascade views; spot lights produce a single view; point
-    /// lights produce 6 cube map face views for omnidirectional shadows.
-    fn build_shadow_views(
+    /// Append shadow views directly into caller-retained frame storage. Each
+    /// directional light may produce multiple cascade views; spot lights
+    /// produce one and point lights six cube faces.
+    fn append_shadow_views(
         extracted_scene: &ExtractedScene,
         camera: &RenderCamera,
-        _existing_view_count: usize,
-    ) -> Vec<crate::core::view::RenderView> {
+        active_views: &mut Vec<crate::core::view::RenderView>,
+    ) {
         use myth_scene::light::LightKind;
 
-        // Compute scene caster extent (for CSM Z extension)
+        // Compute scene caster extent (for CSM Z extension) from the
+        // persistent conservative caster union. RenderWorld expands every
+        // caster AABB to its enclosing sphere box, so the farthest union
+        // corner cannot underestimate the previous per-caster
+        // `distance(center) + half_diagonal` bound.
         let camera_pos: glam::Vec3 = camera.position.to_array().into();
-        let mut max_distance = 0.0f32;
-        for item in &extracted_scene.render_items {
-            if !item.cast_shadows {
-                continue;
-            }
-            let aabb = item.world_aabb;
-            let effective_radius = if aabb.is_finite() {
-                aabb.size().length() * 0.5
-            } else {
-                0.0
-            };
-            let center_ws = aabb.center();
-            let distance = camera_pos.distance(center_ws) + effective_radius;
-            max_distance = max_distance.max(distance);
-        }
+        let max_distance = extracted_scene
+            .shadow_caster_bounds_union()
+            .filter(myth_resources::BoundingBox::is_finite)
+            .map_or(0.0, |bounds| {
+                let farthest_delta = (bounds.min - camera_pos)
+                    .abs()
+                    .max((bounds.max - camera_pos).abs());
+                farthest_delta.length()
+            });
         let scene_caster_extent = max_distance.max(50.0);
 
-        let mut shadow_views = Vec::with_capacity(16);
+        let shadow_view_start = active_views.len();
 
         for (light_buffer_index, light) in extracted_scene.lights.iter().enumerate() {
             if !light.cast_shadows {
@@ -2111,9 +2118,10 @@ impl RenderFrame {
                     };
                     let shadow_far = shadow_cfg.max_shadow_distance.min(cam_far);
                     let caster_extension = scene_caster_extent.max(shadow_cfg.max_shadow_distance);
-                    let base_layer = shadow_views.len() as u32;
+                    let base_layer =
+                        u32::try_from(active_views.len() - shadow_view_start).unwrap_or(u32::MAX);
 
-                    let (views, _splits) = shadow_utils::build_directional_views(
+                    let _splits = shadow_utils::append_directional_views(
                         light.id,
                         light.direction,
                         light_buffer_index,
@@ -2122,12 +2130,13 @@ impl RenderFrame {
                         shadow_far,
                         caster_extension,
                         base_layer,
+                        active_views,
                     );
-                    shadow_views.extend(views);
                 }
                 LightKind::Spot(spot) => {
-                    let base_layer = shadow_views.len() as u32;
-                    shadow_views.push(shadow_utils::build_spot_view(
+                    let base_layer =
+                        u32::try_from(active_views.len() - shadow_view_start).unwrap_or(u32::MAX);
+                    active_views.push(shadow_utils::build_spot_view(
                         light.id,
                         light_buffer_index,
                         light.position,
@@ -2146,20 +2155,20 @@ impl RenderFrame {
                     {
                         continue;
                     }
-                    let base_layer = shadow_views.len() as u32;
-                    shadow_views.extend(shadow_utils::build_point_views(
+                    let base_layer =
+                        u32::try_from(active_views.len() - shadow_view_start).unwrap_or(u32::MAX);
+                    shadow_utils::append_point_views(
                         light.id,
                         light_buffer_index,
                         light.position,
                         point,
                         &shadow_cfg,
                         base_layer,
-                    ));
+                        active_views,
+                    );
                 }
             }
         }
-
-        shadow_views
     }
 
     /// Write per-light shadow metadata (layer indices, cascade matrices,

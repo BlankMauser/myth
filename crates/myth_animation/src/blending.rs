@@ -167,6 +167,14 @@ impl FrameBlendState {
     pub fn iter_nodes(
         &self,
     ) -> impl Iterator<Item = (&NodeHandle, &FxHashMap<TargetPath, BlendEntry>)> {
-        self.entries.iter()
+        self.entries.iter().filter(|(_, props)| !props.is_empty())
+    }
+
+    /// Whether this frame contributes one exact property for a node.
+    #[inline]
+    pub fn has_contribution(&self, node: NodeHandle, target: TargetPath) -> bool {
+        self.entries
+            .get(&node)
+            .is_some_and(|props| props.contains_key(&target))
     }
 }

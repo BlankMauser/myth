@@ -34,15 +34,16 @@ let child = scene.spawn_sphere(0.35, material, &engine.assets);
 scene.attach(child, parent);
 
 // 链式调用设置 Transform
-scene.node(&parent).set_position(0.0, 1.0, 0.0);
-scene.node(&child).set_position(1.0, 0.0, 0.0);
+scene.edit_node(parent).set_position(0.0, 1.0, 0.0);
+scene.edit_node(child).set_position(1.0, 0.0, 0.0);
 
 ```
 
-::: info 获取节点的两种方式
+::: info 读取与编辑节点
 
-* 使用 `scene.node(&handle)`：提供链式的快捷 API（如 `set_position`、`look_at`），适合快速初始化。
-* 使用 `scene.get_node_mut(handle)`：返回节点的可变引用，适合在 `on_update` 循环中进行复杂的逻辑计算和底层组件访问。
+* 使用 `scene.node(handle)`：只读访问节点，不会产生变更记录。
+* 使用 `scene.node_mut(handle)`：取得原始可变引用，适合复杂的底层组件操作；引擎会保守地将其记录为潜在变更。
+* 使用 `scene.edit_node(handle)`：提供精确记录变更的链式 API（如 `set_position`、`look_at`），适合初始化和常规逐帧编辑。
 :::
 
 ## 3. 摄像机与环境控制
@@ -53,7 +54,7 @@ scene.node(&child).set_position(1.0, 0.0, 0.0);
 
 ```rust
 let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
-scene.node(&camera).set_position(0.0, 2.0, 5.0).look_at(Vec3::ZERO);
+scene.edit_node(camera).set_position(0.0, 2.0, 5.0).look_at(Vec3::ZERO);
 
 // 务必将其设置为活跃相机
 scene.active_camera = Some(camera);

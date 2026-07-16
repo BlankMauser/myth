@@ -87,7 +87,7 @@ mod app {
 
             let floor = scene.spawn_plane(18.0, 84.0, floor_material, &engine.assets);
             scene
-                .node(&floor)
+                .edit_node(floor)
                 .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
                 .set_position(0.0, -0.3, 0.0)
                 .set_receive_shadows(false);
@@ -99,7 +99,7 @@ mod app {
             ] {
                 let wall = scene.spawn_box(sx, sy, sz, wall_material, &engine.assets);
                 scene
-                    .node(&wall)
+                    .edit_node(wall)
                     .set_position(x, y, z)
                     .set_shadows(false, true);
             }
@@ -119,7 +119,7 @@ mod app {
                         scene.spawn_box(1.3, 1.3, 1.3, block_material, &engine.assets)
                     };
                     scene
-                        .node(&block)
+                        .edit_node(block)
                         .set_position(x, y, z)
                         .set_shadows(false, true);
                 }
@@ -148,7 +148,7 @@ mod app {
                         );
                         scene.attach(helper, light);
                         scene
-                            .node(&helper)
+                            .edit_node(helper)
                             .set_position(0.0, 0.0, 0.0)
                             .set_shadows(false, false);
                         let base = Vec3::new(
@@ -156,7 +156,7 @@ mod app {
                             0.85 + iy as f32 * 0.5,
                             centered_lattice(iz, LIGHT_GRID_Z, 3.25),
                         );
-                        scene.node(&light).set_position(base.x, base.y, base.z);
+                        scene.edit_node(light).set_position(base.x, base.y, base.z);
                         lights.push(HeatmapLight {
                             node: light,
                             base,
@@ -170,11 +170,11 @@ mod app {
             let camera_pos = Vec3::new(0.0, 4.2, 20.0);
             let target = Vec3::new(0.0, 1.8, 0.0);
             let cam = scene.add_camera(Camera::new_perspective(46.0, 16.0 / 9.0, 0.1));
-            if let Some(camera) = scene.get_camera_mut(cam) {
+            if let Some(camera) = scene.camera_mut(cam) {
                 camera.debug_view.mode = DebugViewMode::ClusterHeatmap;
             }
             scene
-                .node(&cam)
+                .edit_node(cam)
                 .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
                 .look_at(target);
             scene.active_camera = Some(cam);
@@ -202,7 +202,7 @@ mod app {
             if engine.input.get_key_down(Key::H) {
                 self.show_heatmap = !self.show_heatmap;
                 if let Some(camera_node) = scene.active_camera {
-                    if let Some(camera) = scene.get_camera_mut(camera_node) {
+                    if let Some(camera) = scene.camera_mut(camera_node) {
                         camera.debug_view.mode = if self.show_heatmap {
                             DebugViewMode::ClusterHeatmap
                         } else {
@@ -216,17 +216,17 @@ mod app {
                 let offset_x = (self.time * 0.72 + light.phase).sin() * light.amplitude.x;
                 let offset_y = (self.time * 1.18 + light.phase * 0.45).sin() * light.amplitude.y;
                 let offset_z = (self.time * 0.94 + light.phase * 1.3).cos() * light.amplitude.z;
-                scene.node(&light.node).set_position(
+                scene.edit_node(light.node).set_position(
                     light.base.x + offset_x,
                     light.base.y + offset_y,
                     light.base.z + offset_z,
                 );
             }
 
-            if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+            let _ = scene.edit_main_camera_bundle(|transform, camera| {
                 self.controls
                     .update(transform, &engine.input, camera.fov(), frame.dt);
-            }
+            });
 
             if let Some(fps) = self.fps_counter.update() {
                 let mode_label = if self.show_heatmap {

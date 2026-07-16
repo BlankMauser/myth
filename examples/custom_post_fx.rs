@@ -145,7 +145,7 @@ impl AppHandler for CustomPostFxDemo {
 
         let floor = scene.add_mesh(Mesh::new(box_geo, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.12, 0.0)
             .set_scale_xyz(20.0, 0.24, 20.0)
             .set_shadows(false, true);
@@ -154,7 +154,7 @@ impl AppHandler for CustomPostFxDemo {
         for index in 0..48 {
             let handle = scene.add_mesh(Mesh::new(sphere_geo, palette[index % palette.len()]));
             scene
-                .node(&handle)
+                .edit_node(handle)
                 .set_cast_shadows(false)
                 .set_receive_shadows(false);
             orbs.push(PostFxOrb {
@@ -172,16 +172,16 @@ impl AppHandler for CustomPostFxDemo {
         }
         let key = scene.add_light(key);
         scene
-            .node(&key)
+            .edit_node(key)
             .set_position(8.0, 10.0, 8.0)
             .look_at(Vec3::new(0.0, 1.4, 0.0));
 
         let ring_light = scene.add_light(Light::new_point(Vec3::new(0.35, 0.9, 1.0), 1.8, 24.0));
-        scene.node(&ring_light).set_position(0.0, 4.0, 5.0);
+        scene.edit_node(ring_light).set_position(0.0, 4.0, 5.0);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 3.0, 12.5)
             .look_at(Vec3::new(0.0, 1.4, 0.0));
         scene.active_camera = Some(cam);
@@ -216,12 +216,12 @@ impl AppHandler for CustomPostFxDemo {
             let pulse = 0.18 + 0.12 * (self.time * 1.6 + orb.phase).sin().abs();
 
             scene
-                .node(&orb.handle)
+                .edit_node(orb.handle)
                 .set_position(x, y, z)
                 .set_scale(pulse);
         }
 
-        if let Some(node) = scene.get_node_mut(self.ring_light) {
+        if let Some(node) = scene.node_mut(self.ring_light) {
             node.transform.position = Vec3::new(
                 self.time.cos() * 5.2,
                 3.4 + (self.time * 1.4).sin() * 0.9,
@@ -229,10 +229,10 @@ impl AppHandler for CustomPostFxDemo {
             );
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             let mode = if self.effect_enabled {

@@ -68,7 +68,7 @@ fn add_box_to_parent(
 ) -> NodeHandle {
     let node = scene.add_mesh_to_parent(Mesh::new(geometry, material), parent);
     scene
-        .node(&node)
+        .edit_node(node)
         .set_position_vec(position)
         .set_scale_xyz(scale.x, scale.y, scale.z)
         .set_shadows(cast_shadows, receive_shadows);
@@ -216,18 +216,18 @@ impl AppHandler for DoomFireDemo {
 
         let floor = scene.add_mesh(Mesh::new(box_geo, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.12, 0.0)
             .set_scale_xyz(14.0, 0.24, 10.0)
             .set_shadows(false, true);
 
         let screen_root = scene.create_node_with_name("DoomFireScreen");
         scene.push_root_node(screen_root);
-        scene.node(&screen_root).set_position(0.0, 1.75, 0.0);
+        scene.edit_node(screen_root).set_position(0.0, 1.75, 0.0);
 
         let screen = scene.add_mesh_to_parent(Mesh::new(plane_geo, screen_material), screen_root);
         scene
-            .node(&screen)
+            .edit_node(screen)
             .set_cast_shadows(false)
             .set_receive_shadows(false);
 
@@ -310,22 +310,22 @@ impl AppHandler for DoomFireDemo {
         }
         let key = scene.add_light(key);
         scene
-            .node(&key)
+            .edit_node(key)
             .set_position(6.0, 8.0, 5.0)
             .look_at(Vec3::new(0.0, 1.4, 0.0));
 
         let warm_light = scene.add_light(Light::new_point(Vec3::new(1.0, 0.52, 0.16), 2.6, 18.0));
-        scene.node(&warm_light).set_position(0.0, 2.1, 1.8);
+        scene.edit_node(warm_light).set_position(0.0, 2.1, 1.8);
         // let helper = scene.add_mesh_to_parent(Mesh::new(sphere_geo, helper_material), warm_light);
         // scene
-        //     .node(&helper)
+        //     .edit_node(helper)
         //     .set_scale(0.14)
         //     .set_cast_shadows(false)
         //     .set_receive_shadows(false);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 1.8, 6.4)
             .look_at(Vec3::new(0.0, 1.65, 0.0));
         scene.active_camera = Some(cam);
@@ -384,17 +384,19 @@ impl AppHandler for DoomFireDemo {
             return;
         };
 
-        scene.node(&self.screen_root).set_rotation(Quat::from_euler(
-            EulerRot::XYZ,
-            -0.04,
-            0.18 * (self.phase * 0.6).sin(),
-            0.0,
-        ));
+        scene
+            .edit_node(self.screen_root)
+            .set_rotation(Quat::from_euler(
+                EulerRot::XYZ,
+                -0.04,
+                0.18 * (self.phase * 0.6).sin(),
+                0.0,
+            ));
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             let mode = if self.turbo { "turbo" } else { "steady" };

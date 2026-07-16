@@ -129,7 +129,7 @@ impl Mesh {
     /// This does not advance temporal history. A renderer may prepare an
     /// attempt that is later abandoned; call [`Self::commit_morph_history`]
     /// only after the commands using this uniform have been submitted.
-    pub fn prepare_morph_uniforms(&mut self) {
+    pub fn prepare_morph_uniforms(&self) {
         if self.morph_target_influences.is_empty() || self.morph_update_frames == 0 {
             return;
         }

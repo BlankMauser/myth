@@ -45,7 +45,7 @@ impl PyOrbitControls {
                 .map_or(60.0_f32.to_radians(), |c| c.fov());
 
             // Update orbit controls with the node's transform
-            if let Some(node) = scene.get_node_mut(handle) {
+            if let Some(node) = scene.node_mut(handle) {
                 self.inner
                     .update(&mut node.transform, &engine.input, fov, dt);
             }
@@ -63,7 +63,7 @@ impl PyOrbitControls {
         with_engine(|engine| {
             let scene = engine.scene_manager.active_scene_mut().unwrap();
             scene.update_subtree(node.handle);
-            if let Some(bbox) = scene.get_bbox_of_node(node.handle, &engine.assets) {
+            if let Some(bbox) = scene.subtree_world_bounds(node.handle, &engine.assets) {
                 self.inner.fit(&bbox);
             }
         })?;

@@ -241,13 +241,13 @@ impl RubikMiniGame {
     ) -> Vec<Cubie> {
         let pedestal = scene.add_mesh(Mesh::new(geometry.unit_box, materials.pedestal));
         scene
-            .node(&pedestal)
+            .edit_node(pedestal)
             .set_position(0.0, -2.25, 0.0)
             .set_scale_xyz(4.8, 0.28, 4.8);
 
         let trim = scene.add_mesh(Mesh::new(geometry.unit_box, materials.trim));
         scene
-            .node(&trim)
+            .edit_node(trim)
             .set_position(0.0, -1.95, 0.0)
             .set_scale_xyz(3.0, 0.12, 3.0);
 
@@ -266,7 +266,7 @@ impl RubikMiniGame {
 
                     let body = scene
                         .add_mesh_to_parent(Mesh::new(geometry.unit_box, materials.body), root);
-                    scene.node(&body).set_scale(CUBIE_SIZE);
+                    scene.edit_node(body).set_scale(CUBIE_SIZE);
 
                     for face in Face::ALL {
                         if !face.is_visible_on(coord) {
@@ -280,7 +280,7 @@ impl RubikMiniGame {
                         let offset = ivec3_to_vec3(face.normal()) * STICKER_OFFSET;
                         let scale = sticker_scale(face.axis());
                         scene
-                            .node(&sticker)
+                            .edit_node(sticker)
                             .set_position_vec(offset)
                             .set_scale_xyz(scale.x, scale.y, scale.z);
                     }
@@ -324,7 +324,7 @@ impl RubikMiniGame {
         position: Vec3,
         rotation: Quat,
     ) {
-        if let Some(node) = scene.get_node_mut(handle) {
+        if let Some(node) = scene.node_mut(handle) {
             node.transform.position = position;
             node.transform.rotation = rotation;
         }
@@ -535,7 +535,7 @@ impl AppHandler for RubikMiniGame {
         let camera_position = Vec3::new(6.0, 5.5, 7.5);
         let camera = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position_vec(camera_position)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(camera);
@@ -566,10 +566,10 @@ impl AppHandler for RubikMiniGame {
 
         self.handle_input(scene, &engine.input);
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         self.begin_next_turn();
         self.animate_active_turn(scene, frame.dt);

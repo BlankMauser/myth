@@ -24,7 +24,7 @@ let cloud = engine.assets.load_gaussian_npz("assets/3dgs/point_cloud.npz".into()
 let node = scene.add_gaussian_cloud("gaussian_cloud", cloud);
 
 // 3. Transform freely
-scene.node(&node).set_rotation_euler(
+scene.edit_node(node).set_rotation_euler(
     std::f32::consts::FRAC_PI_2,
     0.0,
     0.0,

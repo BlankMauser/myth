@@ -303,7 +303,7 @@ impl AppHandler for AuroraGateDemo {
 
         let floor = scene.spawn_plane(20.0, 20.0, floor_material, &engine.assets);
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.08, 0.0)
             .set_receive_shadows(true);
@@ -316,19 +316,19 @@ impl AppHandler for AuroraGateDemo {
         ] {
             let strut = scene.spawn_box(sx, sy, sz, frame_material, &engine.assets);
             scene
-                .node(&strut)
+                .edit_node(strut)
                 .set_position(x, y, z)
                 .set_shadows(true, true);
         }
 
         // let key = scene.add_light(Light::new_directional(Vec3::new(0.92, 0.96, 1.0), 2.1));
         // scene
-        //     .node(&key)
+        //     .edit_node(key)
         //     .set_position(8.0, 10.0, 6.0)
         //     .look_at(Vec3::new(0.0, 2.0, 0.0));
 
         // let accent_light = scene.add_light(Light::new_point(Vec3::new(0.18, 0.95, 0.88), 2.8, 18.0));
-        // scene.node(&accent_light).set_position(0.0, 2.6, 5.8);
+        // scene.edit_node(accent_light).set_position(0.0, 2.6, 5.8);
 
         let portal_geometry = engine
             .assets
@@ -377,26 +377,26 @@ impl AppHandler for AuroraGateDemo {
 
         let outer_gate = scene.add_mesh(Mesh::new(portal_geometry, outer_material));
         scene
-            .node(&outer_gate)
+            .edit_node(outer_gate)
             .set_position(0.0, 2.0, 0.0)
             .set_shadows(false, false);
 
         let inner_gate = scene.add_mesh(Mesh::new(portal_geometry, inner_material));
         scene
-            .node(&inner_gate)
+            .edit_node(inner_gate)
             .set_position(0.0, 2.0, -0.2)
             .set_scale_xyz(0.82, 0.82, 0.92)
             .set_shadows(false, false);
 
         let core_node = scene.spawn_sphere(0.96, core_material, &engine.assets);
         scene
-            .node(&core_node)
+            .edit_node(core_node)
             .set_position(0.0, 2.0, 0.0)
             .set_shadows(false, false);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.4, 10.4)
             .look_at(Vec3::new(0.0, 2.0, 0.0));
         scene.active_camera = Some(camera);
@@ -418,19 +418,19 @@ impl AppHandler for AuroraGateDemo {
             return;
         };
 
-        scene.node(&self.outer_gate).set_rotation(
+        scene.edit_node(self.outer_gate).set_rotation(
             Quat::from_rotation_z(self.time * 0.28) * Quat::from_rotation_y(self.time * 0.10),
         );
-        scene.node(&self.inner_gate).set_rotation(
+        scene.edit_node(self.inner_gate).set_rotation(
             Quat::from_rotation_z(-self.time * 0.42)
                 * Quat::from_rotation_x((self.time * 0.6).sin() * 0.08),
         );
         scene
-            .node(&self.core_node)
+            .edit_node(self.core_node)
             .set_position(0.0, 2.0 + (self.time * 1.8).sin() * 0.16, 0.0)
             .set_rotation(Quat::from_rotation_y(-self.time * 0.8));
 
-        // if let Some(node) = scene.get_node_mut(self.accent_light) {
+        // if let Some(node) = scene.node_mut(self.accent_light) {
         //     node.transform.position = Vec3::new(
         //         self.time.cos() * 5.4,
         //         2.8 + (self.time * 1.6).sin() * 0.6,
@@ -438,10 +438,10 @@ impl AppHandler for AuroraGateDemo {
         //     );
         // }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

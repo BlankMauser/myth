@@ -26,6 +26,7 @@ pub(crate) mod gpu_scene_submission;
 pub(crate) mod material_plan;
 pub mod passes;
 pub mod render_state;
+pub(crate) mod render_world;
 pub(crate) mod scene_pipeline_coordinator;
 pub(crate) mod scene_pipeline_prepare;
 pub(crate) mod scene_source_prepare;
@@ -35,9 +36,10 @@ pub use composer::FrameComposer;
 pub use core::{
     MermaidDumpMode, RdgAttemptOutcome, RdgCommandEncodingFailure, RdgFrameDiagnostics,
     RdgFramePhase, RdgGpuDrivenFailure, RdgGpuDrivenPolicySnapshot,
-    RdgPostSubmitPublicationFailure, RdgRenderTargetKind, RdgResourceMaterializationFailure,
-    RdgRetainedCapacityStats, RdgSceneSubmissionBackend, RdgSceneSubmissionFamily,
-    RdgSceneSubmissionFamilySnapshot, RdgSceneSubmissionSelectionReason, RdgSurfaceAcquireFailure,
+    RdgPostSubmitPublicationFailure, RdgRenderTargetKind, RdgRenderWorldRebuildReason,
+    RdgRenderWorldSnapshot, RdgResourceMaterializationFailure, RdgRetainedCapacityStats,
+    RdgSceneSubmissionBackend, RdgSceneSubmissionFamily, RdgSceneSubmissionFamilySnapshot,
+    RdgSceneSubmissionSelectionReason, RdgSurfaceAcquireFailure,
 };
 #[cfg(feature = "rdg_bench_support")]
 pub use core::{RdgDetailPhase, RdgGpuFrameTimings, RdgGpuPassTiming};

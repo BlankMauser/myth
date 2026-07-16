@@ -185,7 +185,7 @@ impl AppHandler for SlopeBlendDemo {
         sun.cast_shadows = true;
         let sun_node = scene.add_light(sun);
         scene
-            .node(&sun_node)
+            .edit_node(sun_node)
             .set_position(6.0, 9.0, 5.0)
             .look_at(Vec3::new(0.0, 1.0, 0.0));
 
@@ -209,7 +209,7 @@ impl AppHandler for SlopeBlendDemo {
             &engine.assets,
         );
         scene
-            .node(&ground)
+            .edit_node(ground)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_position(0.0, 0.0, 0.0);
 
@@ -228,7 +228,7 @@ impl AppHandler for SlopeBlendDemo {
             &engine.assets,
         );
         scene
-            .node(&rock_a)
+            .edit_node(rock_a)
             .set_position(-2.6, 1.6, 0.0)
             .set_rotation(Quat::from_rotation_y(0.26) * Quat::from_rotation_z(-0.08));
 
@@ -247,7 +247,7 @@ impl AppHandler for SlopeBlendDemo {
             &engine.assets,
         );
         scene
-            .node(&rock_b)
+            .edit_node(rock_b)
             .set_position(0.8, 1.2, -1.1)
             .set_rotation(Quat::from_rotation_y(-0.34) * Quat::from_rotation_x(0.14));
 
@@ -263,11 +263,11 @@ impl AppHandler for SlopeBlendDemo {
             ),
             &engine.assets,
         );
-        scene.node(&rock_c).set_position(3.2, 1.25, 1.0);
+        scene.edit_node(rock_c).set_position(3.2, 1.25, 1.0);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 3.4, 10.0)
             .look_at(Vec3::new(0.0, 1.4, 0.0));
         scene.active_camera = Some(camera);
@@ -288,20 +288,20 @@ impl AppHandler for SlopeBlendDemo {
             return;
         };
 
-        scene.node(&self.rock_a).set_rotation(
+        scene.edit_node(self.rock_a).set_rotation(
             Quat::from_rotation_y(0.26 + self.time * 0.10) * Quat::from_rotation_z(-0.08),
         );
-        scene.node(&self.rock_b).set_rotation(
+        scene.edit_node(self.rock_b).set_rotation(
             Quat::from_rotation_y(-0.34 - self.time * 0.08) * Quat::from_rotation_x(0.14),
         );
         scene
-            .node(&self.rock_c)
+            .edit_node(self.rock_c)
             .set_position(3.2, 1.25 + (self.time * 1.2).sin() * 0.08, 1.0);
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

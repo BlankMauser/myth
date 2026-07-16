@@ -56,7 +56,7 @@ impl AppHandler for ClusteredLightingDemo {
             &engine.assets,
         );
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_position(0.0, -0.55, 0.0)
             .set_receive_shadows(true);
@@ -69,7 +69,7 @@ impl AppHandler for ClusteredLightingDemo {
             &engine.assets,
         );
         scene
-            .node(&wall)
+            .edit_node(wall)
             .set_position(0.0, 2.0, -5.4)
             .set_cast_shadows(false)
             .set_receive_shadows(true);
@@ -116,7 +116,7 @@ impl AppHandler for ClusteredLightingDemo {
                 &engine.assets,
             );
             scene
-                .node(&node)
+                .edit_node(node)
                 .set_position(position.x, position.y + 0.35, position.z)
                 .set_shadows(true, true);
         }
@@ -144,13 +144,13 @@ impl AppHandler for ClusteredLightingDemo {
                 );
                 scene.attach(helper, light);
                 scene
-                    .node(&helper)
+                    .edit_node(helper)
                     .set_position(0.0, 0.0, 0.0)
                     .set_shadows(false, false);
 
                 let x = phase.cos() * radius;
                 let z = phase.sin() * radius;
-                scene.node(&light).set_position(x, height, z);
+                scene.edit_node(light).set_position(x, height, z);
 
                 lights.push(AnimatedLight {
                     node: light,
@@ -166,7 +166,7 @@ impl AppHandler for ClusteredLightingDemo {
         let target = Vec3::new(0.0, 1.0, 0.0);
         let camera_node = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera_node)
+            .edit_node(camera_node)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         scene.active_camera = Some(camera_node);
@@ -196,13 +196,13 @@ impl AppHandler for ClusteredLightingDemo {
             let x = angle.cos() * light.radius;
             let z = angle.sin() * light.radius;
             let y = light.base_height + wobble;
-            scene.node(&light.node).set_position(x, y, z);
+            scene.edit_node(light.node).set_position(x, y, z);
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

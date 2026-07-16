@@ -44,7 +44,7 @@ impl AppHandler for ProceduralOceanDemo {
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.5, 6.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(camera);
@@ -86,10 +86,10 @@ impl AppHandler for ProceduralOceanDemo {
             return;
         };
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         let winit_window = window
             .as_any()

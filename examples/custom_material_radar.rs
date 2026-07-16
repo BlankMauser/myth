@@ -144,7 +144,7 @@ impl AppHandler for RadarSweepDemo {
             &engine.assets,
         );
         scene
-            .node(&radar_plane)
+            .edit_node(radar_plane)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, 0.0, 0.0);
 
@@ -155,13 +155,13 @@ impl AppHandler for RadarSweepDemo {
             &engine.assets,
         );
         scene
-            .node(&base)
+            .edit_node(base)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.02, 0.0);
 
         let key_light = scene.add_light(Light::new_directional(Vec3::new(0.7, 1.0, 0.8), 2.4));
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_position(6.0, 8.0, 5.0)
             .look_at(Vec3::new(0.0, 0.6, 0.0));
 
@@ -172,18 +172,18 @@ impl AppHandler for RadarSweepDemo {
             PhongMaterial::new(Vec4::new(0.12, 0.95, 0.48, 1.0)),
             &engine.assets,
         );
-        scene.node(&blip_a).set_position(1.8, 0.45, 0.6);
+        scene.edit_node(blip_a).set_position(1.8, 0.45, 0.6);
 
         let blip_b = scene.spawn_sphere(
             0.28,
             PhongMaterial::new(Vec4::new(0.18, 0.85, 0.55, 1.0)),
             &engine.assets,
         );
-        scene.node(&blip_b).set_position(-2.1, 0.28, -0.8);
+        scene.edit_node(blip_b).set_position(-2.1, 0.28, -0.8);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 5.4, 6.8)
             .look_at(Vec3::new(0.0, 0.0, 0.0));
         scene.active_camera = Some(camera);
@@ -203,22 +203,22 @@ impl AppHandler for RadarSweepDemo {
             return;
         };
 
-        scene.node(&self.blip_a).set_position(
+        scene.edit_node(self.blip_a).set_position(
             (self.time * 0.9).cos() * 2.2,
             0.45 + (self.time * 4.0).sin().abs() * 0.25,
             (self.time * 0.9).sin() * 1.7,
         );
 
-        scene.node(&self.blip_b).set_position(
+        scene.edit_node(self.blip_b).set_position(
             (self.time * -0.6).cos() * 2.8,
             0.28,
             (self.time * -0.6).sin() * 2.2,
         );
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

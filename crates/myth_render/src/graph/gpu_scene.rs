@@ -33,6 +33,9 @@ use super::extracted::{
 };
 use super::frame::{ExtractedSourceId, FrameSourceId, RenderLists};
 use super::gpu_driven_policy::GpuDrivenFamilyMask;
+use super::render_world::{
+    RenderWorldChangeFlags, RenderWorldConsumerCursor, RenderWorldFullRebuildReason,
+};
 
 const GPU_SCENE_INSTANCE_SCHEMA_ID: u64 = u64::from_be_bytes(*b"MYTHINST");
 const GPU_SCENE_GEOMETRY_SCHEMA_ID: u64 = u64::from_be_bytes(*b"MYTHGEOM");
@@ -48,6 +51,13 @@ const GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS: f64 = 1.5;
 /// shared table scan. The current scene consumes one entry; the remaining
 /// three entries form a small deterministic LRU of dormant domains.
 const GPU_SCENE_DOMAIN_BUDGET: usize = 4;
+/// Hard CPU-memory budget for dormant canonical derivations. The active
+/// recipe is intentionally excluded: it is the minimum authority needed by
+/// the selected scene, while every dormant recipe is a recomputable cache.
+const GPU_SCENE_DORMANT_RECIPE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// Recreate the coherent table family only after an old physical allocation
+/// is at least four times the currently required power-of-two capacity.
+const GPU_SCENE_PHYSICAL_TABLE_SHRINK_RATIO: u64 = 4;
 const GPU_SCENE_SCRATCH_BASELINE: usize = 16;
 /// Instance participates in shadow-caster culling.
 ///
@@ -459,6 +469,9 @@ pub(crate) struct GpuSceneProjectedTableSet {
 pub(crate) struct GpuSceneMultiBinPreflight {
     serial: u64,
     scene_id: u32,
+    recipe_generation: u64,
+    world_revision: u64,
+    minimum_member_count: u32,
     /// Frame-local identity proof. Commit compares only the address and never
     /// dereferences it; this prevents an internal caller from pairing retained
     /// recipe indices with a different `ExtractedScene` that happens to reuse
@@ -551,6 +564,7 @@ impl std::ops::Deref for GpuSceneActiveBatchSet<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GpuSceneMultiBinPreflightFailure {
     Domain(GpuSceneSelectionRejection),
+    RenderWorldDrift,
     InvalidVisibleStride,
     InvalidStorageAlignment,
     LayoutOverflow,
@@ -561,7 +575,7 @@ pub(crate) enum GpuSceneMultiBinPreflightFailure {
 /// one unsupported opaque item rejects the entire GPU backend. `Cohorts`
 /// keeps unsupported and low-reuse bins CPU-owned while retaining only bins
 /// large enough to amortize an indirect submission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum GpuSceneMultiBinSelectionPolicy {
     CompleteDomain,
     Cohorts { minimum_member_count: u32 },
@@ -611,15 +625,14 @@ struct GpuScenePreflightBin {
 struct GpuScenePreflightMember {
     item: u32,
     bin: u32,
-    /// Index into the sparse inverse-update scratch, or `u32::MAX` when the
-    /// retained instance record already owns the exact current inverse.
-    inverse_update: u32,
+    node: NodeHandle,
+    cast_shadows: bool,
+    dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct GpuSceneItemPreflight {
     key: GpuSceneRigidBatchKey,
-    inverse_update: Option<[[f32; 4]; 4]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -631,6 +644,77 @@ struct GpuSceneResolvedBin {
     geometry_id: GpuSceneGeometryId,
     material_id: GpuSceneMaterialId,
     batch_id: GpuSceneBatchId,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum GpuSceneCanonicalSourceState {
+    #[default]
+    CpuOnly,
+    Unsupported(GpuSceneSelectionRejection),
+    Member(u32),
+}
+
+/// One immutable membership/layout projection derived from the canonical
+/// scene recipe. Auto may retain several cohort thresholds, but transform
+/// deltas patch the canonical members once and never rebuild these views.
+#[derive(Debug, Default)]
+struct GpuSceneSelectionView {
+    minimum_member_count: u32,
+    visible_stride: u64,
+    storage_alignment: u64,
+    bins: Vec<GpuScenePreflightBin>,
+    /// Canonical-member indices in extraction order.
+    members: Vec<u32>,
+    /// Canonical-bin -> selected-bin, or `u32::MAX` for a CPU-owned cohort.
+    bin_remap: Vec<u32>,
+    geometry_uniques: FxHashMap<GeometryHandle, GpuSceneGeometryStamp>,
+    material_uniques: FxHashMap<MaterialHandle, GpuSceneMaterialStamp>,
+    instance_uniques: FxHashSet<NodeHandle>,
+    cpu_complement: Vec<ExtractedSourceId>,
+    resolved: Vec<GpuSceneResolvedBin>,
+    shadow_candidate_count: u32,
+    covers_complete_shadow_domain: bool,
+    visible_partition_bytes: u64,
+}
+
+/// Retained canonical GPU Scene recipe for the current Render World revision.
+/// Fixed membership is rebuilt only at an explicit Render World fallback;
+/// transform and previous-history deltas touch the indexed member subset.
+#[derive(Debug, Default)]
+struct GpuSceneCanonicalRecipe {
+    scene_id: u32,
+    topology_epoch: u64,
+    cursor: RenderWorldConsumerCursor,
+    generation: u64,
+    initialized: bool,
+    complete_rejection: Option<GpuSceneSelectionRejection>,
+    fatal_rejection: Option<GpuSceneSelectionRejection>,
+    has_shadow_casters: bool,
+    total_shadow_caster_count: u32,
+    bins: Vec<GpuScenePreflightBin>,
+    members: Vec<GpuScenePreflightMember>,
+    source_states: Vec<GpuSceneCanonicalSourceState>,
+    dirty_members: Vec<u32>,
+    views: FxHashMap<u32, GpuSceneSelectionView>,
+    full_sync_pending: bool,
+    last_used_serial: u64,
+    last_used_seconds: f64,
+}
+
+/// Allocation-free facts produced while the canonical consumer advances.
+/// These counters describe actual recipe work; diagnostics do not trigger an
+/// additional member traversal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GpuSceneRecipeStats {
+    pub(crate) scene_id: u32,
+    pub(crate) revision: u64,
+    pub(crate) members_total: u32,
+    pub(crate) members_reused: u32,
+    pub(crate) members_examined: u32,
+    pub(crate) members_updated: u32,
+    pub(crate) members_rebuilt: u32,
+    pub(crate) retained_bytes: usize,
+    pub(crate) full_rebuild_reason: Option<RenderWorldFullRebuildReason>,
 }
 
 /// Stable semantic identity of a batch. Asset epochs and physical partition
@@ -738,7 +822,6 @@ fn is_gpu_scene_prefrustum_opaque(item: &ExtractedRenderItem) -> bool {
 
 fn preflight_gpu_scene_item(
     item: &ExtractedRenderItem,
-    world_matrix_is_current: bool,
 ) -> Result<Option<GpuSceneItemPreflight>, GpuSceneSelectionRejection> {
     if !is_gpu_scene_prefrustum_opaque(item) {
         return Ok(None);
@@ -774,26 +857,20 @@ fn preflight_gpu_scene_item(
     if !item.world_matrix.is_finite() || !item.prev_world_matrix.is_finite() {
         return Err(GpuSceneSelectionRejection::NonFiniteTransform);
     }
-    let inverse_update = if world_matrix_is_current {
-        None
-    } else {
-        let determinant = item.world_matrix.determinant();
-        if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
-            return Err(GpuSceneSelectionRejection::NonInvertibleTransform);
-        }
-        let inverse = item.world_matrix.inverse();
-        if !inverse.is_finite() {
-            return Err(GpuSceneSelectionRejection::NonInvertibleTransform);
-        }
-        Some(inverse.to_cols_array_2d())
-    };
+    let determinant = item.world_matrix.determinant();
+    if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+        return Err(GpuSceneSelectionRejection::NonInvertibleTransform);
+    }
+    let inverse = item.world_matrix.inverse();
+    if !inverse.is_finite() {
+        return Err(GpuSceneSelectionRejection::NonInvertibleTransform);
+    }
     if !item.world_aabb.is_finite() || !item.world_aabb.min.cmple(item.world_aabb.max).all() {
         return Err(GpuSceneSelectionRejection::NonFiniteBounds);
     }
     Ok(Some(GpuSceneItemPreflight {
         key: GpuSceneRigidBatchKey::from_item(item)
             .expect("indexed GPU Scene candidate lost its index format"),
-        inverse_update,
     }))
 }
 
@@ -1205,6 +1282,9 @@ where
 struct SceneDomain {
     slots: Vec<u32>,
     batch_slots: Vec<u32>,
+    recipe_generation: u64,
+    minimum_member_count: u32,
+    selected_families: GpuDrivenFamilyMask,
     last_used_seconds: f64,
     last_used_sync: u64,
 }
@@ -1333,6 +1413,9 @@ pub(crate) struct GpuSceneTableSetPublicationAcknowledger<'a> {
     batch_dirty_slots: &'a mut Vec<u32>,
     batch_quarantine: &'a mut Vec<QuarantinedSlot>,
     batch_reusable: &'a mut Vec<u32>,
+    last_table_activity_seconds: &'a mut Option<f64>,
+    unsubmitted_table_since_seconds: &'a mut Option<f64>,
+    activity_seconds: f64,
 }
 
 impl GpuSceneTableSetPublicationAcknowledger<'_> {
@@ -1340,6 +1423,7 @@ impl GpuSceneTableSetPublicationAcknowledger<'_> {
         &mut self,
         registry: &PersistentBufferRegistry,
         probe: &GpuSceneTableSetPublicationProbe,
+        used_by_live_submission: bool,
     ) -> bool {
         if probe.revision != self.revision
             || probe
@@ -1386,7 +1470,14 @@ impl GpuSceneTableSetPublicationAcknowledger<'_> {
             self.revision,
             probe.revision,
         );
-        instance && geometry && material && batch
+        let acknowledged = instance && geometry && material && batch;
+        if acknowledged {
+            *self.unsubmitted_table_since_seconds = None;
+            if used_by_live_submission {
+                *self.last_table_activity_seconds = Some(self.activity_seconds);
+            }
+        }
+        acknowledged
     }
 }
 
@@ -1412,24 +1503,13 @@ pub(crate) struct GpuScene {
     lookup: FxHashMap<GpuSceneInstanceKey, GpuSceneInstanceId>,
     domains: FxHashMap<u32, SceneDomain>,
     domain_sweep_scratch: Vec<DomainSweepCandidate>,
+    canonical_recipe: GpuSceneCanonicalRecipe,
+    retained_canonical_recipes: FxHashMap<u32, GpuSceneCanonicalRecipe>,
+    recipe_use_serial: u64,
+    retained_recipe_bytes: usize,
+    recipe_stats: GpuSceneRecipeStats,
+    /// Full-rebuild workspace. Its contents have no cross-frame identity.
     multi_bin_lookup: FxHashMap<GpuSceneRigidBatchKey, u32>,
-    multi_bin_geometry_uniques: FxHashMap<GeometryHandle, GpuSceneGeometryStamp>,
-    multi_bin_material_uniques: FxHashMap<MaterialHandle, GpuSceneMaterialStamp>,
-    multi_bin_instance_uniques: FxHashSet<NodeHandle>,
-    /// Complete item-domain fact accumulated by the retained preflight scan.
-    /// Composer reads it only after an `Ok` outcome, avoiding a second O(N)
-    /// scan while preserving the distinction between shadow lights and actual
-    /// shadow-casting render items.
-    multi_bin_has_shadow_casters: bool,
-    multi_bin_preflight: Vec<GpuScenePreflightBin>,
-    multi_bin_members: Vec<GpuScenePreflightMember>,
-    /// Old-bin -> retained-bin remap used to compact Auto cohorts in place.
-    /// A retained high-water vector avoids an allocation in warm preflight.
-    multi_bin_bin_remap: Vec<u32>,
-    /// Sparse matrix inverses for new or transform-dirty members. Stable
-    /// members reuse the inverse already stored in their persistent record.
-    multi_bin_inverse_updates: Vec<[[f32; 4]; 4]>,
-    multi_bin_resolved: Vec<GpuSceneResolvedBin>,
     multi_bin_committed: Vec<GpuSceneMultiBinCandidate>,
     active_batch_descriptors: Vec<GpuSceneActiveBatchDescriptor>,
     multi_bin_serial: u64,
@@ -1452,6 +1532,10 @@ pub(crate) struct GpuScene {
     generation_exhausted: bool,
     residency_clock_seconds: f64,
     last_residency_sample_seconds: Option<f64>,
+    last_table_activity_seconds: Option<f64>,
+    /// First CPU table mutation not yet covered by an exact submitted
+    /// four-table publication. Repeated failed attempts never refresh it.
+    unsubmitted_table_since_seconds: Option<f64>,
 }
 
 impl GpuScene {
@@ -1482,6 +1566,25 @@ impl GpuScene {
             usage += vec_footprint(&domain.slots, 0);
             usage += vec_footprint(&domain.batch_slots, 0);
         }
+        usage += vec_footprint(&self.canonical_recipe.bins, 0);
+        usage += vec_footprint(&self.canonical_recipe.members, 0);
+        usage += vec_footprint(&self.canonical_recipe.source_states, 0);
+        usage += vec_footprint(&self.canonical_recipe.dirty_members, 0);
+        usage += estimated_hash_map_footprint(&self.canonical_recipe.views, 0);
+        for view in self.canonical_recipe.views.values() {
+            usage += vec_footprint(&view.bins, 0);
+            usage += vec_footprint(&view.members, 0);
+            usage += vec_footprint(&view.bin_remap, 0);
+            usage += estimated_hash_map_footprint(&view.geometry_uniques, 0);
+            usage += estimated_hash_map_footprint(&view.material_uniques, 0);
+            usage += estimated_hash_set_footprint(&view.instance_uniques, 0);
+            usage += vec_footprint(&view.cpu_complement, 0);
+            usage += vec_footprint(&view.resolved, 0);
+        }
+        usage += estimated_hash_map_footprint(&self.retained_canonical_recipes, 0);
+        for recipe in self.retained_canonical_recipes.values() {
+            usage += canonical_recipe_capacity_usage(recipe);
+        }
         usage.baseline_bytes = usage.active_bytes;
         usage
     }
@@ -1505,6 +1608,70 @@ impl GpuScene {
             shrink_vec_by_family_ratio(&mut domain.slots, 0, target_bytes, retained_bytes);
             shrink_vec_by_family_ratio(&mut domain.batch_slots, 0, target_bytes, retained_bytes);
         }
+        shrink_vec_by_family_ratio(
+            &mut self.canonical_recipe.bins,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.canonical_recipe.members,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.canonical_recipe.source_states,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(
+            &mut self.canonical_recipe.dirty_members,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut self.canonical_recipe.views,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        for view in self.canonical_recipe.views.values_mut() {
+            shrink_vec_by_family_ratio(&mut view.bins, 0, target_bytes, retained_bytes);
+            shrink_vec_by_family_ratio(&mut view.members, 0, target_bytes, retained_bytes);
+            shrink_vec_by_family_ratio(&mut view.bin_remap, 0, target_bytes, retained_bytes);
+            shrink_hash_map_by_family_ratio(
+                &mut view.geometry_uniques,
+                0,
+                target_bytes,
+                retained_bytes,
+            );
+            shrink_hash_map_by_family_ratio(
+                &mut view.material_uniques,
+                0,
+                target_bytes,
+                retained_bytes,
+            );
+            shrink_hash_set_by_family_ratio(
+                &mut view.instance_uniques,
+                0,
+                target_bytes,
+                retained_bytes,
+            );
+            shrink_vec_by_family_ratio(&mut view.cpu_complement, 0, target_bytes, retained_bytes);
+            shrink_vec_by_family_ratio(&mut view.resolved, 0, target_bytes, retained_bytes);
+        }
+        shrink_hash_map_by_family_ratio(
+            &mut self.retained_canonical_recipes,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        for recipe in self.retained_canonical_recipes.values_mut() {
+            trim_canonical_recipe_capacity(recipe, target_bytes, retained_bytes);
+        }
         shrink_vec_by_family_ratio(&mut self.reusable_slots, 0, target_bytes, retained_bytes);
         shrink_vec_by_family_ratio(&mut self.quarantined_slots, 0, target_bytes, retained_bytes);
         shrink_vec_by_family_ratio(&mut self.dirty_slots, 0, target_bytes, retained_bytes);
@@ -1512,6 +1679,7 @@ impl GpuScene {
         self.geometries.trim_capacity(target_bytes, retained_bytes);
         self.materials.trim_capacity(target_bytes, retained_bytes);
         self.batches.trim_capacity(target_bytes, retained_bytes);
+        self.refresh_retained_recipe_bytes();
         debug_assert_eq!(self.authority_capacity_usage().active_bytes, active_before);
     }
 
@@ -1519,23 +1687,6 @@ impl GpuScene {
     pub(crate) fn scratch_capacity_usage(&self) -> CapacityUsage {
         vec_footprint(&self.domain_sweep_scratch, GPU_SCENE_DOMAIN_BUDGET)
             + estimated_hash_map_footprint(&self.multi_bin_lookup, GPU_SCENE_SCRATCH_BASELINE)
-            + estimated_hash_map_footprint(
-                &self.multi_bin_geometry_uniques,
-                GPU_SCENE_SCRATCH_BASELINE,
-            )
-            + estimated_hash_map_footprint(
-                &self.multi_bin_material_uniques,
-                GPU_SCENE_SCRATCH_BASELINE,
-            )
-            + estimated_hash_set_footprint(
-                &self.multi_bin_instance_uniques,
-                GPU_SCENE_SCRATCH_BASELINE,
-            )
-            + vec_footprint(&self.multi_bin_preflight, GPU_SCENE_SCRATCH_BASELINE)
-            + vec_footprint(&self.multi_bin_members, GPU_SCENE_SCRATCH_BASELINE)
-            + vec_footprint(&self.multi_bin_bin_remap, GPU_SCENE_SCRATCH_BASELINE)
-            + vec_footprint(&self.multi_bin_inverse_updates, GPU_SCENE_SCRATCH_BASELINE)
-            + vec_footprint(&self.multi_bin_resolved, GPU_SCENE_SCRATCH_BASELINE)
             + vec_footprint(&self.multi_bin_committed, GPU_SCENE_SCRATCH_BASELINE)
             + vec_footprint(&self.active_batch_descriptors, GPU_SCENE_SCRATCH_BASELINE)
             + vec_footprint(&self.scene_batch_scratch, GPU_SCENE_SCRATCH_BASELINE)
@@ -1548,19 +1699,53 @@ impl GpuScene {
     pub(crate) fn clear_frame_scratch(&mut self) {
         self.domain_sweep_scratch.clear();
         self.multi_bin_lookup.clear();
-        self.multi_bin_geometry_uniques.clear();
-        self.multi_bin_material_uniques.clear();
-        self.multi_bin_instance_uniques.clear();
-        self.multi_bin_has_shadow_casters = false;
-        self.multi_bin_preflight.clear();
-        self.multi_bin_members.clear();
-        self.multi_bin_bin_remap.clear();
-        self.multi_bin_inverse_updates.clear();
-        self.multi_bin_resolved.clear();
         self.multi_bin_committed.clear();
         self.active_batch_descriptors.clear();
         self.scene_batch_scratch.clear();
         self.cascade_scratch.clear();
+    }
+
+    /// Advance residency independently of GPU backend selection and reclaim
+    /// authority which has been unused for the real-time TTL.
+    ///
+    /// This runs only after the previous GraphStorage was invalidated. Logical
+    /// persistent-buffer IDs are owner-retired (never reused), so WGPU may
+    /// finish any already-submitted command while the renderer immediately
+    /// releases its CPU/VRAM ownership and rebuilds cold on a future selection.
+    pub(crate) fn maintain_residency(
+        &mut self,
+        registry: &mut PersistentBufferRegistry,
+        elapsed_seconds: f64,
+    ) -> bool {
+        let now = self.observe_residency_time(elapsed_seconds);
+        let table_expired = self
+            .unsubmitted_table_since_seconds
+            .or(self.last_table_activity_seconds)
+            .is_some_and(|last_used| {
+                now - last_used >= GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS
+                    && self.has_retained_table_authority()
+            });
+        if table_expired {
+            self.reset_residency(registry);
+            return true;
+        }
+
+        let physical_shrunk = self.retire_oversized_physical_table_family(registry, now);
+        let active_expired = canonical_recipe_retains_state(&self.canonical_recipe)
+            && now - self.canonical_recipe.last_used_seconds >= GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS;
+        if active_expired {
+            self.canonical_recipe = GpuSceneCanonicalRecipe::default();
+        }
+        let dormant_before = self.retained_canonical_recipes.len();
+        self.retained_canonical_recipes
+            .retain(|_, recipe| now - recipe.last_used_seconds < GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS);
+        let changed = physical_shrunk
+            || active_expired
+            || self.retained_canonical_recipes.len() != dormant_before;
+        if changed {
+            self.refresh_retained_recipe_bytes();
+        }
+        changed
     }
 
     pub(crate) fn trim_scratch_capacity(&mut self, target_bytes: usize, retained_bytes: usize) {
@@ -1573,54 +1758,6 @@ impl GpuScene {
         );
         shrink_hash_map_by_family_ratio(
             &mut self.multi_bin_lookup,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_hash_map_by_family_ratio(
-            &mut self.multi_bin_geometry_uniques,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_hash_map_by_family_ratio(
-            &mut self.multi_bin_material_uniques,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_hash_set_by_family_ratio(
-            &mut self.multi_bin_instance_uniques,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_vec_by_family_ratio(
-            &mut self.multi_bin_preflight,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_vec_by_family_ratio(
-            &mut self.multi_bin_members,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_vec_by_family_ratio(
-            &mut self.multi_bin_bin_remap,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_vec_by_family_ratio(
-            &mut self.multi_bin_inverse_updates,
-            GPU_SCENE_SCRATCH_BASELINE,
-            target_bytes,
-            retained_bytes,
-        );
-        shrink_vec_by_family_ratio(
-            &mut self.multi_bin_resolved,
             GPU_SCENE_SCRATCH_BASELINE,
             target_bytes,
             retained_bytes,
@@ -1653,10 +1790,10 @@ impl GpuScene {
 
     #[cfg(test)]
     pub(crate) fn reserve_capacity_probe(&mut self, scratch_slots: usize, authority_slots: usize) {
-        self.multi_bin_preflight.reserve(scratch_slots);
-        self.multi_bin_members.reserve(scratch_slots);
-        self.multi_bin_bin_remap.reserve(scratch_slots);
+        self.multi_bin_lookup.reserve(scratch_slots);
         self.multi_bin_committed.reserve(scratch_slots);
+        self.canonical_recipe.bins.reserve(authority_slots);
+        self.canonical_recipe.members.reserve(authority_slots);
         self.slots.reserve(authority_slots);
         self.records.reserve(authority_slots);
         self.slot_generation_watermarks.reserve(authority_slots);
@@ -1667,30 +1804,47 @@ impl GpuScene {
     fn project_table_set(
         &self,
         scene_id: u32,
-        visible_view_stride: u64,
-        visible_partition_bytes: u64,
-        bin_count: u32,
+        recipe_generation: u64,
+        view: &GpuSceneSelectionView,
     ) -> Option<GpuSceneProjectedTableSet> {
-        let instance_slot_span = projected_instance_span_for_keys(
-            &self.slots,
-            &self.lookup,
-            self.acknowledged_tail_retained_len(),
-            self.multi_bin_instance_uniques
-                .iter()
-                .copied()
-                .map(|node| GpuSceneInstanceKey { scene_id, node }),
-        )?;
-        let geometry_slot_span = self
-            .geometries
-            .projected_slot_span(self.multi_bin_geometry_uniques.keys().copied())?;
-        let material_slot_span = self
-            .materials
-            .projected_slot_span(self.multi_bin_material_uniques.keys().copied())?;
-        let batch_slot_span = self.batches.projected_slot_span(
-            self.multi_bin_preflight
-                .iter()
-                .map(|bin| GpuSceneBatchKey::new(scene_id, bin.key)),
-        )?;
+        let already_materialized = self.domains.get(&scene_id).is_some_and(|domain| {
+            domain.recipe_generation == recipe_generation
+                && domain.minimum_member_count == view.minimum_member_count
+        });
+        let (instance_slot_span, geometry_slot_span, material_slot_span, batch_slot_span) =
+            if already_materialized {
+                // A retained domain proves every selected semantic key already
+                // owns a stable slot. Current table spans are a conservative
+                // O(1) projection even when an acknowledged suffix can be
+                // trimmed at the subsequent commit boundary.
+                (
+                    u32::try_from(self.records.len()).ok()?,
+                    self.geometries.slot_span(),
+                    self.materials.slot_span(),
+                    self.batches.slot_span(),
+                )
+            } else {
+                (
+                    projected_instance_span_for_keys(
+                        &self.slots,
+                        &self.lookup,
+                        self.acknowledged_tail_retained_len(),
+                        view.instance_uniques
+                            .iter()
+                            .copied()
+                            .map(|node| GpuSceneInstanceKey { scene_id, node }),
+                    )?,
+                    self.geometries
+                        .projected_slot_span(view.geometry_uniques.keys().copied())?,
+                    self.materials
+                        .projected_slot_span(view.material_uniques.keys().copied())?,
+                    self.batches.projected_slot_span(
+                        view.bins
+                            .iter()
+                            .map(|bin| GpuSceneBatchKey::new(scene_id, bin.key)),
+                    )?,
+                )
+            };
         Some(GpuSceneProjectedTableSet {
             instance_slot_span,
             geometry_slot_span,
@@ -1706,9 +1860,11 @@ impl GpuScene {
                 material_slot_span,
             )?,
             batch_logical_bytes: logical_table_bytes::<GpuSceneBatchRecord>(batch_slot_span)?,
-            visible_view_stride,
-            visible_partition_bytes,
-            indirect_args_span: u64::from(bin_count).checked_mul(5 * size_of::<u32>() as u64)?,
+            visible_view_stride: view.visible_partition_bytes,
+            visible_partition_bytes: view.visible_partition_bytes,
+            indirect_args_span: u64::try_from(view.bins.len())
+                .ok()?
+                .checked_mul(5 * size_of::<u32>() as u64)?,
         })
     }
 
@@ -1719,27 +1875,13 @@ impl GpuScene {
         &self.active_batch_descriptors
     }
 
-    #[inline]
-    fn instance_world_matrix_is_current(&self, scene_id: u32, item: &ExtractedRenderItem) -> bool {
-        let key = GpuSceneInstanceKey {
-            scene_id,
-            node: item.node_handle,
-        };
-        self.lookup.get(&key).is_some_and(|id| {
-            let record = &self.records[id.slot as usize];
-            record.metadata[1] != 0
-                && record.metadata[2] == scene_id
-                && record.world_matrix == item.world_matrix.to_cols_array_2d()
-        })
-    }
-
-    /// Build a retained, deterministic multi-bin recipe without touching any
-    /// persistent table or frame-local representative. Bins appear in first
-    /// occurrence order; the hash table is lookup-only and never defines
-    /// output order.
+    /// Build or incrementally advance the canonical recipe, then derive the
+    /// exact selection view requested by Required or Auto. Static warm frames
+    /// neither inspect members nor rebuild bins; pure Render World deltas
+    /// validate only their changed dense sources.
     pub(crate) fn preflight_multi_bin_scene(
         &mut self,
-        extracted_scene: &ExtractedScene,
+        extracted_scene: &mut ExtractedScene,
         visible_stride: u64,
         storage_alignment: u64,
     ) -> Result<Option<GpuSceneMultiBinPreflight>, GpuSceneMultiBinPreflightFailure> {
@@ -1756,7 +1898,7 @@ impl GpuScene {
     /// touched until the returned token is explicitly committed.
     pub(crate) fn preflight_multi_bin_cohorts(
         &mut self,
-        extracted_scene: &ExtractedScene,
+        extracted_scene: &mut ExtractedScene,
         visible_stride: u64,
         storage_alignment: u64,
         minimum_member_count: u32,
@@ -1773,7 +1915,7 @@ impl GpuScene {
 
     fn preflight_multi_bin_scene_with_policy(
         &mut self,
-        extracted_scene: &ExtractedScene,
+        extracted_scene: &mut ExtractedScene,
         visible_stride: u64,
         storage_alignment: u64,
         selection: GpuSceneMultiBinSelectionPolicy,
@@ -1789,98 +1931,377 @@ impl GpuScene {
         if storage_alignment < 8 || !storage_alignment.is_power_of_two() {
             return Err(GpuSceneMultiBinPreflightFailure::InvalidStorageAlignment);
         }
-        let partition_quantum = checked_lcm(visible_stride, storage_alignment)
-            .ok_or(GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-
         self.multi_bin_serial = self
             .multi_bin_serial
             .checked_add(1)
             .expect("GPU Scene multi-bin preflight serial exhausted");
-        self.multi_bin_lookup.clear();
-        self.multi_bin_geometry_uniques.clear();
-        self.multi_bin_material_uniques.clear();
-        self.multi_bin_instance_uniques.clear();
-        self.multi_bin_has_shadow_casters = false;
-        self.multi_bin_preflight.clear();
-        self.multi_bin_members.clear();
-        self.multi_bin_bin_remap.clear();
-        self.multi_bin_inverse_updates.clear();
         self.multi_bin_committed.clear();
         self.active_batch_descriptors.clear();
-        let mut total_shadow_caster_count = 0u32;
+        self.advance_canonical_recipe(extracted_scene)?;
+        if let Some(reason) = self.canonical_recipe.fatal_rejection {
+            return Err(GpuSceneMultiBinPreflightFailure::Domain(reason));
+        }
+        if selection.rejects_unsupported()
+            && let Some(reason) = self.canonical_recipe.complete_rejection
+        {
+            return Err(GpuSceneMultiBinPreflightFailure::Domain(reason));
+        }
+
+        let minimum_member_count = selection.minimum_member_count();
+        let rebuild_view = self
+            .canonical_recipe
+            .views
+            .get(&minimum_member_count)
+            .is_none_or(|view| {
+                view.visible_stride != visible_stride || view.storage_alignment != storage_alignment
+            });
+        if rebuild_view {
+            let view = Self::build_selection_view(
+                &self.canonical_recipe,
+                extracted_scene,
+                visible_stride,
+                storage_alignment,
+                minimum_member_count,
+            )?;
+            self.canonical_recipe
+                .views
+                .insert(minimum_member_count, view);
+            self.refresh_retained_recipe_bytes();
+        }
+        let view = self
+            .canonical_recipe
+            .views
+            .get(&minimum_member_count)
+            .expect("GPU Scene selection view disappeared after materialization");
+        if view.bins.is_empty() {
+            self.recipe_stats.members_total = 0;
+            self.recipe_stats.members_reused = 0;
+            self.recipe_stats.members_updated = 0;
+            self.recipe_stats.members_rebuilt = 0;
+            return Ok(None);
+        }
+
+        let candidate_count = u32::try_from(view.members.len()).map_err(|_| {
+            GpuSceneMultiBinPreflightFailure::Domain(GpuSceneSelectionRejection::TooManyCandidates)
+        })?;
+        let bin_count = u32::try_from(view.bins.len()).map_err(|_| {
+            GpuSceneMultiBinPreflightFailure::Domain(GpuSceneSelectionRejection::TooManyCandidates)
+        })?;
+        let unique_geometry_count = u32::try_from(view.geometry_uniques.len())
+            .map_err(|_| GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
+        let unique_material_count = u32::try_from(view.material_uniques.len())
+            .map_err(|_| GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
+        let table_set = self
+            .project_table_set(
+                extracted_scene.scene_id,
+                self.canonical_recipe.generation,
+                view,
+            )
+            .ok_or(GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
+
+        self.recipe_stats.members_total = candidate_count;
+        self.recipe_stats.retained_bytes = self.retained_recipe_bytes;
+        if self.recipe_stats.full_rebuild_reason.is_some() {
+            self.recipe_stats.members_rebuilt = candidate_count;
+            self.recipe_stats.members_updated = 0;
+            self.recipe_stats.members_reused = 0;
+        } else {
+            let selected_dirty = self
+                .canonical_recipe
+                .dirty_members
+                .iter()
+                .filter(|&&member| {
+                    view.bin_remap[self.canonical_recipe.members[member as usize].bin as usize]
+                        != u32::MAX
+                })
+                .count();
+            self.recipe_stats.members_updated = u32::try_from(selected_dirty).unwrap_or(u32::MAX);
+            self.recipe_stats.members_rebuilt = 0;
+            self.recipe_stats.members_reused =
+                candidate_count.saturating_sub(self.recipe_stats.members_updated);
+        }
+        Ok(Some(GpuSceneMultiBinPreflight {
+            serial: self.multi_bin_serial,
+            scene_id: extracted_scene.scene_id,
+            recipe_generation: self.canonical_recipe.generation,
+            world_revision: self.canonical_recipe.cursor.revision,
+            minimum_member_count,
+            scene_identity: extracted_scene as *const ExtractedScene as usize,
+            projection: GpuSceneMultiBinProjection {
+                candidate_count,
+                bin_count,
+                unique_geometry_count,
+                unique_material_count,
+                shadow_candidate_count: view.shadow_candidate_count,
+                covers_complete_shadow_domain: view.covers_complete_shadow_domain,
+                visible_stride,
+                storage_alignment,
+                visible_partition_bytes: view.visible_partition_bytes,
+                table_set,
+            },
+        }))
+    }
+
+    fn advance_canonical_recipe(
+        &mut self,
+        extracted_scene: &mut ExtractedScene,
+    ) -> Result<(), GpuSceneMultiBinPreflightFailure> {
+        self.activate_canonical_recipe(extracted_scene.scene_id);
+        let cursor = self.canonical_recipe.cursor;
+        let mut rebuild_reason = None;
+        let target_cursor;
+        let target_topology_epoch;
+        {
+            let delta = extracted_scene.render_world_delta(cursor);
+            target_cursor = RenderWorldConsumerCursor {
+                scene_id: delta.scene_id,
+                revision: delta.revision,
+            };
+            target_topology_epoch = delta.topology_epoch;
+            let needs_full_rebuild = !self.canonical_recipe.initialized
+                || delta.requires_full_rebuild
+                || delta.scene_id != self.canonical_recipe.scene_id
+                || delta.topology_epoch != self.canonical_recipe.topology_epoch;
+            if needs_full_rebuild {
+                rebuild_reason = Some(
+                    if delta.full_rebuild_reason != RenderWorldFullRebuildReason::None {
+                        delta.full_rebuild_reason
+                    } else if !self.canonical_recipe.initialized {
+                        RenderWorldFullRebuildReason::Cold
+                    } else if delta.scene_id != self.canonical_recipe.scene_id {
+                        RenderWorldFullRebuildReason::SceneChanged
+                    } else {
+                        RenderWorldFullRebuildReason::SceneCursorOrIdentityDrift
+                    },
+                );
+            } else {
+                self.recipe_stats = GpuSceneRecipeStats {
+                    scene_id: delta.scene_id,
+                    revision: delta.revision,
+                    members_examined: u32::try_from(delta.changes.len()).unwrap_or(u32::MAX),
+                    ..Default::default()
+                };
+                for change in delta.changes {
+                    if change.flags.contains(RenderWorldChangeFlags::FIXED_STATE)
+                        || !self.apply_canonical_source_delta(extracted_scene, change.source)
+                    {
+                        rebuild_reason =
+                            Some(RenderWorldFullRebuildReason::SceneCursorOrIdentityDrift);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(reason) = rebuild_reason {
+            self.rebuild_canonical_recipe(
+                extracted_scene,
+                target_cursor,
+                target_topology_epoch,
+                reason,
+            )?;
+        } else {
+            self.canonical_recipe.cursor = target_cursor;
+            self.recipe_stats.revision = target_cursor.revision;
+        }
+        let acknowledged = extracted_scene.acknowledge_render_world_delta(target_cursor);
+        if !acknowledged {
+            self.canonical_recipe.initialized = false;
+            self.canonical_recipe.full_sync_pending = true;
+            self.recipe_stats.full_rebuild_reason =
+                Some(RenderWorldFullRebuildReason::SceneCursorOrIdentityDrift);
+            return Err(GpuSceneMultiBinPreflightFailure::RenderWorldDrift);
+        }
+        Ok(())
+    }
+
+    fn activate_canonical_recipe(&mut self, scene_id: u32) {
+        self.recipe_use_serial = self
+            .recipe_use_serial
+            .checked_add(1)
+            .expect("GPU Scene recipe use serial exhausted");
+        if self.canonical_recipe.initialized && self.canonical_recipe.scene_id != scene_id {
+            let next = self
+                .retained_canonical_recipes
+                .remove(&scene_id)
+                .unwrap_or_default();
+            let previous = std::mem::replace(&mut self.canonical_recipe, next);
+            let replaced = self
+                .retained_canonical_recipes
+                .insert(previous.scene_id, previous);
+            debug_assert!(
+                replaced.is_none(),
+                "GPU Scene retained two canonical recipes for one scene"
+            );
+        } else if !self.canonical_recipe.initialized
+            && let Some(retained) = self.retained_canonical_recipes.remove(&scene_id)
+        {
+            self.canonical_recipe = retained;
+        }
+        self.canonical_recipe.last_used_serial = self.recipe_use_serial;
+        self.canonical_recipe.last_used_seconds = self.residency_clock_seconds;
+
+        self.enforce_dormant_canonical_recipe_budget(GPU_SCENE_DORMANT_RECIPE_BUDGET_BYTES);
+    }
+
+    /// Keep recomputable canonical derivations within both the scene-count
+    /// and retained-byte budgets. Stable GPU table slots have an independent
+    /// time-based residency policy, so dropping a recipe never recycles a
+    /// physical authority ID or mutates a submitted table.
+    fn enforce_dormant_canonical_recipe_budget(&mut self, byte_budget: usize) {
+        loop {
+            let over_count = self.retained_canonical_recipes.len() >= GPU_SCENE_DOMAIN_BUDGET;
+            let over_bytes = self.dormant_canonical_recipe_retained_bytes() > byte_budget;
+            if !over_count && !over_bytes {
+                break;
+            }
+            let Some(scene) = self
+                .retained_canonical_recipes
+                .iter()
+                .min_by_key(|(scene, recipe)| (recipe.last_used_serial, **scene))
+                .map(|(&scene, _)| scene)
+            else {
+                break;
+            };
+            self.retained_canonical_recipes.remove(&scene);
+        }
+        self.refresh_retained_recipe_bytes();
+    }
+
+    fn dormant_canonical_recipe_retained_bytes(&self) -> usize {
+        self.retained_canonical_recipes
+            .values()
+            .map(canonical_recipe_retained_bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn apply_canonical_source_delta(
+        &mut self,
+        extracted_scene: &ExtractedScene,
+        source: ExtractedSourceId,
+    ) -> bool {
+        let Some(item) = extracted_scene.render_items.get(source.index()) else {
+            return false;
+        };
+        let Some(state) = self
+            .canonical_recipe
+            .source_states
+            .get(source.index())
+            .copied()
+        else {
+            return false;
+        };
+        let current = preflight_gpu_scene_item(item);
+        match (state, current) {
+            (GpuSceneCanonicalSourceState::CpuOnly, Ok(None)) => true,
+            (GpuSceneCanonicalSourceState::Unsupported(old), Err(current)) => old == current,
+            (GpuSceneCanonicalSourceState::Member(member_index), Ok(Some(current))) => {
+                let member = &mut self.canonical_recipe.members[member_index as usize];
+                if member.item as usize != source.index()
+                    || member.node != item.node_handle
+                    || member.cast_shadows != item.cast_shadows
+                    || self.canonical_recipe.bins[member.bin as usize].key != current.key
+                {
+                    return false;
+                }
+                if !self.canonical_recipe.full_sync_pending && !member.dirty {
+                    member.dirty = true;
+                    self.canonical_recipe.dirty_members.push(member_index);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn rebuild_canonical_recipe(
+        &mut self,
+        extracted_scene: &ExtractedScene,
+        cursor: RenderWorldConsumerCursor,
+        topology_epoch: u64,
+        reason: RenderWorldFullRebuildReason,
+    ) -> Result<(), GpuSceneMultiBinPreflightFailure> {
+        self.multi_bin_lookup.clear();
+        let mut geometry_uniques = FxHashMap::default();
+        let mut material_uniques = FxHashMap::default();
+        let mut instance_uniques = FxHashSet::default();
+        let generation = self
+            .canonical_recipe
+            .generation
+            .checked_add(1)
+            .expect("GPU Scene canonical recipe generation exhausted");
+        let mut recipe = GpuSceneCanonicalRecipe {
+            scene_id: extracted_scene.scene_id,
+            topology_epoch,
+            cursor,
+            generation,
+            initialized: true,
+            full_sync_pending: true,
+            ..Default::default()
+        };
+        recipe.source_states.resize(
+            extracted_scene.render_items.len(),
+            GpuSceneCanonicalSourceState::CpuOnly,
+        );
 
         for (item_index, item) in extracted_scene.render_items.iter().enumerate() {
-            self.multi_bin_has_shadow_casters |= item.cast_shadows;
             if item.cast_shadows {
-                total_shadow_caster_count = total_shadow_caster_count.checked_add(1).ok_or(
-                    GpuSceneMultiBinPreflightFailure::Domain(
+                recipe.has_shadow_casters = true;
+                recipe.total_shadow_caster_count = recipe
+                    .total_shadow_caster_count
+                    .checked_add(1)
+                    .ok_or(GpuSceneMultiBinPreflightFailure::Domain(
                         GpuSceneSelectionRejection::TooManyCandidates,
-                    ),
-                )?;
+                    ))?;
             }
-            let world_matrix_is_current =
-                self.instance_world_matrix_is_current(extracted_scene.scene_id, item);
-            let item_preflight = preflight_gpu_scene_item(item, world_matrix_is_current);
-            if let Err(reason) = item_preflight
-                && selection.rejects_unsupported()
-            {
-                return Err(GpuSceneMultiBinPreflightFailure::Domain(reason));
-            }
-            // Auto is deliberately permissive: transparent, unsupported, and
-            // later low-reuse items remain under the CPU cohort authority.
-            let Some(item_preflight) = item_preflight.ok().flatten() else {
-                continue;
+            let item_preflight = match preflight_gpu_scene_item(item) {
+                Ok(None) => continue,
+                Ok(Some(item_preflight)) => item_preflight,
+                Err(rejection) => {
+                    recipe.complete_rejection.get_or_insert(rejection);
+                    recipe.source_states[item_index] =
+                        GpuSceneCanonicalSourceState::Unsupported(rejection);
+                    continue;
+                }
             };
             let key = item_preflight.key;
-            if self.multi_bin_members.len() == u32::MAX as usize {
-                return Err(GpuSceneMultiBinPreflightFailure::Domain(
-                    GpuSceneSelectionRejection::TooManyCandidates,
-                ));
-            }
-            if !self.multi_bin_instance_uniques.insert(item.node_handle) {
-                // Duplicate live identities cannot be split safely between
-                // CPU and GPU ownership; keep this a typed whole-attempt
-                // rejection in both modes.
-                return Err(GpuSceneMultiBinPreflightFailure::Domain(
-                    GpuSceneSelectionRejection::DuplicateInstance,
-                ));
-            }
-            let geometry_stamp = GpuSceneGeometryStamp::from_key(key);
-            if self
-                .multi_bin_geometry_uniques
-                .insert(key.geometry, geometry_stamp)
-                .is_some_and(|existing| existing != geometry_stamp)
-            {
-                return Err(GpuSceneMultiBinPreflightFailure::Domain(
-                    GpuSceneSelectionRejection::ConflictingGeometryEpoch,
-                ));
-            }
-            let material_stamp = GpuSceneMaterialStamp::from_key(key);
-            if self
-                .multi_bin_material_uniques
-                .insert(key.material, material_stamp)
-                .is_some_and(|existing| existing != material_stamp)
-            {
-                return Err(GpuSceneMultiBinPreflightFailure::Domain(
-                    GpuSceneSelectionRejection::ConflictingMaterialEpoch,
-                ));
+            let fatal = if instance_uniques.insert(item.node_handle) {
+                let geometry_stamp = GpuSceneGeometryStamp::from_key(key);
+                if geometry_uniques
+                    .insert(key.geometry, geometry_stamp)
+                    .is_some_and(|existing| existing != geometry_stamp)
+                {
+                    Some(GpuSceneSelectionRejection::ConflictingGeometryEpoch)
+                } else {
+                    let material_stamp = GpuSceneMaterialStamp::from_key(key);
+                    material_uniques
+                        .insert(key.material, material_stamp)
+                        .filter(|existing| *existing != material_stamp)
+                        .map(|_| GpuSceneSelectionRejection::ConflictingMaterialEpoch)
+                }
+            } else {
+                Some(GpuSceneSelectionRejection::DuplicateInstance)
+            };
+            if let Some(fatal) = fatal {
+                recipe.fatal_rejection = Some(fatal);
+                break;
             }
             let bin_index = if let Some(&bin_index) = self.multi_bin_lookup.get(&key) {
-                let bin = &mut self.multi_bin_preflight[bin_index as usize];
-                bin.member_count = bin.member_count.checked_add(1).ok_or(
-                    GpuSceneMultiBinPreflightFailure::Domain(
+                recipe.bins[bin_index as usize].member_count = recipe.bins[bin_index as usize]
+                    .member_count
+                    .checked_add(1)
+                    .ok_or(GpuSceneMultiBinPreflightFailure::Domain(
                         GpuSceneSelectionRejection::TooManyCandidates,
-                    ),
-                )?;
+                    ))?;
                 bin_index
             } else {
-                let bin_index = u32::try_from(self.multi_bin_preflight.len()).map_err(|_| {
+                let bin_index = u32::try_from(recipe.bins.len()).map_err(|_| {
                     GpuSceneMultiBinPreflightFailure::Domain(
                         GpuSceneSelectionRejection::TooManyCandidates,
                     )
                 })?;
                 self.multi_bin_lookup.insert(key, bin_index);
-                self.multi_bin_preflight.push(GpuScenePreflightBin {
+                recipe.bins.push(GpuScenePreflightBin {
                     key,
                     representative: ExtractedSourceId::from_index(item_index),
                     member_count: 1,
@@ -1891,152 +2312,134 @@ impl GpuScene {
                 });
                 bin_index
             };
-            let inverse_update_index = if let Some(inverse) = item_preflight.inverse_update {
-                let index = u32::try_from(self.multi_bin_inverse_updates.len()).map_err(|_| {
-                    GpuSceneMultiBinPreflightFailure::Domain(
-                        GpuSceneSelectionRejection::TooManyCandidates,
-                    )
-                })?;
-                self.multi_bin_inverse_updates.push(inverse);
-                index
-            } else {
-                u32::MAX
-            };
-            self.multi_bin_members.push(GpuScenePreflightMember {
+            let member_index = u32::try_from(recipe.members.len()).map_err(|_| {
+                GpuSceneMultiBinPreflightFailure::Domain(
+                    GpuSceneSelectionRejection::TooManyCandidates,
+                )
+            })?;
+            recipe.members.push(GpuScenePreflightMember {
                 item: u32::try_from(item_index).map_err(|_| {
                     GpuSceneMultiBinPreflightFailure::Domain(
                         GpuSceneSelectionRejection::TooManyCandidates,
                     )
                 })?,
                 bin: bin_index,
-                inverse_update: inverse_update_index,
+                node: item.node_handle,
+                cast_shadows: item.cast_shadows,
+                dirty: false,
             });
+            recipe.source_states[item_index] = GpuSceneCanonicalSourceState::Member(member_index);
         }
+        self.multi_bin_lookup.clear();
+        self.recipe_stats = GpuSceneRecipeStats {
+            scene_id: extracted_scene.scene_id,
+            revision: cursor.revision,
+            members_examined: u32::try_from(extracted_scene.render_items.len()).unwrap_or(u32::MAX),
+            full_rebuild_reason: Some(reason),
+            ..Default::default()
+        };
+        self.canonical_recipe = recipe;
+        self.refresh_retained_recipe_bytes();
+        Ok(())
+    }
 
-        let minimum_member_count = selection.minimum_member_count();
-        if minimum_member_count > 1 && !self.multi_bin_preflight.is_empty() {
-            self.multi_bin_bin_remap
-                .resize(self.multi_bin_preflight.len(), u32::MAX);
-            let mut retained_len = 0usize;
-            for read_index in 0..self.multi_bin_preflight.len() {
-                let bin = self.multi_bin_preflight[read_index];
-                if bin.member_count < minimum_member_count {
-                    continue;
-                }
-                let retained_index = u32::try_from(retained_len).map_err(|_| {
-                    GpuSceneMultiBinPreflightFailure::Domain(
-                        GpuSceneSelectionRejection::TooManyCandidates,
-                    )
-                })?;
-                self.multi_bin_bin_remap[read_index] = retained_index;
-                if retained_len != read_index {
-                    self.multi_bin_preflight[retained_len] = bin;
-                }
-                retained_len += 1;
-            }
-            self.multi_bin_preflight.truncate(retained_len);
-            let bin_remap = &self.multi_bin_bin_remap;
-            self.multi_bin_members.retain_mut(|member| {
-                let retained = bin_remap[member.bin as usize];
-                if retained == u32::MAX {
-                    false
-                } else {
-                    member.bin = retained;
-                    true
-                }
-            });
-
-            // Projection facts must describe only retained cohorts. The maps
-            // are scratch lookup tables, so rebuilding them is mutation-free
-            // with respect to the persistent four-table authority.
-            self.multi_bin_geometry_uniques.clear();
-            self.multi_bin_material_uniques.clear();
-            self.multi_bin_instance_uniques.clear();
-            for member in &self.multi_bin_members {
-                self.multi_bin_instance_uniques
-                    .insert(extracted_scene.render_items[member.item as usize].node_handle);
-            }
-            for bin in &self.multi_bin_preflight {
-                self.multi_bin_geometry_uniques
-                    .insert(bin.key.geometry, GpuSceneGeometryStamp::from_key(bin.key));
-                self.multi_bin_material_uniques
-                    .insert(bin.key.material, GpuSceneMaterialStamp::from_key(bin.key));
-            }
+    fn refresh_retained_recipe_bytes(&mut self) {
+        self.retained_recipe_bytes = canonical_recipe_retained_bytes(&self.canonical_recipe)
+            .saturating_add(
+                estimated_hash_map_footprint(&self.retained_canonical_recipes, 0).retained_bytes,
+            );
+        for recipe in self.retained_canonical_recipes.values() {
+            self.retained_recipe_bytes = self
+                .retained_recipe_bytes
+                .saturating_add(canonical_recipe_retained_bytes(recipe));
         }
+        self.recipe_stats.retained_bytes = self.retained_recipe_bytes;
+    }
 
-        if self.multi_bin_preflight.is_empty() {
-            return Ok(None);
-        }
-
-        let candidate_count = u32::try_from(self.multi_bin_members.len()).map_err(|_| {
-            GpuSceneMultiBinPreflightFailure::Domain(GpuSceneSelectionRejection::TooManyCandidates)
-        })?;
-        let shadow_candidate_count = self
-            .multi_bin_members
-            .iter()
-            .try_fold(0u32, |count, member| {
-                if extracted_scene.render_items[member.item as usize].cast_shadows {
-                    count.checked_add(1)
-                } else {
-                    Some(count)
-                }
-            })
-            .ok_or(GpuSceneMultiBinPreflightFailure::Domain(
-                GpuSceneSelectionRejection::TooManyCandidates,
-            ))?;
-        let covers_complete_shadow_domain = shadow_candidate_count == total_shadow_caster_count;
-
+    fn build_selection_view(
+        recipe: &GpuSceneCanonicalRecipe,
+        extracted_scene: &ExtractedScene,
+        visible_stride: u64,
+        storage_alignment: u64,
+        minimum_member_count: u32,
+    ) -> Result<GpuSceneSelectionView, GpuSceneMultiBinPreflightFailure> {
+        let partition_quantum = checked_lcm(visible_stride, storage_alignment)
+            .ok_or(GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
+        let mut view = GpuSceneSelectionView {
+            minimum_member_count,
+            visible_stride,
+            storage_alignment,
+            ..Default::default()
+        };
+        view.bin_remap.resize(recipe.bins.len(), u32::MAX);
         let mut partition_end = 0u64;
-        for bin in &mut self.multi_bin_preflight {
+        for (canonical_bin, mut bin) in recipe.bins.iter().copied().enumerate() {
+            if bin.member_count < minimum_member_count {
+                continue;
+            }
+            let selected_bin = u32::try_from(view.bins.len()).map_err(|_| {
+                GpuSceneMultiBinPreflightFailure::Domain(
+                    GpuSceneSelectionRejection::TooManyCandidates,
+                )
+            })?;
+            view.bin_remap[canonical_bin] = selected_bin;
             let raw_size = u64::from(bin.member_count)
                 .checked_mul(visible_stride)
                 .ok_or(GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-            let partition_size = checked_align_up(raw_size, partition_quantum)
+            bin.partition_size = checked_align_up(raw_size, partition_quantum)
                 .ok_or(GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-            let partition_base = partition_end;
+            bin.partition_base = partition_end;
             partition_end = partition_end
-                .checked_add(partition_size)
+                .checked_add(bin.partition_size)
                 .ok_or(GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-            bin.partition_base = partition_base;
-            bin.partition_size = partition_size;
-            bin.base_visible_index = u32::try_from(partition_base / visible_stride)
+            bin.base_visible_index = u32::try_from(bin.partition_base / visible_stride)
                 .map_err(|_| GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-            bin.capacity_records = u32::try_from(partition_size / visible_stride)
+            bin.capacity_records = u32::try_from(bin.partition_size / visible_stride)
                 .map_err(|_| GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
+            view.geometry_uniques
+                .insert(bin.key.geometry, GpuSceneGeometryStamp::from_key(bin.key));
+            view.material_uniques
+                .insert(bin.key.material, GpuSceneMaterialStamp::from_key(bin.key));
+            view.bins.push(bin);
         }
+        view.visible_partition_bytes = partition_end;
 
-        let bin_count = u32::try_from(self.multi_bin_preflight.len()).map_err(|_| {
-            GpuSceneMultiBinPreflightFailure::Domain(GpuSceneSelectionRejection::TooManyCandidates)
-        })?;
-        let unique_geometry_count = u32::try_from(self.multi_bin_geometry_uniques.len())
-            .map_err(|_| GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-        let unique_material_count = u32::try_from(self.multi_bin_material_uniques.len())
-            .map_err(|_| GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-        let table_set = self
-            .project_table_set(
-                extracted_scene.scene_id,
-                partition_end,
-                partition_end,
-                bin_count,
-            )
-            .ok_or(GpuSceneMultiBinPreflightFailure::LayoutOverflow)?;
-        Ok(Some(GpuSceneMultiBinPreflight {
-            serial: self.multi_bin_serial,
-            scene_id: extracted_scene.scene_id,
-            scene_identity: extracted_scene as *const ExtractedScene as usize,
-            projection: GpuSceneMultiBinProjection {
-                candidate_count,
-                bin_count,
-                unique_geometry_count,
-                unique_material_count,
-                shadow_candidate_count,
-                covers_complete_shadow_domain,
-                visible_stride,
-                storage_alignment,
-                visible_partition_bytes: partition_end,
-                table_set,
-            },
-        }))
+        for (canonical_member_index, member) in recipe.members.iter().enumerate() {
+            if view.bin_remap[member.bin as usize] == u32::MAX {
+                continue;
+            }
+            let canonical_member_index = u32::try_from(canonical_member_index).map_err(|_| {
+                GpuSceneMultiBinPreflightFailure::Domain(
+                    GpuSceneSelectionRejection::TooManyCandidates,
+                )
+            })?;
+            view.members.push(canonical_member_index);
+            let item = &extracted_scene.render_items[member.item as usize];
+            view.instance_uniques.insert(item.node_handle);
+            if item.cast_shadows {
+                view.shadow_candidate_count = view.shadow_candidate_count.checked_add(1).ok_or(
+                    GpuSceneMultiBinPreflightFailure::Domain(
+                        GpuSceneSelectionRejection::TooManyCandidates,
+                    ),
+                )?;
+            }
+        }
+        view.covers_complete_shadow_domain =
+            view.shadow_candidate_count == recipe.total_shadow_caster_count;
+        for (source_index, state) in recipe.source_states.iter().copied().enumerate() {
+            let selected = match state {
+                GpuSceneCanonicalSourceState::Member(member) => {
+                    view.bin_remap[recipe.members[member as usize].bin as usize] != u32::MAX
+                }
+                GpuSceneCanonicalSourceState::CpuOnly
+                | GpuSceneCanonicalSourceState::Unsupported(_) => false,
+            };
+            if !selected {
+                view.cpu_complement
+                    .push(ExtractedSourceId::from_index(source_index));
+            }
+        }
+        Ok(view)
     }
 
     /// Exact shadow-caster item fact from the latest successful complete
@@ -2044,7 +2447,13 @@ impl GpuScene {
     #[inline]
     #[must_use]
     pub(crate) const fn preflight_has_shadow_casters(&self) -> bool {
-        self.multi_bin_has_shadow_casters
+        self.canonical_recipe.has_shadow_casters
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn recipe_stats(&self) -> GpuSceneRecipeStats {
+        self.recipe_stats
     }
 
     /// Commit the retained recipe as one four-table CPU transaction, then
@@ -2090,9 +2499,16 @@ impl GpuScene {
         }
         if preflight.scene_id != extracted_scene.scene_id
             || preflight.scene_identity != extracted_scene as *const ExtractedScene as usize
+            || preflight.recipe_generation != self.canonical_recipe.generation
+            || preflight.world_revision != self.canonical_recipe.cursor.revision
         {
             return Err(GpuSceneMultiBinCommitFailure::SceneDrift);
         }
+        let mut recipe = std::mem::take(&mut self.canonical_recipe);
+        let mut view = recipe
+            .views
+            .remove(&preflight.minimum_member_count)
+            .expect("GPU Scene preflight lost its retained selection view");
         let mut changed = self.trim_all_acknowledged_tails();
         let sync_serial = self.next_sync_serial();
         let next_revision = self
@@ -2100,105 +2516,118 @@ impl GpuScene {
             .checked_add(1)
             .expect("GPU Scene table-set revision exhausted");
         let now = self.observe_residency_time(elapsed_seconds);
+        recipe.last_used_seconds = now;
         let swept = self.sweep_inactive_domains(extracted_scene.scene_id, now, next_revision);
         changed |= swept != 0;
-
-        self.multi_bin_resolved.clear();
-        let mut asset_tables_changed = false;
-        // Resolve handle-addressed asset tables first. Epoch drift changes the
-        // generation in place; no replacement identity is inserted into the
-        // semantic lookup.
-        for bin_index in 0..self.multi_bin_preflight.len() {
-            let key = self.multi_bin_preflight[bin_index].key;
-            let (geometry_id, geometry_changed) = self.resolve_geometry(key, next_revision);
-            let (material_id, material_changed) = self.resolve_material(key, next_revision);
-            asset_tables_changed |= geometry_changed | material_changed;
-            changed |= geometry_changed | material_changed;
-            self.multi_bin_resolved.push(GpuSceneResolvedBin {
-                geometry_id,
-                material_id,
-                batch_id: GpuSceneBatchId {
-                    slot: u32::MAX,
-                    generation: 0,
-                },
-            });
-        }
-        if asset_tables_changed {
-            // Stable frames must not scan every Batch retained by dormant
-            // scene domains. A cascade can only be required after an asset
-            // table allocation or generation change in this transaction.
-            changed |= self.cascade_asset_generations(next_revision);
-        }
-
         let mut domain = self
             .domains
             .remove(&extracted_scene.scene_id)
             .unwrap_or_default();
         domain.last_used_seconds = now;
         domain.last_used_sync = sync_serial;
-        self.scene_batch_scratch.clear();
-        std::mem::swap(&mut domain.batch_slots, &mut self.scene_batch_scratch);
-
-        // Resolve stable scene+handle+fixed-state batches. Partition and member
-        // count changes patch the record without changing its generation.
-        for bin_index in 0..self.multi_bin_preflight.len() {
-            let bin = self.multi_bin_preflight[bin_index];
-            let resolved = self.multi_bin_resolved[bin_index];
-            let (batch_id, batch_changed, inserted) = self.resolve_batch(
-                extracted_scene.scene_id,
-                bin,
-                resolved.geometry_id,
-                resolved.material_id,
-                next_revision,
-            );
-            changed |= batch_changed;
-            self.multi_bin_resolved[bin_index].batch_id = batch_id;
-            self.batches.mark_seen(authority_id(batch_id), sync_serial);
-            domain.batch_slots.push(batch_id.slot());
-            if inserted {
-                debug_assert_eq!(
-                    self.batches.slots[batch_id.slot() as usize].ref_count,
-                    0,
-                    "new GPU Scene Batch unexpectedly retained a domain reference"
-                );
-                self.batches.add_ref(authority_id(batch_id));
-                self.geometries.add_ref(authority_id(resolved.geometry_id));
-                self.materials.add_ref(authority_id(resolved.material_id));
-            } else {
-                // Batch identity contains `scene_id`, so an existing lookup is
-                // necessarily the one reference already owned by this domain.
-                // `inserted` is therefore the O(1) membership proof; scanning
-                // the old slot list here would turn a stable B-bin frame into
-                // O(B²) work.
-                let slot = &self.batches.slots[batch_id.slot() as usize];
-                debug_assert_eq!(slot.ref_count, 1);
-                debug_assert_eq!(
-                    slot.key.map(|key| key.scene_id),
-                    Some(extracted_scene.scene_id)
-                );
-            }
+        let mut full_sync = recipe.full_sync_pending
+            || domain.recipe_generation != recipe.generation
+            || domain.minimum_member_count != view.minimum_member_count
+            || domain.selected_families != selected_families
+            || view.resolved.len() != view.bins.len();
+        if !full_sync {
+            // A retained domain is the structural proof. Checking only dirty
+            // members keeps invariant drift fail-closed without scanning the
+            // complete membership on a static warm frame.
+            full_sync = recipe.dirty_members.iter().any(|&member_index| {
+                let member = recipe.members[member_index as usize];
+                if view.bin_remap[member.bin as usize] == u32::MAX {
+                    return false;
+                }
+                let item = &extracted_scene.render_items[member.item as usize];
+                !self.lookup.contains_key(&GpuSceneInstanceKey {
+                    scene_id: extracted_scene.scene_id,
+                    node: item.node_handle,
+                })
+            });
+        }
+        if full_sync {
+            self.recipe_stats.members_examined = self
+                .recipe_stats
+                .members_examined
+                .max(preflight.projection.candidate_count);
+            self.recipe_stats.members_rebuilt = preflight.projection.candidate_count;
+            self.recipe_stats.members_updated = 0;
+            self.recipe_stats.members_reused = 0;
         }
 
-        let mut old_batch_index = 0;
-        while old_batch_index < self.scene_batch_scratch.len() {
-            let slot_id = self.scene_batch_scratch[old_batch_index];
-            if self.batches.slots[slot_id as usize].seen_sync == sync_serial {
-                old_batch_index += 1;
-                continue;
+        if full_sync {
+            view.resolved.clear();
+            let mut asset_tables_changed = false;
+            for bin in &view.bins {
+                let (geometry_id, geometry_changed) = self.resolve_geometry(bin.key, next_revision);
+                let (material_id, material_changed) = self.resolve_material(bin.key, next_revision);
+                asset_tables_changed |= geometry_changed | material_changed;
+                changed |= geometry_changed | material_changed;
+                view.resolved.push(GpuSceneResolvedBin {
+                    geometry_id,
+                    material_id,
+                    batch_id: GpuSceneBatchId {
+                        slot: u32::MAX,
+                        generation: 0,
+                    },
+                });
             }
-            self.release_batch_slot(slot_id, next_revision);
-            changed = true;
-            self.scene_batch_scratch.swap_remove(old_batch_index);
+            if asset_tables_changed {
+                changed |= self.cascade_asset_generations(next_revision);
+            }
+
+            self.scene_batch_scratch.clear();
+            std::mem::swap(&mut domain.batch_slots, &mut self.scene_batch_scratch);
+            for (bin_index, &bin) in view.bins.iter().enumerate() {
+                let resolved = view.resolved[bin_index];
+                let (batch_id, batch_changed, inserted) = self.resolve_batch(
+                    extracted_scene.scene_id,
+                    bin,
+                    resolved.geometry_id,
+                    resolved.material_id,
+                    next_revision,
+                );
+                changed |= batch_changed;
+                view.resolved[bin_index].batch_id = batch_id;
+                self.batches.mark_seen(authority_id(batch_id), sync_serial);
+                domain.batch_slots.push(batch_id.slot());
+                if inserted {
+                    self.batches.add_ref(authority_id(batch_id));
+                    self.geometries.add_ref(authority_id(resolved.geometry_id));
+                    self.materials.add_ref(authority_id(resolved.material_id));
+                }
+            }
+            let mut old_batch_index = 0;
+            while old_batch_index < self.scene_batch_scratch.len() {
+                let slot_id = self.scene_batch_scratch[old_batch_index];
+                if self.batches.slots[slot_id as usize].seen_sync == sync_serial {
+                    old_batch_index += 1;
+                } else {
+                    self.release_batch_slot(slot_id, next_revision);
+                    changed = true;
+                    self.scene_batch_scratch.swap_remove(old_batch_index);
+                }
+            }
+            self.scene_batch_scratch.clear();
         }
-        self.scene_batch_scratch.clear();
 
         let selected_instance_flags = gpu_scene_instance_family_flags(selected_families);
         let mut inserted_instances = 0u32;
         let mut retired_instances = 0u32;
-        for member_index in 0..self.multi_bin_members.len() {
-            let member = self.multi_bin_members[member_index];
+        let selected_members: &[u32] = if full_sync {
+            &view.members
+        } else {
+            &recipe.dirty_members
+        };
+        for &canonical_member_index in selected_members {
+            let member = recipe.members[canonical_member_index as usize];
+            let selected_bin = view.bin_remap[member.bin as usize];
+            if selected_bin == u32::MAX {
+                continue;
+            }
             let item = &extracted_scene.render_items[member.item as usize];
-            let resolved = self.multi_bin_resolved[member.bin as usize];
+            let resolved = view.resolved[selected_bin as usize];
             let input = GpuSceneInstanceInput::new(
                 item.node_handle,
                 item.world_matrix,
@@ -2218,17 +2647,13 @@ impl GpuScene {
                 node: item.node_handle,
             };
             let existing = self.lookup.get(&key).copied();
-            let world_matrix_inverse = if member.inverse_update == u32::MAX {
-                let id = existing
-                    .expect("GPU Scene stable-inverse recipe lost its retained instance identity");
-                self.records[id.slot as usize].world_matrix_inverse
-            } else {
-                self.multi_bin_inverse_updates[member.inverse_update as usize]
-            };
+            let world_matrix_inverse = item.world_matrix.inverse().to_cols_array_2d();
             if let Some(id) = existing {
                 let slot_index = id.slot as usize;
-                assert_ne!(self.slots[slot_index].seen_sync, sync_serial);
-                self.slots[slot_index].seen_sync = sync_serial;
+                if full_sync {
+                    assert_ne!(self.slots[slot_index].seen_sync, sync_serial);
+                    self.slots[slot_index].seen_sync = sync_serial;
+                }
                 let dependency_drift = self.slots[slot_index].batch_id != Some(resolved.batch_id);
                 let current = if dependency_drift {
                     changed = true;
@@ -2261,6 +2686,7 @@ impl GpuScene {
                 self.slots[current_index].material_id = Some(resolved.material_id);
                 self.slots[current_index].batch_id = Some(resolved.batch_id);
             } else {
+                debug_assert!(full_sync);
                 let id = self.allocate_slot_with_dependencies(
                     key,
                     input,
@@ -2273,19 +2699,23 @@ impl GpuScene {
                 changed = true;
             }
         }
-
-        let mut domain_index = 0;
-        while domain_index < domain.slots.len() {
-            let slot_id = domain.slots[domain_index];
-            if self.slots[slot_id as usize].seen_sync == sync_serial {
-                domain_index += 1;
-                continue;
+        if full_sync {
+            let mut domain_index = 0;
+            while domain_index < domain.slots.len() {
+                let slot_id = domain.slots[domain_index];
+                if self.slots[slot_id as usize].seen_sync == sync_serial {
+                    domain_index += 1;
+                    continue;
+                }
+                self.retire_slot(slot_id, next_revision);
+                domain.slots.swap_remove(domain_index);
+                retired_instances += 1;
+                changed = true;
             }
-            self.retire_slot(slot_id, next_revision);
-            domain.slots.swap_remove(domain_index);
-            retired_instances += 1;
-            changed = true;
         }
+        domain.recipe_generation = recipe.generation;
+        domain.minimum_member_count = view.minimum_member_count;
+        domain.selected_families = selected_families;
         if !domain.slots.is_empty() || !domain.batch_slots.is_empty() {
             assert!(
                 self.domains
@@ -2300,6 +2730,11 @@ impl GpuScene {
             .expect("GPU Scene instance alive count drift");
         if changed {
             self.revision = next_revision;
+            self.unsubmitted_table_since_seconds.get_or_insert(now);
+        }
+        recipe.full_sync_pending = false;
+        for member_index in recipe.dirty_members.drain(..) {
+            recipe.members[member_index as usize].dirty = false;
         }
 
         // Publish a dense CPU complement with one ordered linear merge. The
@@ -2318,36 +2753,24 @@ impl GpuScene {
                 & (GpuDrivenFamilyMask::SHADOW_2D | GpuDrivenFamilyMask::SHADOW_CUBE);
         }
         if !incomplete_families.is_empty() {
-            let mut retained_index = 0usize;
-            for item_index in 0..extracted_scene.render_items.len() {
-                let retained = self
-                    .multi_bin_members
-                    .get(retained_index)
-                    .is_some_and(|member| member.item as usize == item_index);
-                if retained {
-                    retained_index += 1;
-                } else {
-                    let item = &extracted_scene.render_items[item_index];
-                    render_lists.append_gpu_cpu_complement(
-                        ExtractedSourceId::from_index(item_index),
-                        item.cast_shadows,
-                        incomplete_families,
-                    );
-                }
+            for &source in &view.cpu_complement {
+                let item = &extracted_scene.render_items[source.index()];
+                render_lists.append_gpu_cpu_complement(
+                    source,
+                    item.cast_shadows,
+                    incomplete_families,
+                );
             }
-            debug_assert_eq!(
-                retained_index,
-                self.multi_bin_members.len(),
-                "retained GPU Scene members must remain extraction-order sorted"
-            );
         }
 
         // Publish ownership only after the persistent authority transaction
         // has no remaining fallible boundary. These attempt-local claims are
-        // a debug-only CPU xor GPU proof. Release collection consumes the
-        // dense complement directly and performs no scene-width stamp writes.
-        #[cfg(any(debug_assertions, test))]
-        for member in &self.multi_bin_members {
+        // a unit-test CPU xor GPU proof. Runtime collection consumes the dense
+        // complement directly and performs no scene-width stamp writes, even
+        // in ordinary debug builds.
+        #[cfg(test)]
+        for &member_index in &view.members {
+            let member = recipe.members[member_index as usize];
             render_lists.claim_gpu_family_ownership(
                 ExtractedSourceId::from_index(member.item as usize),
                 selected_families,
@@ -2356,9 +2779,8 @@ impl GpuScene {
 
         self.multi_bin_committed.clear();
         self.active_batch_descriptors.clear();
-        for bin_index in 0..self.multi_bin_preflight.len() {
-            let bin = self.multi_bin_preflight[bin_index];
-            let batch_id = self.multi_bin_resolved[bin_index].batch_id;
+        for (bin_index, &bin) in view.bins.iter().enumerate() {
+            let batch_id = view.resolved[bin_index].batch_id;
             let representative = render_lists.append_gpu_opaque_representative(bin.representative);
             self.multi_bin_committed.push(GpuSceneMultiBinCandidate {
                 batch_id,
@@ -2377,6 +2799,9 @@ impl GpuScene {
                     partition_size: bin.partition_size,
                 });
         }
+        recipe.views.insert(preflight.minimum_member_count, view);
+        self.canonical_recipe = recipe;
+        self.refresh_retained_recipe_bytes();
         Ok(&self.multi_bin_committed)
     }
 
@@ -2992,6 +3417,9 @@ impl GpuScene {
             batch_dirty_slots: &mut self.batches.dirty_slots,
             batch_quarantine: &mut self.batches.quarantined_slots,
             batch_reusable: &mut self.batches.reusable_slots,
+            last_table_activity_seconds: &mut self.last_table_activity_seconds,
+            unsubmitted_table_since_seconds: &mut self.unsubmitted_table_since_seconds,
+            activity_seconds: self.residency_clock_seconds,
         };
         Ok((plan, acknowledger))
     }
@@ -3348,6 +3776,101 @@ impl GpuScene {
         self.residency_clock_seconds
     }
 
+    fn has_retained_table_authority(&self) -> bool {
+        self.persistent_instance_buffer.is_some()
+            || self.persistent_geometry_buffer.is_some()
+            || self.persistent_material_buffer.is_some()
+            || self.persistent_batch_buffer.is_some()
+            || !self.domains.is_empty()
+            || !self.slots.is_empty()
+            || !self.geometries.slots.is_empty()
+            || !self.materials.slots.is_empty()
+            || !self.batches.slots.is_empty()
+    }
+
+    /// Release an obsolete physical high-water mark while preserving the CPU
+    /// table identities and generation watermarks. Retiring the coherent ID
+    /// family forces one complete republish on the next live graph and avoids
+    /// mixing old and recreated table members.
+    fn retire_oversized_physical_table_family(
+        &mut self,
+        registry: &mut PersistentBufferRegistry,
+        now: f64,
+    ) -> bool {
+        let ids = [
+            self.persistent_instance_buffer,
+            self.persistent_geometry_buffer,
+            self.persistent_material_buffer,
+            self.persistent_batch_buffer,
+        ];
+        let required = [
+            table_spec::<GpuSceneInstanceRecord>(self.records.len(), GPU_SCENE_INSTANCE_SCHEMA_ID),
+            table_spec::<GpuSceneGeometryRecord>(
+                self.geometries.records.len(),
+                GPU_SCENE_GEOMETRY_SCHEMA_ID,
+            ),
+            table_spec::<GpuSceneMaterialRecord>(
+                self.materials.records.len(),
+                GPU_SCENE_MATERIAL_SCHEMA_ID,
+            ),
+            table_spec::<GpuSceneBatchRecord>(
+                self.batches.records.len(),
+                GPU_SCENE_BATCH_SCHEMA_ID,
+            ),
+        ];
+        let oversized = ids.iter().zip(required).any(|(&id, spec)| {
+            let Some(id) = id else {
+                return false;
+            };
+            let required = spec.desc.physical_allocation_size();
+            registry
+                .physical_allocation_size(id)
+                .is_some_and(|allocated| {
+                    allocated >= required.saturating_mul(GPU_SCENE_PHYSICAL_TABLE_SHRINK_RATIO)
+                })
+        });
+        if !oversized {
+            return false;
+        }
+
+        for id in [
+            self.persistent_instance_buffer.take(),
+            self.persistent_geometry_buffer.take(),
+            self.persistent_material_buffer.take(),
+            self.persistent_batch_buffer.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let removed = registry.remove_buffer(id);
+            debug_assert!(removed, "GPU Scene lost its owned persistent-buffer record");
+        }
+        self.unsubmitted_table_since_seconds.get_or_insert(now);
+        true
+    }
+
+    fn reset_residency(&mut self, registry: &mut PersistentBufferRegistry) {
+        for id in [
+            self.persistent_instance_buffer.take(),
+            self.persistent_geometry_buffer.take(),
+            self.persistent_material_buffer.take(),
+            self.persistent_batch_buffer.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let removed = registry.remove_buffer(id);
+            debug_assert!(removed, "GPU Scene lost its owned persistent-buffer record");
+        }
+        let residency_clock_seconds = self.residency_clock_seconds;
+        let last_residency_sample_seconds = self.last_residency_sample_seconds;
+        *self = Self {
+            residency_clock_seconds,
+            last_residency_sample_seconds,
+            ..Self::default()
+        };
+    }
+
     /// Retire inactive domains as part of the selected scene's one logical
     /// transaction. The current scene is never a victim. Candidate order is
     /// deterministic even when several frames share one floating timestamp.
@@ -3390,6 +3913,7 @@ impl GpuScene {
         let eviction_count = expired_count.max(budget_eviction_count);
 
         let mut retired = 0u32;
+        let mut recipe_retired = false;
         for candidate_index in 0..eviction_count {
             let scene_id = self.domain_sweep_scratch[candidate_index].scene_id;
             let domain = self
@@ -3405,8 +3929,16 @@ impl GpuScene {
             for slot_id in domain.batch_slots {
                 self.release_batch_slot(slot_id, retired_revision);
             }
+            // Canonical derivation is a cache of the same dormant scene
+            // authority. Once the time-based table domain is retired, keeping
+            // its potentially much larger CPU recipe would create a split
+            // residency policy and an unbounded high-water retention tail.
+            recipe_retired |= self.retained_canonical_recipes.remove(&scene_id).is_some();
         }
         self.domain_sweep_scratch.clear();
+        if recipe_retired {
+            self.refresh_retained_recipe_bytes();
+        }
         retired
     }
 
@@ -3479,6 +4011,78 @@ impl GpuScene {
             .expect("GPU Scene synchronization serial exhausted");
         self.sync_serial
     }
+}
+
+fn canonical_recipe_capacity_usage(recipe: &GpuSceneCanonicalRecipe) -> CapacityUsage {
+    let mut usage = vec_footprint(&recipe.bins, 0)
+        + vec_footprint(&recipe.members, 0)
+        + vec_footprint(&recipe.source_states, 0)
+        + vec_footprint(&recipe.dirty_members, 0)
+        + estimated_hash_map_footprint(&recipe.views, 0);
+    for view in recipe.views.values() {
+        usage += vec_footprint(&view.bins, 0)
+            + vec_footprint(&view.members, 0)
+            + vec_footprint(&view.bin_remap, 0)
+            + estimated_hash_map_footprint(&view.geometry_uniques, 0)
+            + estimated_hash_map_footprint(&view.material_uniques, 0)
+            + estimated_hash_set_footprint(&view.instance_uniques, 0)
+            + vec_footprint(&view.cpu_complement, 0)
+            + vec_footprint(&view.resolved, 0);
+    }
+    usage
+}
+
+fn trim_canonical_recipe_capacity(
+    recipe: &mut GpuSceneCanonicalRecipe,
+    target_bytes: usize,
+    retained_bytes: usize,
+) {
+    shrink_vec_by_family_ratio(&mut recipe.bins, 0, target_bytes, retained_bytes);
+    shrink_vec_by_family_ratio(&mut recipe.members, 0, target_bytes, retained_bytes);
+    shrink_vec_by_family_ratio(&mut recipe.source_states, 0, target_bytes, retained_bytes);
+    shrink_vec_by_family_ratio(&mut recipe.dirty_members, 0, target_bytes, retained_bytes);
+    shrink_hash_map_by_family_ratio(&mut recipe.views, 0, target_bytes, retained_bytes);
+    for view in recipe.views.values_mut() {
+        shrink_vec_by_family_ratio(&mut view.bins, 0, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(&mut view.members, 0, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(&mut view.bin_remap, 0, target_bytes, retained_bytes);
+        shrink_hash_map_by_family_ratio(
+            &mut view.geometry_uniques,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_map_by_family_ratio(
+            &mut view.material_uniques,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_hash_set_by_family_ratio(
+            &mut view.instance_uniques,
+            0,
+            target_bytes,
+            retained_bytes,
+        );
+        shrink_vec_by_family_ratio(&mut view.cpu_complement, 0, target_bytes, retained_bytes);
+        shrink_vec_by_family_ratio(&mut view.resolved, 0, target_bytes, retained_bytes);
+    }
+}
+
+fn canonical_recipe_retained_bytes(recipe: &GpuSceneCanonicalRecipe) -> usize {
+    canonical_recipe_capacity_usage(recipe).retained_bytes
+}
+
+#[inline]
+fn canonical_recipe_retains_state(recipe: &GpuSceneCanonicalRecipe) -> bool {
+    recipe.initialized
+        || recipe.scene_id != 0
+        || recipe.generation != 0
+        || recipe.bins.capacity() != 0
+        || recipe.members.capacity() != 0
+        || recipe.source_states.capacity() != 0
+        || recipe.dirty_members.capacity() != 0
+        || recipe.views.capacity() != 0
 }
 
 #[inline]
@@ -3760,9 +4364,17 @@ mod tests {
     }
 
     fn extracted_scene(items: impl IntoIterator<Item = ExtractedRenderItem>) -> ExtractedScene {
+        extracted_scene_with_id(17, items)
+    }
+
+    fn extracted_scene_with_id(
+        scene_id: u32,
+        items: impl IntoIterator<Item = ExtractedRenderItem>,
+    ) -> ExtractedScene {
         let mut scene = ExtractedScene::new();
-        scene.scene_id = 17;
+        scene.scene_id = scene_id;
         scene.render_items.extend(items);
+        scene.initialize_test_render_world(scene_id, true);
         scene
     }
 
@@ -3800,7 +4412,7 @@ mod tests {
 
     fn preflight_and_commit(
         authority: &mut GpuScene,
-        scene: &ExtractedScene,
+        scene: &mut ExtractedScene,
         elapsed_seconds: f64,
         lists: &mut RenderLists,
     ) -> GpuSceneMultiBinProjection {
@@ -3813,6 +4425,22 @@ mod tests {
             .commit_multi_bin_selection(scene, preflight, elapsed_seconds, lists)
             .unwrap();
         projection
+    }
+
+    fn dormant_recipe(
+        scene_id: u32,
+        last_used_serial: u64,
+        reserved_members: usize,
+    ) -> GpuSceneCanonicalRecipe {
+        let mut recipe = GpuSceneCanonicalRecipe {
+            scene_id,
+            initialized: true,
+            last_used_serial,
+            ..Default::default()
+        };
+        recipe.members.reserve_exact(reserved_members);
+        recipe.source_states.reserve_exact(reserved_members);
+        recipe
     }
 
     fn publish_table_set(
@@ -3842,13 +4470,13 @@ mod tests {
             ));
         }
         registry.commit_batch(&commits).unwrap();
-        assert!(acknowledger.acknowledge_if_published(registry, &probe));
+        assert!(acknowledger.acknowledge_if_published(registry, &probe, true));
         probe
     }
 
     #[test]
     fn four_table_projection_is_read_only_and_two_by_two_ids_are_stable() {
-        let scene = extracted_scene([
+        let mut scene = extracted_scene([
             rigid_item_with_assets(1, 10, 20),
             rigid_item_with_assets(2, 11, 20),
             rigid_item_with_assets(3, 10, 21),
@@ -3858,7 +4486,7 @@ mod tests {
         let mut lists = RenderLists::new();
 
         let preflight = authority
-            .preflight_multi_bin_scene(&scene, 16, 256)
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3903,7 +4531,7 @@ mod tests {
         let revision = authority.revision;
 
         lists.begin_intent_collection();
-        preflight_and_commit(&mut authority, &scene, 0.1, &mut lists);
+        preflight_and_commit(&mut authority, &mut scene, 0.1, &mut lists);
         assert_eq!(authority.revision, revision);
         assert_eq!(
             geometry_ids,
@@ -3944,11 +4572,11 @@ mod tests {
         let singleton = rigid_item_with_assets(4, 11, 21);
         let mut unsupported = rigid_item_with_assets(5, 12, 22);
         unsupported.geometry_has_morph_targets = true;
-        let scene = extracted_scene(shared.into_iter().chain([singleton, unsupported]));
+        let mut scene = extracted_scene(shared.into_iter().chain([singleton, unsupported]));
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
         let preflight = authority
-            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .preflight_multi_bin_cohorts(&mut scene, 16, 256, 2)
             .unwrap()
             .unwrap();
         assert_eq!(preflight.projection.candidate_count, 3);
@@ -3958,8 +4586,9 @@ mod tests {
         assert_eq!(preflight.projection.table_set.instance_slot_span, 3);
         assert_eq!(preflight.projection.shadow_candidate_count, 3);
         assert!(!preflight.projection.covers_complete_shadow_domain);
-        assert_eq!(authority.multi_bin_members.len(), 3);
-        assert_eq!(authority.multi_bin_preflight[0].member_count, 3);
+        let view = &authority.canonical_recipe.views[&2];
+        assert_eq!(view.members.len(), 3);
+        assert_eq!(view.bins[0].member_count, 3);
         assert_eq!(authority.revision, 0, "preflight must remain read-only");
         authority
             .commit_multi_bin_selection_with_families(
@@ -4043,7 +4672,7 @@ mod tests {
             101,
             0,
             0,
-            "Shadow2D".into(),
+            "Shadow2D",
             Mat4::IDENTITY,
             shadow_frustum,
             (64, 64),
@@ -4053,7 +4682,7 @@ mod tests {
             202,
             0,
             1,
-            "ShadowCube".into(),
+            "ShadowCube",
             Mat4::IDENTITY,
             shadow_frustum,
             (64, 64),
@@ -4062,7 +4691,7 @@ mod tests {
 
         let mut authority = GpuScene::new();
         let d2 = authority
-            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .preflight_multi_bin_cohorts(&mut scene, 16, 256, 2)
             .unwrap()
             .unwrap();
         authority
@@ -4092,7 +4721,7 @@ mod tests {
 
         lists.begin_intent_collection();
         let cube = authority
-            .preflight_multi_bin_cohorts(&scene, 16, 256, 2)
+            .preflight_multi_bin_cohorts(&mut scene, 16, 256, 2)
             .unwrap()
             .unwrap();
         authority
@@ -4123,10 +4752,10 @@ mod tests {
 
     #[test]
     fn asset_epoch_bump_cascades_batch_and_instance_generation_in_place() {
-        let scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
+        let mut scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
-        preflight_and_commit(&mut authority, &scene, 0.0, &mut lists);
+        preflight_and_commit(&mut authority, &mut scene, 0.0, &mut lists);
         let geometry_before = geometry_id(authority.geometries.id(geometry(10)).unwrap());
         let batch_before = authority.multi_bin_committed[0].batch_id;
         let instance_before = authority.instance_id(17, node(1)).unwrap();
@@ -4135,9 +4764,9 @@ mod tests {
         changed.geometry_asset_identity += 1;
         changed.geometry_asset_version += 1;
         changed.geometry_structure_version += 1;
-        let changed_scene = extracted_scene([changed]);
+        let mut changed_scene = extracted_scene([changed]);
         lists.begin_intent_collection();
-        preflight_and_commit(&mut authority, &changed_scene, 0.1, &mut lists);
+        preflight_and_commit(&mut authority, &mut changed_scene, 0.1, &mut lists);
 
         let geometry_after = geometry_id(authority.geometries.id(geometry(10)).unwrap());
         let batch_after = authority.multi_bin_committed[0].batch_id;
@@ -4224,11 +4853,11 @@ mod tests {
             let first = rigid_item_with_assets(1, 10, 20);
             let mut second = rigid_item_with_assets(2, 10, 20);
             mutate(&mut second);
-            let scene = extracted_scene([first, second]);
+            let mut scene = extracted_scene([first, second]);
             let mut authority = GpuScene::new();
 
             assert_eq!(
-                authority.preflight_multi_bin_scene(&scene, 16, 256),
+                authority.preflight_multi_bin_scene(&mut scene, 16, 256),
                 Err(GpuSceneMultiBinPreflightFailure::Domain(expected)),
                 "same-handle stamp conflict was misclassified: {label}"
             );
@@ -4246,11 +4875,11 @@ mod tests {
     #[test]
     fn coherent_table_set_is_all_invalid_or_all_valid_and_trim_advances_revision() {
         let gpu = gpu();
-        let scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
+        let mut scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
         let mut registry = PersistentBufferRegistry::new();
-        preflight_and_commit(&mut authority, &scene, 0.0, &mut lists);
+        preflight_and_commit(&mut authority, &mut scene, 0.0, &mut lists);
 
         {
             let plan = authority.plan_table_set(&mut registry, 1).unwrap();
@@ -4317,11 +4946,11 @@ mod tests {
     #[test]
     fn four_table_quarantine_replays_then_reuses_without_aba() {
         let gpu = gpu();
-        let first_scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
+        let mut first_scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
         let mut registry = PersistentBufferRegistry::new();
-        preflight_and_commit(&mut authority, &first_scene, 0.0, &mut lists);
+        preflight_and_commit(&mut authority, &mut first_scene, 0.0, &mut lists);
         let first_instance = authority.instance_id(17, node(1)).unwrap();
         let first_geometry = geometry_id(authority.geometries.id(geometry(10)).unwrap());
         let first_material = material_id(authority.materials.id(material(20)).unwrap());
@@ -4334,9 +4963,9 @@ mod tests {
         assert_eq!(authority.materials.quarantined_slots.len(), 1);
         assert_eq!(authority.batches.quarantined_slots.len(), 1);
 
-        let second_scene = extracted_scene([rigid_item_with_assets(2, 11, 21)]);
+        let mut second_scene = extracted_scene([rigid_item_with_assets(2, 11, 21)]);
         lists.begin_intent_collection();
-        preflight_and_commit(&mut authority, &second_scene, 0.1, &mut lists);
+        preflight_and_commit(&mut authority, &mut second_scene, 0.1, &mut lists);
         assert_ne!(
             authority.instance_id(17, node(2)).unwrap().slot(),
             first_instance.slot()
@@ -4356,9 +4985,9 @@ mod tests {
         publish_table_set(&mut authority, &mut registry, &gpu, 2);
 
         let third = rigid_item_with_assets(3, 12, 22);
-        let expanded = extracted_scene([rigid_item_with_assets(2, 11, 21), third]);
+        let mut expanded = extracted_scene([rigid_item_with_assets(2, 11, 21), third]);
         lists.begin_intent_collection();
-        preflight_and_commit(&mut authority, &expanded, 0.2, &mut lists);
+        preflight_and_commit(&mut authority, &mut expanded, 0.2, &mut lists);
         let reused_instance = authority.instance_id(17, node(3)).unwrap();
         let reused_geometry = geometry_id(authority.geometries.id(geometry(12)).unwrap());
         let reused_material = material_id(authority.materials.id(material(22)).unwrap());
@@ -4385,10 +5014,10 @@ mod tests {
 
     #[test]
     fn saturated_generations_fail_closed_and_never_wrap_or_alias() {
-        let scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
+        let mut scene = extracted_scene([rigid_item_with_assets(1, 10, 20)]);
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
-        preflight_and_commit(&mut authority, &scene, 0.0, &mut lists);
+        preflight_and_commit(&mut authority, &mut scene, 0.0, &mut lists);
         let original = authority.geometries.id(geometry(10)).unwrap();
         let index = original.slot as usize;
         authority.geometries.slots[index].generation = u32::MAX;
@@ -4402,11 +5031,11 @@ mod tests {
 
         let mut changed = scene.render_items[0].clone();
         changed.geometry_asset_identity += 1;
-        let changed_scene = extracted_scene([changed]);
+        let mut changed_scene = extracted_scene([changed]);
         lists.begin_intent_collection();
         let revision = authority.revision;
         assert_eq!(
-            authority.preflight_multi_bin_scene(&changed_scene, 16, 256),
+            authority.preflight_multi_bin_scene(&mut changed_scene, 16, 256),
             Err(GpuSceneMultiBinPreflightFailure::Domain(
                 GpuSceneSelectionRejection::GenerationExhausted
             ))
@@ -4451,7 +5080,7 @@ mod tests {
 
     #[test]
     fn multi_bin_preflight_groups_exact_keys_in_first_occurrence_order() {
-        let scene = extracted_scene([
+        let mut scene = extracted_scene([
             rigid_item_with_assets(1, 10, 20),
             rigid_item_with_assets(2, 11, 20),
             rigid_item_with_assets(3, 10, 21),
@@ -4462,7 +5091,7 @@ mod tests {
         let mut lists = RenderLists::new();
 
         let preflight = authority
-            .preflight_multi_bin_scene(&scene, 16, 256)
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .unwrap();
         assert_eq!(preflight.projection.candidate_count, 5);
@@ -4523,11 +5152,11 @@ mod tests {
             let first = rigid_item_with_assets(1, 10, 20);
             let mut second = rigid_item_with_assets(2, 10, 20);
             mutate(&mut second);
-            let scene = extracted_scene([first, second]);
+            let mut scene = extracted_scene([first, second]);
             let mut authority = GpuScene::new();
 
             let projection = authority
-                .preflight_multi_bin_scene(&scene, 16, 256)
+                .preflight_multi_bin_scene(&mut scene, 16, 256)
                 .unwrap_or_else(|error| panic!("supported drift was rejected ({label}): {error:?}"))
                 .expect("two supported candidates must produce a projection")
                 .projection;
@@ -4536,8 +5165,8 @@ mod tests {
             assert_eq!(projection.unique_geometry_count, geometry_count, "{label}");
             assert_eq!(projection.unique_material_count, material_count, "{label}");
             assert_eq!(
-                authority
-                    .multi_bin_preflight
+                authority.canonical_recipe.views[&1]
+                    .bins
                     .iter()
                     .map(|bin| bin.representative.index())
                     .collect::<Vec<_>>(),
@@ -4556,12 +5185,12 @@ mod tests {
     #[test]
     fn multi_bin_commit_rejects_a_different_extracted_scene_with_the_same_id() {
         let item = rigid_item_with_assets(1, 10, 20);
-        let scene = extracted_scene([item.clone()]);
+        let mut scene = extracted_scene([item.clone()]);
         let impostor = extracted_scene([item]);
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
         let preflight = authority
-            .preflight_multi_bin_scene(&scene, 16, 256)
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .unwrap();
 
@@ -4575,64 +5204,432 @@ mod tests {
     }
 
     #[test]
-    fn multi_bin_inverse_recipe_is_sparse_and_only_tracks_world_matrix_changes() {
-        let initial = extracted_scene([
+    fn canonical_recipe_static_warm_frame_does_not_examine_members() {
+        let mut scene = extracted_scene([
             rigid_item_with_assets(1, 10, 20),
             rigid_item_with_assets(2, 11, 21),
         ]);
         let mut authority = GpuScene::new();
         let mut lists = RenderLists::new();
         let cold = authority
-            .preflight_multi_bin_scene(&initial, 16, 256)
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .unwrap();
-        assert_eq!(authority.multi_bin_inverse_updates.len(), 2);
         authority
-            .commit_multi_bin_selection(&initial, cold, 0.0, &mut lists)
+            .commit_multi_bin_selection(&scene, cold, 0.0, &mut lists)
             .unwrap();
+        let revision = authority.revision;
 
-        let mut motion_only = rigid_item_with_assets(1, 10, 20);
-        motion_only.prev_world_matrix = Mat4::from_translation(glam::Vec3::splat(-7.0));
-        let motion_scene = extracted_scene([motion_only, rigid_item_with_assets(2, 11, 21)]);
         lists.begin_intent_collection();
-        let motion = authority
-            .preflight_multi_bin_scene(&motion_scene, 16, 256)
+        let warm = authority
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .unwrap();
-        assert!(
-            authority.multi_bin_inverse_updates.is_empty(),
-            "previous-transform changes do not invalidate the current inverse"
-        );
+        assert_eq!(authority.recipe_stats().members_total, 2);
+        assert_eq!(authority.recipe_stats().members_examined, 0);
+        assert_eq!(authority.recipe_stats().members_updated, 0);
+        assert_eq!(authority.recipe_stats().members_rebuilt, 0);
+        assert_eq!(authority.recipe_stats().members_reused, 2);
         authority
-            .commit_multi_bin_selection(&motion_scene, motion, 0.1, &mut lists)
+            .commit_multi_bin_selection(&scene, warm, 0.1, &mut lists)
             .unwrap();
+        assert_eq!(authority.revision, revision);
 
-        let mut moved = rigid_item_with_assets(1, 10, 20);
-        moved.world_matrix = Mat4::from_scale_rotation_translation(
+        let previous_world = scene.render_items[0].world_matrix;
+        let moved_world = Mat4::from_scale_rotation_translation(
             glam::Vec3::new(2.0, 3.0, 4.0),
             glam::Quat::from_rotation_y(0.4),
             glam::Vec3::new(9.0, 2.0, -3.0),
         );
-        let expected_inverse = moved.world_matrix.inverse().to_cols_array_2d();
-        let moved_scene = extracted_scene([moved, rigid_item_with_assets(2, 11, 21)]);
+        scene.render_items[0].prev_world_matrix = previous_world;
+        scene.render_items[0].world_matrix = moved_world;
+        scene.render_items[0].world_aabb = BoundingBox {
+            min: glam::Vec3::new(8.0, 1.0, -4.0),
+            max: glam::Vec3::new(10.0, 3.0, -2.0),
+        };
+        scene.mark_test_source_change(
+            ExtractedSourceId::from_index(0),
+            RenderWorldChangeFlags::TRANSFORM,
+        );
         lists.begin_intent_collection();
-        let moved_preflight = authority
-            .preflight_multi_bin_scene(&moved_scene, 16, 256)
+        let _abandoned = authority
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            authority.multi_bin_inverse_updates,
-            [expected_inverse],
-            "only the one transform-dirty instance derives an inverse"
-        );
+        assert_eq!(authority.recipe_stats().members_examined, 1);
+        assert_eq!(authority.recipe_stats().members_updated, 1);
+        assert_eq!(authority.recipe_stats().members_rebuilt, 0);
+        lists.begin_intent_collection();
+        let moved = authority
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.recipe_stats().members_examined, 0);
+        assert_eq!(authority.recipe_stats().members_updated, 1);
         authority
-            .commit_multi_bin_selection(&moved_scene, moved_preflight, 0.2, &mut lists)
+            .commit_multi_bin_selection(&scene, moved, 0.2, &mut lists)
             .unwrap();
         let moved_id = authority.instance_id(17, node(1)).unwrap();
         assert_eq!(
             authority.records[moved_id.slot() as usize].world_matrix_inverse,
-            expected_inverse
+            moved_world.inverse().to_cols_array_2d()
         );
+
+        scene.render_items[0].prev_world_matrix = moved_world;
+        scene.mark_test_source_change(
+            ExtractedSourceId::from_index(0),
+            RenderWorldChangeFlags::PREVIOUS_SETTLE,
+        );
+        lists.begin_intent_collection();
+        let settled = authority
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.recipe_stats().members_examined, 1);
+        assert_eq!(authority.recipe_stats().members_updated, 1);
+        authority
+            .commit_multi_bin_selection(&scene, settled, 0.3, &mut lists)
+            .unwrap();
+        assert_eq!(
+            authority.records[moved_id.slot() as usize].previous_world_matrix,
+            moved_world.to_cols_array_2d()
+        );
+
+        scene.render_items[1].material_version += 1;
+        scene.mark_test_source_change(
+            ExtractedSourceId::from_index(1),
+            RenderWorldChangeFlags::FIXED_STATE,
+        );
+        lists.begin_intent_collection();
+        let fixed = authority
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.recipe_stats().members_examined, 2);
+        assert_eq!(authority.recipe_stats().members_rebuilt, 2);
+        assert!(authority.recipe_stats().full_rebuild_reason.is_some());
+        authority
+            .commit_multi_bin_selection(&scene, fixed, 0.4, &mut lists)
+            .unwrap();
+    }
+
+    #[test]
+    fn canonical_recipes_and_authority_domains_survive_scene_alternation() {
+        let mut first = extracted_scene_with_id(
+            17,
+            [
+                rigid_item_with_assets(1, 10, 20),
+                rigid_item_with_assets(2, 10, 20),
+            ],
+        );
+        let mut second = extracted_scene_with_id(
+            18,
+            [
+                rigid_item_with_assets(3, 11, 21),
+                rigid_item_with_assets(4, 11, 21),
+            ],
+        );
+        let mut authority = GpuScene::new();
+        let mut lists = RenderLists::new();
+
+        preflight_and_commit(&mut authority, &mut first, 0.0, &mut lists);
+        lists.begin_intent_collection();
+        preflight_and_commit(&mut authority, &mut second, 0.1, &mut lists);
+        lists.begin_intent_collection();
+        let preflight = authority
+            .preflight_multi_bin_scene(&mut first, 16, 256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.recipe_stats().scene_id, 17);
+        assert_eq!(authority.recipe_stats().members_examined, 0);
+        assert_eq!(authority.recipe_stats().members_rebuilt, 0);
+        authority
+            .commit_multi_bin_selection(&first, preflight, 0.2, &mut lists)
+            .unwrap();
+        assert!(authority.retained_canonical_recipes.contains_key(&18));
+    }
+
+    #[test]
+    fn dormant_canonical_recipe_byte_budget_evicts_deterministic_lru() {
+        let mut authority = GpuScene::new();
+        authority
+            .retained_canonical_recipes
+            .insert(41, dormant_recipe(41, 1, 64));
+        authority
+            .retained_canonical_recipes
+            .insert(42, dormant_recipe(42, 2, 64));
+        authority
+            .retained_canonical_recipes
+            .insert(43, dormant_recipe(43, 3, 64));
+
+        let retained_newest = [42_u32, 43_u32]
+            .into_iter()
+            .map(|scene_id| {
+                canonical_recipe_retained_bytes(&authority.retained_canonical_recipes[&scene_id])
+            })
+            .fold(0usize, usize::saturating_add);
+        assert!(
+            authority.dormant_canonical_recipe_retained_bytes() > retained_newest,
+            "test fixture must exceed the injected dormant byte budget"
+        );
+
+        // Exercise the production eviction algorithm with a small injected
+        // budget instead of allocating more than 64 MiB in a unit test.
+        authority.enforce_dormant_canonical_recipe_budget(retained_newest);
+
+        assert!(!authority.retained_canonical_recipes.contains_key(&41));
+        assert!(authority.retained_canonical_recipes.contains_key(&42));
+        assert!(authority.retained_canonical_recipes.contains_key(&43));
+        assert_eq!(
+            authority.dormant_canonical_recipe_retained_bytes(),
+            retained_newest
+        );
+        assert_eq!(
+            authority.recipe_stats.retained_bytes,
+            authority.retained_recipe_bytes
+        );
+    }
+
+    #[test]
+    fn time_sweep_retires_matching_dormant_recipe_with_gpu_domain() {
+        let mut first = extracted_scene_with_id(51, [rigid_item_with_assets(1, 10, 20)]);
+        let mut second = extracted_scene_with_id(52, [rigid_item_with_assets(2, 11, 21)]);
+        let mut authority = GpuScene::new();
+        let mut lists = RenderLists::new();
+
+        preflight_and_commit(&mut authority, &mut first, 0.0, &mut lists);
+        lists.begin_intent_collection();
+        preflight_and_commit(&mut authority, &mut second, 0.1, &mut lists);
+        assert!(authority.domains.contains_key(&51));
+        assert!(authority.retained_canonical_recipes.contains_key(&51));
+        let retained_before = authority.retained_recipe_bytes;
+
+        lists.begin_intent_collection();
+        preflight_and_commit(
+            &mut authority,
+            &mut second,
+            GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS + 0.1,
+            &mut lists,
+        );
+
+        assert!(!authority.domains.contains_key(&51));
+        assert!(!authority.retained_canonical_recipes.contains_key(&51));
+        assert!(authority.retained_recipe_bytes < retained_before);
+        assert_eq!(
+            authority.recipe_stats.retained_bytes,
+            authority.retained_recipe_bytes
+        );
+    }
+
+    #[test]
+    fn frame_residency_maintenance_retires_active_tables_and_recipe_while_mode_is_idle() {
+        let mut authority = GpuScene::new();
+        let mut registry = PersistentBufferRegistry::new();
+        let ids: [PersistentBufferId; 4] = std::array::from_fn(|_| registry.create_buffer());
+        authority.persistent_instance_buffer = Some(ids[0]);
+        authority.persistent_geometry_buffer = Some(ids[1]);
+        authority.persistent_material_buffer = Some(ids[2]);
+        authority.persistent_batch_buffer = Some(ids[3]);
+        authority.canonical_recipe = dormant_recipe(61, 1, 128);
+        authority.last_table_activity_seconds = Some(0.0);
+
+        assert!(!authority.maintain_residency(&mut registry, 0.0));
+        assert!(
+            authority.maintain_residency(&mut registry, GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS + 0.01,)
+        );
+
+        assert!(!authority.canonical_recipe.initialized);
+        assert!(authority.retained_canonical_recipes.is_empty());
+        assert!(authority.persistent_instance_buffer.is_none());
+        assert!(authority.persistent_geometry_buffer.is_none());
+        assert!(authority.persistent_material_buffer.is_none());
+        assert!(authority.persistent_batch_buffer.is_none());
+        assert_eq!(authority.retained_recipe_bytes, 0);
+        for id in ids {
+            assert!(
+                !registry.remove_buffer(id),
+                "owner retirement must permanently remove the old logical ID"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_canonical_recipe_with_retained_capacity_still_expires_by_time() {
+        let mut authority = GpuScene::new();
+        let mut registry = PersistentBufferRegistry::new();
+        authority.canonical_recipe = dormant_recipe(62, 1, 128);
+        authority.canonical_recipe.initialized = false;
+
+        assert!(authority.canonical_recipe.members.capacity() >= 128);
+        assert!(canonical_recipe_retains_state(&authority.canonical_recipe));
+        assert!(!authority.maintain_residency(&mut registry, 0.0));
+        assert!(
+            authority.maintain_residency(&mut registry, GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS + 0.01,)
+        );
+
+        assert!(!canonical_recipe_retains_state(&authority.canonical_recipe));
+        assert_eq!(authority.canonical_recipe.members.capacity(), 0);
+        assert_eq!(authority.canonical_recipe.source_states.capacity(), 0);
+        assert_eq!(authority.retained_recipe_bytes, 0);
+    }
+
+    #[test]
+    fn repeated_unsubmitted_table_attempts_do_not_refresh_authority_age() {
+        let mut first = extracted_scene_with_id(63, [rigid_item_with_assets(1, 10, 20)]);
+        let mut second = extracted_scene_with_id(64, [rigid_item_with_assets(2, 11, 21)]);
+        let mut authority = GpuScene::new();
+        let mut registry = PersistentBufferRegistry::new();
+        let mut lists = RenderLists::new();
+
+        preflight_and_commit(&mut authority, &mut first, 0.0, &mut lists);
+        assert_eq!(authority.unsubmitted_table_since_seconds, Some(0.0));
+
+        lists.begin_intent_collection();
+        preflight_and_commit(
+            &mut authority,
+            &mut second,
+            GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS * 0.75,
+            &mut lists,
+        );
+        assert_eq!(
+            authority.unsubmitted_table_since_seconds,
+            Some(0.0),
+            "a later CPU mutation must not hide the first unsubmitted attempt"
+        );
+        assert!(
+            !authority.maintain_residency(&mut registry, GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS * 0.75,)
+        );
+        assert!(
+            authority.maintain_residency(&mut registry, GPU_SCENE_DOMAIN_IDLE_TTL_SECONDS + 0.01,)
+        );
+
+        assert!(authority.unsubmitted_table_since_seconds.is_none());
+        assert!(authority.domains.is_empty());
+        assert!(authority.slots.is_empty());
+        assert!(authority.geometries.slots.is_empty());
+        assert!(authority.materials.slots.is_empty());
+        assert!(authority.batches.slots.is_empty());
+    }
+
+    #[test]
+    fn oversized_physical_table_retires_the_complete_coherent_family() {
+        let gpu = gpu();
+        let mut authority = GpuScene::new();
+        let mut registry = PersistentBufferRegistry::new();
+        let ids: [PersistentBufferId; 4] = std::array::from_fn(|_| registry.create_buffer());
+        let specs = [
+            table_spec::<GpuSceneInstanceRecord>(64, GPU_SCENE_INSTANCE_SCHEMA_ID),
+            table_spec::<GpuSceneGeometryRecord>(64, GPU_SCENE_GEOMETRY_SCHEMA_ID),
+            table_spec::<GpuSceneMaterialRecord>(64, GPU_SCENE_MATERIAL_SCHEMA_ID),
+            table_spec::<GpuSceneBatchRecord>(64, GPU_SCENE_BATCH_SCHEMA_ID),
+        ];
+        let mut commits = Vec::with_capacity(4);
+        for (&id, spec) in ids.iter().zip(specs) {
+            let plan = registry.plan_buffer(id, 1, 1, spec).unwrap();
+            let physical = registry
+                .materialize(&gpu.device, plan.buffer, Some("oversized GPU Scene table"))
+                .unwrap();
+            assert!(
+                physical.allocation_size
+                    >= BufferDesc::MIN_ALLOCATION_SIZE * GPU_SCENE_PHYSICAL_TABLE_SHRINK_RATIO
+            );
+            commits.push(PersistentBufferCommitRequest::new(
+                plan.commit.unwrap(),
+                physical.token,
+            ));
+        }
+        registry.commit_batch(&commits).unwrap();
+
+        authority.persistent_instance_buffer = Some(ids[0]);
+        authority.persistent_geometry_buffer = Some(ids[1]);
+        authority.persistent_material_buffer = Some(ids[2]);
+        authority.persistent_batch_buffer = Some(ids[3]);
+        authority.last_table_activity_seconds = Some(0.0);
+
+        assert!(authority.maintain_residency(&mut registry, 0.0));
+        assert!(authority.persistent_instance_buffer.is_none());
+        assert!(authority.persistent_geometry_buffer.is_none());
+        assert!(authority.persistent_material_buffer.is_none());
+        assert!(authority.persistent_batch_buffer.is_none());
+        assert_eq!(authority.unsubmitted_table_since_seconds, Some(0.0));
+        for id in ids {
+            assert!(
+                !registry.remove_buffer(id),
+                "one oversized member must retire the whole coherent table family"
+            );
+        }
+    }
+
+    #[test]
+    fn evicted_canonical_recipe_rebuilds_despite_matching_world_cursor_tokens() {
+        let mut scenes = (0..=GPU_SCENE_DOMAIN_BUDGET)
+            .map(|index| {
+                let scene_id = u32::try_from(index + 1).unwrap();
+                extracted_scene_with_id(
+                    scene_id,
+                    [rigid_item_with_assets(
+                        u64::from(scene_id),
+                        100 + u64::from(scene_id),
+                        200 + u64::from(scene_id),
+                    )],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut authority = GpuScene::new();
+        let mut lists = RenderLists::new();
+
+        preflight_and_commit(&mut authority, &mut scenes[0], 0.0, &mut lists);
+        let first_cursor = authority.canonical_recipe.cursor;
+        let first_generation = authority.canonical_recipe.generation;
+        assert_eq!(first_cursor.scene_id, scenes[0].scene_id);
+
+        for (index, scene) in scenes.iter_mut().enumerate().skip(1) {
+            lists.begin_intent_collection();
+            preflight_and_commit(&mut authority, scene, index as f64 * 0.1, &mut lists);
+        }
+
+        let first_scene_id = scenes[0].scene_id;
+        assert_ne!(authority.canonical_recipe.scene_id, first_scene_id);
+        assert_eq!(
+            authority.retained_canonical_recipes.len(),
+            GPU_SCENE_DOMAIN_BUDGET - 1
+        );
+        assert!(
+            !authority
+                .retained_canonical_recipes
+                .contains_key(&first_scene_id),
+            "the oldest canonical recipe must be evicted at the domain budget"
+        );
+        let warm_world = scenes[0].render_world_delta(first_cursor);
+        assert_eq!(warm_world.scene_id, first_cursor.scene_id);
+        assert_eq!(warm_world.revision, first_cursor.revision);
+        assert!(!warm_world.requires_full_rebuild);
+        assert!(warm_world.changes.is_empty());
+
+        lists.begin_intent_collection();
+        preflight_and_commit(
+            &mut authority,
+            &mut scenes[0],
+            (GPU_SCENE_DOMAIN_BUDGET + 1) as f64 * 0.1,
+            &mut lists,
+        );
+
+        // Both counters deliberately wrap back to the same values owned by
+        // the evicted recipe. Residency, rather than a coincident numeric
+        // token, must decide whether canonical CPU state is reusable.
+        assert_eq!(authority.canonical_recipe.cursor, first_cursor);
+        assert_eq!(authority.canonical_recipe.generation, first_generation);
+        assert_eq!(authority.recipe_stats().scene_id, first_scene_id);
+        assert_eq!(authority.recipe_stats().members_examined, 1);
+        assert_eq!(authority.recipe_stats().members_rebuilt, 1);
+        assert_eq!(
+            authority.recipe_stats().full_rebuild_reason,
+            Some(RenderWorldFullRebuildReason::Cold)
+        );
+        assert!(authority.instance_id(first_scene_id, node(1)).is_some());
+        let acknowledged = scenes[0].render_world_delta(first_cursor);
+        assert!(!acknowledged.requires_full_rebuild);
+        assert!(acknowledged.changes.is_empty());
     }
 
     #[test]
@@ -4650,13 +5647,13 @@ mod tests {
                 node_id += 1;
             }
         }
-        let scene = extracted_scene(items);
+        let mut scene = extracted_scene(items);
         let mut authority = GpuScene::new();
         let preflight = authority
-            .preflight_multi_bin_scene(&scene, 24, 64)
+            .preflight_multi_bin_scene(&mut scene, 24, 64)
             .unwrap()
             .unwrap();
-        let bins = &authority.multi_bin_preflight;
+        let bins = &authority.canonical_recipe.views[&1].bins;
         assert_eq!(bins.len(), counts.len());
         let quantum = checked_lcm(24, 64).unwrap();
         let mut previous_end = 0u64;
@@ -4674,11 +5671,11 @@ mod tests {
         assert!(previous_end < raw_bytes + bins.len() as u64 * quantum);
 
         assert_eq!(
-            authority.preflight_multi_bin_scene(&scene, 24, 4),
+            authority.preflight_multi_bin_scene(&mut scene, 24, 4),
             Err(GpuSceneMultiBinPreflightFailure::InvalidStorageAlignment)
         );
         assert_eq!(
-            authority.preflight_multi_bin_scene(&scene, u64::MAX, 8),
+            authority.preflight_multi_bin_scene(&mut scene, u64::MAX, 8),
             Err(GpuSceneMultiBinPreflightFailure::LayoutOverflow)
         );
     }
@@ -4774,11 +5771,11 @@ mod tests {
         for &(label, expected, mutate) in cases {
             let mut unsupported = rigid_item_with_assets(2, 11, 21);
             mutate(&mut unsupported);
-            let scene = extracted_scene([rigid_item_with_assets(1, 10, 20), unsupported]);
+            let mut scene = extracted_scene([rigid_item_with_assets(1, 10, 20), unsupported]);
             let mut authority = GpuScene::new();
 
             assert_eq!(
-                authority.preflight_multi_bin_scene(&scene, 16, 256),
+                authority.preflight_multi_bin_scene(&mut scene, 16, 256),
                 Err(GpuSceneMultiBinPreflightFailure::Domain(expected)),
                 "unsupported shape produced the wrong rejection: {label}"
             );
@@ -4801,7 +5798,7 @@ mod tests {
         transmission
             .material_classification
             .insert(MaterialClassification::USES_TRANSMISSION);
-        let scene = extracted_scene([
+        let mut scene = extracted_scene([
             rigid_item(1, -1000.0),
             rigid_item(2, 1000.0),
             transparent,
@@ -4810,18 +5807,18 @@ mod tests {
         let mut authority = GpuScene::new();
 
         let projection = authority
-            .preflight_multi_bin_scene(&scene, 16, 256)
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .expect("the opaque pre-frustum domain must not be empty")
             .projection;
         assert_eq!(projection.candidate_count, 2);
         assert_eq!(projection.bin_count, 1);
-        assert_eq!(authority.multi_bin_preflight[0].member_count, 2);
+        let view = &authority.canonical_recipe.views[&1];
+        assert_eq!(view.bins[0].member_count, 2);
         assert_eq!(
-            authority
-                .multi_bin_members
+            view.members
                 .iter()
-                .map(|member| member.item)
+                .map(|&member| authority.canonical_recipe.members[member as usize].item)
                 .collect::<Vec<_>>(),
             [0, 1]
         );
@@ -4833,11 +5830,11 @@ mod tests {
         transparent
             .material_classification
             .insert(MaterialClassification::TRANSPARENT);
-        let scene = extracted_scene([rigid_item(1, 1.0), transparent]);
+        let mut scene = extracted_scene([rigid_item(1, 1.0), transparent]);
         let mut shadow_authority = GpuScene::new();
 
         let projection = shadow_authority
-            .preflight_multi_bin_scene(&scene, 16, 256)
+            .preflight_multi_bin_scene(&mut scene, 16, 256)
             .unwrap()
             .unwrap()
             .projection;
@@ -4845,10 +5842,10 @@ mod tests {
         assert!(!projection.covers_complete_shadow_domain);
         assert!(shadow_authority.preflight_has_shadow_casters());
 
-        let only_transparent = extracted_scene([scene.render_items[1].clone()]);
+        let mut only_transparent = extracted_scene([scene.render_items[1].clone()]);
         assert!(
             shadow_authority
-                .preflight_multi_bin_scene(&only_transparent, 16, 256)
+                .preflight_multi_bin_scene(&mut only_transparent, 16, 256)
                 .unwrap()
                 .is_none()
         );
@@ -4856,9 +5853,9 @@ mod tests {
 
         let mut non_caster = scene.render_items[1].clone();
         non_caster.cast_shadows = false;
-        let complete_scene = extracted_scene([scene.render_items[0].clone(), non_caster]);
+        let mut complete_scene = extracted_scene([scene.render_items[0].clone(), non_caster]);
         let projection = shadow_authority
-            .preflight_multi_bin_scene(&complete_scene, 16, 256)
+            .preflight_multi_bin_scene(&mut complete_scene, 16, 256)
             .unwrap()
             .unwrap()
             .projection;
@@ -5021,7 +6018,7 @@ mod tests {
             )]);
             scene.scene_id = scene_id;
             lists.begin_intent_collection();
-            preflight_and_commit(&mut authority, &scene, 0.0, &mut lists);
+            preflight_and_commit(&mut authority, &mut scene, 0.0, &mut lists);
         }
         assert!(authority.instance_id(1, node(1)).is_none());
         assert!(authority.geometries.id(geometry(101)).is_none());

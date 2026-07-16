@@ -36,6 +36,10 @@ pub struct Node {
     // === Core State ===
     /// Visibility flag for culling
     pub visible: bool,
+
+    // Low-level hierarchy setters cannot update Scene's topology journal.
+    // Scene audits this bit for nodes returned through node_mut().
+    pub(crate) untracked_hierarchy_mutation: bool,
 }
 
 impl Node {
@@ -47,6 +51,7 @@ impl Node {
             children: Vec::new(),
             transform: Transform::new(),
             visible: true,
+            untracked_hierarchy_mutation: false,
         }
     }
 
@@ -70,6 +75,7 @@ impl Node {
     #[inline]
     pub fn set_parent(&mut self, parent: Option<NodeHandle>) {
         self.parent = parent;
+        self.untracked_hierarchy_mutation = true;
     }
 
     /// Appends a child handle. Prefer using [`crate::Scene::attach`] which keeps
@@ -78,6 +84,12 @@ impl Node {
     #[inline]
     pub fn push_child(&mut self, child: NodeHandle) {
         self.children.push(child);
+        self.untracked_hierarchy_mutation = true;
+    }
+
+    #[inline]
+    pub(crate) fn take_untracked_hierarchy_mutation(&mut self) -> bool {
+        std::mem::take(&mut self.untracked_hierarchy_mutation)
     }
 
     /// Returns a reference to the world transformation matrix.

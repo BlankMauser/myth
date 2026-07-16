@@ -204,7 +204,7 @@ impl PyDirectionalLightComponent {
     fn get_color(&self) -> PyResult<[f32; 3]> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.color.to_array())
                 .unwrap_or([1.0; 3])
         })
@@ -213,7 +213,7 @@ impl PyDirectionalLightComponent {
     #[setter]
     fn set_color(&self, color: [f32; 3]) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.color = Vec3::from(color);
             }
         })
@@ -223,7 +223,7 @@ impl PyDirectionalLightComponent {
     fn get_intensity(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.intensity)
                 .unwrap_or(1.0)
         })
@@ -232,7 +232,7 @@ impl PyDirectionalLightComponent {
     #[setter]
     fn set_intensity(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.intensity = val;
             }
         })
@@ -242,7 +242,7 @@ impl PyDirectionalLightComponent {
     fn get_cast_shadows(&self) -> PyResult<bool> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.cast_shadows)
                 .unwrap_or(false)
         })
@@ -251,7 +251,7 @@ impl PyDirectionalLightComponent {
     #[setter]
     fn set_cast_shadows(&self, val: bool) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.cast_shadows = val;
             }
         })
@@ -276,7 +276,7 @@ impl PyPointLightComponent {
     fn get_color(&self) -> PyResult<[f32; 3]> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.color.to_array())
                 .unwrap_or([1.0; 3])
         })
@@ -285,7 +285,7 @@ impl PyPointLightComponent {
     #[setter]
     fn set_color(&self, color: [f32; 3]) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.color = Vec3::from(color);
             }
         })
@@ -295,7 +295,7 @@ impl PyPointLightComponent {
     fn get_intensity(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.intensity)
                 .unwrap_or(1.0)
         })
@@ -304,7 +304,7 @@ impl PyPointLightComponent {
     #[setter]
     fn set_intensity(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.intensity = val;
             }
         })
@@ -314,7 +314,7 @@ impl PyPointLightComponent {
     fn get_range(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .and_then(|l| match &l.kind {
                     LightKind::Point(p) => Some(p.range),
                     _ => None,
@@ -326,7 +326,7 @@ impl PyPointLightComponent {
     #[setter]
     fn set_range(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle)
+            if let Some(light) = scene.light_mut(self.handle)
                 && let LightKind::Point(ref mut p) = light.kind
             {
                 p.range = val;
@@ -338,7 +338,7 @@ impl PyPointLightComponent {
     fn get_cast_shadows(&self) -> PyResult<bool> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.cast_shadows)
                 .unwrap_or(false)
         })
@@ -347,7 +347,7 @@ impl PyPointLightComponent {
     #[setter]
     fn set_cast_shadows(&self, val: bool) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.cast_shadows = val;
             }
         })
@@ -372,7 +372,7 @@ impl PySpotLightComponent {
     fn get_color(&self) -> PyResult<[f32; 3]> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.color.to_array())
                 .unwrap_or([1.0; 3])
         })
@@ -381,7 +381,7 @@ impl PySpotLightComponent {
     #[setter]
     fn set_color(&self, color: [f32; 3]) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.color = Vec3::from(color);
             }
         })
@@ -391,7 +391,7 @@ impl PySpotLightComponent {
     fn get_intensity(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.intensity)
                 .unwrap_or(1.0)
         })
@@ -400,7 +400,7 @@ impl PySpotLightComponent {
     #[setter]
     fn set_intensity(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.intensity = val;
             }
         })
@@ -410,7 +410,7 @@ impl PySpotLightComponent {
     fn get_range(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .and_then(|l| match &l.kind {
                     LightKind::Spot(s) => Some(s.range),
                     _ => None,
@@ -422,7 +422,7 @@ impl PySpotLightComponent {
     #[setter]
     fn set_range(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle)
+            if let Some(light) = scene.light_mut(self.handle)
                 && let LightKind::Spot(ref mut s) = light.kind
             {
                 s.range = val;
@@ -434,7 +434,7 @@ impl PySpotLightComponent {
     fn get_inner_cone(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .and_then(|l| match &l.kind {
                     LightKind::Spot(s) => Some(s.inner_cone),
                     _ => None,
@@ -446,7 +446,7 @@ impl PySpotLightComponent {
     #[setter]
     fn set_inner_cone(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle)
+            if let Some(light) = scene.light_mut(self.handle)
                 && let LightKind::Spot(ref mut s) = light.kind
             {
                 s.inner_cone = val;
@@ -458,7 +458,7 @@ impl PySpotLightComponent {
     fn get_outer_cone(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .and_then(|l| match &l.kind {
                     LightKind::Spot(s) => Some(s.outer_cone),
                     _ => None,
@@ -470,7 +470,7 @@ impl PySpotLightComponent {
     #[setter]
     fn set_outer_cone(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle)
+            if let Some(light) = scene.light_mut(self.handle)
                 && let LightKind::Spot(ref mut s) = light.kind
             {
                 s.outer_cone = val;
@@ -482,7 +482,7 @@ impl PySpotLightComponent {
     fn get_cast_shadows(&self) -> PyResult<bool> {
         with_active_scene(|scene| {
             scene
-                .get_light(self.handle)
+                .light(self.handle)
                 .map(|l| l.cast_shadows)
                 .unwrap_or(false)
         })
@@ -491,7 +491,7 @@ impl PySpotLightComponent {
     #[setter]
     fn set_cast_shadows(&self, val: bool) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(light) = scene.get_light_mut(self.handle) {
+            if let Some(light) = scene.light_mut(self.handle) {
                 light.cast_shadows = val;
             }
         })
@@ -509,7 +509,7 @@ pub(crate) fn get_light_component(
     handle: NodeHandle,
 ) -> PyResult<Option<Py<PyAny>>> {
     let kind = with_active_scene(|scene| {
-        scene.get_light(handle).map(|l| match &l.kind {
+        scene.light(handle).map(|l| match &l.kind {
             LightKind::Directional(_) => 0u8,
             LightKind::Point(_) => 1,
             LightKind::Spot(_) => 2,

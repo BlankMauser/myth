@@ -1217,7 +1217,7 @@ impl OceanRenderer {
         }
     }
 
-    fn resolve_camera_state(&self, scene: &mut Scene) -> OceanCameraState {
+    fn resolve_camera_state(&self, scene: &Scene) -> OceanCameraState {
         match self.camera_source {
             OceanCameraSource::Reference => OceanCameraState::reference(self.time),
             OceanCameraSource::SceneMainCamera => Self::scene_camera_state(scene)
@@ -1225,8 +1225,8 @@ impl OceanRenderer {
         }
     }
 
-    fn scene_camera_state(scene: &mut Scene) -> Option<OceanCameraState> {
-        let (transform, camera) = scene.query_main_camera_bundle()?;
+    fn scene_camera_state(scene: &Scene) -> Option<OceanCameraState> {
+        let (transform, camera) = scene.main_camera_bundle()?;
         let (right, up, basis_forward) = transform.rotation_basis();
         let forward = (-basis_forward).normalize_or_zero();
 

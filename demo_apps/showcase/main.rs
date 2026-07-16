@@ -501,7 +501,7 @@ impl AppHandler for ShowcaseApp {
             || engine.input.get_mouse_button(MouseButton::Right)
             || engine.input.scroll_delta().y.abs() > 0.01;
 
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node_id) {
+        if let Some(cam_node) = scene.node_mut(self.cam_node_id) {
             self.controls
                 .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
 
@@ -579,13 +579,13 @@ impl ShowcaseApp {
 
         // ── Three-point lighting
         let apply_light = |scene: &mut Scene, handle: NodeHandle, cfg: &LightConfig| {
-            if let Some(light) = scene.get_light_mut(handle) {
+            if let Some(light) = scene.light_mut(handle) {
                 light.color = cfg.color;
                 light.intensity = cfg.intensity;
                 light.cast_shadows = cfg.cast_shadows;
             }
             if cfg.intensity > 0.0 {
-                if let Some(node) = scene.get_node_mut(handle) {
+                if let Some(node) = scene.node_mut(handle) {
                     node.transform.position = cfg.position;
                     node.transform.look_at(Vec3::ZERO, Vec3::Y);
                 }

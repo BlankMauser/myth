@@ -67,7 +67,7 @@ impl AppHandler for BloomDemo {
         // Setup camera
         let cam_node_id = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 0.0, 3.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node_id);
@@ -101,7 +101,7 @@ impl AppHandler for BloomDemo {
                 let gltf_node = scene.instantiate(prefab.as_ref());
                 scene.play_if_any_animation(gltf_node);
                 scene.update_matrix_world();
-                if let Some(bbox) = scene.get_bbox_of_node(gltf_node, &assets) {
+                if let Some(bbox) = scene.subtree_world_bounds(gltf_node, &assets) {
                     self.controls.fit(&bbox);
                 }
                 self.model_loaded = true;
@@ -112,10 +112,10 @@ impl AppHandler for BloomDemo {
         }
 
         // Camera controls
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node_id) {
+        let _ = scene.edit_node_transform(self.cam_node_id, |transform| {
             self.controls
-                .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
-        }
+                .update(transform, &engine.input, 45.0, frame.dt);
+        });
 
         // Interactive bloom controls
         let input = &engine.input;

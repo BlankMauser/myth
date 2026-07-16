@@ -195,19 +195,19 @@ impl AppHandler for CustomMaterialDemo {
             &engine.assets,
         );
         scene
-            .node(&ground)
+            .edit_node(ground)
             .set_position(0.0, -0.05, 0.0)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2));
 
         let key_light = scene.add_light(Light::new_directional(Vec3::new(0.85, 0.92, 1.0), 3.5));
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_position(6.0, 10.0, 4.0)
             .look_at(Vec3::new(0.0, 1.4, 0.0));
 
         let fill_light = scene.add_light(Light::new_directional(Vec3::new(0.2, 0.35, 0.7), 1.1));
         scene
-            .node(&fill_light)
+            .edit_node(fill_light)
             .set_position(-5.0, 4.0, -8.0)
             .look_at(Vec3::new(0.0, 1.2, 0.0));
 
@@ -227,7 +227,7 @@ impl AppHandler for CustomMaterialDemo {
             ),
             &engine.assets,
         );
-        scene.node(&core_node).set_position(0.0, 1.55, 0.0);
+        scene.edit_node(core_node).set_position(0.0, 1.55, 0.0);
 
         let satellite_box = scene.spawn_box(
             0.85,
@@ -250,7 +250,7 @@ impl AppHandler for CustomMaterialDemo {
             ),
             &engine.assets,
         );
-        scene.node(&satellite_box).set_position(-3.2, 1.4, 0.0);
+        scene.edit_node(satellite_box).set_position(-3.2, 1.4, 0.0);
 
         let satellite_sphere = scene.spawn_sphere(
             0.9,
@@ -271,11 +271,13 @@ impl AppHandler for CustomMaterialDemo {
             ),
             &engine.assets,
         );
-        scene.node(&satellite_sphere).set_position(3.0, 1.25, -0.8);
+        scene
+            .edit_node(satellite_sphere)
+            .set_position(3.0, 1.25, -0.8);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.8, 8.5)
             .look_at(Vec3::new(0.0, 1.4, 0.0));
         scene.active_camera = Some(camera);
@@ -300,11 +302,11 @@ impl AppHandler for CustomMaterialDemo {
         let orbit_b = -self.time * 1.15;
 
         scene
-            .node(&self.core_node)
+            .edit_node(self.core_node)
             .set_rotation(Quat::from_rotation_y(self.time * 0.45));
 
         scene
-            .node(&self.satellite_box)
+            .edit_node(self.satellite_box)
             .set_position(
                 orbit_a.cos() * 3.1,
                 1.35 + (self.time * 1.7).sin() * 0.35,
@@ -315,7 +317,7 @@ impl AppHandler for CustomMaterialDemo {
             );
 
         scene
-            .node(&self.satellite_sphere)
+            .edit_node(self.satellite_sphere)
             .set_position(
                 orbit_b.cos() * 2.2,
                 1.15 + (self.time * 2.3).sin() * 0.25,
@@ -325,10 +327,10 @@ impl AppHandler for CustomMaterialDemo {
                 Quat::from_rotation_y(-self.time * 1.1) * Quat::from_rotation_x(self.time * 0.7),
             );
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

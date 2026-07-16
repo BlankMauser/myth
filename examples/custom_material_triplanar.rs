@@ -160,13 +160,13 @@ impl AppHandler for TriplanarDemo {
 
         let key_light = scene.add_light(Light::new_directional(Vec3::new(1.0, 0.98, 0.94), 3.2));
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_position(6.0, 10.0, 5.0)
             .look_at(Vec3::new(0.0, 1.4, 0.0));
 
         let fill_light = scene.add_light(Light::new_directional(Vec3::new(0.62, 0.70, 0.85), 0.9));
         scene
-            .node(&fill_light)
+            .edit_node(fill_light)
             .set_position(-7.0, 5.0, -8.0)
             .look_at(Vec3::new(0.0, 1.2, 0.0));
 
@@ -177,7 +177,7 @@ impl AppHandler for TriplanarDemo {
             &engine.assets,
         );
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_position(0.0, -0.05, 0.0);
 
@@ -197,22 +197,22 @@ impl AppHandler for TriplanarDemo {
 
         let monolith_a = scene.spawn_box(1.4, 4.8, 1.4, material_handle, &engine.assets);
         scene
-            .node(&monolith_a)
+            .edit_node(monolith_a)
             .set_position(-2.2, 2.35, 0.0)
             .set_rotation(Quat::from_rotation_y(0.18));
 
         let monolith_b = scene.spawn_box(1.9, 3.2, 1.9, material_handle, &engine.assets);
         scene
-            .node(&monolith_b)
+            .edit_node(monolith_b)
             .set_position(2.0, 1.55, -0.8)
             .set_rotation(Quat::from_rotation_y(-0.34) * Quat::from_rotation_x(0.12));
 
         let sphere = scene.spawn_sphere(1.25, material_handle, &engine.assets);
-        scene.node(&sphere).set_position(0.0, 1.3, 2.2);
+        scene.edit_node(sphere).set_position(0.0, 1.3, 2.2);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.9, 9.0)
             .look_at(Vec3::new(0.0, 1.8, 0.0));
         scene.active_camera = Some(camera);
@@ -234,19 +234,19 @@ impl AppHandler for TriplanarDemo {
         };
 
         scene
-            .node(&self.monolith_a)
+            .edit_node(self.monolith_a)
             .set_rotation(Quat::from_rotation_y(0.18 + self.time * 0.18));
-        scene.node(&self.monolith_b).set_rotation(
+        scene.edit_node(self.monolith_b).set_rotation(
             Quat::from_rotation_y(-0.34 - self.time * 0.12) * Quat::from_rotation_x(0.12),
         );
-        scene.node(&self.sphere).set_rotation(
+        scene.edit_node(self.sphere).set_rotation(
             Quat::from_rotation_y(self.time * 0.48) * Quat::from_rotation_x(self.time * 0.12),
         );
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

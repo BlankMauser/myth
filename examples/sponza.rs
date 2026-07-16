@@ -47,7 +47,7 @@ impl AppHandler for HttpGltfExample {
         }
         let light_node = scene.add_light(dir_light);
 
-        if let Some(node) = scene.get_node_mut(light_node) {
+        if let Some(node) = scene.node_mut(light_node) {
             node.transform.position = Vec3::new(2.0, 12.0, 6.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -59,7 +59,7 @@ impl AppHandler for HttpGltfExample {
         ));
         let cam_node_id = scene.add_camera(camera);
 
-        if let Some(node) = scene.get_node_mut(cam_node_id) {
+        if let Some(node) = scene.node_mut(cam_node_id) {
             node.transform.position = Vec3::new(6.0, 4.0, 0.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -100,10 +100,10 @@ impl AppHandler for HttpGltfExample {
             }
         }
 
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node_id) {
+        let _ = scene.edit_node_transform(self.cam_node_id, |transform| {
             self.controls
-                .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
-        }
+                .update(transform, &engine.input, 45.0, frame.dt);
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Sponza Lighting Example - FPS: {:.0}", fps));

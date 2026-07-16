@@ -121,7 +121,7 @@ impl AppHandler for HyperspaceStarfieldDemo {
             let material_index = (next_rand(&mut rng) as usize) % star_palette.len();
             let star_handle = scene.add_mesh(Mesh::new(box_geo, star_palette[material_index]));
             scene
-                .node(&star_handle)
+                .edit_node(star_handle)
                 .set_cast_shadows(false)
                 .set_receive_shadows(false);
 
@@ -137,7 +137,7 @@ impl AppHandler for HyperspaceStarfieldDemo {
 
         let gate_root = scene.create_node_with_name("JumpGate");
         scene.push_root_node(gate_root);
-        scene.node(&gate_root).set_position(0.0, 0.0, -68.0);
+        scene.edit_node(gate_root).set_position(0.0, 0.0, -68.0);
 
         for ring_index in 0..2 {
             let radius = if ring_index == 0 { 6.0 } else { 8.0 };
@@ -158,7 +158,7 @@ impl AppHandler for HyperspaceStarfieldDemo {
                 let radial = Vec3::new(angle.cos(), angle.sin(), 0.0);
                 let tangential = angle + std::f32::consts::FRAC_PI_2;
                 scene
-                    .node(&segment_handle)
+                    .edit_node(segment_handle)
                     .set_position_vec(radial * radius)
                     .set_rotation(Quat::from_rotation_z(tangential))
                     .set_scale_xyz(0.30, 1.5 - ring_index as f32 * 0.35, 0.18)
@@ -169,14 +169,14 @@ impl AppHandler for HyperspaceStarfieldDemo {
 
         let core = scene.add_mesh_to_parent(Mesh::new(box_geo, core_material), gate_root);
         scene
-            .node(&core)
+            .edit_node(core)
             .set_scale_xyz(0.45, 0.45, 0.45)
             .set_cast_shadows(false)
             .set_receive_shadows(false);
 
         let cam_node_id = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 0.0, 8.0)
             .look_at(Vec3::new(0.0, 0.0, -50.0));
         scene.active_camera = Some(cam_node_id);
@@ -201,7 +201,7 @@ impl AppHandler for HyperspaceStarfieldDemo {
         };
 
         scene
-            .node(&self.cam_node_id)
+            .edit_node(self.cam_node_id)
             .set_position(
                 (self.time * 0.9).sin() * 0.16,
                 (self.time * 0.7).cos() * 0.12,
@@ -221,14 +221,14 @@ impl AppHandler for HyperspaceStarfieldDemo {
             let stretch = star.size * (1.0 + depth * depth * 22.0 * warp);
 
             scene
-                .node(&star.handle)
+                .edit_node(star.handle)
                 .set_position_vec(star.position)
                 .set_scale_xyz(width, width, stretch);
         }
 
         let gate_scale = 1.0 + (self.time * 2.3).sin() * 0.06;
         scene
-            .node(&self.gate_root)
+            .edit_node(self.gate_root)
             .set_rotation(Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, self.time * 0.45))
             .set_scale(gate_scale);
 

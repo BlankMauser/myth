@@ -84,7 +84,7 @@ impl SsrShowroomDemo {
     ) {
         let node = scene.add_mesh(Mesh::new(box_geo, material));
         scene
-            .node(&node)
+            .edit_node(node)
             .set_position(position.x, position.y, position.z)
             .set_scale_xyz(scale.x, scale.y, scale.z)
             .set_shadows(casts_shadows, casts_shadows);
@@ -98,7 +98,7 @@ impl SsrShowroomDemo {
     ) {
         let node = scene.add_mesh(Mesh::new(box_geo, material));
         scene
-            .node(&node)
+            .edit_node(node)
             .set_position(position.x, 0.42, position.z)
             .set_scale_xyz(1.75, 0.84, 1.75)
             .set_shadows(true, true);
@@ -277,12 +277,12 @@ impl AppHandler for SsrShowroomDemo {
         key_light.cast_shadows = true;
         let key_light = scene.add_light(key_light);
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_rotation(Quat::from_euler(EulerRot::YXZ, -0.55, -0.72, 0.0));
 
         let fill_light = scene.add_light(Light::new_directional(Vec3::new(0.26, 0.38, 0.62), 0.35));
         scene
-            .node(&fill_light)
+            .edit_node(fill_light)
             .set_rotation(Quat::from_euler(EulerRot::YXZ, 1.45, -0.28, 0.0));
 
         let mut accent_lights = Vec::new();
@@ -297,12 +297,12 @@ impl AppHandler for SsrShowroomDemo {
             let mut point = Light::new_point(*color, 5.0, 7.8);
             point.cast_shadows = true;
             let light = scene.add_light(point);
-            scene.node(&light).set_position(base.x, base.y, base.z);
+            scene.edit_node(light).set_position(base.x, base.y, base.z);
 
             let helper = scene.add_mesh(Mesh::new(sphere_geo, *helper_material));
             scene.attach(helper, light);
             scene
-                .node(&helper)
+                .edit_node(helper)
                 .set_position(0.0, 0.0, 0.0)
                 .set_scale(0.20)
                 .set_shadows(false, false);
@@ -359,7 +359,7 @@ impl AppHandler for SsrShowroomDemo {
         for (mesh, base, spin_axis, scale, spin_speed, bob_amp, bob_phase) in showpiece_specs {
             let node = scene.add_mesh(mesh);
             scene
-                .node(&node)
+                .edit_node(node)
                 .set_position(base.x, base.y, base.z)
                 .set_scale_xyz(scale.x, scale.y, scale.z)
                 .set_shadows(true, true);
@@ -375,7 +375,7 @@ impl AppHandler for SsrShowroomDemo {
 
         let floor_ring = scene.add_mesh(Mesh::new(sphere_geo, chrome_material));
         scene
-            .node(&floor_ring)
+            .edit_node(floor_ring)
             .set_position(0.0, 0.34, 4.6)
             .set_scale_xyz(0.38, 0.38, 0.38)
             .set_shadows(true, true);
@@ -401,7 +401,7 @@ impl AppHandler for SsrShowroomDemo {
         let camera_target = Vec3::new(0.0, 1.7, -0.8);
         let cam = scene.add_camera(camera);
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(camera_target);
         scene.active_camera = Some(cam);
@@ -441,7 +441,7 @@ impl AppHandler for SsrShowroomDemo {
 
         if engine.input.get_key_down(Key::Y)
             && let Some(camera_node) = scene.active_camera
-            && let Some(camera) = scene.get_camera_mut(camera_node)
+            && let Some(camera) = scene.camera_mut(camera_node)
         {
             camera.set_aa_mode(toggle_taa(camera.aa_mode));
         }
@@ -449,7 +449,7 @@ impl AppHandler for SsrShowroomDemo {
         #[cfg(feature = "debug_view")]
         if engine.input.get_key_down(Key::G)
             && let Some(camera_node) = scene.active_camera
-            && let Some(camera) = scene.get_camera_mut(camera_node)
+            && let Some(camera) = scene.camera_mut(camera_node)
         {
             camera.debug_view.mode = next_debug_mode(camera.debug_view.mode);
         }
@@ -462,7 +462,7 @@ impl AppHandler for SsrShowroomDemo {
                 light.base.z + angle.sin() * light.radius,
             );
             scene
-                .node(&light.node)
+                .edit_node(light.node)
                 .set_position(position.x, position.y, position.z);
         }
 
@@ -474,20 +474,20 @@ impl AppHandler for SsrShowroomDemo {
                 self.time * showpiece.spin_speed + showpiece.bob_phase,
             );
             scene
-                .node(&showpiece.node)
+                .edit_node(showpiece.node)
                 .set_position(showpiece.base.x, height, showpiece.base.z)
                 .set_rotation(rotation);
         }
 
-        // if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        // let _ = scene.edit_main_camera_bundle(|transform, camera| {
         //     self.controls
         //         .update(transform, &engine.input, camera.fov(), frame.dt);
-        // }
+        // });
 
         if let Some(fps) = self.fps_counter.update() {
             #[cfg(feature = "debug_view")]
             let debug_label = scene
-                .query_main_camera_bundle()
+                .main_camera_bundle()
                 .map(|(_, camera)| camera.debug_view.mode.label())
                 .unwrap_or("Final Image");
 
@@ -496,7 +496,7 @@ impl AppHandler for SsrShowroomDemo {
 
             let ssr_label = if scene.ssr.enabled { "On" } else { "Off" };
             let aa_label = scene
-                .query_main_camera_bundle()
+                .main_camera_bundle()
                 .map(|(_, camera)| {
                     if camera.aa_mode.is_taa() {
                         "TAA+FXAA"

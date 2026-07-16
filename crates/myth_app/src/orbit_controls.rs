@@ -21,11 +21,10 @@
 //!     }
 //!
 //!     fn update(&mut self, engine: &mut Engine, _: &dyn Window, frame: &FrameState) {
-//!         if let Some((transform, camera)) = engine.scene_manager
-//!             .active_scene_mut()
-//!             .and_then(|s| s.query_main_camera_bundle())
-//!         {
-//!             self.orbit.update(transform, &engine.input, camera.fov, frame.dt);
+//!         if let Some(scene) = engine.scene_manager.active_scene_mut() {
+//!             let _ = scene.edit_main_camera_bundle(|transform, camera| {
+//!                 self.orbit.update(transform, &engine.input, camera.fov(), frame.dt);
+//!             });
 //!         }
 //!     }
 //! }

@@ -361,9 +361,17 @@ impl PersistentBufferRegistry {
     /// Owner-only retirement that also covers a buffer which was never live
     /// enough to materialize. IDs are never reused, so every outstanding plan,
     /// commit, and physical token becomes permanently stale.
-    #[cfg(test)]
     pub(crate) fn remove_buffer(&mut self, id: PersistentBufferId) -> bool {
         self.records.remove(&id).is_some()
+    }
+
+    /// Physical allocation bytes retained by one live owner record.
+    #[inline]
+    pub(crate) fn physical_allocation_size(&self, id: PersistentBufferId) -> Option<u64> {
+        self.records
+            .get(&id)
+            .and_then(|record| record.physical.as_ref())
+            .map(|physical| physical.allocation_size)
     }
 
     /// Plan one exact revision for an attempt without performing WGPU work.

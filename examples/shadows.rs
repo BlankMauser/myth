@@ -31,7 +31,7 @@ impl AppHandler for ShadowAllLightsDemo {
             &engine.assets,
         );
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_cast_shadows(false)
             .set_receive_shadows(true);
@@ -45,7 +45,7 @@ impl AppHandler for ShadowAllLightsDemo {
             &engine.assets,
         );
         scene
-            .node(&sphere)
+            .edit_node(sphere)
             .set_position(0.0, 1.0, 0.0)
             .set_shadows(true, true);
 
@@ -58,7 +58,7 @@ impl AppHandler for ShadowAllLightsDemo {
             &engine.assets,
         );
         scene
-            .node(&cube)
+            .edit_node(cube)
             .set_position(-3.5, 0.6, 0.0)
             .set_shadows(true, true);
 
@@ -71,7 +71,7 @@ impl AppHandler for ShadowAllLightsDemo {
             &engine.assets,
         );
         scene
-            .node(&cube2)
+            .edit_node(cube2)
             .set_position(3.0, 1.0, -1.5)
             .set_shadows(true, true);
 
@@ -84,7 +84,7 @@ impl AppHandler for ShadowAllLightsDemo {
         }
         let dir_node = scene.add_light(dir_light);
         scene
-            .node(&dir_node)
+            .edit_node(dir_node)
             .set_position(8.0, 12.0, 6.0)
             .look_at(Vec3::ZERO);
 
@@ -97,7 +97,7 @@ impl AppHandler for ShadowAllLightsDemo {
         }
         let spot_node = scene.add_light(spot);
         scene
-            .node(&spot_node)
+            .edit_node(spot_node)
             .set_position(-6.0, 8.0, 4.0)
             .look_at(Vec3::new(-3.5, 0.0, 0.0));
 
@@ -108,7 +108,9 @@ impl AppHandler for ShadowAllLightsDemo {
             shadow.map_size = 1024;
         }
         let point_light_node = scene.add_light(point);
-        scene.node(&point_light_node).set_position(0.0, 3.0, 3.0);
+        scene
+            .edit_node(point_light_node)
+            .set_position(0.0, 3.0, 3.0);
 
         let point_helper = scene.spawn_sphere(
             0.1,
@@ -118,7 +120,7 @@ impl AppHandler for ShadowAllLightsDemo {
         );
 
         scene
-            .node(&point_helper)
+            .edit_node(point_helper)
             .set_cast_shadows(false)
             .set_receive_shadows(false);
 
@@ -127,7 +129,7 @@ impl AppHandler for ShadowAllLightsDemo {
         // ── Camera ────────────────────────────────────────────────────
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(10.0, 8.0, 10.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -147,16 +149,16 @@ impl AppHandler for ShadowAllLightsDemo {
 
         // Orbit the point light slowly
         self.time += frame.dt;
-        if let Some(node) = scene.get_node_mut(self.point_light_node) {
+        if let Some(node) = scene.node_mut(self.point_light_node) {
             let x = 3.0 * self.time.cos();
             let z = 3.0 * self.time.sin();
             node.transform.position = Vec3::new(x, 3.0, z);
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

@@ -108,7 +108,7 @@ impl AppHandler for ProceduralSkyDemo {
 
         let cam_node_id = scene.add_camera(camera);
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 0.5, 4.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node_id);
@@ -184,15 +184,15 @@ impl AppHandler for ProceduralSkyDemo {
             && let Some(prefab) = assets.prefabs.get(self.helmet_prefab)
         {
             let root = scene.instantiate(prefab.as_ref());
-            scene.node(&root).set_position(0.0, 0.0, 0.0);
+            scene.edit_node(root).set_position(0.0, 0.0, 0.0);
             self.helmet_loaded = true;
         }
 
         // Orbit camera
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node_id) {
+        let _ = scene.edit_node_transform(self.cam_node_id, |transform| {
             self.controls
-                .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
-        }
+                .update(transform, &engine.input, 45.0, frame.dt);
+        });
 
         if engine.input.get_key_down(Key::Space) {
             self.cycle.auto_tick = !self.cycle.auto_tick;

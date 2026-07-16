@@ -26,7 +26,7 @@ let spz_cloud = engine.assets.load_gaussian_spz("assets/3dgs/scene.spz".into());
 let node = scene.add_gaussian_cloud("gaussian_cloud", cloud);
 
 // 3. 自由进行空间变换
-scene.node(&node).set_rotation_euler(
+scene.edit_node(node).set_rotation_euler(
     std::f32::consts::FRAC_PI_2, 
     0.0, 
     0.0

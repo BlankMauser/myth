@@ -71,7 +71,7 @@ impl AppHandler for OceanCompositeSceneDemo {
 
         let platform = scene.spawn_box(7.8, 0.42, 3.0, stone_material, &engine.assets);
         scene
-            .node(&platform)
+            .edit_node(platform)
             .set_position(0.0, -0.38, -1.3)
             .set_shadows(true, true);
 
@@ -83,38 +83,38 @@ impl AppHandler for OceanCompositeSceneDemo {
         ] {
             let column = scene.spawn_box(sx, sy, sz, stone_material, &engine.assets);
             scene
-                .node(&column)
+                .edit_node(column)
                 .set_position(x, y, z)
                 .set_shadows(true, true);
         }
 
         let beam = scene.spawn_box(5.8, 0.18, 0.28, metal_material, &engine.assets);
         scene
-            .node(&beam)
+            .edit_node(beam)
             .set_position(0.0, 2.28, -1.5)
             .set_shadows(true, true);
 
         let beacon_ring = scene.spawn_torus(1.2, 0.12, metal_material, &engine.assets);
         scene
-            .node(&beacon_ring)
+            .edit_node(beacon_ring)
             .set_position(0.0, 1.45, 0.0)
             .set_rotation(Quat::from_rotation_x(FRAC_PI_2 * 0.35))
             .set_shadows(true, true);
 
         let beacon_core = scene.spawn_sphere(0.44, emissive_material, &engine.assets);
         scene
-            .node(&beacon_core)
+            .edit_node(beacon_core)
             .set_position(0.0, 1.45, 0.0)
             .set_shadows(false, false);
 
         let mut shard_nodes = Vec::new();
         for index in 0..5 {
             let shard = scene.spawn_box(0.22, 1.1, 0.22, emissive_material, &engine.assets);
-            scene.node(&shard).set_shadows(false, false);
+            scene.edit_node(shard).set_shadows(false, false);
             shard_nodes.push(shard);
             let angle = index as f32 * 1.2566371;
             scene
-                .node(&shard)
+                .edit_node(shard)
                 .set_position(angle.cos() * 1.9, 1.4, angle.sin() * 1.9);
         }
 
@@ -125,16 +125,16 @@ impl AppHandler for OceanCompositeSceneDemo {
         }
         let sun = scene.add_light(sun);
         scene
-            .node(&sun)
+            .edit_node(sun)
             .set_position(-8.0, 9.0, 5.0)
             .look_at(Vec3::new(0.0, 0.8, 0.0));
 
         let accent_light = scene.add_light(Light::new_point(Vec3::new(0.18, 0.92, 1.0), 2.4, 18.0));
-        scene.node(&accent_light).set_position(0.0, 2.4, 2.8);
+        scene.edit_node(accent_light).set_position(0.0, 2.4, 2.8);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.2, 8.8)
             .look_at(Vec3::new(0.0, 1.0, -0.8));
         scene.active_camera = Some(camera);
@@ -200,20 +200,20 @@ impl AppHandler for OceanCompositeSceneDemo {
             return;
         };
 
-        scene.node(&self.beacon_ring).set_rotation(
+        scene.edit_node(self.beacon_ring).set_rotation(
             Quat::from_rotation_x(FRAC_PI_2 * 0.35)
                 * Quat::from_rotation_y(self.time * 0.36)
                 * Quat::from_rotation_z(self.time * 0.18),
         );
         scene
-            .node(&self.beacon_core)
+            .edit_node(self.beacon_core)
             .set_position(0.0, 1.45 + (self.time * 1.6).sin() * 0.12, 0.0)
             .set_rotation(Quat::from_rotation_y(-self.time * 0.8));
 
         for (index, shard) in self.shard_nodes.iter().enumerate() {
             let orbit = self.time * (0.58 + index as f32 * 0.05) + index as f32 * 1.2566371;
             scene
-                .node(shard)
+                .edit_node(*shard)
                 .set_position(
                     orbit.cos() * 1.9,
                     1.45 + (self.time * 2.0 + index as f32).sin() * 0.24,
@@ -225,7 +225,7 @@ impl AppHandler for OceanCompositeSceneDemo {
                 );
         }
 
-        if let Some(node) = scene.get_node_mut(self.accent_light) {
+        if let Some(node) = scene.node_mut(self.accent_light) {
             node.transform.position = Vec3::new(
                 self.time.cos() * 2.8,
                 2.4 + (self.time * 1.8).sin() * 0.4,
@@ -233,10 +233,10 @@ impl AppHandler for OceanCompositeSceneDemo {
             );
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Ocean Composite Scene | FPS: {:.1}", fps));

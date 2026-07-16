@@ -14,7 +14,7 @@ use crate::graph::core::graph::{GraphStorage, RdgRetainedCapacityStats};
 use crate::graph::core::persistent::TEMPORAL_DOMAIN_TTL_FRAMES;
 use crate::graph::core::{
     HistoryRegistry, PersistentBufferRegistry, RdgDiagnosticsRecorder, RdgFrameDiagnostics,
-    RdgFramePhase, RdgRendererAttemptGuard,
+    RdgFramePhase, RdgRenderWorldRebuildReason, RdgRenderWorldSnapshot, RdgRendererAttemptGuard,
 };
 #[cfg(feature = "rdg_bench_support")]
 use crate::graph::core::{RdgGpuFrameTimings, RdgGpuTimingRecorder};
@@ -35,6 +35,7 @@ use crate::graph::passes::{
     SimpleForwardFeature, SkyboxFeature, SsaoFeature, SsgiFeature, SsrFeature, SsssFeature,
     TaaFeature, ToneMappingFeature, TransmissionCopyFeature, TransparentFeature,
 };
+use crate::graph::render_world::RenderWorldFullRebuildReason;
 use myth_assets::AssetServer;
 use myth_core::Result;
 use myth_resources::uniforms::GpuLightStorage;
@@ -53,6 +54,51 @@ use crate::pipeline::{
 use crate::settings::{
     ClusteredShadingMode, GpuDrivenMode, RenderPath, RendererInitConfig, RendererSettings,
 };
+
+#[inline]
+fn rdg_render_world_rebuild_reason(
+    reason: RenderWorldFullRebuildReason,
+) -> Option<RdgRenderWorldRebuildReason> {
+    Some(match reason {
+        RenderWorldFullRebuildReason::None => return None,
+        RenderWorldFullRebuildReason::Cold | RenderWorldFullRebuildReason::SceneInitial => {
+            RdgRenderWorldRebuildReason::InitialMaterialization
+        }
+        RenderWorldFullRebuildReason::SceneChanged => {
+            RdgRenderWorldRebuildReason::SceneIdentityDrift
+        }
+        RenderWorldFullRebuildReason::SceneExplicit => {
+            RdgRenderWorldRebuildReason::ExplicitInvalidation
+        }
+        RenderWorldFullRebuildReason::SceneOverflow => {
+            RdgRenderWorldRebuildReason::MutationOverflow
+        }
+        RenderWorldFullRebuildReason::SceneUntrackedStorage => {
+            RdgRenderWorldRebuildReason::UntrackedSceneStorage
+        }
+        RenderWorldFullRebuildReason::SceneCursorOrIdentityDrift => {
+            RdgRenderWorldRebuildReason::MutationCursorDrift
+        }
+        RenderWorldFullRebuildReason::SceneUntrackedHierarchy => {
+            RdgRenderWorldRebuildReason::UntrackedHierarchy
+        }
+        RenderWorldFullRebuildReason::TopologyChanged => {
+            RdgRenderWorldRebuildReason::TopologyChanged
+        }
+        RenderWorldFullRebuildReason::AssetAuthorityDrift => {
+            RdgRenderWorldRebuildReason::AssetAuthorityDrift
+        }
+        RenderWorldFullRebuildReason::AssetEpochFallback => {
+            RdgRenderWorldRebuildReason::AssetEpochChanged
+        }
+        RenderWorldFullRebuildReason::GpuFactsUpgrade => {
+            RdgRenderWorldRebuildReason::GpuFactProfileChanged
+        }
+        RenderWorldFullRebuildReason::JournalOverflow => {
+            RdgRenderWorldRebuildReason::ConsumerJournalOverflow
+        }
+    })
+}
 
 fn build_pipeline_layout(
     device: &wgpu::Device,
@@ -437,11 +483,13 @@ impl Renderer {
         // Invalidate every arena node before GPU Scene maintenance can clear
         // or shrink slices borrowed by the previous graph's pass payloads.
         state.graph_storage.clear();
-        if self.settings.gpu_driven != GpuDrivenMode::Off {
-            state
-                .gpu_scene_capacity
-                .maintain(&mut state.gpu_scene, &mut state.gpu_scene_render);
-        }
+        state.gpu_scene.maintain_residency(
+            &mut state.persistent_buffer_registry,
+            f64::from(frame_time.time),
+        );
+        state
+            .gpu_scene_capacity
+            .maintain(&mut state.gpu_scene, &mut state.gpu_scene_render);
         // Reset the arena in O(1) — all previous PassNodes are trivially
         // forgotten (no Drop needed).
         state.frame_arena.reset();
@@ -490,6 +538,47 @@ impl Renderer {
             feature_config,
             published_pmrem_max_mip,
         );
+        let render_world_stats = state.render_frame.last_render_world_sync_stats();
+        let hierarchy_stats = scene.last_transform_update_stats();
+        let mutation_journal = scene.render_mutation_journal_stats();
+        let retained_bytes = render_world_stats
+            .retained_bytes
+            .saturating_add(hierarchy_stats.retained_bytes)
+            .saturating_add(mutation_journal.estimated_retained_bytes);
+        state
+            .rdg_diagnostics
+            .record_render_world(RdgRenderWorldSnapshot {
+                scene_id: Some(render_world_stats.scene_id),
+                revision: render_world_stats.revision,
+                resident_scene_count: render_world_stats.resident_domain_count,
+                mutation_count: render_world_stats.mutation_count,
+                hierarchy_dirty_roots_examined: u32::try_from(hierarchy_stats.dirty_roots_examined)
+                    .unwrap_or(u32::MAX),
+                hierarchy_dirty_parent_links_examined: u32::try_from(
+                    hierarchy_stats.dirty_root_parent_links_examined,
+                )
+                .unwrap_or(u32::MAX),
+                hierarchy_nodes_visited: u32::try_from(hierarchy_stats.visited_nodes)
+                    .unwrap_or(u32::MAX),
+                hierarchy_nodes_updated: u32::try_from(hierarchy_stats.updated_world_matrices)
+                    .unwrap_or(u32::MAX),
+                hierarchy_full_traversal: hierarchy_stats.full_traversal,
+                render_item_count: render_world_stats.item_count,
+                render_items_reused: render_world_stats.items_reused,
+                render_items_examined: render_world_stats.items_examined,
+                render_items_added: render_world_stats.items_added,
+                render_items_updated: render_world_stats.items_updated,
+                render_items_removed: render_world_stats.items_removed,
+                render_items_rebuilt: render_world_stats.items_rebuilt,
+                shadow_casters_examined: render_world_stats.shadow_casters_examined,
+                shadow_aggregate_rebuilt: render_world_stats.shadow_union_rebuilt,
+                submitted_history_settled: render_world_stats.submitted_history_settled,
+                retained_bytes: u64::try_from(retained_bytes).unwrap_or(u64::MAX),
+                rebuild_reason: rdg_render_world_rebuild_reason(
+                    render_world_stats.full_rebuild_reason,
+                ),
+                ..RdgRenderWorldSnapshot::default()
+            });
 
         frame_attempt.enter_phase(RdgFramePhase::Maintenance);
 
@@ -725,8 +814,9 @@ impl Renderer {
                 state.gpu_driven_policy.bump_epoch();
                 if self.settings.gpu_driven == GpuDrivenMode::Off {
                     // Runtime disable is the one transition that drains the
-                    // previous GPU attempt scratch. Subsequent Off frames do
-                    // not touch the GPU Scene capacity ledger at all.
+                    // previous GPU attempt scratch immediately. Regular frame
+                    // maintenance continues to age retained authority and the
+                    // capacity ledger while the mode remains Off.
                     state.gpu_scene.clear_frame_scratch();
                     state.gpu_scene_render.clear_finalization_scratch();
                 }
@@ -1488,7 +1578,7 @@ mod tests {
 
         let receiver = scene.spawn(receiver_geometry, receiver_material, &assets);
         scene
-            .node(&receiver)
+            .edit_node(receiver)
             .set_position(0.0, -1.0, 0.0)
             .set_scale_xyz(6.0, 0.12, 6.0)
             .set_cast_shadows(false)
@@ -1496,7 +1586,7 @@ mod tests {
 
         let caster = scene.spawn(caster_geometry, caster_material, &assets);
         scene
-            .node(&caster)
+            .edit_node(caster)
             .set_position(-0.35, -0.15, 0.0)
             .set_scale_xyz(1.0, 1.0, 1.0)
             .set_cast_shadows(cast_shadows)
@@ -1510,7 +1600,7 @@ mod tests {
         }
         let directional = scene.add_light(directional);
         scene
-            .node(&directional)
+            .edit_node(directional)
             .set_position(-4.0, 6.0, -4.0)
             .look_at(Vec3::new(-0.2, -0.8, 0.0));
 
@@ -1523,7 +1613,7 @@ mod tests {
             shadow.normal_bias = 0.0;
         }
         let point = scene.add_light(point);
-        scene.node(&point).set_position(-2.0, 1.8, 2.4);
+        scene.edit_node(point).set_position(-2.0, 1.8, 2.4);
         scene.update_matrix_world();
 
         (assets, scene)
@@ -1563,7 +1653,7 @@ mod tests {
             UnlitMaterial::new(Vec4::ONE).with_map(textures[0]),
             &assets,
         );
-        scene.node(&left).set_position(-0.7, 0.0, 0.0);
+        scene.edit_node(left).set_position(-0.7, 0.0, 0.0);
         let right = scene.spawn_box(
             0.75,
             1.25,
@@ -1571,7 +1661,7 @@ mod tests {
             UnlitMaterial::new(Vec4::ONE).with_map(textures[1]),
             &assets,
         );
-        scene.node(&right).set_position(0.7, 0.0, 0.0);
+        scene.edit_node(right).set_position(0.7, 0.0, 0.0);
         scene.update_matrix_world();
 
         (assets, scene, textures)
@@ -1851,6 +1941,179 @@ mod tests {
             .morph_uniforms();
         assert!((submitted.weights[0].x - 1.0).abs() <= f32::EPSILON);
         assert!(submitted.prev_weights[0].x.abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn surface_acquisition_failure_does_not_advance_render_world_transform_history() {
+        let mut renderer = init_headless_renderer();
+        let assets = AssetServer::new();
+        let mut scene = Scene::new();
+        let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, PhysicalMaterial::new(Vec4::ONE), &assets);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 0);
+        let baseline_world = {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            let item = state
+                .render_frame
+                .extracted_scene
+                .render_items
+                .iter()
+                .find(|item| item.node_handle == mesh_node)
+                .expect("baseline render-world item missing");
+            assert_eq!(item.prev_world_matrix, item.world_matrix);
+            item.world_matrix
+        };
+        assert!(
+            renderer
+                .latest_rdg_diagnostics()
+                .expect("baseline diagnostics missing")
+                .queue_submitted()
+        );
+
+        scene.edit_node(mesh_node).set_position(2.0, 0.0, 0.0);
+        scene.update_matrix_world();
+        renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    frame_count: 1,
+                    ..FrameTime::default()
+                },
+            )
+            .expect("surface-failure frame composer missing")
+            .with_forced_surface_acquisition_failure(RdgSurfaceAcquireFailure::Timeout)
+            .render();
+
+        let failed = renderer
+            .latest_rdg_diagnostics()
+            .expect("surface-failure diagnostics missing");
+        assert_eq!(
+            failed.outcome(),
+            RdgAttemptOutcome::SurfaceAcquisitionFailed(RdgSurfaceAcquireFailure::Timeout)
+        );
+        assert!(!failed.queue_submitted());
+        assert_eq!(failed.render_world().submitted_history_settled(), 0);
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            let item = state
+                .render_frame
+                .extracted_scene
+                .render_items
+                .iter()
+                .find(|item| item.node_handle == mesh_node)
+                .expect("failed-frame render-world item missing");
+            assert_eq!(item.prev_world_matrix, baseline_world);
+            assert_ne!(item.world_matrix, baseline_world);
+        }
+
+        // The acquisition failure must not publish the moved transform. The
+        // next extraction therefore still renders motion from the last frame
+        // that actually reached queue submission.
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 2);
+        let submitted = renderer
+            .latest_rdg_diagnostics()
+            .expect("recovery diagnostics missing");
+        assert!(submitted.queue_submitted());
+        assert_eq!(submitted.render_world().submitted_history_settled(), 0);
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            let item = state
+                .render_frame
+                .extracted_scene
+                .render_items
+                .iter()
+                .find(|item| item.node_handle == mesh_node)
+                .expect("recovery render-world item missing");
+            assert_eq!(item.prev_world_matrix, baseline_world);
+            assert_ne!(item.world_matrix, baseline_world);
+        }
+
+        // Settlement is deliberately replayed at the next extraction, after
+        // the submitted graph no longer borrows the render-world records.
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 3);
+        let settled = renderer
+            .latest_rdg_diagnostics()
+            .expect("settlement diagnostics missing");
+        assert!(settled.queue_submitted());
+        assert_eq!(settled.render_world().submitted_history_settled(), 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let item = state
+            .render_frame
+            .extracted_scene
+            .render_items
+            .iter()
+            .find(|item| item.node_handle == mesh_node)
+            .expect("settled render-world item missing");
+        assert_eq!(item.prev_world_matrix, item.world_matrix);
+        assert_ne!(item.world_matrix, baseline_world);
+
+        let settled_world = item.world_matrix;
+        scene.edit_node(mesh_node).set_position(4.0, 0.0, 0.0);
+        scene.update_matrix_world();
+        let abandoned = renderer
+            .begin_frame(
+                &mut scene,
+                make_camera(),
+                &assets,
+                FrameTime {
+                    time: 4.0 / 60.0,
+                    delta_time: 1.0 / 60.0,
+                    frame_count: 4,
+                },
+            )
+            .expect("abandoned transform frame composer missing");
+        drop(abandoned);
+
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("abandoned transform diagnostics missing");
+        assert_eq!(diagnostics.outcome(), RdgAttemptOutcome::Abandoned);
+        assert!(!diagnostics.queue_submitted());
+        {
+            let state = renderer.context.as_ref().expect("renderer state missing");
+            let item = state
+                .render_frame
+                .extracted_scene
+                .render_items
+                .iter()
+                .find(|item| item.node_handle == mesh_node)
+                .expect("abandoned-frame render-world item missing");
+            assert_eq!(item.prev_world_matrix, settled_world);
+            assert_ne!(item.world_matrix, settled_world);
+        }
+
+        // Dropping a fully composed CPU graph is the other unsubmitted-frame
+        // boundary. It must preserve the same baseline and retained delta as
+        // target acquisition failure.
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 5);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let item = state
+            .render_frame
+            .extracted_scene
+            .render_items
+            .iter()
+            .find(|item| item.node_handle == mesh_node)
+            .expect("post-abandon render-world item missing");
+        assert_eq!(item.prev_world_matrix, settled_world);
+        assert_ne!(item.world_matrix, settled_world);
+
+        render_frame(&mut renderer, &mut scene, make_camera(), &assets, 6);
+        let diagnostics = renderer
+            .latest_rdg_diagnostics()
+            .expect("post-abandon settlement diagnostics missing");
+        assert_eq!(diagnostics.render_world().submitted_history_settled(), 1);
+        let state = renderer.context.as_ref().expect("renderer state missing");
+        let item = state
+            .render_frame
+            .extracted_scene
+            .render_items
+            .iter()
+            .find(|item| item.node_handle == mesh_node)
+            .expect("post-abandon settled render-world item missing");
+        assert_eq!(item.prev_world_matrix, item.world_matrix);
+        assert_ne!(item.world_matrix, settled_world);
     }
 
     #[test]
@@ -3073,7 +3336,9 @@ mod tests {
         let material = PhysicalMaterial::new(Vec4::new(0.6, 0.6, 0.6, 1.0));
         material.set_map(Some(texture));
         let mesh_node = scene.spawn_box(1.0, 1.0, 1.0, material, &assets);
-        scene.node(&mesh_node).set_position(1_000_000.0, 0.0, 0.0);
+        scene
+            .edit_node(mesh_node)
+            .set_position(1_000_000.0, 0.0, 0.0);
         scene.update_matrix_world();
         let (geometry_handle, material_handle) = {
             let mesh = scene.meshes.get(mesh_node).expect("test mesh missing");
@@ -3372,11 +3637,19 @@ mod tests {
         let mut scene = Scene::new();
         spawn_test_morph_box(&mut scene, &assets);
         spawn_test_morph_box(&mut scene, &assets);
-        let mut extraction_order = scene.meshes.iter().map(|(node, _)| node);
-        let culled_node = extraction_order.next().expect("first test mesh missing");
-        let visible_node = extraction_order.next().expect("second test mesh missing");
-        assert!(extraction_order.next().is_none());
-        scene.node(&culled_node).set_position(1_000_000.0, 0.0, 0.0);
+        let mut nodes = scene
+            .meshes
+            .iter()
+            .map(|(node, _)| node)
+            .collect::<Vec<_>>();
+        nodes.sort_unstable_by_key(|node| crate::graph::render_world::node_order(*node));
+        let [culled_node, visible_node] = nodes.as_slice() else {
+            panic!("expected exactly two test meshes");
+        };
+        let (culled_node, visible_node) = (*culled_node, *visible_node);
+        scene
+            .edit_node(culled_node)
+            .set_position(1_000_000.0, 0.0, 0.0);
         for (node, influence) in [(culled_node, 0.25), (visible_node, 1.0)] {
             let mesh = scene.meshes.get_mut(node).expect("test mesh missing");
             mesh.set_morph_target_influence(0, influence);
@@ -3429,8 +3702,8 @@ mod tests {
             .expect("box mesh missing")
             .material;
         let sphere_node = scene.spawn_sphere(0.5, material, &assets);
-        scene.node(&box_node).set_position(-0.75, 0.0, 0.0);
-        scene.node(&sphere_node).set_position(0.75, 0.0, 0.0);
+        scene.edit_node(box_node).set_position(-0.75, 0.0, 0.0);
+        scene.edit_node(sphere_node).set_position(0.75, 0.0, 0.0);
         scene.update_matrix_world();
         let rigid_morph_buffer_ids = [
             scene
@@ -3490,7 +3763,7 @@ mod tests {
         );
 
         let morph_node = spawn_test_morph_box(&mut scene, &assets);
-        scene.node(&morph_node).set_position(-1.5, 0.0, 0.0);
+        scene.edit_node(morph_node).set_position(-1.5, 0.0, 0.0);
         let morph_buffer_id = scene
             .meshes
             .get(morph_node)
@@ -3500,7 +3773,7 @@ mod tests {
 
         let skinned_node =
             scene.spawn_box(0.5, 0.5, 0.5, PhysicalMaterial::new(Vec4::ONE), &assets);
-        scene.node(&skinned_node).set_position(0.0, 0.0, 0.0);
+        scene.edit_node(skinned_node).set_position(0.0, 0.0, 0.0);
         let skinned_morph_buffer_id = scene
             .meshes
             .get(skinned_node)
@@ -3518,7 +3791,7 @@ mod tests {
         scene.bind_skeleton(skinned_node, skeleton_key, BindMode::Attached);
 
         let stale_node = scene.spawn_box(0.5, 0.5, 0.5, PhysicalMaterial::new(Vec4::ONE), &assets);
-        scene.node(&stale_node).set_position(1.5, 0.0, 0.0);
+        scene.edit_node(stale_node).set_position(1.5, 0.0, 0.0);
         let stale_skeleton = scene.add_skeleton(Skeleton::new(
             "Removed Group2 Recipe Skeleton",
             vec![bone],

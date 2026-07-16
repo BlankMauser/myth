@@ -93,12 +93,12 @@ impl AppHandler for Earth {
         let scene = engine.scene_manager.active_scene_mut().unwrap();
 
         let earth_node_id = scene.add_mesh(mesh);
-        if let Some(earth) = scene.get_node_mut(earth_node_id) {
+        if let Some(earth) = scene.node_mut(earth_node_id) {
             earth.transform.rotation = Quat::from_euler(glam::EulerRot::XYZ, 0.0, -1.0, 0.0);
         }
 
         let cloud_node_id = scene.add_mesh(cloud_mesh);
-        if let Some(clouds) = scene.get_node_mut(cloud_node_id) {
+        if let Some(clouds) = scene.node_mut(cloud_node_id) {
             clouds.transform.scale = Vec3::splat(1.005);
             clouds.transform.rotation = Quat::from_euler(glam::EulerRot::XYZ, 0.0, 0.0, 0.41);
         }
@@ -110,7 +110,7 @@ impl AppHandler for Earth {
             .environment
             .set_ambient_light(Vec3::new(0.0001, 0.0001, 0.0001));
 
-        if let Some(light_node) = scene.get_node_mut(light_handle) {
+        if let Some(light_node) = scene.node_mut(light_handle) {
             light_node.transform.position = Vec3::new(3.0, 0.0, 1.0);
             light_node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -119,7 +119,7 @@ impl AppHandler for Earth {
         let camera = Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1);
         let cam_node_id = scene.add_camera(camera);
 
-        if let Some(node) = scene.get_node_mut(cam_node_id) {
+        if let Some(node) = scene.node_mut(cam_node_id) {
             node.transform.position = Vec3::new(0.0, 0.0, 250.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -143,20 +143,20 @@ impl AppHandler for Earth {
         let rot_clouds = Quat::from_euler(glam::EulerRot::XYZ, 0.0, 0.00125 * 60.0 * frame.dt, 0.0);
 
         // Earth self-rotation
-        if let Some(node) = scene.get_node_mut(self.earth_node_id) {
+        if let Some(node) = scene.node_mut(self.earth_node_id) {
             node.transform.rotation = rot * node.transform.rotation;
         }
 
         // Cloud layer self-rotation
-        if let Some(clouds) = scene.get_node_mut(self.cloud_node_id) {
+        if let Some(clouds) = scene.node_mut(self.cloud_node_id) {
             clouds.transform.rotation = rot_clouds * clouds.transform.rotation;
         }
 
         // Orbit controls
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         // FPS Display
         if let Some(fps) = self.fps_counter.update() {

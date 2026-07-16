@@ -100,7 +100,7 @@ impl SceneExt for Scene {
                 self.set_name(handle, name);
             }
 
-            if let Some(node) = self.get_node_mut(handle) {
+            if let Some(node) = self.node_mut(handle) {
                 node.transform = p_node.transform;
             }
 

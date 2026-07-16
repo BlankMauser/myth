@@ -27,7 +27,7 @@ impl AppHandler for ShadowBasicDemo {
             &engine.assets,
         );
         scene
-            .node(&cube_node)
+            .edit_node(cube_node)
             .set_position(0.0, 3.2, 0.0)
             .set_shadows(true, true);
 
@@ -39,7 +39,7 @@ impl AppHandler for ShadowBasicDemo {
             &engine.assets,
         );
         scene
-            .node(&ground_node)
+            .edit_node(ground_node)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_cast_shadows(false)
             .set_receive_shadows(true);
@@ -52,14 +52,14 @@ impl AppHandler for ShadowBasicDemo {
         }
         let light_node = scene.add_light(dir_light);
         scene
-            .node(&light_node)
+            .edit_node(light_node)
             .set_position(8.0, 12.0, 6.0)
             .look_at(Vec3::ZERO);
 
         // Camera
         let cam_node = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam_node)
+            .edit_node(cam_node)
             .set_position(8.0, 6.0, 8.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node);
@@ -76,14 +76,14 @@ impl AppHandler for ShadowBasicDemo {
             return;
         };
 
-        if let Some(node) = scene.get_node_mut(self.cube_node) {
+        if let Some(node) = scene.node_mut(self.cube_node) {
             node.transform.rotation *= Quat::from_rotation_y(1.2 * frame.dt);
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Shadow Basic | FPS: {:.2}", fps));

@@ -92,7 +92,7 @@ impl AppHandler for SkyOceanDemo {
 
         let cam_node_id = scene.add_camera(camera);
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 2.0, 7.5)
             .look_at(Vec3::new(0.0, 0.9, -18.0));
         scene.active_camera = Some(cam_node_id);
@@ -166,17 +166,19 @@ impl AppHandler for SkyOceanDemo {
 
         if self.ocean.camera_source() == OceanCameraSource::Reference {
             let (position, target, fov_radians) = self.ocean.reference_camera_view();
-            if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+            let _ = scene.edit_main_camera_bundle(|transform, camera| {
                 transform.position = position;
                 transform.look_at(target, Vec3::Y);
                 camera.set_fov(fov_radians);
-            }
+            });
             self.controls.set_target(target);
             self.controls.set_position(position);
-        } else if let Some((transform, camera)) = scene.query_main_camera_bundle() {
-            camera.set_fov_degrees(SCENE_CAMERA_FOV_DEGREES);
-            self.controls
-                .update(transform, &engine.input, camera.fov(), frame.dt);
+        } else {
+            let _ = scene.edit_main_camera_bundle(|transform, camera| {
+                camera.set_fov_degrees(SCENE_CAMERA_FOV_DEGREES);
+                self.controls
+                    .update(transform, &engine.input, camera.fov(), frame.dt);
+            });
         }
 
         self.cycle.update(scene, &engine.input, frame.dt);

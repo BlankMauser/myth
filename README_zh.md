@@ -75,14 +75,14 @@ impl AppHandler for MyApp {
         );
         // 2. 设置相机
         let cam_node_id = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
-        scene.node(&cam_node_id).set_position(0.0, 0.0, 5.0).look_at(Vec3::ZERO);
+        scene.edit_node(cam_node_id).set_position(0.0, 0.0, 5.0).look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node_id);
         // 3. 添加光源
         scene.add_light(Light::new_directional(Vec3::ONE, 5.0));
 
         // 4. 设置更新回调以旋转立方体
         scene.on_update(move |scene, _input, _dt| {
-            if let Some(node) = scene.get_node_mut(mesh_handle) {
+            if let Some(node) = scene.node_mut(mesh_handle) {
                 let rot_y = Quat::from_rotation_y(0.02);
                 let rot_x = Quat::from_rotation_x(0.01);
                 node.transform.rotation = node.transform.rotation * rot_y * rot_x;

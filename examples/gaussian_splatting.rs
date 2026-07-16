@@ -28,7 +28,7 @@ impl AppHandler for GaussianSplattingDemo {
         let cloud_handle = engine.assets.load_gaussian_npz(npz_path);
         let _cloud_node = scene.add_gaussian_cloud("gaussian_cloud", cloud_handle);
 
-        scene.node(&_cloud_node).set_rotation_euler(
+        scene.edit_node(_cloud_node).set_rotation_euler(
             std::f32::consts::FRAC_PI_2,
             0.0,
             std::f32::consts::FRAC_PI_2,
@@ -40,7 +40,7 @@ impl AppHandler for GaussianSplattingDemo {
 
         let cam_node = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node)
+            .edit_node(cam_node)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         scene.active_camera = Some(cam_node);
@@ -52,13 +52,11 @@ impl AppHandler for GaussianSplattingDemo {
     }
 
     fn update(&mut self, engine: &mut Engine, window: &dyn Window, frame: &FrameState) {
-        if let Some((transform, camera)) = engine
-            .scene_manager
-            .active_scene_mut()
-            .and_then(|s| s.query_main_camera_bundle())
-        {
-            self.controls
-                .update(transform, &engine.input, camera.fov(), frame.dt);
+        if let Some(scene) = engine.scene_manager.active_scene_mut() {
+            let _ = scene.edit_main_camera_bundle(|transform, camera| {
+                self.controls
+                    .update(transform, &engine.input, camera.fov(), frame.dt);
+            });
         }
 
         if let Some(fps) = self.fps_counter.update() {

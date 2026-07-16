@@ -81,7 +81,7 @@ impl AppHandler for VectorBallsDemo {
 
         let floor = scene.spawn_plane(24.0, 24.0, floor_material, &engine.assets);
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_position(0.0, -3.0, 0.0)
             .set_cast_shadows(false)
@@ -95,15 +95,15 @@ impl AppHandler for VectorBallsDemo {
         }
         let key = scene.add_light(key);
         scene
-            .node(&key)
+            .edit_node(key)
             .set_position(10.0, 12.0, 8.0)
             .look_at(Vec3::new(0.0, 0.5, 0.0));
 
         let orbit_light = scene.add_light(Light::new_point(Vec3::new(0.55, 0.9, 1.0), 1.8, 28.0));
-        scene.node(&orbit_light).set_position(0.0, 5.0, 8.0);
+        scene.edit_node(orbit_light).set_position(0.0, 5.0, 8.0);
         let magenta_light =
             scene.add_light(Light::new_point(Vec3::new(1.0, 0.25, 0.85), 1.4, 28.0));
-        scene.node(&magenta_light).set_position(0.0, -1.0, -6.0);
+        scene.edit_node(magenta_light).set_position(0.0, -1.0, -6.0);
 
         let mut rng = 0x51A2_BA11;
         let mut balls = Vec::with_capacity(BALL_COUNT);
@@ -111,7 +111,7 @@ impl AppHandler for VectorBallsDemo {
             let material = palette[index % palette.len()];
             let handle = scene.add_mesh(Mesh::new(sphere_geo, material));
             scene
-                .node(&handle)
+                .edit_node(handle)
                 .set_cast_shadows(false)
                 .set_receive_shadows(false);
 
@@ -138,7 +138,7 @@ impl AppHandler for VectorBallsDemo {
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 2.8, 15.0)
             .look_at(Vec3::new(0.0, 0.5, 0.0));
         scene.active_camera = Some(cam);
@@ -174,12 +174,12 @@ impl AppHandler for VectorBallsDemo {
                         .sin()
                         .abs();
             scene
-                .node(&ball.handle)
+                .edit_node(ball.handle)
                 .set_position_vec(position)
                 .set_scale(ball.size * pulse);
         }
 
-        if let Some(node) = scene.get_node_mut(self.orbit_light) {
+        if let Some(node) = scene.node_mut(self.orbit_light) {
             node.transform.position = Vec3::new(
                 (self.time * 0.75).cos() * 7.5,
                 4.2 + (self.time * 1.4).sin() * 1.3,
@@ -187,10 +187,10 @@ impl AppHandler for VectorBallsDemo {
             );
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Vector Balls | FPS: {:.1}", fps));

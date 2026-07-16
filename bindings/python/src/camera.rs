@@ -280,7 +280,7 @@ impl PyPerspectiveCameraComponent {
     fn get_fov(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| c.fov().to_degrees())
                 .unwrap_or(60.0)
         })
@@ -289,7 +289,7 @@ impl PyPerspectiveCameraComponent {
     #[setter]
     fn set_fov(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_fov_degrees(val);
             }
         })
@@ -299,7 +299,7 @@ impl PyPerspectiveCameraComponent {
     fn get_aspect(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| c.aspect())
                 .unwrap_or(1.0)
         })
@@ -308,7 +308,7 @@ impl PyPerspectiveCameraComponent {
     #[setter]
     fn set_aspect(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_aspect(val);
             }
         })
@@ -318,7 +318,7 @@ impl PyPerspectiveCameraComponent {
     fn get_near(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| c.near())
                 .unwrap_or(0.1)
         })
@@ -327,7 +327,7 @@ impl PyPerspectiveCameraComponent {
     #[setter]
     fn set_near(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_near(val);
             }
         })
@@ -337,7 +337,7 @@ impl PyPerspectiveCameraComponent {
     fn get_far(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| c.far())
                 .unwrap_or(1000.0)
         })
@@ -346,7 +346,7 @@ impl PyPerspectiveCameraComponent {
     #[setter]
     fn set_far(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_far(val);
             }
         })
@@ -357,7 +357,7 @@ impl PyPerspectiveCameraComponent {
     fn get_antialiasing(&self) -> PyResult<PyAntiAliasing> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| PyAntiAliasing { mode: c.aa_mode })
                 .unwrap_or_else(PyAntiAliasing::none)
         })
@@ -366,7 +366,7 @@ impl PyPerspectiveCameraComponent {
     #[setter]
     fn set_antialiasing(&self, aa: PyAntiAliasing) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_aa_mode(aa.mode);
             }
         })
@@ -392,7 +392,7 @@ impl PyOrthographicCameraComponent {
     fn get_size(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| c.ortho_size())
                 .unwrap_or(10.0)
         })
@@ -401,7 +401,7 @@ impl PyOrthographicCameraComponent {
     #[setter]
     fn set_size(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_ortho_size(val);
             }
         })
@@ -411,7 +411,7 @@ impl PyOrthographicCameraComponent {
     fn get_near(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| c.near())
                 .unwrap_or(0.1)
         })
@@ -420,7 +420,7 @@ impl PyOrthographicCameraComponent {
     #[setter]
     fn set_near(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_near(val);
             }
         })
@@ -430,7 +430,7 @@ impl PyOrthographicCameraComponent {
     fn get_far(&self) -> PyResult<f32> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| c.far())
                 .unwrap_or(1000.0)
         })
@@ -439,7 +439,7 @@ impl PyOrthographicCameraComponent {
     #[setter]
     fn set_far(&self, val: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_far(val);
             }
         })
@@ -450,7 +450,7 @@ impl PyOrthographicCameraComponent {
     fn get_antialiasing(&self) -> PyResult<PyAntiAliasing> {
         with_active_scene(|scene| {
             scene
-                .get_camera(self.handle)
+                .camera(self.handle)
                 .map(|c| PyAntiAliasing { mode: c.aa_mode })
                 .unwrap_or_else(PyAntiAliasing::none)
         })
@@ -459,7 +459,7 @@ impl PyOrthographicCameraComponent {
     #[setter]
     fn set_antialiasing(&self, aa: PyAntiAliasing) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(cam) = scene.get_camera_mut(self.handle) {
+            if let Some(cam) = scene.camera_mut(self.handle) {
                 cam.set_aa_mode(aa.mode);
             }
         })
@@ -476,7 +476,7 @@ pub(crate) fn get_camera_component(
     py: Python<'_>,
     handle: NodeHandle,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let proj = with_active_scene(|scene| scene.get_camera(handle).map(|c| c.projection_type()))?;
+    let proj = with_active_scene(|scene| scene.camera(handle).map(|c| c.projection_type()))?;
 
     match proj {
         Some(ProjectionType::Perspective) => Ok(Some(

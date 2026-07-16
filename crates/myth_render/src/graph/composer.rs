@@ -74,10 +74,10 @@ use crate::graph::core::{
     GlobalStateSources, GraphBlackboard, HistoryRegistry, HookStage, PersistentBufferRegistry,
     PersistentBufferResolver, PrepareContext, RdgCommandEncodingFailure, RdgComposerAttemptGuard,
     RdgDiagnosticsRecorder, RdgFramePhase, RdgGpuDrivenFailure, RdgGpuDrivenPolicySnapshot,
-    RdgPostSubmitPublicationFailure, RdgRenderTargetKind, RdgResourceMaterializationFailure,
-    RdgSceneSubmissionBackend, RdgSceneSubmissionFamily, RdgSceneSubmissionSelectionReason,
-    RenderGraph, SceneBufferMaterializationFailure, SceneBufferSources, SceneDrawPrepareContext,
-    TextureDesc, TransientPool, ViewResolver,
+    RdgPostSubmitPublicationFailure, RdgRenderTargetKind, RdgRenderWorldRebuildReason,
+    RdgResourceMaterializationFailure, RdgSceneSubmissionBackend, RdgSceneSubmissionFamily,
+    RdgSceneSubmissionSelectionReason, RenderGraph, SceneBufferMaterializationFailure,
+    SceneBufferSources, SceneDrawPrepareContext, TextureDesc, TransientPool, ViewResolver,
 };
 use crate::graph::extracted::SceneFeatures;
 use crate::graph::frame::{RenderLists, ShadowLightInstance};
@@ -834,12 +834,32 @@ const fn multi_bin_preflight_failure_reason(
 ) -> RdgGpuDrivenFailure {
     match reason {
         GpuSceneMultiBinPreflightFailure::Domain(reason) => selection_failure_reason(reason),
+        GpuSceneMultiBinPreflightFailure::RenderWorldDrift => {
+            RdgGpuDrivenFailure::SubmissionDescriptorDrift
+        }
         GpuSceneMultiBinPreflightFailure::InvalidVisibleStride
         | GpuSceneMultiBinPreflightFailure::InvalidStorageAlignment
         | GpuSceneMultiBinPreflightFailure::LayoutOverflow => {
             RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits
         }
     }
+}
+
+#[inline]
+fn record_gpu_scene_recipe_diagnostics(diagnostics: &RdgDiagnosticsRecorder, gpu_scene: &GpuScene) {
+    let stats = gpu_scene.recipe_stats();
+    diagnostics.update_render_world(|snapshot| {
+        snapshot.gpu_members_reused = stats.members_reused;
+        snapshot.gpu_members_examined = stats.members_examined;
+        snapshot.gpu_members_updated = stats.members_updated;
+        snapshot.gpu_members_rebuilt = stats.members_rebuilt;
+        snapshot.retained_bytes = snapshot
+            .retained_bytes
+            .saturating_add(u64::try_from(stats.retained_bytes).unwrap_or(u64::MAX));
+        if stats.full_rebuild_reason.is_some() && snapshot.rebuild_reason.is_none() {
+            snapshot.rebuild_reason = Some(RdgRenderWorldRebuildReason::ConsumerRevisionGap);
+        }
+    });
 }
 
 #[inline]
@@ -1040,6 +1060,7 @@ impl<'a> FrameComposer<'a> {
         let mut gpu_policy_submission_token = None;
         let mut policy_minimum_cohort_members = 0;
         let mut policy_exact_evaluated = false;
+        let mut gpu_recipe_evaluated = false;
 
         #[cfg(feature = "rdg_bench_support")]
         let backend_selection_timing =
@@ -1062,6 +1083,7 @@ impl<'a> FrameComposer<'a> {
                         .device_limits()
                         .min_storage_buffer_offset_alignment,
                 );
+                gpu_recipe_evaluated = true;
                 let preflight = match self.ctx.gpu_scene.preflight_multi_bin_scene(
                     self.ctx.extracted_scene,
                     GPU_SCENE_VISIBLE_INSTANCE_SIZE,
@@ -1069,6 +1091,7 @@ impl<'a> FrameComposer<'a> {
                 ) {
                     Ok(preflight) => preflight,
                     Err(reason) => {
+                        record_gpu_scene_recipe_diagnostics(rdg_diagnostics, self.ctx.gpu_scene);
                         rdg_diagnostics
                             .mark_gpu_driven_failed(multi_bin_preflight_failure_reason(reason));
                         return;
@@ -1094,6 +1117,7 @@ impl<'a> FrameComposer<'a> {
                         shadow_workload,
                     );
                     if !capability_families.contains(GpuDrivenFamilyMask::MAIN_PREPASS) {
+                        record_gpu_scene_recipe_diagnostics(rdg_diagnostics, self.ctx.gpu_scene);
                         rdg_diagnostics.mark_gpu_driven_failed(
                             RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
                         );
@@ -1101,12 +1125,17 @@ impl<'a> FrameComposer<'a> {
                     }
                     selected_families.insert(GpuDrivenFamilyMask::MAIN_PREPASS);
                     if has_shadow_work && !preflight.projection.covers_complete_shadow_domain {
+                        record_gpu_scene_recipe_diagnostics(rdg_diagnostics, self.ctx.gpu_scene);
                         rdg_diagnostics
                             .mark_gpu_driven_failed(RdgGpuDrivenFailure::UnsupportedShadowDomain);
                         return;
                     }
                     if shadow_workload.d2_view_count != 0 {
                         if !capability_families.contains(GpuDrivenFamilyMask::SHADOW_2D) {
+                            record_gpu_scene_recipe_diagnostics(
+                                rdg_diagnostics,
+                                self.ctx.gpu_scene,
+                            );
                             rdg_diagnostics.mark_gpu_driven_failed(
                                 RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
                             );
@@ -1116,6 +1145,10 @@ impl<'a> FrameComposer<'a> {
                     }
                     if shadow_workload.cube_view_count != 0 {
                         if !capability_families.contains(GpuDrivenFamilyMask::SHADOW_CUBE) {
+                            record_gpu_scene_recipe_diagnostics(
+                                rdg_diagnostics,
+                                self.ctx.gpu_scene,
+                            );
                             rdg_diagnostics.mark_gpu_driven_failed(
                                 RdgGpuDrivenFailure::WorkloadExceedsDeviceLimits,
                             );
@@ -1127,6 +1160,7 @@ impl<'a> FrameComposer<'a> {
                     gpu_scene_preflight = Some(preflight);
                 } else {
                     if has_shadow_work {
+                        record_gpu_scene_recipe_diagnostics(rdg_diagnostics, self.ctx.gpu_scene);
                         rdg_diagnostics
                             .mark_gpu_driven_failed(RdgGpuDrivenFailure::UnsupportedShadowDomain);
                         return;
@@ -1177,6 +1211,7 @@ impl<'a> FrameComposer<'a> {
                                     .device_limits()
                                     .min_storage_buffer_offset_alignment,
                             );
+                            gpu_recipe_evaluated = true;
                             let (preflight, preflight_failure) =
                                 match self.ctx.gpu_scene.preflight_multi_bin_cohorts(
                                     self.ctx.extracted_scene,
@@ -1293,6 +1328,7 @@ impl<'a> FrameComposer<'a> {
                 f64::from(self.ctx.frame_time.time),
                 self.ctx.render_lists,
             ) {
+                record_gpu_scene_recipe_diagnostics(rdg_diagnostics, self.ctx.gpu_scene);
                 rdg_diagnostics.mark_gpu_driven_failed(multi_bin_commit_failure_reason(reason));
                 return;
             }
@@ -1300,6 +1336,9 @@ impl<'a> FrameComposer<'a> {
         } else {
             false
         };
+        if gpu_recipe_evaluated {
+            record_gpu_scene_recipe_diagnostics(rdg_diagnostics, self.ctx.gpu_scene);
+        }
         let selected_candidate_count =
             selection_projection.map_or(0, |projection| projection.candidate_count);
         let selected_shadow_candidate_count =
@@ -2952,12 +2991,14 @@ impl<'a> FrameComposer<'a> {
             // swap-chain image.
             graph.compile_topology();
 
+            let mut gpu_scene_live_submission = false;
             for submission in diagnostic_main_submissions.into_iter().flatten() {
                 let (cpu, gpu) = graph
                     .storage
                     .scene_submissions
                     .live_backend_presence(submission)
                     .expect("main diagnostics retained a stale scene submission");
+                gpu_scene_live_submission |= gpu;
                 rdg_diagnostics.record_live_scene_submissions(
                     RdgSceneSubmissionFamily::MainPrepass,
                     RdgSceneSubmissionBackend::CpuDirect,
@@ -2980,6 +3021,7 @@ impl<'a> FrameComposer<'a> {
                             .scene_submissions
                             .live_backend_presence(submission)
                             .expect("shadow diagnostics retained a stale scene submission");
+                        gpu_scene_live_submission |= gpu;
                         rdg_diagnostics.record_live_scene_submissions(
                             family,
                             RdgSceneSubmissionBackend::CpuDirect,
@@ -3592,6 +3634,18 @@ impl<'a> FrameComposer<'a> {
                 );
                 return;
             };
+            // Queue acceptance is the transactional boundary for retained
+            // world-transform and emitted morph history. Publish/commit both
+            // immediately after submit, before diagnostics, timing, policy or
+            // any other fallible/debug-only post-submit bookkeeping. The
+            // actual RenderWorld settle remains deferred until the next
+            // extraction because graph payloads still borrow its records.
+            self.ctx.extracted_scene.mark_world_history_submitted();
+            self.ctx.extracted_scene.commit_prepared_draw_history(
+                self.ctx.scene,
+                self.ctx.render_lists,
+                &graph.storage.draw_plans,
+            );
             rdg_diagnostics.mark_queue_submitted();
             #[cfg(feature = "rdg_bench_support")]
             if let Some(sample) = gpu_timing_sample.take() {
@@ -3605,15 +3659,6 @@ impl<'a> FrameComposer<'a> {
                 );
             }
             rdg_diagnostics.enter_phase(RdgFramePhase::Publish);
-            // Morph history is a submission result, not a begin-frame side
-            // effect. Once the queue accepts these commands, advance the
-            // previous-weight baseline even if later publication bookkeeping
-            // reports an internal error.
-            self.ctx.extracted_scene.commit_prepared_draw_history(
-                self.ctx.scene,
-                self.ctx.render_lists,
-                &graph.storage.draw_plans,
-            );
             graph.commit_submitted_asset_texture_mipmaps();
             let persistent_buffers_published = if graph.has_persistent_buffer_commit_groups() {
                 graph.commit_submitted_persistent_buffers(
@@ -3656,7 +3701,11 @@ impl<'a> FrameComposer<'a> {
                 let _ = gpu_scene_publication_acknowledger
                     .as_mut()
                     .expect("GPU Scene publication probe lost its acknowledger")
-                    .acknowledge_if_published(self.ctx.persistent_buffer_registry, &probe);
+                    .acknowledge_if_published(
+                        self.ctx.persistent_buffer_registry,
+                        &probe,
+                        gpu_scene_live_submission,
+                    );
             }
             drop(surface_view_tracked);
         };

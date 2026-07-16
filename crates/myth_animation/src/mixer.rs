@@ -9,6 +9,10 @@ use crate::events::{self, FiredEvent};
 use crate::target::AnimationTarget;
 use myth_core::NodeHandle;
 
+const ANIMATED_TRANSLATION: u8 = 1 << 0;
+const ANIMATED_ROTATION: u8 = 1 << 1;
+const ANIMATED_SCALE: u8 = 1 << 2;
+
 new_key_type! {
     pub struct ActionHandle;
 }
@@ -53,9 +57,9 @@ pub struct AnimationMixer {
     blend_state: FrameBlendState,
     /// Events fired during the most recent update.
     fired_events: Vec<FiredEvent>,
-    /// Node handles that were animated in the previous frame.
-    /// Used for rest-pose restoration when animation influence is lost.
-    animated_last_frame: Vec<NodeHandle>,
+    /// Node handles and transform properties animated in the previous frame.
+    /// Used for exact rest-pose restoration when one influence is lost.
+    animated_last_frame: Vec<(NodeHandle, u8)>,
 
     // Temporary buffer for blended morph weights during application phase.
     morph_buffer: crate::values::MorphWeightData,
@@ -222,23 +226,13 @@ impl AnimationMixer {
     /// 2. **Sampling & accumulation**: Active actions sample their tracks and
     ///    accumulate weighted results into the blend buffer. Track-to-node
     ///    mapping uses [`crate::binding::ClipBinding`] + [`Rig`] for O(1) lookup.
-    /// 3. **Application**: Blended values are mixed with the rest pose and
+    /// 3. **Restoration**: Properties animated last frame but absent from this
+    ///    frame's blend are reset once to their rest pose.
+    /// 4. **Application**: Blended values are mixed with the rest pose and
     ///    written to scene nodes.
-    /// 4. **Restoration**: Nodes that were animated last frame but received no
-    ///    contributions this frame are reset to their rest pose.
     pub fn update(&mut self, dt: f32, target: &mut dyn AnimationTarget) {
         if !self.enabled {
             return;
-        }
-
-        // phase 0: Restore all nodes that were animated in the previous frame to their rest pose.
-        for &prev_handle in &self.animated_last_frame {
-            if let Some(rest) = target.rest_transform(prev_handle) {
-                target.set_node_position(prev_handle, rest.position);
-                target.set_node_rotation(prev_handle, rest.rotation);
-                target.set_node_scale(prev_handle, rest.scale);
-                target.mark_node_dirty(prev_handle);
-            }
         }
 
         let dt = dt * self.time_scale;
@@ -247,8 +241,6 @@ impl AnimationMixer {
         // Clear per-frame state
         self.blend_state.clear();
         self.fired_events.clear();
-
-        self.animated_last_frame.clear();
 
         // Phase 1: Advance time and collect events
         for &handle in &self.active_handles {
@@ -328,15 +320,48 @@ impl AnimationMixer {
             }
         }
 
+        // Restore only properties which lost all animation influence. The old
+        // restore-everything/apply-everything sequence manufactured two Scene
+        // mutations per animated node even for a paused or constant pose.
+        for &(node_handle, previous_properties) in &self.animated_last_frame {
+            let missing_translation = previous_properties & ANIMATED_TRANSLATION != 0
+                && !self
+                    .blend_state
+                    .has_contribution(node_handle, TargetPath::Translation);
+            let missing_rotation = previous_properties & ANIMATED_ROTATION != 0
+                && !self
+                    .blend_state
+                    .has_contribution(node_handle, TargetPath::Rotation);
+            let missing_scale = previous_properties & ANIMATED_SCALE != 0
+                && !self
+                    .blend_state
+                    .has_contribution(node_handle, TargetPath::Scale);
+            if (missing_translation || missing_rotation || missing_scale)
+                && let Some(rest) = target.rest_transform(node_handle)
+            {
+                if missing_translation {
+                    target.set_node_position(node_handle, rest.position);
+                }
+                if missing_rotation {
+                    target.set_node_rotation(node_handle, rest.rotation);
+                }
+                if missing_scale {
+                    target.set_node_scale(node_handle, rest.scale);
+                }
+                target.mark_node_dirty(node_handle);
+            }
+        }
+        self.animated_last_frame.clear();
+
         // Phase 3: Apply blended results to scene nodes using rest pose as base
         for (&node_handle, props) in self.blend_state.iter_nodes() {
-            self.animated_last_frame.push(node_handle);
-
             let rest_transform = target.rest_transform(node_handle).unwrap_or_default();
+            let mut animated_transform_properties = 0;
 
             for (t, entry) in props {
                 match (t, entry) {
                     (TargetPath::Translation, BlendEntry::Translation { value, weight }) => {
+                        animated_transform_properties |= ANIMATED_TRANSLATION;
                         if *weight < 1.0 {
                             target.set_node_position(
                                 node_handle,
@@ -348,6 +373,7 @@ impl AnimationMixer {
                         target.mark_node_dirty(node_handle);
                     }
                     (TargetPath::Rotation, BlendEntry::Rotation { value, weight }) => {
+                        animated_transform_properties |= ANIMATED_ROTATION;
                         if *weight < 1.0 {
                             let corrected = if rest_transform.rotation.dot(*value) < 0.0 {
                                 -*value
@@ -364,6 +390,7 @@ impl AnimationMixer {
                         target.mark_node_dirty(node_handle);
                     }
                     (TargetPath::Scale, BlendEntry::Scale { value, weight }) => {
+                        animated_transform_properties |= ANIMATED_SCALE;
                         if *weight < 1.0 {
                             target.set_node_scale(
                                 node_handle,
@@ -385,6 +412,10 @@ impl AnimationMixer {
                     }
                     _ => {}
                 }
+            }
+            if animated_transform_properties != 0 {
+                self.animated_last_frame
+                    .push((node_handle, animated_transform_properties));
             }
         }
     }

@@ -1549,6 +1549,11 @@ pub struct ExecuteContext<'a> {
     pub(crate) asset_textures: AssetTextureResolver<'a>,
     pub(crate) scene_buffers: SceneBufferResolver<'a>,
     pub device: &'a Device,
+    /// Compatibility access for execute-time `write_buffer`/`write_texture`
+    /// operations. Pass nodes must not call [`wgpu::Queue::submit`]: Composer
+    /// owns the frame's single submission and all post-submit publication
+    /// transactions. This raw queue is scheduled to become a write-only facade
+    /// before parallel command recording.
     pub queue: &'a Queue,
     pub pipeline_cache: &'a PipelineCache,
     pub(crate) prepared_bind_groups: &'a PreparedBindGroupStore,

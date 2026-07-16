@@ -64,7 +64,7 @@ impl TransmissionGlassLab {
         };
 
         scene
-            .node(&self.camera_node)
+            .edit_node(self.camera_node)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         self.controls.set_target(target);
@@ -180,7 +180,7 @@ impl AppHandler for TransmissionGlassLab {
 
         let floor = scene.add_mesh(Mesh::new(box_geo, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.14, 0.0)
             .set_scale_xyz(16.0, 0.18, 11.0)
             .set_shadows(false, true);
@@ -190,7 +190,7 @@ impl AppHandler for TransmissionGlassLab {
             let x = -6.05 + index as f32 * 1.10;
             let height = 2.8 + (index % 3) as f32 * 0.75;
             scene
-                .node(&bar)
+                .edit_node(bar)
                 .set_position(x, height * 0.5 + 0.35, -4.8)
                 .set_scale_xyz(0.46, height, 0.22)
                 .set_shadows(false, false);
@@ -227,14 +227,14 @@ impl AppHandler for TransmissionGlassLab {
         for (position, material, label, spin_speed) in station_specs {
             let pedestal = scene.add_mesh(Mesh::new(box_geo, pedestal_material));
             scene
-                .node(&pedestal)
+                .edit_node(pedestal)
                 .set_position(position.x, 0.32, position.z)
                 .set_scale_xyz(1.50, 0.64, 1.50)
                 .set_shadows(true, true);
 
             let object = scene.add_mesh(Mesh::new(sphere_geo, material));
             scene
-                .node(&object)
+                .edit_node(object)
                 .set_position(position.x, 1.42, position.z)
                 .set_scale(1.06)
                 .set_shadows(true, true);
@@ -255,25 +255,25 @@ impl AppHandler for TransmissionGlassLab {
         }
         let key_light = scene.add_light(key_light);
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_position(8.0, 12.0, 4.5)
             .look_at(Vec3::new(0.0, 1.1, 0.0));
 
         let fill_light = scene.add_light(Light::new_point(Vec3::new(0.30, 0.88, 1.0), 1.0, 18.0));
-        scene.node(&fill_light).set_position(-6.4, 2.8, 3.0);
+        scene.edit_node(fill_light).set_position(-6.4, 2.8, 3.0);
 
         let orbit_light = scene.add_light(Light::new_point(Vec3::new(1.0, 0.74, 0.30), 1.7, 24.0));
-        scene.node(&orbit_light).set_position(0.0, 4.6, 6.0);
+        scene.edit_node(orbit_light).set_position(0.0, 4.6, 6.0);
         let helper = scene.add_mesh_to_parent(Mesh::new(sphere_geo, helper_material), orbit_light);
         scene
-            .node(&helper)
+            .edit_node(helper)
             .set_scale(0.14)
             .set_shadows(false, false);
 
         let (camera_pos, target) = Self::overview_camera();
         let camera_node = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera_node)
+            .edit_node(camera_node)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         scene.active_camera = Some(camera_node);
@@ -330,13 +330,13 @@ impl AppHandler for TransmissionGlassLab {
         }
 
         for station in &self.stations {
-            if let Some(node) = scene.get_node_mut(station.object) {
+            if let Some(node) = scene.node_mut(station.object) {
                 node.transform.rotation *= Quat::from_rotation_y(frame.dt * station.spin_speed);
             }
         }
 
         if self.orbit_light_enabled {
-            if let Some(node) = scene.get_node_mut(self.orbit_light) {
+            if let Some(node) = scene.node_mut(self.orbit_light) {
                 let orbit = self.time * 0.95;
                 node.transform.position = Vec3::new(
                     5.4 * orbit.cos(),
@@ -346,10 +346,10 @@ impl AppHandler for TransmissionGlassLab {
             }
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

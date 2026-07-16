@@ -181,13 +181,13 @@ impl AppHandler for DissolveDemo {
             &engine.assets,
         );
         scene
-            .node(&ground)
+            .edit_node(ground)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.1, 0.0);
 
         let light = scene.add_light(Light::new_directional(Vec3::new(1.0, 0.95, 0.9), 3.2));
         scene
-            .node(&light)
+            .edit_node(light)
             .set_position(6.0, 9.0, 4.0)
             .look_at(Vec3::new(0.0, 1.2, 0.0));
 
@@ -210,7 +210,7 @@ impl AppHandler for DissolveDemo {
             ),
             &engine.assets,
         );
-        scene.node(&box_node).set_position(-2.4, 1.2, 0.0);
+        scene.edit_node(box_node).set_position(-2.4, 1.2, 0.0);
 
         let sphere_node = scene.spawn_sphere(
             1.0,
@@ -229,7 +229,7 @@ impl AppHandler for DissolveDemo {
             ),
             &engine.assets,
         );
-        scene.node(&sphere_node).set_position(0.0, 1.3, 0.0);
+        scene.edit_node(sphere_node).set_position(0.0, 1.3, 0.0);
 
         let shard_node = scene.spawn_box(
             0.9,
@@ -250,11 +250,11 @@ impl AppHandler for DissolveDemo {
             ),
             &engine.assets,
         );
-        scene.node(&shard_node).set_position(2.3, 1.5, -0.2);
+        scene.edit_node(shard_node).set_position(2.3, 1.5, -0.2);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.9, 8.0)
             .look_at(Vec3::new(0.0, 1.2, 0.0));
         scene.active_camera = Some(camera);
@@ -275,23 +275,23 @@ impl AppHandler for DissolveDemo {
             return;
         };
 
-        scene.node(&self.box_node).set_rotation(
+        scene.edit_node(self.box_node).set_rotation(
             Quat::from_rotation_y(self.time * 0.7) * Quat::from_rotation_x(self.time * 0.3),
         );
 
         scene
-            .node(&self.sphere_node)
+            .edit_node(self.sphere_node)
             .set_position(0.0, 1.3 + (self.time * 1.6).sin() * 0.25, 0.0)
             .set_rotation(Quat::from_rotation_y(-self.time * 0.8));
 
-        scene.node(&self.shard_node).set_rotation(
+        scene.edit_node(self.shard_node).set_rotation(
             Quat::from_rotation_z(self.time * 0.9) * Quat::from_rotation_y(self.time * 1.1),
         );
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

@@ -48,7 +48,7 @@ impl AppHandler for ClusteredStressDemo {
             &engine.assets,
         );
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_position(0.0, -0.45, 0.0)
             .set_receive_shadows(false);
@@ -86,7 +86,7 @@ impl AppHandler for ClusteredStressDemo {
                     )
                 };
                 scene
-                    .node(&node)
+                    .edit_node(node)
                     .set_position(x as f32 * 2.2, 0.35, z as f32 * 2.2)
                     .set_shadows(false, true);
             }
@@ -112,7 +112,7 @@ impl AppHandler for ClusteredStressDemo {
                     );
                     scene.attach(helper, light);
                     scene
-                        .node(&helper)
+                        .edit_node(helper)
                         .set_position(0.0, 0.0, 0.0)
                         .set_shadows(false, false);
 
@@ -121,7 +121,7 @@ impl AppHandler for ClusteredStressDemo {
                         1.4 + iy as f32 * 1.25,
                         centered_lattice(iz, LIGHT_LAYERS_Z, 3.3),
                     );
-                    scene.node(&light).set_position(base.x, base.y, base.z);
+                    scene.edit_node(light).set_position(base.x, base.y, base.z);
                     lights.push(StressLight {
                         node: light,
                         base,
@@ -136,7 +136,7 @@ impl AppHandler for ClusteredStressDemo {
         let target = Vec3::new(0.0, 1.5, 0.0);
         let cam = scene.add_camera(Camera::new_perspective(50.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         scene.active_camera = Some(cam);
@@ -164,17 +164,17 @@ impl AppHandler for ClusteredStressDemo {
             let wobble_x = (self.time * 0.55 + light.phase).sin() * light.amplitude;
             let wobble_y = (self.time * 1.2 + light.phase * 0.5).sin() * (light.amplitude * 0.75);
             let wobble_z = (self.time * 0.85 + light.phase * 1.3).cos() * light.amplitude;
-            scene.node(&light.node).set_position(
+            scene.edit_node(light.node).set_position(
                 light.base.x + wobble_x,
                 light.base.y + wobble_y,
                 light.base.z + wobble_z,
             );
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

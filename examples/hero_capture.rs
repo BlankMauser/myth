@@ -90,12 +90,12 @@ fn main() {
         // ── Three-point lighting (Cinematic: warm key / cool fill, rim off)
         let key = scene.add_light(Light::new_directional(Vec3::new(1.0, 0.85, 0.6), 5.0));
         scene
-            .node(&key)
+            .edit_node(key)
             .set_position(5.0, 5.0, 5.0)
             .look_at(Vec3::ZERO);
         let fill = scene.add_light(Light::new_directional(Vec3::new(0.3, 0.5, 1.0), 1.0));
         scene
-            .node(&fill)
+            .edit_node(fill)
             .set_position(-5.0, 2.0, -2.0)
             .look_at(Vec3::ZERO);
 
@@ -132,7 +132,7 @@ fn main() {
         camera.set_aa_mode(AntiAliasingMode::MSAA_FXAA(4, FxaaSettings::default()));
         cam_node_id = scene.add_camera(camera);
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(-0.1, 1.45, -0.45)
             .look_at(Vec3::new(0.0, 1.5, 0.0));
         scene.active_camera = Some(cam_node_id);

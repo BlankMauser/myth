@@ -11,11 +11,12 @@ pub mod camera;
 pub mod day_night;
 pub mod environment;
 pub mod light;
+pub mod mutation;
 pub mod node;
+pub mod node_editor;
 pub mod scene;
 pub mod skeleton;
 pub mod transform_system;
-pub mod wrapper;
 
 // Re-exports from dependencies
 pub use myth_core::{NodeHandle, SkeletonKey, Transform};
@@ -23,7 +24,7 @@ pub use myth_core::{NodeHandle, SkeletonKey, Transform};
 /// Trait for resolving a geometry handle to its local-space bounding box.
 ///
 /// Implement this on your asset storage type (e.g. `AssetServer`) so that
-/// [`Scene::get_bbox_of_node`] can compute world-space bounds without
+/// [`Scene::subtree_world_bounds`] can compute world-space bounds without
 /// depending on the asset crate directly.
 pub trait GeometryQuery {
     fn get_geometry_bbox(
@@ -40,7 +41,12 @@ pub use camera::{DebugViewMode, DebugViewSettings};
 pub use day_night::DayNightCycle;
 pub use environment::Environment;
 pub use light::{DirectionalLight, Light, LightKind, PointLight, ShadowConfig, SpotLight};
+pub use mutation::{
+    SceneFullRebuildReasons, SceneMutation, SceneMutationBatch, SceneMutationCursor,
+    SceneMutationFlags, SceneMutationJournalStats, SceneStorage,
+};
 pub use node::Node;
+pub use node_editor::NodeEditor;
 pub use scene::{CallbackLogic, NodeBuilder, Scene, SceneLogic, SplitPrimitiveTag};
 pub use skeleton::{BindMode, Skeleton, SkinBinding};
-pub use wrapper::SceneNode;
+pub use transform_system::TransformUpdateStats;

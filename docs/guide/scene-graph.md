@@ -33,14 +33,15 @@ let child = scene.spawn_sphere(0.35, material, &engine.assets);
 scene.attach(child, parent);
 
 // Chainable transform setup
-scene.node(&parent).set_position(0.0, 1.0, 0.0);
-scene.node(&child).set_position(1.0, 0.0, 0.0);
+scene.edit_node(parent).set_position(0.0, 1.0, 0.0);
+scene.edit_node(child).set_position(1.0, 0.0, 0.0);
 ```
 
-::: info Two Ways to Access a Node
+::: info Reading and Editing Nodes
 
-* `scene.node(&handle)`: Provides a chainable, convenient API (e.g. `set_position`, `look_at`), ideal for quick initialization.
-* `scene.get_node_mut(handle)`: Returns a mutable reference to the node, ideal for complex logic and low-level component access inside `on_update` loops.
+* `scene.node(handle)`: Provides read-only access without recording a mutation.
+* `scene.node_mut(handle)`: Returns a raw mutable reference for complex low-level component access; the engine conservatively records a potential mutation.
+* `scene.edit_node(handle)`: Provides a chainable API (e.g. `set_position`, `look_at`) with exact mutation tracking, ideal for initialization and routine per-frame edits.
 :::
 
 ## 3. Camera & Environment Control
@@ -51,7 +52,7 @@ The renderer skips scenes that have no active camera. A typical setup:
 
 ```rust
 let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
-scene.node(&camera).set_position(0.0, 2.0, 5.0).look_at(Vec3::ZERO);
+scene.edit_node(camera).set_position(0.0, 2.0, 5.0).look_at(Vec3::ZERO);
 
 // Be sure to mark it as the active camera
 scene.active_camera = Some(camera);

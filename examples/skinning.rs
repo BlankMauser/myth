@@ -61,7 +61,7 @@ impl AppHandler for SkinningDemo {
         // Camera — chainable
         let cam_node_id = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 1.5, 4.0)
             .look_at(Vec3::new(0.0, 1.0, 0.0));
         scene.active_camera = Some(cam_node_id);
@@ -101,10 +101,10 @@ impl AppHandler for SkinningDemo {
             }
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Skinning Animation | FPS: {:.2}", fps));

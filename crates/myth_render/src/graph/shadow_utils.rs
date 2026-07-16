@@ -223,6 +223,37 @@ pub fn build_directional_views(
     caster_extension: f32,
     base_layer: u32,
 ) -> (Vec<RenderView>, [f32; MAX_CASCADES as usize]) {
+    let mut views = Vec::with_capacity(shadow_cfg.cascade_count.clamp(1, MAX_CASCADES) as usize);
+    let splits = append_directional_views(
+        light_id,
+        light_direction,
+        light_buffer_index,
+        camera,
+        shadow_cfg,
+        shadow_far,
+        caster_extension,
+        base_layer,
+        &mut views,
+    );
+    (views, splits)
+}
+
+/// Appends directional cascade views into caller-retained storage.
+///
+/// This is the zero-intermediate-allocation path used by `RenderFrame`; the
+/// owned [`build_directional_views`] wrapper remains for public compatibility.
+#[allow(clippy::too_many_arguments)]
+pub fn append_directional_views(
+    light_id: u64,
+    light_direction: Vec3,
+    light_buffer_index: usize,
+    camera: &RenderCamera,
+    shadow_cfg: &ShadowConfig,
+    shadow_far: f32,
+    caster_extension: f32,
+    base_layer: u32,
+    views: &mut Vec<RenderView>,
+) -> [f32; MAX_CASCADES as usize] {
     let cascade_count = shadow_cfg.cascade_count.clamp(1, MAX_CASCADES);
     let cam_near = camera.near.max(0.1);
 
@@ -233,7 +264,7 @@ pub fn build_directional_views(
         shadow_cfg.cascade_split_lambda,
     );
 
-    let mut views = Vec::with_capacity(cascade_count as usize);
+    views.reserve(cascade_count as usize);
     let mut prev_split = cam_near;
 
     for (c, split) in splits.iter().enumerate().take(cascade_count as usize) {
@@ -259,7 +290,7 @@ pub fn build_directional_views(
             light_id,
             base_layer + c as u32,
             light_buffer_index,
-            format!("DirLight_{light_id}_Cascade_{c}"),
+            "DirectionalShadow",
             vp,
             frustum,
             (shadow_cfg.map_size, shadow_cfg.map_size),
@@ -267,7 +298,7 @@ pub fn build_directional_views(
         ));
     }
 
-    (views, splits)
+    splits
 }
 
 /// Builds a single [`RenderView`] for a spot light shadow.
@@ -288,7 +319,7 @@ pub fn build_spot_view(
         light_id,
         base_layer,
         light_buffer_index,
-        format!("SpotLight_{light_id}"),
+        "SpotShadow",
         vp,
         frustum,
         (shadow_cfg.map_size, shadow_cfg.map_size),
@@ -358,23 +389,42 @@ pub fn build_point_views(
     shadow_cfg: &ShadowConfig,
     base_layer: u32,
 ) -> Vec<RenderView> {
-    let vps = build_point_vps(position, point.range);
-    let face_names = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"];
+    let mut views = Vec::with_capacity(CUBE_FACES as usize);
+    append_point_views(
+        light_id,
+        light_buffer_index,
+        position,
+        point,
+        shadow_cfg,
+        base_layer,
+        &mut views,
+    );
+    views
+}
 
-    vps.iter()
-        .enumerate()
-        .map(|(face, vp)| {
-            let frustum = Frustum::from_matrix_standard_z(*vp);
-            RenderView::new_shadow(
-                light_id,
-                base_layer + face as u32,
-                light_buffer_index,
-                format!("PointLight_{light_id}_{}", face_names[face]),
-                *vp,
-                frustum,
-                (shadow_cfg.map_size, shadow_cfg.map_size),
-                None,
-            )
-        })
-        .collect()
+/// Appends the six point-light cube faces into caller-retained storage.
+pub fn append_point_views(
+    light_id: u64,
+    light_buffer_index: usize,
+    position: Vec3,
+    point: &PointLight,
+    shadow_cfg: &ShadowConfig,
+    base_layer: u32,
+    views: &mut Vec<RenderView>,
+) {
+    let vps = build_point_vps(position, point.range);
+    views.reserve(CUBE_FACES as usize);
+    for (face, vp) in vps.iter().enumerate() {
+        let frustum = Frustum::from_matrix_standard_z(*vp);
+        views.push(RenderView::new_shadow(
+            light_id,
+            base_layer + face as u32,
+            light_buffer_index,
+            "PointShadow",
+            *vp,
+            frustum,
+            (shadow_cfg.map_size, shadow_cfg.map_size),
+            None,
+        ));
+    }
 }

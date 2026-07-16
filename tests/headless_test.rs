@@ -9,8 +9,8 @@
 use myth::prelude::*;
 use myth::render::core::ReadbackStream;
 use myth::renderer::graph::{
-    RdgAttemptOutcome, RdgFrameDiagnostics, RdgGpuDrivenFailure, RdgSceneSubmissionBackend,
-    RdgSceneSubmissionFamily, RdgSceneSubmissionSelectionReason,
+    RdgAttemptOutcome, RdgFrameDiagnostics, RdgGpuDrivenFailure, RdgRenderWorldRebuildReason,
+    RdgSceneSubmissionBackend, RdgSceneSubmissionFamily, RdgSceneSubmissionSelectionReason,
 };
 use myth::scene::light::LIGHT_FLAG_IS_SUN;
 
@@ -41,7 +41,7 @@ fn headless_sync_readback() {
         0.1,
     ));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 2.0, 5.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -94,7 +94,7 @@ fn headless_stream_recording() {
         0.1,
     ));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 2.0, 5.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -267,6 +267,121 @@ fn assert_main_submission_backend(
     );
 }
 
+/// Public end-to-end contract for M7.9's retained frontend. This deliberately
+/// covers a journey rather than private helpers: a static submitted scene must
+/// become O(0), one transform must remain O(changed), submitted history must
+/// settle transactionally, and switching back to a resident scene must reuse
+/// its exact RenderWorld authority.
+#[test]
+fn render_world_is_incremental_transactional_and_scene_resident() {
+    let (mut engine, _) = setup_headless_with_settings(
+        96,
+        96,
+        RendererSettings {
+            path: RenderPath::BasicForward,
+            gpu_driven: GpuDrivenMode::Off,
+            ..RendererSettings::default()
+        },
+    );
+    let geometry = engine
+        .assets
+        .geometries
+        .add(Geometry::new_box(0.8, 0.8, 0.8));
+    let material = engine
+        .assets
+        .materials
+        .add(UnlitMaterial::new(Vec4::new(0.2, 0.7, 0.4, 1.0)));
+
+    let moving = {
+        let scene = engine.scene_manager.create_active();
+        let moving = scene.add_mesh(Mesh::new(geometry, material));
+        let camera = scene.add_camera(Camera::new_perspective(50.0, 1.0, 0.1));
+        scene
+            .edit_node(camera)
+            .set_position(0.0, 1.5, 4.0)
+            .look_at(Vec3::ZERO);
+        scene.active_camera = Some(camera);
+        moving
+    };
+    let first_scene = engine
+        .scene_manager
+        .active_handle()
+        .expect("first scene handle missing");
+
+    let initial = render_and_observe_rdg(&mut engine, "render-world-initial");
+    let initial_world = initial.render_world();
+    assert_eq!(initial_world.render_item_count(), 1);
+    assert_eq!(initial_world.render_items_added(), 1);
+    assert_eq!(
+        initial_world.rebuild_reason(),
+        Some(RdgRenderWorldRebuildReason::InitialMaterialization)
+    );
+
+    // The first transform update may require one previous-matrix settlement
+    // frame. The following frame is the steady-state contract.
+    let _ = render_and_observe_rdg(&mut engine, "render-world-settle-initial");
+    let warm = render_and_observe_rdg(&mut engine, "render-world-warm");
+    let warm_world = warm.render_world();
+    assert_eq!(warm_world.hierarchy_nodes_visited(), 0);
+    assert_eq!(warm_world.hierarchy_dirty_roots_examined(), 0);
+    assert_eq!(warm_world.render_items_examined(), 0);
+    assert_eq!(warm_world.shadow_casters_examined(), 0);
+    assert_eq!(warm_world.render_items_reused(), 1);
+    assert_eq!(warm_world.rebuild_reason(), None);
+
+    engine
+        .scene_manager
+        .active_scene_mut()
+        .expect("active scene missing")
+        .edit_node(moving)
+        .set_position(1.25, 0.0, 0.0);
+    let changed = render_and_observe_rdg(&mut engine, "render-world-transform");
+    let changed_world = changed.render_world();
+    assert_eq!(changed_world.hierarchy_dirty_roots_examined(), 1);
+    assert_eq!(changed_world.render_items_examined(), 1);
+    assert_eq!(changed_world.render_items_updated(), 1);
+    assert_eq!(changed_world.render_items_rebuilt(), 0);
+    assert_eq!(changed_world.rebuild_reason(), None);
+
+    let submitted = render_and_observe_rdg(&mut engine, "render-world-history-settle");
+    assert_eq!(submitted.render_world().submitted_history_settled(), 1);
+    let static_again = render_and_observe_rdg(&mut engine, "render-world-static-again");
+    assert_eq!(static_again.render_world().hierarchy_nodes_visited(), 0);
+    assert_eq!(static_again.render_world().render_items_examined(), 0);
+    assert_eq!(static_again.render_world().submitted_history_settled(), 0);
+
+    let second_scene = engine.scene_manager.create_scene();
+    {
+        let scene = engine
+            .scene_manager
+            .get_scene_mut(second_scene)
+            .expect("second scene missing");
+        scene.add_mesh(Mesh::new(geometry, material));
+        let camera = scene.add_camera(Camera::new_perspective(50.0, 1.0, 0.1));
+        scene
+            .edit_node(camera)
+            .set_position(0.0, 1.5, 4.0)
+            .look_at(Vec3::ZERO);
+        scene.active_camera = Some(camera);
+    }
+    engine.scene_manager.set_active(second_scene);
+    let second = render_and_observe_rdg(&mut engine, "render-world-second-scene");
+    assert_eq!(second.render_world().resident_scene_count(), 2);
+    assert_eq!(
+        second.render_world().rebuild_reason(),
+        Some(RdgRenderWorldRebuildReason::InitialMaterialization)
+    );
+
+    engine.scene_manager.set_active(first_scene);
+    let restored = render_and_observe_rdg(&mut engine, "render-world-restored-scene");
+    let restored_world = restored.render_world();
+    assert_eq!(restored_world.resident_scene_count(), 2);
+    assert_eq!(restored_world.render_item_count(), 1);
+    assert_eq!(restored_world.render_items_examined(), 0);
+    assert_eq!(restored_world.render_items_reused(), 1);
+    assert_eq!(restored_world.rebuild_reason(), None);
+}
+
 /// Exercises the public runtime policy boundary against one long-lived scene
 /// and renderer. A successful live GPU backend plus a non-empty readback is an
 /// end-to-end contract: compute culling produced indirect arguments and the
@@ -297,7 +412,7 @@ fn gpu_driven_runtime_switches_are_publicly_observable_and_raster_equivalent() {
 
     let scene = engine.scene_manager.create_active();
     let first = scene.add_mesh(Mesh::new(geometry, material));
-    scene.node(&first).set_position(-4.5, 0.0, -4.5);
+    scene.edit_node(first).set_position(-4.5, 0.0, -4.5);
 
     let mut sun = Light::new_directional(Vec3::ONE, 2.5);
     sun.cast_shadows = true;
@@ -307,13 +422,13 @@ fn gpu_driven_runtime_switches_are_publicly_observable_and_raster_equivalent() {
     }
     let sun = scene.add_light(sun);
     scene
-        .node(&sun)
+        .edit_node(sun)
         .set_position(8.0, 12.0, 6.0)
         .look_at(Vec3::ZERO);
 
     let camera = scene.add_camera(Camera::new_perspective(48.0, 1.0, 0.1));
     scene
-        .node(&camera)
+        .edit_node(camera)
         .set_position(0.0, 11.5, 16.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(camera);
@@ -338,7 +453,7 @@ fn gpu_driven_runtime_switches_are_publicly_observable_and_raster_equivalent() {
             let z = index / SIDE;
             let node = scene.add_mesh(Mesh::new(geometry, material));
             scene
-                .node(&node)
+                .edit_node(node)
                 .set_position(x as f32 * 0.6 - 4.5, 0.0, z as f32 * 0.6 - 4.5);
         }
     }
@@ -378,6 +493,16 @@ fn gpu_driven_runtime_switches_are_publicly_observable_and_raster_equivalent() {
         auto_entered_gpu,
         "dense Auto workload did not enter GPU-driven submission within {AUTO_WAIT_LIMIT} submitted frames"
     );
+    let dense_warm = render_and_observe_rdg(&mut engine, "dense-auto-warm");
+    assert_main_submission_backend(
+        &dense_warm,
+        "dense-auto-warm",
+        RdgSceneSubmissionBackend::GpuDriven,
+    );
+    let dense_warm_world = dense_warm.render_world();
+    assert_eq!(dense_warm_world.gpu_members_examined(), 0);
+    assert_eq!(dense_warm_world.gpu_members_rebuilt(), 0);
+    assert!(dense_warm_world.gpu_members_reused() > 0);
 
     let (hf, basic) = (RenderPath::HighFidelity, RenderPath::BasicForward);
     let (required, off) = (GpuDrivenMode::Required, GpuDrivenMode::Off);
@@ -400,7 +525,7 @@ fn gpu_driven_runtime_switches_are_publicly_observable_and_raster_equivalent() {
         engine
             .scene_manager
             .active_scene_mut()
-            .and_then(|scene| scene.get_light_mut(sun))
+            .and_then(|scene| scene.light_mut(sun))
             .expect("GPU-driven sun is missing")
             .cast_shadows = shadows;
         let diagnostics = render_and_observe_rdg(&mut engine, stage);
@@ -447,7 +572,7 @@ fn physical_material_sphere() {
 
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 0.0, 4.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -472,15 +597,15 @@ fn physical_material_sphere_with_procedural_sun_transmittance() {
 
     let sun = scene.add_light(Light::new_directional(Vec3::ONE, 3.0));
     scene
-        .node(&sun)
+        .edit_node(sun)
         .set_position(0.0, 3.0, -10.0)
         .look_at(Vec3::ZERO);
-    let light = scene.get_light_mut(sun).expect("sun light missing");
+    let light = scene.light_mut(sun).expect("sun light missing");
     light.flags |= LIGHT_FLAG_IS_SUN;
 
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 0.0, 4.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -509,7 +634,7 @@ fn physical_metallic_vs_dielectric() {
         scene.add_light(Light::new_directional(Vec3::ONE, 3.0));
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 1.0, 4.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -528,7 +653,7 @@ fn physical_metallic_vs_dielectric() {
         scene.add_light(Light::new_directional(Vec3::ONE, 3.0));
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 1.0, 4.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -554,7 +679,7 @@ fn physical_emissive_no_light() {
 
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 0.0, 4.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -581,7 +706,7 @@ fn phong_material_sphere() {
 
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 0.0, 4.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -603,7 +728,7 @@ fn phong_emissive_no_light() {
 
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 0.0, 4.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -627,7 +752,7 @@ fn unlit_material_no_light() {
     // No light - unlit should still render.
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 0.0, 4.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -654,7 +779,7 @@ fn multi_light_scene() {
         scene.add_light(Light::new_directional(Vec3::ONE, 2.0));
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 0.0, 4.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -672,10 +797,10 @@ fn multi_light_scene() {
         scene.spawn_sphere(1.0, mat, &engine.assets);
         scene.add_light(Light::new_directional(Vec3::ONE, 2.0));
         let point = scene.add_light(Light::new_point(Vec3::new(1.0, 0.2, 0.2), 15.0, 20.0));
-        scene.node(&point).set_position(2.0, 2.0, 2.0);
+        scene.edit_node(point).set_position(2.0, 2.0, 2.0);
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 0.0, 4.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -710,14 +835,14 @@ fn clustered_dense_point_lights() {
             );
             let light = scene.add_light(Light::new_point(color, 7.5, 4.2));
             scene
-                .node(&light)
+                .edit_node(light)
                 .set_position(angle.cos() * radius, height, angle.sin() * radius);
         }
     }
 
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 2.6, 5.2)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -745,14 +870,14 @@ fn populate_dense_point_light_scene(scene: &mut Scene, assets: &AssetServer) {
             );
             let light = scene.add_light(Light::new_point(color, 7.5, 4.2));
             scene
-                .node(&light)
+                .edit_node(light)
                 .set_position(angle.cos() * radius, height, angle.sin() * radius);
         }
     }
 
     let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 2.6, 5.2)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -801,7 +926,7 @@ fn populate_clustered_corridor_scene(scene: &mut Scene, assets: &AssetServer) {
 
     let floor = scene.spawn_plane(18.0, 56.0, floor_material, assets);
     scene
-        .node(&floor)
+        .edit_node(floor)
         .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
         .set_position(0.0, -0.3, 0.0)
         .set_receive_shadows(false);
@@ -813,7 +938,7 @@ fn populate_clustered_corridor_scene(scene: &mut Scene, assets: &AssetServer) {
     ] {
         let wall = scene.spawn_box(sx, sy, sz, wall_material.clone(), assets);
         scene
-            .node(&wall)
+            .edit_node(wall)
             .set_position(x, y, z)
             .set_shadows(false, true);
     }
@@ -833,7 +958,7 @@ fn populate_clustered_corridor_scene(scene: &mut Scene, assets: &AssetServer) {
                 scene.spawn_box(1.3, 1.3, 1.3, block_material.clone(), assets)
             };
             scene
-                .node(&block)
+                .edit_node(block)
                 .set_position(x, y, z)
                 .set_shadows(false, true);
         }
@@ -856,14 +981,14 @@ fn populate_clustered_corridor_scene(scene: &mut Scene, assets: &AssetServer) {
                     0.9 + iy as f32 * 0.7,
                     centered_lattice(iz, LIGHT_GRID_Z, 4.1),
                 );
-                scene.node(&light).set_position(base.x, base.y, base.z);
+                scene.edit_node(light).set_position(base.x, base.y, base.z);
             }
         }
     }
 
     let cam = scene.add_camera(Camera::new_perspective(46.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 4.2, 20.0)
         .look_at(Vec3::new(0.0, 1.8, 0.0));
     scene.active_camera = Some(cam);
@@ -985,14 +1110,14 @@ fn alpha_blend_vs_opaque() {
         // Background plane
         let bg = UnlitMaterial::new(Vec4::new(0.0, 0.0, 1.0, 1.0));
         let bg_node = scene.spawn_plane(4.0, 4.0, bg, &engine.assets);
-        scene.node(&bg_node).set_position(0.0, 0.0, -2.0);
+        scene.edit_node(bg_node).set_position(0.0, 0.0, -2.0);
         // Foreground box (opaque red)
         let fg = UnlitMaterial::new(Vec4::new(1.0, 0.0, 0.0, 1.0));
         scene.spawn_box(1.0, 1.0, 0.1, fg, &engine.assets);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 0.0, 3.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -1006,7 +1131,7 @@ fn alpha_blend_vs_opaque() {
         let scene = engine.scene_manager.create_active();
         let bg = UnlitMaterial::new(Vec4::new(0.0, 0.0, 1.0, 1.0));
         let bg_node = scene.spawn_plane(4.0, 4.0, bg, &engine.assets);
-        scene.node(&bg_node).set_position(0.0, 0.0, -2.0);
+        scene.edit_node(bg_node).set_position(0.0, 0.0, -2.0);
         // Foreground box: same red but 50% alpha with Blend mode
         let fg =
             UnlitMaterial::new(Vec4::new(1.0, 0.0, 0.0, 0.5)).with_alpha_mode(AlphaMode::Blend);
@@ -1014,7 +1139,7 @@ fn alpha_blend_vs_opaque() {
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 0.0, 3.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -1045,7 +1170,7 @@ fn physical_roughness_variation() {
         scene.add_light(Light::new_directional(Vec3::ONE, 3.0));
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 0.0, 4.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -1064,7 +1189,7 @@ fn physical_roughness_variation() {
         scene.add_light(Light::new_directional(Vec3::ONE, 3.0));
         let cam = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 0.0, 4.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam);
@@ -1089,31 +1214,31 @@ fn multi_object_scene() {
         .with_roughness(0.2)
         .with_metalness(1.0);
     let sphere = scene.spawn_sphere(0.6, sphere_mat, &engine.assets);
-    scene.node(&sphere).set_position(-1.5, 0.0, 0.0);
+    scene.edit_node(sphere).set_position(-1.5, 0.0, 0.0);
 
     // Green dielectric box
     let box_mat = PhysicalMaterial::new(Vec4::new(0.1, 0.8, 0.2, 1.0))
         .with_roughness(0.6)
         .with_metalness(0.0);
     let bx = scene.spawn_box(1.0, 1.0, 1.0, box_mat, &engine.assets);
-    scene.node(&bx).set_position(0.0, 0.0, 0.0);
+    scene.edit_node(bx).set_position(0.0, 0.0, 0.0);
 
     // Blue rough sphere
     let blue_mat = PhysicalMaterial::new(Vec4::new(0.1, 0.3, 1.0, 1.0))
         .with_roughness(0.9)
         .with_metalness(0.5);
     let blue_sphere = scene.spawn_sphere(0.4, blue_mat, &engine.assets);
-    scene.node(&blue_sphere).set_position(1.5, 0.0, 0.0);
+    scene.edit_node(blue_sphere).set_position(1.5, 0.0, 0.0);
 
     // Lights
     scene.add_light(Light::new_directional(Vec3::ONE, 2.5));
     let pt = scene.add_light(Light::new_point(Vec3::new(1.0, 0.8, 0.6), 10.0, 15.0));
-    scene.node(&pt).set_position(0.0, 3.0, 3.0);
+    scene.edit_node(pt).set_position(0.0, 3.0, 3.0);
 
     // Camera
     let cam = scene.add_camera(Camera::new_perspective(60.0, 1.0, 0.1));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 3.0, 6.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);

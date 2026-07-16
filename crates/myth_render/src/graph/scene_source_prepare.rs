@@ -391,7 +391,7 @@ impl SceneSourcePrepareStore {
         }
 
         let skeleton_pool = &scene.skeleton_pool;
-        let meshes = &mut scene.meshes;
+        let meshes = &scene.meshes;
         for allocation in &self.allocations {
             let recipe = &self.recipes[allocation.recipe.index()];
             debug_assert_eq!(recipe.id, allocation.recipe);
@@ -402,7 +402,7 @@ impl SceneSourcePrepareStore {
                 continue;
             };
             let skeleton = recipe.skeleton.and_then(|key| skeleton_pool.get(key));
-            let Some(mesh) = meshes.get_mut(recipe.node_handle) else {
+            let Some(mesh) = meshes.get(recipe.node_handle) else {
                 continue;
             };
             if (mesh.geometry, mesh.material) != (geometry.key.handle, material.handle()) {

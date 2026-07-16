@@ -131,7 +131,7 @@ impl AppHandler for GaussianSplattingDemo {
 
         let cam_node = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node)
+            .edit_node(cam_node)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         scene.active_camera = Some(cam_node);
@@ -180,10 +180,10 @@ impl AppHandler for GaussianSplattingDemo {
 
         self.process_load_results(scene, &engine.assets);
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

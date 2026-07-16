@@ -129,7 +129,7 @@ impl AppHandler for PlasmaTunnelDemo {
             ),
             &engine.assets,
         );
-        scene.node(&portal_node).set_position(0.0, 1.7, -0.4);
+        scene.edit_node(portal_node).set_position(0.0, 1.7, -0.4);
 
         let floor = scene.spawn_plane(
             18.0,
@@ -140,7 +140,7 @@ impl AppHandler for PlasmaTunnelDemo {
             &engine.assets,
         );
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.02, 0.0)
             .set_shadows(false, true);
@@ -166,13 +166,13 @@ impl AppHandler for PlasmaTunnelDemo {
         ] {
             let pillar = scene.spawn_box(0.8, 5.0, 0.8, pillar_material, &engine.assets);
             scene
-                .node(&pillar)
+                .edit_node(pillar)
                 .set_position(x, 2.5, z)
                 .set_shadows(true, true);
 
             let band = scene.spawn_box(0.95, 0.12, 0.95, neon_material, &engine.assets);
             scene
-                .node(&band)
+                .edit_node(band)
                 .set_position(x, 1.4, z)
                 .set_cast_shadows(false)
                 .set_receive_shadows(false);
@@ -180,7 +180,7 @@ impl AppHandler for PlasmaTunnelDemo {
 
         let ring_root = scene.create_node_with_name("PlasmaRing");
         scene.push_root_node(ring_root);
-        scene.node(&ring_root).set_position(0.0, 1.7, -0.2);
+        scene.edit_node(ring_root).set_position(0.0, 1.7, -0.2);
 
         let ring_geo = engine
             .assets
@@ -192,7 +192,7 @@ impl AppHandler for PlasmaTunnelDemo {
             let segment_handle =
                 scene.add_mesh_to_parent(Mesh::new(ring_geo, neon_material), ring_root);
             scene
-                .node(&segment_handle)
+                .edit_node(segment_handle)
                 .set_position_vec(radial * 3.35)
                 .set_rotation(Quat::from_rotation_z(angle + FRAC_PI_2))
                 .set_scale_xyz(0.20, 0.92, 0.18)
@@ -208,16 +208,16 @@ impl AppHandler for PlasmaTunnelDemo {
         }
         let key = scene.add_light(key);
         scene
-            .node(&key)
+            .edit_node(key)
             .set_position(8.0, 10.0, 6.0)
             .look_at(Vec3::new(0.0, 1.6, -0.5));
 
         let fill = scene.add_light(Light::new_point(Vec3::new(0.4, 0.95, 1.0), 1.2, 20.0));
-        scene.node(&fill).set_position(-3.5, 2.5, 3.0);
+        scene.edit_node(fill).set_position(-3.5, 2.5, 3.0);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 1.8, 8.0)
             .look_at(Vec3::new(0.0, 1.7, -0.2));
         scene.active_camera = Some(cam);
@@ -238,17 +238,17 @@ impl AppHandler for PlasmaTunnelDemo {
             return;
         };
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         scene
-            .node(&self.ring_root)
+            .edit_node(self.ring_root)
             .set_rotation(Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, self.time * 0.5))
             .set_scale(1.0 + (self.time * 1.8).sin() * 0.05);
 
-        scene.node(&self.portal_node).set_scale_xyz(
+        scene.edit_node(self.portal_node).set_scale_xyz(
             1.0 + (self.time * 0.9).sin() * 0.015,
             1.0 + (self.time * 1.1).cos() * 0.02,
             1.0,

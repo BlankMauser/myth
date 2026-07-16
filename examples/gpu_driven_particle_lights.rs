@@ -232,7 +232,7 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
         }
         let sun = scene.add_light(sun);
         scene
-            .node(&sun)
+            .edit_node(sun)
             .set_position(9.0, 14.0, 8.0)
             .look_at(Vec3::new(0.0, 1.5, 0.0));
 
@@ -241,7 +241,7 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
             (Vec3::new(0.2, 0.75, 1.0), 3.0, 2.0, 4.2, 1.4, 7.0),
         ] {
             let local = scene.add_light(Light::new_point(color, intensity, range));
-            scene.node(&local).set_position(x, y, z);
+            scene.edit_node(local).set_position(x, y, z);
         }
 
         for &(color, intensity, range, x, y, z, target_x, target_y, target_z) in &[
@@ -270,7 +270,7 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
         ] {
             let local = scene.add_light(Light::new_spot(color, intensity, range, 0.24, 0.52));
             scene
-                .node(&local)
+                .edit_node(local)
                 .set_position(x, y, z)
                 .look_at(Vec3::new(target_x, target_y, target_z));
         }
@@ -304,7 +304,7 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
 
         let floor = scene.spawn_plane(24.0, 88.0, floor_material, &engine.assets);
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.18, 0.0)
             .set_receive_shadows(false);
@@ -316,7 +316,7 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
         ] {
             let wall = scene.spawn_box(sx, sy, sz, wall_material, &engine.assets);
             scene
-                .node(&wall)
+                .edit_node(wall)
                 .set_position(x, y, z)
                 .set_shadows(false, true);
         }
@@ -327,14 +327,14 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
             for x in [-5.5, 5.5] {
                 let pillar = scene.spawn_box(0.55, 4.8, 0.55, frame_material, &engine.assets);
                 scene
-                    .node(&pillar)
+                    .edit_node(pillar)
                     .set_position(x, 2.08, z)
                     .set_shadows(true, true);
             }
 
             let beam = scene.spawn_box(11.8, 0.16, 0.28, accent_material, &engine.assets);
             scene
-                .node(&beam)
+                .edit_node(beam)
                 .set_position(0.0, 4.18, z)
                 .set_shadows(false, false);
 
@@ -344,14 +344,14 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
                 scene.spawn_box(1.25, 1.25, 1.25, hero_material, &engine.assets)
             };
             scene
-                .node(&hero)
+                .edit_node(hero)
                 .set_position(0.0, 0.72, z)
                 .set_shadows(true, true);
         }
 
         let centerpiece = scene.spawn_torus(2.7, 0.32, hero_material, &engine.assets);
         scene
-            .node(&centerpiece)
+            .edit_node(centerpiece)
             .set_position(0.0, 2.15, 0.0)
             .set_rotation(Quat::from_rotation_x(FRAC_PI_2 * 0.35))
             .set_shadows(true, true);
@@ -359,13 +359,13 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
         let core = scene.spawn_sphere(0.88, accent_material, &engine.assets);
         scene.attach(core, centerpiece);
         scene
-            .node(&core)
+            .edit_node(core)
             .set_position(0.0, 0.0, 0.0)
             .set_shadows(false, false);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 4.8, 17.5)
             .look_at(Vec3::new(0.0, 1.8, 0.0));
         scene.active_camera = Some(camera);
@@ -422,15 +422,15 @@ impl AppHandler for GpuDrivenParticleLightsDemo {
             self.swarm_enabled = !self.swarm_enabled;
         }
 
-        if let Some(node) = scene.get_node_mut(self.centerpiece) {
+        if let Some(node) = scene.node_mut(self.centerpiece) {
             node.transform.rotation *= Quat::from_rotation_y(frame.dt * 0.55);
             node.transform.rotation *= Quat::from_rotation_x(frame.dt * 0.22);
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

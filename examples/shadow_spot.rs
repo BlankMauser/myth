@@ -26,7 +26,7 @@ impl AppHandler for ShadowSpotDemo {
             &engine.assets,
         );
         scene
-            .node(&sphere_node)
+            .edit_node(sphere_node)
             .set_position(0.0, 1.0, 0.0)
             .set_shadows(true, true);
 
@@ -38,7 +38,7 @@ impl AppHandler for ShadowSpotDemo {
             &engine.assets,
         );
         scene
-            .node(&floor_node)
+            .edit_node(floor_node)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_cast_shadows(false)
             .set_receive_shadows(true);
@@ -51,14 +51,14 @@ impl AppHandler for ShadowSpotDemo {
         }
         let spot_node = scene.add_light(spot);
         scene
-            .node(&spot_node)
+            .edit_node(spot_node)
             .set_position(6.0, 10.0, 4.0)
             .look_at(Vec3::ZERO);
 
         // Camera
         let cam_node = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam_node)
+            .edit_node(cam_node)
             .set_position(8.0, 6.0, 8.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node);
@@ -74,10 +74,10 @@ impl AppHandler for ShadowSpotDemo {
             return;
         };
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Shadow Spot | FPS: {:.2}", fps));

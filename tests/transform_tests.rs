@@ -10,6 +10,7 @@
 
 use glam::{Affine3A, EulerRot, Mat4, Quat, Vec3};
 use myth::scene::NodeHandle;
+use myth::scene::Scene;
 use myth::scene::Transform;
 use myth::scene::camera::Camera;
 use myth::scene::node::Node;
@@ -29,6 +30,141 @@ fn approx_eq(a: f32, b: f32) -> bool {
 
 fn vec3_approx(a: Vec3, b: Vec3) -> bool {
     approx_eq(a.x, b.x) && approx_eq(a.y, b.y) && approx_eq(a.z, b.z)
+}
+
+#[test]
+fn scene_transform_updates_are_incremental_and_coalesce_dirty_roots() {
+    let mut scene = Scene::new();
+    let parent = scene.add_node(Node::new());
+    let child = scene.add_to_parent(Node::new(), parent);
+
+    let initial = scene.update_matrix_world();
+    assert!(initial.full_traversal);
+    assert_eq!(initial.visited_nodes, 2);
+
+    // Identity transforms do not need a compatibility settle pass.
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+
+    scene.node_mut(child).unwrap().transform.position = Vec3::Y;
+    scene.node_mut(parent).unwrap().transform.position = Vec3::X;
+    scene.node_mut(parent).unwrap().transform.scale = Vec3::splat(2.0);
+
+    // Parent supersedes the already-dirty child, so each node is visited once.
+    let changed = scene.update_matrix_world();
+    assert!(!changed.full_traversal);
+    assert_eq!(changed.visited_nodes, 2);
+    assert_eq!(changed.updated_world_matrices, 2);
+    let child_world = scene
+        .node(child)
+        .unwrap()
+        .transform
+        .world_matrix
+        .translation;
+    assert!(vec3_approx(child_world.into(), Vec3::new(1.0, 2.0, 0.0)));
+
+    scene.node_mut(parent).unwrap().transform.position = Vec3::Y;
+    let continuous = scene.update_matrix_world();
+    assert_eq!(
+        continuous.visited_nodes, 2,
+        "continuous animation must update a subtree once, not settle then update it"
+    );
+}
+
+#[test]
+fn raw_node_storage_mutation_triggers_one_full_transform_fallback() {
+    let mut scene = Scene::new();
+    let root = scene.add_node(Node::new());
+    scene.update_matrix_world();
+    scene.update_matrix_world();
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+
+    scene.nodes.get_mut(root).unwrap().transform.position = Vec3::X;
+    let fallback = scene.update_matrix_world();
+    assert!(fallback.full_traversal);
+    assert_eq!(fallback.visited_nodes, 1);
+}
+
+#[test]
+fn render_flush_updates_late_dirty_roots_without_settling_earlier_motion() {
+    let mut scene = Scene::new();
+    let earlier = scene.add_node(Node::new());
+    let late = scene.add_node(Node::new());
+    scene.update_matrix_world();
+
+    scene.edit_node(earlier).set_position_vec(Vec3::X);
+    scene.update_matrix_world();
+    let earlier_before_flush = scene.node(earlier).unwrap().transform;
+    assert_ne!(
+        earlier_before_flush.previous_world_matrix,
+        earlier_before_flush.world_matrix
+    );
+
+    scene.edit_node(late).set_position_vec(Vec3::Y);
+    let flush = scene.flush_dirty_world_matrices();
+    assert_eq!(flush.visited_nodes, 1);
+    let earlier_after_flush = scene.node(earlier).unwrap().transform;
+    assert_eq!(
+        earlier_after_flush.previous_world_matrix,
+        earlier_before_flush.previous_world_matrix
+    );
+    assert_eq!(
+        earlier_after_flush.world_matrix,
+        earlier_before_flush.world_matrix
+    );
+    assert_eq!(
+        scene.node(late).unwrap().transform.world_matrix.translation,
+        Vec3::Y.into()
+    );
+}
+
+#[test]
+fn overlapping_settle_roots_stay_disjoint_across_a_render_flush() {
+    let mut scene = Scene::new();
+    let parent = scene.add_node(Node::new());
+    let child = scene.add_to_parent(Node::new(), parent);
+    scene.update_matrix_world();
+
+    // A simulation-side parent update owes previous-matrix settlement for the
+    // whole subtree. A later child-only extraction flush must not append a
+    // redundant child settle root below it.
+    scene.edit_node(parent).set_position_vec(Vec3::X);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 2);
+    scene.edit_node(child).set_position_vec(Vec3::Y);
+    assert_eq!(scene.flush_dirty_world_matrices().visited_nodes, 1);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 2);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+
+    // The inverse overlap is equivalent: a late parent update subsumes an
+    // existing child settle root instead of retaining both roots.
+    scene.edit_node(child).set_position_vec(Vec3::Z);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 1);
+    scene.edit_node(parent).set_position_vec(Vec3::Y);
+    assert_eq!(scene.flush_dirty_world_matrices().visited_nodes, 2);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 2);
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+}
+
+#[test]
+fn many_independent_dirty_roots_coalesce_with_linear_parent_work() {
+    const ROOT_COUNT: usize = 4_096;
+
+    let mut scene = Scene::new();
+    let roots = (0..ROOT_COUNT)
+        .map(|_| scene.add_node(Node::new()))
+        .collect::<Vec<_>>();
+    scene.update_matrix_world();
+    assert_eq!(scene.update_matrix_world().visited_nodes, 0);
+
+    for (index, &root) in roots.iter().enumerate() {
+        scene.node_mut(root).unwrap().transform.position.x = index as f32;
+    }
+    let stats = scene.update_matrix_world();
+
+    assert!(!stats.full_traversal);
+    assert_eq!(stats.dirty_roots_examined, ROOT_COUNT);
+    assert_eq!(stats.dirty_root_parent_links_examined, 0);
+    assert_eq!(stats.visited_nodes, ROOT_COUNT);
 }
 
 // ============================================================================

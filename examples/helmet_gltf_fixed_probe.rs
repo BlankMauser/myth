@@ -165,7 +165,7 @@ impl AppHandler for HelmetGltfFixedProbe {
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 0.0, 3.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(camera);
@@ -248,10 +248,10 @@ impl AppHandler for HelmetGltfFixedProbe {
         let Some(scene) = engine.scene_manager.active_scene_mut() else {
             return;
         };
-        if let Some(camera) = scene.get_node_mut(self.camera) {
+        let _ = scene.edit_node_transform(self.camera, |transform| {
             self.controls
-                .update(&mut camera.transform, &engine.input, 45.0, frame.dt);
-        }
+                .update(transform, &engine.input, 45.0, frame.dt);
+        });
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("glTF PBR Demo - FPS: {fps:.0}"));
         }

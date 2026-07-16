@@ -36,9 +36,9 @@ pub use diagnostics::RdgDetailPhase;
 pub use diagnostics::{
     RdgAttemptOutcome, RdgCommandEncodingFailure, RdgFrameDiagnostics, RdgFramePhase,
     RdgGpuDrivenFailure, RdgGpuDrivenPolicySnapshot, RdgPostSubmitPublicationFailure,
-    RdgRenderTargetKind, RdgResourceMaterializationFailure, RdgSceneSubmissionBackend,
-    RdgSceneSubmissionFamily, RdgSceneSubmissionFamilySnapshot, RdgSceneSubmissionSelectionReason,
-    RdgSurfaceAcquireFailure,
+    RdgRenderTargetKind, RdgRenderWorldRebuildReason, RdgRenderWorldSnapshot,
+    RdgResourceMaterializationFailure, RdgSceneSubmissionBackend, RdgSceneSubmissionFamily,
+    RdgSceneSubmissionFamilySnapshot, RdgSceneSubmissionSelectionReason, RdgSurfaceAcquireFailure,
 };
 pub(crate) use diagnostics::{
     RdgComposerAttemptGuard, RdgDiagnosticsRecorder, RdgRendererAttemptGuard,

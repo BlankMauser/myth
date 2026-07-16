@@ -29,6 +29,8 @@
 //!     └── iterate shadow views → draw per-view commands
 //! ```
 
+use std::borrow::Cow;
+
 use glam::Mat4;
 
 use myth_scene::camera::Frustum;
@@ -56,8 +58,8 @@ pub struct RenderView {
     /// Identifies this view's purpose (main camera, shadow cascade, etc.).
     pub target: ViewTarget,
 
-    /// Debug name (e.g. `"DirLight_42_Cascade_2"`).
-    pub name: String,
+    /// Debug class name. Exact light/layer identity lives in [`ViewTarget`].
+    pub name: Cow<'static, str>,
 
     /// View-Projection matrix, uploaded to the GPU for vertex transformation.
     pub view_projection: Mat4,
@@ -88,7 +90,7 @@ impl RenderView {
     pub fn new_main_camera(vp: Mat4, frustum: Frustum, size: (u32, u32)) -> Self {
         Self {
             target: ViewTarget::MainCamera,
-            name: "MainCamera".to_string(),
+            name: Cow::Borrowed("MainCamera"),
             view_projection: vp,
             frustum,
             viewport_size: size,
@@ -103,7 +105,7 @@ impl RenderView {
         light_id: u64,
         layer_index: u32,
         light_buffer_index: usize,
-        name: String,
+        name: impl Into<Cow<'static, str>>,
         vp: Mat4,
         frustum: Frustum,
         size: (u32, u32),
@@ -114,7 +116,7 @@ impl RenderView {
                 light_id,
                 layer_index,
             },
-            name,
+            name: name.into(),
             view_projection: vp,
             frustum,
             viewport_size: size,

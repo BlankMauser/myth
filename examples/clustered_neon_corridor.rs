@@ -92,7 +92,7 @@ impl AppHandler for ClusteredNeonCorridorDemo {
 
         let floor = scene.spawn_plane(16.0, 76.0, floor_material, &engine.assets);
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.18, 0.0)
             .set_receive_shadows(false);
@@ -104,7 +104,7 @@ impl AppHandler for ClusteredNeonCorridorDemo {
         ] {
             let wall = scene.spawn_box(sx, sy, sz, wall_material, &engine.assets);
             scene
-                .node(&wall)
+                .edit_node(wall)
                 .set_position(x, y, z)
                 .set_shadows(false, true);
         }
@@ -115,14 +115,14 @@ impl AppHandler for ClusteredNeonCorridorDemo {
             for x in [-4.35, 4.35] {
                 let pillar = scene.spawn_box(0.52, 4.8, 0.52, frame_material, &engine.assets);
                 scene
-                    .node(&pillar)
+                    .edit_node(pillar)
                     .set_position(x, 2.1, z)
                     .set_shadows(true, true);
             }
 
             let beam = scene.spawn_box(9.8, 0.18, 0.42, accent_material, &engine.assets);
             scene
-                .node(&beam)
+                .edit_node(beam)
                 .set_position(0.0, 4.05, z)
                 .set_cast_shadows(false)
                 .set_receive_shadows(false);
@@ -133,7 +133,7 @@ impl AppHandler for ClusteredNeonCorridorDemo {
                 scene.spawn_box(1.5, 1.5, 1.5, hero_material, &engine.assets)
             };
             scene
-                .node(&hero)
+                .edit_node(hero)
                 .set_position(0.0, 0.72, z)
                 .set_shadows(true, true);
         }
@@ -160,7 +160,7 @@ impl AppHandler for ClusteredNeonCorridorDemo {
                 );
                 scene.attach(helper, light);
                 scene
-                    .node(&helper)
+                    .edit_node(helper)
                     .set_position(0.0, 0.0, 0.0)
                     .set_shadows(false, false);
 
@@ -172,7 +172,7 @@ impl AppHandler for ClusteredNeonCorridorDemo {
                     _ => (1.85, 1.1, -0.75, Vec3::new(0.28, 0.22, 0.18), 1.02),
                 };
                 let base = Vec3::new(x, y, z + z_offset);
-                scene.node(&light).set_position(base.x, base.y, base.z);
+                scene.edit_node(light).set_position(base.x, base.y, base.z);
 
                 lights.push(CorridorLight {
                     node: light,
@@ -188,7 +188,7 @@ impl AppHandler for ClusteredNeonCorridorDemo {
         let target = Vec3::new(0.0, 1.4, 0.0);
         let cam = scene.add_camera(Camera::new_perspective(48.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         scene.active_camera = Some(cam);
@@ -218,17 +218,17 @@ impl AppHandler for ClusteredNeonCorridorDemo {
                 (self.time * (light.speed * 1.7) + light.phase * 0.7).sin() * light.amplitude.y;
             let offset_z =
                 (self.time * (light.speed * 1.15) + light.phase * 1.3).cos() * light.amplitude.z;
-            scene.node(&light.node).set_position(
+            scene.edit_node(light.node).set_position(
                 light.base.x + offset_x,
                 light.base.y + offset_y,
                 light.base.z + offset_z,
             );
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

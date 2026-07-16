@@ -155,7 +155,7 @@ impl AppHandler for SkyboxDemo {
         // --- Camera ---
         let cam_node = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node)
+            .edit_node(cam_node)
             .set_position(0.0, 0.0, 3.5)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node);
@@ -191,7 +191,10 @@ impl AppHandler for SkyboxDemo {
         if !self.helmet_loaded {
             if let Some(prefab) = assets.prefabs.get(self.helmet_prefab) {
                 let node = scene.instantiate(prefab.as_ref());
-                scene.node(&node).set_scale(1.0).set_position(0.0, 0.0, 0.0);
+                scene
+                    .edit_node(node)
+                    .set_scale(1.0)
+                    .set_position(0.0, 0.0, 0.0);
                 self.helmet_loaded = true;
             } else if let Some(err) = assets.prefabs.get_error(self.helmet_prefab) {
                 eprintln!("Failed to load skybox demo helmet: {err}");
@@ -249,10 +252,10 @@ impl AppHandler for SkyboxDemo {
         }
 
         // --- Orbit camera ---
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node) {
+        let _ = scene.edit_node_transform(self.cam_node, |transform| {
             self.controls
-                .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
-        }
+                .update(transform, &engine.input, 45.0, frame.dt);
+        });
 
         // --- Title bar ---
         if let Some(fps) = self.fps_counter.update() {

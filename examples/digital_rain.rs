@@ -74,7 +74,7 @@ fn add_box_to_parent(
 ) -> NodeHandle {
     let node = scene.add_mesh_to_parent(Mesh::new(geometry, material), parent);
     scene
-        .node(&node)
+        .edit_node(node)
         .set_position_vec(position)
         .set_scale_xyz(scale.x, scale.y, scale.z)
         .set_shadows(cast_shadows, receive_shadows);
@@ -248,14 +248,14 @@ impl AppHandler for DigitalRainDemo {
 
         let floor = scene.add_mesh(Mesh::new(box_geo, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.12, 0.0)
             .set_scale_xyz(14.0, 0.24, 12.0)
             .set_shadows(false, true);
 
         let panel_root = scene.create_node_with_name("DigitalRainPanels");
         scene.push_root_node(panel_root);
-        scene.node(&panel_root).set_position(0.0, 2.1, -0.5);
+        scene.edit_node(panel_root).set_position(0.0, 2.1, -0.5);
 
         for &(x, z, yaw, width, height) in &[
             (0.0, 0.0, 0.0, 3.0, 4.8),
@@ -264,7 +264,7 @@ impl AppHandler for DigitalRainDemo {
         ] {
             let panel = scene.add_mesh_to_parent(Mesh::new(plane_geo, screen_material), panel_root);
             scene
-                .node(&panel)
+                .edit_node(panel)
                 .set_position(x, 0.0, z)
                 .set_rotation(Quat::from_rotation_y(yaw))
                 .set_scale_xyz(width, height, 1.0)
@@ -296,26 +296,26 @@ impl AppHandler for DigitalRainDemo {
         for &(x, z) in &[(-4.5, 1.6), (4.5, 1.6), (-4.5, -2.4), (4.5, -2.4)] {
             let pillar = scene.spawn_box(0.35, 4.6, 0.35, frame_material, &engine.assets);
             scene
-                .node(&pillar)
+                .edit_node(pillar)
                 .set_position(x, 2.3, z)
                 .set_shadows(true, true);
 
             let band = scene.spawn_box(0.55, 0.12, 0.55, neon_material, &engine.assets);
             scene
-                .node(&band)
+                .edit_node(band)
                 .set_position(x, 1.4, z)
                 .set_cast_shadows(false)
                 .set_receive_shadows(false);
         }
 
         let left_light = scene.add_light(Light::new_point(Vec3::new(0.18, 1.0, 0.45), 1.8, 18.0));
-        scene.node(&left_light).set_position(-2.8, 2.2, 2.5);
+        scene.edit_node(left_light).set_position(-2.8, 2.2, 2.5);
         let right_light = scene.add_light(Light::new_point(Vec3::new(0.18, 1.0, 0.45), 1.8, 18.0));
-        scene.node(&right_light).set_position(2.8, 2.2, 2.5);
+        scene.edit_node(right_light).set_position(2.8, 2.2, 2.5);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 2.1, 8.2)
             .look_at(Vec3::new(0.0, 2.0, -0.2));
         scene.active_camera = Some(cam);
@@ -373,17 +373,19 @@ impl AppHandler for DigitalRainDemo {
             return;
         };
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
-        scene.node(&self.panel_root).set_rotation(Quat::from_euler(
-            EulerRot::XYZ,
-            0.0,
-            (self.phase as f32 * 0.01).sin() * 0.04,
-            0.0,
-        ));
+        scene
+            .edit_node(self.panel_root)
+            .set_rotation(Quat::from_euler(
+                EulerRot::XYZ,
+                0.0,
+                (self.phase as f32 * 0.01).sin() * 0.04,
+                0.0,
+            ));
 
         if let Some(fps) = self.fps_counter.update() {
             let mode = if glitch { "GLITCH" } else { "Flow" };

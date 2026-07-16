@@ -41,7 +41,7 @@ fn main() {
         0.1,
     ));
     scene
-        .node(&cam)
+        .edit_node(cam)
         .set_position(0.0, 3.0, 8.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(cam);
@@ -49,7 +49,7 @@ fn main() {
     // Directional light
     let light = scene.add_light(Light::new_directional(Vec3::ONE, 5.0));
     scene
-        .node(&light)
+        .edit_node(light)
         .set_position(5.0, 10.0, 5.0)
         .look_at(Vec3::ZERO);
 

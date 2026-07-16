@@ -22,6 +22,48 @@ use crate::camera::Camera;
 use crate::node::Node;
 use myth_core::NodeHandle;
 
+/// Work performed by one transform-system update.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransformUpdateStats {
+    pub visited_nodes: usize,
+    pub updated_world_matrices: usize,
+    pub changed_world_matrices: usize,
+    pub settled_previous_matrices: usize,
+    /// Exact dirty candidates considered by the retained root coalescer.
+    pub dirty_roots_examined: usize,
+    /// Parent links followed while reducing dirty candidates to disjoint roots.
+    pub dirty_root_parent_links_examined: usize,
+    pub untracked_hierarchy_mutations: usize,
+    pub full_traversal: bool,
+    pub retained_bytes: usize,
+}
+
+impl TransformUpdateStats {
+    #[inline]
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.visited_nodes = self.visited_nodes.saturating_add(other.visited_nodes);
+        self.updated_world_matrices = self
+            .updated_world_matrices
+            .saturating_add(other.updated_world_matrices);
+        self.changed_world_matrices = self
+            .changed_world_matrices
+            .saturating_add(other.changed_world_matrices);
+        self.settled_previous_matrices = self
+            .settled_previous_matrices
+            .saturating_add(other.settled_previous_matrices);
+        self.dirty_roots_examined = self
+            .dirty_roots_examined
+            .saturating_add(other.dirty_roots_examined);
+        self.dirty_root_parent_links_examined = self
+            .dirty_root_parent_links_examined
+            .saturating_add(other.dirty_root_parent_links_examined);
+        self.untracked_hierarchy_mutations = self
+            .untracked_hierarchy_mutations
+            .saturating_add(other.untracked_hierarchy_mutations);
+        self.full_traversal |= other.full_traversal;
+    }
+}
+
 /// Level-order batch information for parallelization.
 #[derive(Debug, Default)]
 pub struct LevelOrderBatches {
@@ -187,19 +229,44 @@ pub fn update_hierarchy_iterative(
     nodes: &mut SlotMap<NodeHandle, Node>,
     cameras: &mut SparseSecondaryMap<NodeHandle, Camera>,
     roots: &[NodeHandle],
-) {
+) -> TransformUpdateStats {
     let mut stack: Vec<(NodeHandle, Affine3A, bool)> = Vec::with_capacity(64);
+
+    update_hierarchy_iterative_with_scratch(nodes, cameras, roots, &mut stack)
+}
+
+pub(crate) fn update_hierarchy_iterative_with_scratch(
+    nodes: &mut SlotMap<NodeHandle, Node>,
+    cameras: &mut SparseSecondaryMap<NodeHandle, Camera>,
+    roots: &[NodeHandle],
+    stack: &mut Vec<(NodeHandle, Affine3A, bool)>,
+) -> TransformUpdateStats {
+    stack.clear();
 
     for &root_handle in roots.iter().rev() {
         stack.push((root_handle, Affine3A::IDENTITY, false));
     }
 
+    update_from_stack(nodes, cameras, stack)
+}
+
+fn update_from_stack(
+    nodes: &mut SlotMap<NodeHandle, Node>,
+    cameras: &mut SparseSecondaryMap<NodeHandle, Camera>,
+    stack: &mut Vec<(NodeHandle, Affine3A, bool)>,
+) -> TransformUpdateStats {
+    let mut stats = TransformUpdateStats::default();
     while let Some((node_handle, parent_world_matrix, parent_changed)) = stack.pop() {
+        stats.visited_nodes += 1;
         // --- Phase 1: Mutable borrow, handle update logic ---
         let (current_world, world_needs_update) = {
             let Some(node) = nodes.get_mut(node_handle) else {
                 continue;
             };
+
+            if node.take_untracked_hierarchy_mutation() {
+                stats.untracked_hierarchy_mutations += 1;
+            }
 
             node.transform.previous_world_matrix = node.transform.world_matrix;
 
@@ -207,7 +274,11 @@ pub fn update_hierarchy_iterative(
             let world_needs_update = local_changed || parent_changed;
 
             if world_needs_update {
+                stats.updated_world_matrices += 1;
                 let new_world = parent_world_matrix * *node.transform.local_matrix();
+                if new_world != node.transform.world_matrix {
+                    stats.changed_world_matrices += 1;
+                }
                 node.transform.set_world_matrix(new_world);
 
                 if let Some(camera) = cameras.get_mut(node_handle) {
@@ -228,6 +299,73 @@ pub fn update_hierarchy_iterative(
             }
         }
     }
+    stats
+}
+
+/// Updates a coalesced set of dirty roots and all of their descendants.
+pub fn update_subtrees_iterative(
+    nodes: &mut SlotMap<NodeHandle, Node>,
+    cameras: &mut SparseSecondaryMap<NodeHandle, Camera>,
+    roots: &[NodeHandle],
+) -> TransformUpdateStats {
+    let mut stack = Vec::with_capacity(64.max(roots.len()));
+    update_subtrees_iterative_with_scratch(nodes, cameras, roots, &mut stack)
+}
+
+pub(crate) fn update_subtrees_iterative_with_scratch(
+    nodes: &mut SlotMap<NodeHandle, Node>,
+    cameras: &mut SparseSecondaryMap<NodeHandle, Camera>,
+    roots: &[NodeHandle],
+    stack: &mut Vec<(NodeHandle, Affine3A, bool)>,
+) -> TransformUpdateStats {
+    stack.clear();
+    for &root_handle in roots.iter().rev() {
+        let parent_world = nodes
+            .get(root_handle)
+            .and_then(|node| node.parent)
+            .and_then(|parent| nodes.get(parent))
+            .map_or(Affine3A::IDENTITY, |parent| parent.transform.world_matrix);
+        stack.push((root_handle, parent_world, false));
+    }
+    update_from_stack(nodes, cameras, stack)
+}
+
+/// Latches current world matrices into the legacy previous-world cache for a
+/// coalesced set of roots without recomputing world transforms.
+pub fn settle_previous_subtrees(
+    nodes: &mut SlotMap<NodeHandle, Node>,
+    roots: &[NodeHandle],
+) -> TransformUpdateStats {
+    let mut stack = Vec::with_capacity(64.max(roots.len()));
+    settle_previous_subtrees_with_scratch(nodes, roots, &mut stack)
+}
+
+pub(crate) fn settle_previous_subtrees_with_scratch(
+    nodes: &mut SlotMap<NodeHandle, Node>,
+    roots: &[NodeHandle],
+    stack: &mut Vec<NodeHandle>,
+) -> TransformUpdateStats {
+    stack.clear();
+    stack.extend(roots.iter().rev().copied());
+    let mut stats = TransformUpdateStats::default();
+
+    while let Some(handle) = stack.pop() {
+        {
+            let Some(node) = nodes.get_mut(handle) else {
+                continue;
+            };
+            stats.visited_nodes += 1;
+            if node.transform.previous_world_matrix != node.transform.world_matrix {
+                node.transform.previous_world_matrix = node.transform.world_matrix;
+                stats.settled_previous_matrices += 1;
+            }
+        }
+        if let Some(node) = nodes.get(handle) {
+            stack.extend(node.children.iter().rev().copied());
+        }
+    }
+
+    stats
 }
 
 /// Recursively updates a single node and its subtree (original recursive version kept for reference)
@@ -294,21 +432,8 @@ pub fn update_subtree(
     nodes: &mut SlotMap<NodeHandle, Node>,
     cameras: &mut SparseSecondaryMap<NodeHandle, Camera>,
     root_handle: NodeHandle,
-) {
-    // Get parent node's world matrix (if exists)
-    let parent_world = if let Some(node) = nodes.get(root_handle) {
-        if let Some(parent_handle) = node.parent {
-            nodes
-                .get(parent_handle)
-                .map_or(Affine3A::IDENTITY, |p| p.transform.world_matrix)
-        } else {
-            Affine3A::IDENTITY
-        }
-    } else {
-        return;
-    };
-
-    update_transform_recursive(nodes, cameras, root_handle, parent_world, true);
+) -> TransformUpdateStats {
+    update_subtrees_iterative(nodes, cameras, &[root_handle])
 }
 
 #[cfg(test)]

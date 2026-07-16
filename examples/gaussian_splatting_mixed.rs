@@ -60,33 +60,33 @@ impl AppHandler for GaussianSplattingMixedDemo {
 
         let floor = scene.add_mesh(Mesh::new(box_geometry, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.55, 0.0)
             .set_scale_xyz(14.0, 0.25, 14.0);
 
         let left_pedestal = scene.add_mesh(Mesh::new(box_geometry, pedestal_material));
         scene
-            .node(&left_pedestal)
+            .edit_node(left_pedestal)
             .set_position(-2.45, 0.45, 1.10)
             .set_scale_xyz(0.95, 0.90, 0.95)
             .set_rotation_euler(0.0, 0.45, 0.0);
 
         let right_pedestal = scene.add_mesh(Mesh::new(box_geometry, accent_material));
         scene
-            .node(&right_pedestal)
+            .edit_node(right_pedestal)
             .set_position(2.15, 0.72, -1.35)
             .set_scale_xyz(0.85, 1.45, 0.85)
             .set_rotation_euler(0.0, -0.35, 0.0);
 
         let rear_stage = scene.add_mesh(Mesh::new(box_geometry, pedestal_material));
         scene
-            .node(&rear_stage)
+            .edit_node(rear_stage)
             .set_position(0.0, -0.05, -2.85)
             .set_scale_xyz(2.40, 0.35, 0.95);
 
         let animated_orb = scene.add_mesh(Mesh::new(sphere_geometry, orb_material));
         scene
-            .node(&animated_orb)
+            .edit_node(animated_orb)
             .set_position(0.0, 0.95, 2.10)
             .set_scale_xyz(0.28, 0.28, 0.28);
 
@@ -96,7 +96,7 @@ impl AppHandler for GaussianSplattingMixedDemo {
             .assets
             .load_gaussian_npz(format!("{}3dgs/point_cloud.npz", ASSET_PATH));
         let cloud_node = scene.add_gaussian_cloud("gaussian_cloud", cloud_handle);
-        scene.node(&cloud_node).set_rotation_euler(
+        scene.edit_node(cloud_node).set_rotation_euler(
             std::f32::consts::FRAC_PI_2,
             0.0,
             std::f32::consts::FRAC_PI_2,
@@ -106,7 +106,7 @@ impl AppHandler for GaussianSplattingMixedDemo {
         let camera_target = Vec3::new(0.0, 0.55, 0.0);
         let camera = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(camera_position.x, camera_position.y, camera_position.z)
             .look_at(camera_target);
         scene.active_camera = Some(camera);
@@ -137,7 +137,7 @@ impl AppHandler for GaussianSplattingMixedDemo {
         };
 
         for prop in &self.rotating_props {
-            if let Some(node) = scene.get_node_mut(prop.handle) {
+            if let Some(node) = scene.node_mut(prop.handle) {
                 node.transform.rotation *= Quat::from_rotation_y(prop.angular_speed * frame.dt);
             }
         }
@@ -151,15 +151,15 @@ impl AppHandler for GaussianSplattingMixedDemo {
             orbit_radius * orbit_angle.sin(),
         );
 
-        if let Some(node) = scene.get_node_mut(self.animated_orb) {
+        if let Some(node) = scene.node_mut(self.animated_orb) {
             node.transform.position = orb_position;
             node.transform.scale = Vec3::splat(0.26 + 0.04 * (self.time * 3.0).sin().abs());
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("3DGS Mesh Occlusion | FPS: {:.2}", fps));

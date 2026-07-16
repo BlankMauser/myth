@@ -35,12 +35,12 @@ let _cube = scene.spawn_box(2.0, 2.0, 2.0, UnlitMaterial::new(Vec4::ONE).with_ma
 
 // Camera
 let cam = scene.add_camera(Camera::new_perspective(45.0, width as f32 / height as f32, 0.1));
-scene.node(&cam).set_position(0.0, 3.0, 8.0).look_at(Vec3::ZERO);
+scene.edit_node(cam).set_position(0.0, 3.0, 8.0).look_at(Vec3::ZERO);
 scene.active_camera = Some(cam);
 
 // Directional light
 let light = scene.add_light(Light::new_directional(Vec3::ONE, 5.0));
-scene.node(&light).set_position(5.0, 10.0, 5.0).look_at(Vec3::ZERO);
+scene.edit_node(light).set_position(5.0, 10.0, 5.0).look_at(Vec3::ZERO);
 ```
 
 ## 3. Render and Read Back Pixels

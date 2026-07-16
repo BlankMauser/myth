@@ -546,7 +546,7 @@ impl GaussianSplattingFeature {
         let mut ordered_plans = Vec::new();
 
         for (node_handle, cloud_handle) in &scene.gaussian_clouds {
-            let Some(node) = scene.get_node(node_handle) else {
+            let Some(node) = scene.node(node_handle) else {
                 continue;
             };
             if !node.visible {

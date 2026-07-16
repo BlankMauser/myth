@@ -64,7 +64,7 @@ impl PrimitiveSpawnShowcase {
         };
 
         scene
-            .node(&self.camera_node)
+            .edit_node(self.camera_node)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         self.controls.set_target(target);
@@ -153,14 +153,14 @@ impl AppHandler for PrimitiveSpawnShowcase {
 
         let floor = scene.spawn_plane(18.0, 12.0, floor_material, &engine.assets);
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.02, 0.0)
             .set_shadows(false, true);
 
         let back_wall = scene.spawn_plane(15.0, 5.4, wall_material, &engine.assets);
         scene
-            .node(&back_wall)
+            .edit_node(back_wall)
             .set_position(0.0, 2.4, -6.2)
             .set_shadows(false, false);
 
@@ -168,12 +168,12 @@ impl AppHandler for PrimitiveSpawnShowcase {
 
         let box_pedestal = scene.spawn_box(1.75, 0.60, 1.75, pedestal_material, &engine.assets);
         scene
-            .node(&box_pedestal)
+            .edit_node(box_pedestal)
             .set_position(-4.2, 0.30, -1.9)
             .set_shadows(true, true);
         let box_node = scene.spawn_box(1.35, 1.35, 1.35, primitive_materials[0], &engine.assets);
         scene
-            .node(&box_node)
+            .edit_node(box_node)
             .set_position(-4.2, 1.28, -1.9)
             .set_rotation(Quat::from_rotation_y(0.32))
             .set_shadows(true, true);
@@ -186,12 +186,12 @@ impl AppHandler for PrimitiveSpawnShowcase {
 
         let sphere_pedestal = scene.spawn_box(1.75, 0.60, 1.75, pedestal_material, &engine.assets);
         scene
-            .node(&sphere_pedestal)
+            .edit_node(sphere_pedestal)
             .set_position(0.0, 0.30, -1.9)
             .set_shadows(true, true);
         let sphere_node = scene.spawn_sphere(0.84, primitive_materials[1], &engine.assets);
         scene
-            .node(&sphere_node)
+            .edit_node(sphere_node)
             .set_position(0.0, 1.44, -1.9)
             .set_shadows(true, true);
         stations.push(PrimitiveStation {
@@ -204,13 +204,13 @@ impl AppHandler for PrimitiveSpawnShowcase {
         let cylinder_pedestal =
             scene.spawn_box(1.75, 0.60, 1.75, pedestal_material, &engine.assets);
         scene
-            .node(&cylinder_pedestal)
+            .edit_node(cylinder_pedestal)
             .set_position(4.2, 0.30, -1.9)
             .set_shadows(true, true);
         let cylinder_node =
             scene.spawn_cylinder(0.70, 1.95, primitive_materials[2], &engine.assets);
         scene
-            .node(&cylinder_node)
+            .edit_node(cylinder_node)
             .set_position(4.2, 1.58, -1.9)
             .set_rotation(Quat::from_rotation_y(0.22))
             .set_shadows(true, true);
@@ -223,12 +223,12 @@ impl AppHandler for PrimitiveSpawnShowcase {
 
         let plane_pedestal = scene.spawn_box(1.75, 0.60, 1.75, pedestal_material, &engine.assets);
         scene
-            .node(&plane_pedestal)
+            .edit_node(plane_pedestal)
             .set_position(-4.2, 0.30, 2.3)
             .set_shadows(true, true);
         let plane_node = scene.spawn_plane(1.85, 1.85, primitive_materials[3], &engine.assets);
         scene
-            .node(&plane_node)
+            .edit_node(plane_node)
             .set_position(-4.2, 1.46, 2.3)
             .set_rotation(Quat::from_euler(EulerRot::XYZ, -0.30, 0.42, 0.0))
             .set_shadows(true, true);
@@ -241,12 +241,12 @@ impl AppHandler for PrimitiveSpawnShowcase {
 
         let cone_pedestal = scene.spawn_box(1.75, 0.60, 1.75, pedestal_material, &engine.assets);
         scene
-            .node(&cone_pedestal)
+            .edit_node(cone_pedestal)
             .set_position(0.0, 0.30, 2.3)
             .set_shadows(true, true);
         let cone_node = scene.spawn_cone(0.92, 1.95, primitive_materials[4], &engine.assets);
         scene
-            .node(&cone_node)
+            .edit_node(cone_node)
             .set_position(0.0, 1.58, 2.3)
             .set_rotation(Quat::from_rotation_y(0.28))
             .set_shadows(true, true);
@@ -259,12 +259,12 @@ impl AppHandler for PrimitiveSpawnShowcase {
 
         let torus_pedestal = scene.spawn_box(1.75, 0.60, 1.75, pedestal_material, &engine.assets);
         scene
-            .node(&torus_pedestal)
+            .edit_node(torus_pedestal)
             .set_position(4.2, 0.30, 2.3)
             .set_shadows(true, true);
         let torus_node = scene.spawn_torus(0.92, 0.28, primitive_materials[5], &engine.assets);
         scene
-            .node(&torus_node)
+            .edit_node(torus_node)
             .set_position(4.2, 1.52, 2.3)
             .set_rotation(Quat::from_euler(EulerRot::XYZ, 0.58, 0.22, 0.0))
             .set_shadows(true, true);
@@ -283,20 +283,20 @@ impl AppHandler for PrimitiveSpawnShowcase {
         }
         let key_light = scene.add_light(key_light);
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_position(8.5, 11.5, 7.0)
             .look_at(Vec3::new(0.0, 1.2, 0.0));
 
         let fill_light = scene.add_light(Light::new_point(Vec3::new(0.28, 0.86, 1.0), 1.0, 18.0));
-        scene.node(&fill_light).set_position(-6.6, 3.0, 4.2);
+        scene.edit_node(fill_light).set_position(-6.6, 3.0, 4.2);
 
         let rim_light = scene.add_light(Light::new_point(Vec3::new(1.0, 0.58, 0.24), 1.1, 20.0));
-        scene.node(&rim_light).set_position(6.8, 3.6, -2.8);
+        scene.edit_node(rim_light).set_position(6.8, 3.6, -2.8);
 
         let (camera_pos, target) = Self::overview_camera();
         let camera_node = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera_node)
+            .edit_node(camera_node)
             .set_position(camera_pos.x, camera_pos.y, camera_pos.z)
             .look_at(target);
         scene.active_camera = Some(camera_node);
@@ -350,16 +350,16 @@ impl AppHandler for PrimitiveSpawnShowcase {
 
         if self.auto_spin {
             for station in &self.stations {
-                if let Some(node) = scene.get_node_mut(station.object) {
+                if let Some(node) = scene.node_mut(station.object) {
                     node.transform.rotation *= Quat::from_rotation_y(frame.dt * station.spin_speed);
                 }
             }
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!(

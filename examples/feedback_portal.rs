@@ -26,7 +26,7 @@ fn add_box_to_parent(
 ) -> NodeHandle {
     let node = scene.add_mesh_to_parent(Mesh::new(geometry, material), parent);
     scene
-        .node(&node)
+        .edit_node(node)
         .set_position_vec(position)
         .set_scale_xyz(scale.x, scale.y, scale.z)
         .set_shadows(cast_shadows, receive_shadows);
@@ -208,18 +208,18 @@ impl AppHandler for FeedbackPortalDemo {
 
         let floor = scene.add_mesh(Mesh::new(box_geo, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.12, 0.0)
             .set_scale_xyz(16.0, 0.24, 12.0)
             .set_shadows(false, true);
 
         let ring_root = scene.create_node_with_name("FeedbackPortal");
         scene.push_root_node(ring_root);
-        scene.node(&ring_root).set_position(0.0, 2.1, -0.2);
+        scene.edit_node(ring_root).set_position(0.0, 2.1, -0.2);
 
         let portal = scene.add_mesh_to_parent(Mesh::new(plane_geo, portal_material), ring_root);
         scene
-            .node(&portal)
+            .edit_node(portal)
             .set_scale_xyz(4.8, 4.8, 1.0)
             .set_cast_shadows(false)
             .set_receive_shadows(false);
@@ -230,7 +230,7 @@ impl AppHandler for FeedbackPortalDemo {
             let segment_handle =
                 scene.add_mesh_to_parent(Mesh::new(box_geo, neon_material), ring_root);
             scene
-                .node(&segment_handle)
+                .edit_node(segment_handle)
                 .set_position_vec(radial * 2.9)
                 .set_rotation(Quat::from_rotation_z(angle + std::f32::consts::FRAC_PI_2))
                 .set_scale_xyz(0.18, 0.72, 0.22)
@@ -260,13 +260,13 @@ impl AppHandler for FeedbackPortalDemo {
         );
 
         let left_light = scene.add_light(Light::new_point(Vec3::new(0.4, 0.95, 1.0), 1.5, 22.0));
-        scene.node(&left_light).set_position(-3.0, 2.6, 2.4);
+        scene.edit_node(left_light).set_position(-3.0, 2.6, 2.4);
         let right_light = scene.add_light(Light::new_point(Vec3::new(1.0, 0.35, 0.9), 1.3, 22.0));
-        scene.node(&right_light).set_position(3.0, 1.8, 2.8);
+        scene.edit_node(right_light).set_position(3.0, 1.8, 2.8);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 2.1, 8.2)
             .look_at(Vec3::new(0.0, 2.1, -0.2));
         scene.active_camera = Some(cam);
@@ -310,13 +310,13 @@ impl AppHandler for FeedbackPortalDemo {
             return;
         };
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         scene
-            .node(&self.ring_root)
+            .edit_node(self.ring_root)
             .set_rotation(Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, self.phase * 0.16))
             .set_scale(1.0 + self.phase.sin() * 0.03);
 

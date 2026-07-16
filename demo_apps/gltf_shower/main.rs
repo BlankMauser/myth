@@ -65,7 +65,7 @@ impl AppHandler for ShowcaseApp {
         // 2. Add directional light (auxiliary lighting)
         let light = Light::new_directional(Vec3::new(1.0, 1.0, 1.0), 3.0);
         let light_node = scene.add_light(light);
-        if let Some(node) = scene.get_node_mut(light_node) {
+        if let Some(node) = scene.node_mut(light_node) {
             node.transform.position = Vec3::new(5.0, 10.0, 5.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -79,7 +79,7 @@ impl AppHandler for ShowcaseApp {
         }
         let cam_node_id = scene.add_camera(camera);
 
-        if let Some(node) = scene.get_node_mut(cam_node_id) {
+        if let Some(node) = scene.node_mut(cam_node_id) {
             node.transform.position = Vec3::new(0.0, 0.0, 5.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -136,7 +136,7 @@ impl AppHandler for ShowcaseApp {
         }
 
         // --- 3. Update controls ---
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node_id) {
+        if let Some(cam_node) = scene.node_mut(self.cam_node_id) {
             self.controls
                 .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
         }
@@ -169,7 +169,7 @@ impl ShowcaseApp {
         }
 
         // 4. Calculate bounding box and focus camera
-        if let Some(bbox) = scene.get_bbox_of_node(root_node, assets) {
+        if let Some(bbox) = scene.subtree_world_bounds(root_node, assets) {
             let center = bbox.center();
             let radius = bbox.size().length() * 0.5;
 
@@ -179,9 +179,9 @@ impl ShowcaseApp {
             self.controls
                 .set_position(center + Vec3::new(0.0, radius, radius * 2.5));
 
-            if let Some((_, camera)) = scene.query_main_camera_bundle() {
+            let _ = scene.edit_main_camera_bundle(|_, camera| {
                 camera.set_near(radius * 0.01);
-            }
+            });
         }
     }
 }

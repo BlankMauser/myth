@@ -39,7 +39,7 @@ impl AppHandler for HelmetGltf {
 
         let cam_node_id = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 0.0, 3.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node_id);
@@ -70,10 +70,10 @@ impl AppHandler for HelmetGltf {
             }
         }
 
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node_id) {
+        let _ = scene.edit_node_transform(self.cam_node_id, |transform| {
             self.controls
-                .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
-        }
+                .update(transform, &engine.input, 45.0, frame.dt);
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("glTF PBR Demo - FPS: {:.0}", fps));

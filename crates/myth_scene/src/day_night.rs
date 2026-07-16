@@ -180,19 +180,19 @@ impl DayNightCycle {
             return;
         };
 
-        if let Some((light, node)) = scene.get_light_bundle(handle) {
-            node.transform.position = direction_to_body * distance.max(0.001);
+        scene.edit_light_bundle(handle, |transform, light| {
+            transform.position = direction_to_body * distance.max(0.001);
             let up = if direction_to_body.y.abs() > 0.999 {
                 Vec3::Z
             } else {
                 Vec3::Y
             };
-            node.transform.look_at(Vec3::ZERO, up);
+            transform.look_at(Vec3::ZERO, up);
             light.intensity = intensity.max(0.0);
             light.flags &= !(LIGHT_FLAG_IS_SUN | LIGHT_FLAG_IS_MOON);
             light.flags |= celestial_flag;
             light.cast_shadows = light.intensity > 0.001;
-        }
+        });
     }
 }
 
@@ -309,18 +309,19 @@ mod tests {
         assert!(params.moon_direction.length_squared() > 0.99);
 
         let (sun_position_len, sun_intensity, sun_flags, sun_cast_shadows) = {
-            let (sun_light, sun_node) = scene.get_light_bundle(sun).expect("sun light missing");
+            let (sun_transform, sun_light) = scene.light_bundle(sun).expect("sun light missing");
             (
-                sun_node.transform.position.length(),
+                sun_transform.position.length(),
                 sun_light.intensity,
                 sun_light.flags,
                 sun_light.cast_shadows,
             )
         };
         let (moon_position_len, moon_intensity, moon_flags, moon_cast_shadows) = {
-            let (moon_light, moon_node) = scene.get_light_bundle(moon).expect("moon light missing");
+            let (moon_transform, moon_light) =
+                scene.light_bundle(moon).expect("moon light missing");
             (
-                moon_node.transform.position.length(),
+                moon_transform.position.length(),
                 moon_light.intensity,
                 moon_light.flags,
                 moon_light.cast_shadows,

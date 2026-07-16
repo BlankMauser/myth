@@ -73,7 +73,7 @@ impl AppHandler for CubeWaveDemo {
 
         let floor = scene.add_mesh(Mesh::new(box_geo, floor_material));
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_position(0.0, -0.15, 0.0)
             .set_scale_xyz(24.0, 0.30, 24.0)
             .set_shadows(false, true);
@@ -88,7 +88,7 @@ impl AppHandler for CubeWaveDemo {
 
                 let cube = scene.add_mesh(Mesh::new(box_geo, palette[material_index]));
                 scene
-                    .node(&cube)
+                    .edit_node(cube)
                     .set_position(base.x, 0.35, base.y)
                     .set_scale_xyz(0.72, 0.72, 0.72)
                     .set_shadows(true, true);
@@ -109,23 +109,23 @@ impl AppHandler for CubeWaveDemo {
         }
         let sun = scene.add_light(sun);
         scene
-            .node(&sun)
+            .edit_node(sun)
             .set_position(10.0, 12.0, 5.0)
             .look_at(Vec3::new(0.0, 1.0, 0.0));
 
         let orbit_light = scene.add_light(Light::new_point(Vec3::new(0.32, 0.82, 1.0), 1.4, 30.0));
-        scene.node(&orbit_light).set_position(0.0, 4.5, 6.0);
+        scene.edit_node(orbit_light).set_position(0.0, 4.5, 6.0);
         let light_helper =
             scene.add_mesh_to_parent(Mesh::new(sphere_geo, helper_material), orbit_light);
         scene
-            .node(&light_helper)
+            .edit_node(light_helper)
             .set_scale(0.15)
             .set_cast_shadows(false)
             .set_receive_shadows(false);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(10.0, 10.0, 10.0)
             .look_at(Vec3::new(0.0, 1.0, 0.0));
         scene.active_camera = Some(cam);
@@ -156,7 +156,7 @@ impl AppHandler for CubeWaveDemo {
             let twist = 0.12 * (self.time * 0.9 + cell.phase).sin();
 
             scene
-                .node(&cell.handle)
+                .edit_node(cell.handle)
                 .set_position(cell.base.x, height * 0.5, cell.base.y)
                 .set_scale_xyz(0.74, height, 0.74)
                 .set_rotation(Quat::from_euler(
@@ -167,7 +167,7 @@ impl AppHandler for CubeWaveDemo {
                 ));
         }
 
-        if let Some(node) = scene.get_node_mut(self.orbit_light) {
+        if let Some(node) = scene.node_mut(self.orbit_light) {
             let orbit = self.time * 0.75;
             node.transform.position = Vec3::new(
                 6.0 * orbit.cos(),
@@ -176,10 +176,10 @@ impl AppHandler for CubeWaveDemo {
             );
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Cube Wave | FPS: {:.1}", fps));

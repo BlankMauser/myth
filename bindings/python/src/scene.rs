@@ -111,7 +111,7 @@ impl PyScene {
                 let mut cam = Camera::new_perspective(persp.fov, aspect, persp.near);
                 cam.set_aa_mode(persp.anti_aliasing.mode);
                 let h = scene.add_camera(cam);
-                if let Some(node) = scene.get_node_mut(h) {
+                if let Some(node) = scene.node_mut(h) {
                     node.transform.position =
                         Vec3::new(persp.position[0], persp.position[1], persp.position[2]);
                 }
@@ -127,7 +127,7 @@ impl PyScene {
                 let mut cam = Camera::new_orthographic(ortho.size, aspect, ortho.near, ortho.far);
                 cam.set_aa_mode(ortho.anti_aliasing.mode);
                 let h = scene.add_camera(cam);
-                if let Some(node) = scene.get_node_mut(h) {
+                if let Some(node) = scene.node_mut(h) {
                     node.transform.position =
                         Vec3::new(ortho.position[0], ortho.position[1], ortho.position[2]);
                 }
@@ -595,7 +595,7 @@ impl PyObject3D {
     fn get_position(&self) -> PyResult<[f32; 3]> {
         let result = with_active_scene(|scene| {
             scene
-                .get_node(self.handle)
+                .node(self.handle)
                 .map(|n| n.transform.position.to_array())
                 .unwrap_or([0.0; 3])
         })?;
@@ -605,7 +605,7 @@ impl PyObject3D {
     #[setter]
     fn set_position(&self, pos: [f32; 3]) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.position = Vec3::new(pos[0], pos[1], pos[2]);
             }
         })?;
@@ -620,7 +620,7 @@ impl PyObject3D {
     fn get_rotation(&self) -> PyResult<[f32; 3]> {
         let result = with_active_scene(|scene| {
             scene
-                .get_node(self.handle)
+                .node(self.handle)
                 .map(|n| {
                     let (x, y, z) = n
                         .transform
@@ -636,7 +636,7 @@ impl PyObject3D {
     #[setter]
     fn set_rotation(&self, rot: [f32; 3]) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.rotation =
                     Quat::from_euler(myth_engine::math::EulerRot::XYZ, rot[0], rot[1], rot[2]);
             }
@@ -652,7 +652,7 @@ impl PyObject3D {
     fn get_scale(&self) -> PyResult<[f32; 3]> {
         let result = with_active_scene(|scene| {
             scene
-                .get_node(self.handle)
+                .node(self.handle)
                 .map(|n| n.transform.scale.to_array())
                 .unwrap_or([1.0; 3])
         })?;
@@ -662,7 +662,7 @@ impl PyObject3D {
     #[setter]
     fn set_scale(&self, s: [f32; 3]) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.scale = Vec3::new(s[0], s[1], s[2]);
             }
         })?;
@@ -698,7 +698,7 @@ impl PyObject3D {
     /// Rotate around the local X axis by `angle` radians.
     fn rotate_x(&self, angle: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.rotation *= Quat::from_rotation_x(angle);
             }
         })?;
@@ -708,7 +708,7 @@ impl PyObject3D {
     /// Rotate around the local Y axis by `angle` radians.
     fn rotate_y(&self, angle: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.rotation *= Quat::from_rotation_y(angle);
             }
         })?;
@@ -718,7 +718,7 @@ impl PyObject3D {
     /// Rotate around the local Z axis by `angle` radians.
     fn rotate_z(&self, angle: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.rotation *= Quat::from_rotation_z(angle);
             }
         })?;
@@ -728,7 +728,7 @@ impl PyObject3D {
     /// Rotate around the **world** X axis by `angle` radians.
     fn rotate_world_x(&self, angle: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.rotation = Quat::from_rotation_x(angle) * node.transform.rotation;
             }
         })?;
@@ -738,7 +738,7 @@ impl PyObject3D {
     /// Rotate around the **world** Y axis by `angle` radians.
     fn rotate_world_y(&self, angle: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.rotation = Quat::from_rotation_y(angle) * node.transform.rotation;
             }
         })?;
@@ -748,7 +748,7 @@ impl PyObject3D {
     /// Rotate around the **world** Z axis by `angle` radians.
     fn rotate_world_z(&self, angle: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.rotation = Quat::from_rotation_z(angle) * node.transform.rotation;
             }
         })?;
@@ -762,7 +762,7 @@ impl PyObject3D {
     /// Set uniform scale (single float).
     fn set_uniform_scale(&self, s: f32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.transform.scale = Vec3::splat(s);
             }
         })?;
@@ -776,14 +776,14 @@ impl PyObject3D {
     #[getter]
     fn get_visible(&self) -> PyResult<bool> {
         let result =
-            with_active_scene(|scene| scene.get_node(self.handle).is_none_or(|n| n.visible))?;
+            with_active_scene(|scene| scene.node(self.handle).is_none_or(|n| n.visible))?;
         Ok(result)
     }
 
     #[setter]
     fn set_visible(&self, v: bool) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 node.visible = v;
             }
         })?;
@@ -843,7 +843,7 @@ impl PyObject3D {
     /// Rotate this node to look at a world-space target position.
     fn look_at(&self, target: [f32; 3]) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(node) = scene.get_node_mut(self.handle) {
+            if let Some(node) = scene.node_mut(self.handle) {
                 let pos = node.transform.position;
                 let tgt = Vec3::new(target[0], target[1], target[2]);
                 let dir = (tgt - pos).normalize_or_zero();
@@ -861,7 +861,7 @@ impl PyObject3D {
 
     #[getter]
     fn get_name(&self) -> PyResult<Option<String>> {
-        let result = with_active_scene(|scene| scene.get_name(self.handle).map(String::from))?;
+        let result = with_active_scene(|scene| scene.name(self.handle).map(String::from))?;
         Ok(result)
     }
 
@@ -908,7 +908,7 @@ impl PyObject3D {
     fn __repr__(&self) -> PyResult<String> {
         let name = with_active_scene(|scene| {
             scene
-                .get_name(self.handle)
+                .name(self.handle)
                 .map(String::from)
                 .unwrap_or_else(|| format!("{:?}", self.handle))
         })?;
@@ -987,7 +987,7 @@ impl PyMeshComponent {
     fn get_visible(&self) -> PyResult<bool> {
         with_active_scene(|scene| {
             scene
-                .get_mesh(self.handle)
+                .mesh(self.handle)
                 .map(|m| m.visible)
                 .unwrap_or(true)
         })
@@ -996,7 +996,7 @@ impl PyMeshComponent {
     #[setter]
     fn set_visible(&self, val: bool) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(mesh) = scene.get_mesh_mut(self.handle) {
+            if let Some(mesh) = scene.mesh_mut(self.handle) {
                 mesh.visible = val;
             }
         })
@@ -1006,7 +1006,7 @@ impl PyMeshComponent {
     fn get_cast_shadows(&self) -> PyResult<bool> {
         with_active_scene(|scene| {
             scene
-                .get_mesh(self.handle)
+                .mesh(self.handle)
                 .map(|m| m.cast_shadows)
                 .unwrap_or(true)
         })
@@ -1015,7 +1015,7 @@ impl PyMeshComponent {
     #[setter]
     fn set_cast_shadows(&self, val: bool) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(mesh) = scene.get_mesh_mut(self.handle) {
+            if let Some(mesh) = scene.mesh_mut(self.handle) {
                 mesh.cast_shadows = val;
             }
         })
@@ -1025,7 +1025,7 @@ impl PyMeshComponent {
     fn get_receive_shadows(&self) -> PyResult<bool> {
         with_active_scene(|scene| {
             scene
-                .get_mesh(self.handle)
+                .mesh(self.handle)
                 .map(|m| m.receive_shadows)
                 .unwrap_or(true)
         })
@@ -1034,7 +1034,7 @@ impl PyMeshComponent {
     #[setter]
     fn set_receive_shadows(&self, val: bool) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(mesh) = scene.get_mesh_mut(self.handle) {
+            if let Some(mesh) = scene.mesh_mut(self.handle) {
                 mesh.receive_shadows = val;
             }
         })
@@ -1044,7 +1044,7 @@ impl PyMeshComponent {
     fn get_render_order(&self) -> PyResult<i32> {
         with_active_scene(|scene| {
             scene
-                .get_mesh(self.handle)
+                .mesh(self.handle)
                 .map(|m| m.render_order)
                 .unwrap_or(0)
         })
@@ -1053,7 +1053,7 @@ impl PyMeshComponent {
     #[setter]
     fn set_render_order(&self, val: i32) -> PyResult<()> {
         with_active_scene(|scene| {
-            if let Some(mesh) = scene.get_mesh_mut(self.handle) {
+            if let Some(mesh) = scene.mesh_mut(self.handle) {
                 mesh.render_order = val;
             }
         })
@@ -1063,7 +1063,7 @@ impl PyMeshComponent {
     fn set_morph_target_influences(&self, influences: Vec<f32>) -> PyResult<()> {
         with_active_scene(|scene| {
             scene.set_morph_weights(self.handle, influences.clone());
-            if let Some(mesh) = scene.get_mesh_mut(self.handle) {
+            if let Some(mesh) = scene.mesh_mut(self.handle) {
                 mesh.set_morph_target_influences(&influences);
             }
         })
@@ -1073,11 +1073,11 @@ impl PyMeshComponent {
     fn get_morph_target_influences(&self) -> PyResult<Vec<f32>> {
         let result = with_active_scene(|scene| {
             scene
-                .get_morph_weights(self.handle)
-                .cloned()
+                .morph_weights(self.handle)
+                .map(<[f32]>::to_vec)
                 .or_else(|| {
                     scene
-                        .get_mesh(self.handle)
+                        .mesh(self.handle)
                         .map(|m| m.morph_target_influences().to_vec())
                 })
                 .unwrap_or_default()
@@ -1095,7 +1095,7 @@ pub(crate) fn get_mesh_component(
     py: Python<'_>,
     handle: NodeHandle,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let has_mesh = with_active_scene(|scene| scene.get_mesh(handle).is_some())?;
+    let has_mesh = with_active_scene(|scene| scene.mesh(handle).is_some())?;
     if has_mesh {
         Ok(Some(
             PyMeshComponent { handle }

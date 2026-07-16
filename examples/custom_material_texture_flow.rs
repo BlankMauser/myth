@@ -163,13 +163,13 @@ impl AppHandler for TextureFlowDemo {
             &engine.assets,
         );
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-FRAC_PI_2))
             .set_position(0.0, -0.15, 0.0);
 
         let light = scene.add_light(Light::new_directional(Vec3::new(0.95, 1.0, 1.0), 2.8));
         scene
-            .node(&light)
+            .edit_node(light)
             .set_position(5.0, 8.0, 6.0)
             .look_at(Vec3::new(0.0, 1.2, 0.0));
 
@@ -192,7 +192,7 @@ impl AppHandler for TextureFlowDemo {
             &engine.assets,
         );
         scene
-            .node(&panel_left)
+            .edit_node(panel_left)
             .set_position(-2.2, 1.9, 0.0)
             .set_rotation(Quat::from_rotation_y(0.38));
 
@@ -215,7 +215,7 @@ impl AppHandler for TextureFlowDemo {
             &engine.assets,
         );
         scene
-            .node(&panel_right)
+            .edit_node(panel_right)
             .set_position(2.2, 1.9, -0.3)
             .set_rotation(Quat::from_rotation_y(-0.42));
 
@@ -238,11 +238,11 @@ impl AppHandler for TextureFlowDemo {
             ),
             &engine.assets,
         );
-        scene.node(&center_box).set_position(0.0, 1.1, 0.0);
+        scene.edit_node(center_box).set_position(0.0, 1.1, 0.0);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.7, 8.2)
             .look_at(Vec3::new(0.0, 1.6, 0.0));
         scene.active_camera = Some(camera);
@@ -264,23 +264,23 @@ impl AppHandler for TextureFlowDemo {
         };
 
         scene
-            .node(&self.panel_left)
+            .edit_node(self.panel_left)
             .set_rotation(Quat::from_rotation_y(0.38 + (self.time * 0.8).sin() * 0.12));
 
         scene
-            .node(&self.panel_right)
+            .edit_node(self.panel_right)
             .set_rotation(Quat::from_rotation_y(
                 -0.42 + (self.time * 0.9).cos() * 0.14,
             ));
 
-        scene.node(&self.center_box).set_rotation(
+        scene.edit_node(self.center_box).set_rotation(
             Quat::from_rotation_y(self.time * 0.9) * Quat::from_rotation_x(self.time * 0.35),
         );
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

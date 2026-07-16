@@ -58,7 +58,7 @@ impl AppHandler for HelloTriangle {
         let camera = Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1);
         let cam_node_id = scene.add_camera(camera);
 
-        if let Some(node) = scene.get_node_mut(cam_node_id) {
+        if let Some(node) = scene.node_mut(cam_node_id) {
             node.transform.position = Vec3::new(0.0, 0.0, 3.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }

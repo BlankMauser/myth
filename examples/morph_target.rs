@@ -44,7 +44,7 @@ impl AppHandler for MorphTargetDemo {
 
         let camera = Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1);
         let cam_node_id = scene.add_camera(camera);
-        if let Some(node) = scene.get_node_mut(cam_node_id) {
+        if let Some(node) = scene.node_mut(cam_node_id) {
             node.transform.position = Vec3::new(0.0, 0.0, 4.0);
             node.transform.look_at(Vec3::ZERO, Vec3::Y);
         }
@@ -102,10 +102,10 @@ impl AppHandler for MorphTargetDemo {
             }
         }
 
-        if let Some(cam_node) = scene.get_node_mut(self.cam_node_id) {
+        let _ = scene.edit_node_transform(self.cam_node_id, |transform| {
             self.controls
-                .update(&mut cam_node.transform, &engine.input, 45.0, frame.dt);
-        }
+                .update(transform, &engine.input, 45.0, frame.dt);
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Morph Target Demo - FPS: {:.1}", fps));

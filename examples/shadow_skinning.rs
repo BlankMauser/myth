@@ -60,7 +60,7 @@ impl AppHandler for SkinningDemo {
         }
         let light_node = scene.add_light(dir_light);
         scene
-            .node(&light_node)
+            .edit_node(light_node)
             .set_position(0.0, 12.0, 6.0)
             .look_at(Vec3::ZERO);
 
@@ -72,7 +72,7 @@ impl AppHandler for SkinningDemo {
             &engine.assets,
         );
         scene
-            .node(&ground_node)
+            .edit_node(ground_node)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_cast_shadows(false)
             .set_receive_shadows(true);
@@ -84,7 +84,7 @@ impl AppHandler for SkinningDemo {
         // Camera
         let cam_node_id = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 1.5, 4.0)
             .look_at(Vec3::new(0.0, 1.0, 0.0));
         scene.active_camera = Some(cam_node_id);
@@ -124,10 +124,10 @@ impl AppHandler for SkinningDemo {
             }
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Skinning Animation | FPS: {:.2}", fps));

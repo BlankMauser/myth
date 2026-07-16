@@ -170,13 +170,13 @@ impl AppHandler for DetailSurfaceDemo {
             &engine.assets,
         );
         scene
-            .node(&floor)
+            .edit_node(floor)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_position(0.0, -0.05, 0.0);
 
         let light = scene.add_light(Light::new_directional(Vec3::new(0.78, 0.92, 1.0), 2.2));
         scene
-            .node(&light)
+            .edit_node(light)
             .set_position(5.0, 8.0, 4.0)
             .look_at(Vec3::new(0.0, 1.5, 0.0));
 
@@ -212,7 +212,7 @@ impl AppHandler for DetailSurfaceDemo {
             &engine.assets,
         );
         scene
-            .node(&panel_left)
+            .edit_node(panel_left)
             .set_position(-2.3, 2.0, 0.0)
             .set_rotation(Quat::from_rotation_y(0.32));
 
@@ -232,7 +232,7 @@ impl AppHandler for DetailSurfaceDemo {
             &engine.assets,
         );
         scene
-            .node(&panel_right)
+            .edit_node(panel_right)
             .set_position(2.3, 2.0, -0.2)
             .set_rotation(Quat::from_rotation_y(-0.36));
 
@@ -252,11 +252,11 @@ impl AppHandler for DetailSurfaceDemo {
             ),
             &engine.assets,
         );
-        scene.node(&center_block).set_position(0.0, 1.0, 0.5);
+        scene.edit_node(center_block).set_position(0.0, 1.0, 0.5);
 
         let camera = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(0.0, 2.7, 8.3)
             .look_at(Vec3::new(0.0, 1.8, 0.0));
         scene.active_camera = Some(camera);
@@ -278,21 +278,21 @@ impl AppHandler for DetailSurfaceDemo {
         };
 
         scene
-            .node(&self.panel_left)
+            .edit_node(self.panel_left)
             .set_rotation(Quat::from_rotation_y(0.32 + (self.time * 0.7).sin() * 0.08));
         scene
-            .node(&self.panel_right)
+            .edit_node(self.panel_right)
             .set_rotation(Quat::from_rotation_y(
                 -0.36 + (self.time * 0.9).cos() * 0.08,
             ));
-        scene.node(&self.center_block).set_rotation(
+        scene.edit_node(self.center_block).set_rotation(
             Quat::from_rotation_y(self.time * 0.55) * Quat::from_rotation_x(self.time * 0.18),
         );
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
     }
 }
 

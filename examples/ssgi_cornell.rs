@@ -117,21 +117,21 @@ impl AppHandler for SsgiCornellDemo {
         ] {
             let wall = scene.spawn_box(sx, sy, sz, material, &engine.assets);
             scene
-                .node(&wall)
+                .edit_node(wall)
                 .set_position(x, y, z)
                 .set_shadows(true, true);
         }
 
         let short_box = scene.spawn_box(1.65, 2.1, 1.65, hero, &engine.assets);
         scene
-            .node(&short_box)
+            .edit_node(short_box)
             .set_position(-1.1, 1.05, -0.95)
             .set_rotation(Quat::from_rotation_y(0.32))
             .set_shadows(true, true);
 
         let tall_box = scene.spawn_box(1.35, 3.75, 1.35, hero, &engine.assets);
         scene
-            .node(&tall_box)
+            .edit_node(tall_box)
             .set_position(1.15, 1.875, 0.65)
             .set_rotation(Quat::from_rotation_y(-0.24))
             .set_shadows(true, true);
@@ -139,12 +139,12 @@ impl AppHandler for SsgiCornellDemo {
         let mut point = Light::new_point(Vec3::new(1.0, 0.97, 0.92), 6.0, 7.2);
         point.cast_shadows = true;
         let light_node = scene.add_light(point);
-        scene.node(&light_node).set_position(0.0, 5.2, 0.0);
+        scene.edit_node(light_node).set_position(0.0, 5.2, 0.0);
 
         let bulb_mesh = scene.spawn_sphere(0.18, bulb, &engine.assets);
         scene.attach(bulb_mesh, light_node);
         scene
-            .node(&bulb_mesh)
+            .edit_node(bulb_mesh)
             .set_position(0.0, 0.0, 0.0)
             .set_shadows(false, false);
 
@@ -159,7 +159,7 @@ impl AppHandler for SsgiCornellDemo {
         }
         let cam = scene.add_camera(camera);
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(0.0, 2.6, 9.4)
             .look_at(Vec3::new(0.0, 2.3, 0.0));
         scene.active_camera = Some(cam);
@@ -196,7 +196,7 @@ impl AppHandler for SsgiCornellDemo {
 
         if engine.input.get_key_down(Key::Y)
             && let Some(camera_node) = scene.active_camera
-            && let Some(camera) = scene.get_camera_mut(camera_node)
+            && let Some(camera) = scene.camera_mut(camera_node)
         {
             camera.set_aa_mode(toggle_taa(camera.aa_mode));
         }
@@ -204,7 +204,7 @@ impl AppHandler for SsgiCornellDemo {
         #[cfg(feature = "debug_view")]
         if engine.input.get_key_down(Key::G)
             && let Some(camera_node) = scene.active_camera
-            && let Some(camera) = scene.get_camera_mut(camera_node)
+            && let Some(camera) = scene.camera_mut(camera_node)
         {
             camera.debug_view.mode = next_debug_mode(camera.debug_view.mode);
         }
@@ -215,18 +215,18 @@ impl AppHandler for SsgiCornellDemo {
             self.time.sin() * 0.75,
         );
         scene
-            .node(&self.light_node)
+            .edit_node(self.light_node)
             .set_position(light_pos.x, light_pos.y, light_pos.z);
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             #[cfg(feature = "debug_view")]
             let debug_label = scene
-                .query_main_camera_bundle()
+                .main_camera_bundle()
                 .map(|(_, camera)| camera.debug_view.mode.label())
                 .unwrap_or("Final Image");
 
@@ -235,7 +235,7 @@ impl AppHandler for SsgiCornellDemo {
 
             let enabled_label = if scene.ssgi.enabled { "On" } else { "Off" };
             let aa_label = scene
-                .query_main_camera_bundle()
+                .main_camera_bundle()
                 .map(|(_, camera)| {
                     if camera.aa_mode.is_taa() {
                         "TAA+FXAA"

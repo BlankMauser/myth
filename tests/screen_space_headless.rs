@@ -98,10 +98,10 @@ fn temporal_screen_space_pipeline_survives_runtime_transitions() {
         .with_metalness(0.92);
 
     let floor_node = scene.spawn_box(6.0, 0.2, 6.0, floor, &engine.assets);
-    scene.node(&floor_node).set_position(0.0, -1.2, 0.0);
+    scene.edit_node(floor_node).set_position(0.0, -1.2, 0.0);
 
     let box_node = scene.spawn_box(1.2, 1.2, 1.2, box_mat, &engine.assets);
-    scene.node(&box_node).set_position(0.0, 0.0, 0.0);
+    scene.edit_node(box_node).set_position(0.0, 0.0, 0.0);
 
     scene.add_light(Light::new_directional(Vec3::ONE, 4.0));
 
@@ -111,7 +111,7 @@ fn temporal_screen_space_pipeline_survives_runtime_transitions() {
         0.1,
     ));
     scene
-        .node(&camera_a)
+        .edit_node(camera_a)
         .set_position(0.0, 1.4, 4.5)
         .look_at(Vec3::new(0.0, -0.2, 0.0));
     let camera_b = scene.add_camera(Camera::new_perspective(
@@ -120,7 +120,7 @@ fn temporal_screen_space_pipeline_survives_runtime_transitions() {
         0.1,
     ));
     scene
-        .node(&camera_b)
+        .edit_node(camera_b)
         .set_position(2.5, 1.1, 3.8)
         .look_at(Vec3::new(0.0, -0.2, 0.0));
     scene.active_camera = Some(camera_a);
@@ -137,7 +137,7 @@ fn temporal_screen_space_pipeline_survives_runtime_transitions() {
             .active_scene_mut()
             .expect("active scene missing");
         scene
-            .get_camera_mut(camera_a)
+            .camera_mut(camera_a)
             .expect("primary camera missing")
             .mark_camera_cut();
     }
@@ -219,7 +219,7 @@ fn pending_texture_becomes_visible_and_refreshes_under_the_same_handles() {
     );
     let camera = scene.add_camera(Camera::new_perspective(45.0, 1.0, 0.1));
     scene
-        .node(&camera)
+        .edit_node(camera)
         .set_position(0.0, 0.0, 5.0)
         .look_at(Vec3::ZERO);
     scene.active_camera = Some(camera);

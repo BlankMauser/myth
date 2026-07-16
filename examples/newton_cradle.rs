@@ -26,7 +26,7 @@ fn add_box_to_parent(
 ) -> NodeHandle {
     let node = scene.add_mesh_to_parent(Mesh::new(geometry, material), parent);
     scene
-        .node(&node)
+        .edit_node(node)
         .set_position_vec(position)
         .set_scale_xyz(scale.x, scale.y, scale.z)
         .set_shadows(cast_shadows, receive_shadows);
@@ -87,14 +87,14 @@ impl AppHandler for NewtonCradleDemo {
 
         let table = scene.add_mesh(Mesh::new(box_geo, table_material));
         scene
-            .node(&table)
+            .edit_node(table)
             .set_position(0.0, -0.15, 0.0)
             .set_scale_xyz(14.0, 0.30, 10.0)
             .set_shadows(false, true);
 
         let cradle_root = scene.create_node_with_name("CradleRoot");
         scene.push_root_node(cradle_root);
-        scene.node(&cradle_root).set_position(0.0, 0.25, 0.0);
+        scene.edit_node(cradle_root).set_position(0.0, 0.25, 0.0);
 
         for &x in &[-2.0, 2.0] {
             for &z in &[-0.5, 0.5] {
@@ -154,7 +154,7 @@ impl AppHandler for NewtonCradleDemo {
             let pivot = scene.create_node_with_name(&format!("Pivot_{index}"));
             scene.push_root_node(pivot);
             scene.attach(pivot, cradle_root);
-            scene.node(&pivot).set_position(x, 2.92, 0.0);
+            scene.edit_node(pivot).set_position(x, 2.92, 0.0);
 
             add_box_to_parent(
                 scene,
@@ -179,7 +179,7 @@ impl AppHandler for NewtonCradleDemo {
 
             let bob = scene.add_mesh_to_parent(Mesh::new(sphere_geo, ball_material), pivot);
             scene
-                .node(&bob)
+                .edit_node(bob)
                 .set_position(0.0, -(STRING_LENGTH + BALL_RADIUS), 0.0)
                 .set_scale(BALL_RADIUS)
                 .set_shadows(true, true);
@@ -194,23 +194,23 @@ impl AppHandler for NewtonCradleDemo {
         }
         let key_light = scene.add_light(key_light);
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_position(8.0, 10.0, 6.0)
             .look_at(Vec3::new(0.0, 1.6, 0.0));
 
         let fill_light = scene.add_light(Light::new_point(Vec3::new(0.62, 0.76, 1.0), 0.8, 18.0));
-        scene.node(&fill_light).set_position(-3.0, 2.6, 2.0);
+        scene.edit_node(fill_light).set_position(-3.0, 2.6, 2.0);
 
         let helper = scene.add_mesh_to_parent(Mesh::new(sphere_geo, helper_material), fill_light);
         scene
-            .node(&helper)
+            .edit_node(helper)
             .set_scale(0.12)
             .set_cast_shadows(false)
             .set_receive_shadows(false);
 
         let cam = scene.add_camera(Camera::new_perspective(45.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&cam)
+            .edit_node(cam)
             .set_position(5.5, 3.6, 8.0)
             .look_at(Vec3::new(0.0, 1.5, 0.0));
         scene.active_camera = Some(cam);
@@ -241,10 +241,12 @@ impl AppHandler for NewtonCradleDemo {
                 _ => 0.0,
             };
 
-            scene.node(pivot).set_rotation(Quat::from_rotation_z(angle));
+            scene
+                .edit_node(*pivot)
+                .set_rotation(Quat::from_rotation_z(angle));
         }
 
-        if let Some(node) = scene.get_node_mut(self.fill_light) {
+        if let Some(node) = scene.node_mut(self.fill_light) {
             node.transform.position = Vec3::new(
                 -3.0 + (self.time * 0.8).cos() * 1.6,
                 2.7 + (self.time * 1.3).sin() * 0.25,
@@ -252,10 +254,10 @@ impl AppHandler for NewtonCradleDemo {
             );
         }
 
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         if let Some(fps) = self.fps_counter.update() {
             window.set_title(&format!("Newton Cradle | FPS: {:.1}", fps));

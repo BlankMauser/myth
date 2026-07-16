@@ -59,7 +59,7 @@ impl AppHandler for PbrBox {
         // Camera
         let cam_node_id = scene.add_camera(Camera::new_perspective(45.0, 1280.0 / 720.0, 0.1));
         scene
-            .node(&cam_node_id)
+            .edit_node(cam_node_id)
             .set_position(0.0, 3.0, 10.0)
             .look_at(Vec3::ZERO);
         scene.active_camera = Some(cam_node_id);
@@ -76,17 +76,17 @@ impl AppHandler for PbrBox {
             return;
         };
         // Rotate cube
-        if let Some(node) = scene.get_node_mut(self.cube_node_id) {
+        if let Some(node) = scene.node_mut(self.cube_node_id) {
             let rot_y = Quat::from_rotation_y(0.02 * 60.0 * frame.dt);
             let rot_x = Quat::from_rotation_x(0.01 * 60.0 * frame.dt);
             node.transform.rotation = node.transform.rotation * rot_y * rot_x;
         }
 
         // Orbit controls
-        if let Some((transform, camera)) = scene.query_main_camera_bundle() {
+        let _ = scene.edit_main_camera_bundle(|transform, camera| {
             self.controls
                 .update(transform, &engine.input, camera.fov(), frame.dt);
-        }
+        });
 
         // FPS display
         if let Some(fps) = self.fps_counter.update() {

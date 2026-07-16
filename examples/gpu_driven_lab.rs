@@ -429,7 +429,7 @@ impl GpuDrivenLab {
             };
             let node = scene.add_mesh_to_parent(Mesh::new(self.geometry, material), root);
             scene
-                .node(&node)
+                .edit_node(node)
                 .set_position(base.x, base.y, base.z)
                 .set_scale(0.16)
                 .set_shadows(cast_shadows, cast_shadows);
@@ -472,7 +472,7 @@ impl GpuDrivenLab {
         }
         let sun = scene.add_light(sun);
         scene
-            .node(&sun)
+            .edit_node(sun)
             .set_position(14.0, 20.0, 12.0)
             .look_at(Vec3::ZERO);
         self.workload_lights.push(sun);
@@ -487,7 +487,7 @@ impl GpuDrivenLab {
                 shadow.map_size = 256;
             }
             let point = scene.add_light(point);
-            scene.node(&point).set_position(
+            scene.edit_node(point).set_position(
                 angle.cos() * 9.0,
                 7.0 + index as f32 * 0.45,
                 angle.sin() * 9.0,
@@ -505,7 +505,7 @@ impl GpuDrivenLab {
         let time_cos = (self.time * 2.4).cos();
         for object in &self.dynamic_objects {
             let wave = time_sin * object.phase_cos + time_cos * object.phase_sin;
-            scene.node(&object.node).set_position(
+            scene.edit_node(object.node).set_position(
                 object.base.x,
                 object.base.y + wave * 0.32,
                 object.base.z,
@@ -1117,7 +1117,7 @@ impl AppHandler for GpuDrivenLab {
         ));
         let key_light = scene.add_light(Light::new_directional(Vec3::ONE, 2.2));
         scene
-            .node(&key_light)
+            .edit_node(key_light)
             .set_position(10.0, 16.0, 8.0)
             .look_at(Vec3::ZERO);
 
@@ -1125,7 +1125,7 @@ impl AppHandler for GpuDrivenLab {
         let camera_target = Vec3::ZERO;
         let camera = scene.add_camera(Camera::new_perspective(50.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position(camera_position.x, camera_position.y, camera_position.z)
             .look_at(camera_target);
         scene.active_camera = Some(camera);
@@ -1266,9 +1266,11 @@ impl AppHandler for GpuDrivenLab {
         let ab_active = self.ab.is_active();
         let animation_dt = if ab_active { 1.0 / 60.0 } else { frame.dt };
         self.animate_dynamic_storm(scene, animation_dt);
-        if !ab_active && let Some((transform, camera)) = scene.query_main_camera_bundle() {
-            self.controls
-                .update(transform, &engine.input, camera.fov(), frame.dt);
+        if !ab_active {
+            let _ = scene.edit_main_camera_bundle(|transform, camera| {
+                self.controls
+                    .update(transform, &engine.input, camera.fov(), frame.dt);
+            });
         }
 
         #[cfg(feature = "rdg_bench_support")]

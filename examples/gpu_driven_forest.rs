@@ -125,7 +125,7 @@ impl AppHandler for GpuDrivenForestDemo {
 
         let ground = scene.add_mesh(Mesh::new(ground_geometry, ground_material));
         scene
-            .node(&ground)
+            .edit_node(ground)
             .set_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .set_position(0.0, -0.02, 0.0)
             .set_shadows(false, true);
@@ -145,7 +145,7 @@ impl AppHandler for GpuDrivenForestDemo {
 
                 let trunk = scene.add_mesh(Mesh::new(trunk_geometry, trunk_material));
                 scene
-                    .node(&trunk)
+                    .edit_node(trunk)
                     .set_position(world_x, 0.5 * scale, world_z)
                     .set_scale_xyz(scale, scale, scale)
                     .set_rotation(Quat::from_rotation_y(rotation))
@@ -156,7 +156,7 @@ impl AppHandler for GpuDrivenForestDemo {
                     foliage_materials[index % foliage_materials.len()],
                 ));
                 scene
-                    .node(&foliage)
+                    .edit_node(foliage)
                     .set_position(world_x, 1.48 * scale, world_z)
                     .set_scale_xyz(scale, scale, scale)
                     .set_rotation(Quat::from_rotation_y(rotation))
@@ -175,7 +175,7 @@ impl AppHandler for GpuDrivenForestDemo {
         }
         let sun = scene.add_light(sun);
         scene
-            .node(&sun)
+            .edit_node(sun)
             .set_position(-55.0, 82.0, 34.0)
             .look_at(Vec3::ZERO);
 
@@ -183,7 +183,7 @@ impl AppHandler for GpuDrivenForestDemo {
         let camera_target = Vec3::new(0.0, 4.0, 0.0);
         let camera = scene.add_camera(Camera::new_perspective(48.0, 16.0 / 9.0, 0.1));
         scene
-            .node(&camera)
+            .edit_node(camera)
             .set_position_vec(camera_position)
             .look_at(camera_target);
         scene.active_camera = Some(camera);
@@ -324,7 +324,7 @@ impl AppHandler for GpuDrivenForestDemo {
 
         if self.workload != previous_workload
             && let Some(scene) = engine.scene_manager.active_scene_mut()
-            && let Some(sun) = scene.get_light_mut(self.sun)
+            && let Some(sun) = scene.light_mut(self.sun)
         {
             // Keep the complete four-cascade configuration resident and
             // toggle only whether it contributes shadow views. This makes
@@ -333,11 +333,11 @@ impl AppHandler for GpuDrivenForestDemo {
             sun.cast_shadows = self.workload.shadows_enabled();
         }
 
-        if let Some(scene) = engine.scene_manager.active_scene_mut()
-            && let Some((transform, camera)) = scene.query_main_camera_bundle()
-        {
-            self.controls
-                .update(transform, &engine.input, camera.fov(), frame.dt);
+        if let Some(scene) = engine.scene_manager.active_scene_mut() {
+            let _ = scene.edit_main_camera_bundle(|transform, camera| {
+                self.controls
+                    .update(transform, &engine.input, camera.fov(), frame.dt);
+            });
         }
 
         if let Some(fps) = self.fps_counter.update() {
