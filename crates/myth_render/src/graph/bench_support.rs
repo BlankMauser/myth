@@ -10,9 +10,11 @@ use myth_resources::{
     geometry::Geometry,
     image::{Image, ImageDimension, PixelFormat},
     material::{Material, MaterialSettings, PhysicalMaterial},
+    mesh::Mesh,
     shader_defines::ShaderDefines,
     texture::{Texture, TextureSource},
 };
+use myth_scene::{Node, NodeHandle, Scene, camera::Camera, transform_system::TransformUpdateStats};
 use slotmap::{Key, KeyData};
 
 use crate::core::BindingInterfaceId;
@@ -30,6 +32,9 @@ use crate::graph::frame::{
 use crate::graph::gpu_driven_policy::{
     GpuDrivenAutoDecisionReason, GpuDrivenAutoPolicy, GpuDrivenCoarseGate, GpuDrivenExactWorkload,
     GpuDrivenFamilyMask, GpuDrivenPolicyDomainKey, GpuDrivenWorkloadSynopsis, mix64,
+};
+use crate::graph::render_world::{
+    RenderWorldConsumerCursor, RenderWorldFullRebuildReason, RenderWorldSyncStats,
 };
 use crate::graph::scene_pipeline_prepare::{
     PrepassPipelineL1Key, ScenePipelinePrepareStore, SceneRecipeOrdinal,
@@ -2192,6 +2197,548 @@ fn encode_cpu_command(source: u32, bin: u32) -> u64 {
     u64::from(source) << 32 | u64::from(bin)
 }
 
+/// Mutation density applied before one persistent RenderWorld benchmark sync.
+///
+/// Mutation authoring is deliberately separate from [`RenderWorldBenchHarness::sync`]
+/// so Criterion can exclude simulation/editor work and measure only the real
+/// extraction-boundary consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderWorldBenchWorkload {
+    /// No Scene changes after the retained RenderWorld has reached a warm state.
+    StaticWarm,
+    /// Change the transform of exactly one dense render source.
+    SingleTransform,
+    /// Change one percent of dense render sources (rounded up).
+    OnePercentTransforms,
+    /// Change every dense render source.
+    AllTransforms,
+    /// Add or remove one render source, forcing a deterministic topology rebuild.
+    TopologyRebuild,
+    /// Switch between two already-warm retained Scene domains.
+    SceneAlternation,
+}
+
+impl RenderWorldBenchWorkload {
+    /// Stable Criterion label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StaticWarm => "static_warm",
+            Self::SingleTransform => "single_transform",
+            Self::OnePercentTransforms => "one_percent_transforms",
+            Self::AllTransforms => "all_transforms",
+            Self::TopologyRebuild => "topology_rebuild",
+            Self::SceneAlternation => "scene_alternation",
+        }
+    }
+
+    /// Exact number of Scene mutations expected for an item count.
+    #[must_use]
+    pub const fn mutation_count(self, item_count: usize) -> usize {
+        match self {
+            Self::StaticWarm | Self::SceneAlternation => 0,
+            Self::SingleTransform => {
+                if item_count == 0 {
+                    0
+                } else {
+                    1
+                }
+            }
+            Self::OnePercentTransforms => {
+                if item_count == 0 {
+                    0
+                } else {
+                    item_count.saturating_add(99) / 100
+                }
+            }
+            Self::AllTransforms => item_count,
+            Self::TopologyRebuild => 1,
+        }
+    }
+}
+
+/// Stable public projection of the private RenderWorld rebuild reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderWorldBenchRebuildReason {
+    /// Incremental reuse/update path.
+    None,
+    /// Scene topology epoch changed.
+    TopologyChanged,
+    /// A conservative reason outside this benchmark's registered contracts.
+    Other,
+}
+
+/// O(1) correctness token from one production RenderWorld synchronization.
+///
+/// The token contains no references into retained journals, allowing a
+/// benchmark to stop its timer before validating and acknowledging the exact
+/// consumer frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderWorldBenchRunToken {
+    /// Stable Scene identity observed by the retained domain.
+    pub scene_id: u32,
+    /// Persistent RenderWorld revision after synchronization.
+    pub revision: u64,
+    /// Scene journal entries consumed by this synchronization.
+    pub mutation_count: u32,
+    /// Dense render sources retained after synchronization.
+    pub item_count: u32,
+    /// Dense sources reused without materialization.
+    pub items_reused: u32,
+    /// Sources inspected by the selected synchronization plan.
+    pub items_examined: u32,
+    /// Dense source records updated in place.
+    pub items_updated: u32,
+    /// Dense source records rebuilt from Scene authority.
+    pub items_rebuilt: u32,
+    /// Dense sources newly introduced by a full rebuild.
+    pub items_added: u32,
+    /// Dense sources retired by a full rebuild.
+    pub items_removed: u32,
+    /// Number of active plus dormant retained Scene domains.
+    pub resident_domain_count: u32,
+    /// Bytes retained by the production RenderWorld domains and indexes.
+    pub retained_bytes: usize,
+    /// Dirty transform candidates considered at this extraction boundary.
+    pub transform_dirty_roots_examined: usize,
+    /// Parent links followed while coalescing transform roots.
+    pub transform_parent_links_examined: usize,
+    /// Transform nodes visited at this extraction boundary.
+    pub transform_nodes_visited: usize,
+    /// Transform nodes whose world matrix was updated.
+    pub transform_nodes_updated: usize,
+    /// Bytes retained by the Scene transform-update scratch.
+    pub transform_retained_bytes: usize,
+    /// Whether transform synchronization used the conservative full traversal.
+    pub transform_full_traversal: bool,
+    /// Exact rebuild classification relevant to the benchmark matrix.
+    pub rebuild_reason: RenderWorldBenchRebuildReason,
+    /// Opaque value keeping the observed production result alive.
+    pub checksum: u64,
+}
+
+impl RenderWorldBenchRunToken {
+    fn from_stats(stats: RenderWorldSyncStats, transform: TransformUpdateStats) -> Self {
+        let rebuild_reason = match stats.full_rebuild_reason {
+            RenderWorldFullRebuildReason::None => RenderWorldBenchRebuildReason::None,
+            RenderWorldFullRebuildReason::TopologyChanged => {
+                RenderWorldBenchRebuildReason::TopologyChanged
+            }
+            _ => RenderWorldBenchRebuildReason::Other,
+        };
+        let mut checksum = u64::from(stats.scene_id);
+        for value in [
+            stats.revision,
+            u64::from(stats.mutation_count),
+            u64::from(stats.item_count),
+            u64::from(stats.items_reused),
+            u64::from(stats.items_examined),
+            u64::from(stats.items_updated),
+            u64::from(stats.items_rebuilt),
+            u64::from(stats.items_added),
+            u64::from(stats.items_removed),
+            u64::from(stats.resident_domain_count),
+            u64::try_from(stats.retained_bytes).unwrap_or(u64::MAX),
+            u64::try_from(transform.dirty_roots_examined).unwrap_or(u64::MAX),
+            u64::try_from(transform.dirty_root_parent_links_examined).unwrap_or(u64::MAX),
+            u64::try_from(transform.visited_nodes).unwrap_or(u64::MAX),
+            u64::try_from(transform.updated_world_matrices).unwrap_or(u64::MAX),
+            u64::try_from(transform.retained_bytes).unwrap_or(u64::MAX),
+            u64::from(transform.full_traversal),
+            rebuild_reason as u64,
+        ] {
+            checksum = mix64(checksum, value);
+        }
+        Self {
+            scene_id: stats.scene_id,
+            revision: stats.revision,
+            mutation_count: stats.mutation_count,
+            item_count: stats.item_count,
+            items_reused: stats.items_reused,
+            items_examined: stats.items_examined,
+            items_updated: stats.items_updated,
+            items_rebuilt: stats.items_rebuilt,
+            items_added: stats.items_added,
+            items_removed: stats.items_removed,
+            resident_domain_count: stats.resident_domain_count,
+            retained_bytes: stats.retained_bytes,
+            transform_dirty_roots_examined: transform.dirty_roots_examined,
+            transform_parent_links_examined: transform.dirty_root_parent_links_examined,
+            transform_nodes_visited: transform.visited_nodes,
+            transform_nodes_updated: transform.updated_world_matrices,
+            transform_retained_bytes: transform.retained_bytes,
+            transform_full_traversal: transform.full_traversal,
+            rebuild_reason,
+            checksum,
+        }
+    }
+}
+
+/// CPU-only fixture for the production Scene -> PersistentRenderWorld path.
+///
+/// Every source is a real Scene node with a real Mesh referencing resident
+/// Geometry and Material assets. Construction performs a cold extraction and
+/// a static warm extraction, then acknowledges the retained consumer journal.
+/// Subsequent iterations reuse all high-water-mark allocations. GPU profile
+/// capture is disabled intentionally: this isolates M7.9's CPU RenderWorld and
+/// MutationJournal costs without creating a WGPU device or approximating the
+/// production synchronization algorithm.
+pub struct RenderWorldBenchHarness {
+    scene: Scene,
+    alternate_scene: Option<Scene>,
+    assets: AssetServer,
+    geometry: GeometryHandle,
+    material: MaterialHandle,
+    camera: myth_scene::camera::RenderCamera,
+    extracted_scene: ExtractedScene,
+    render_nodes: Vec<NodeHandle>,
+    topology_extra_node: Option<NodeHandle>,
+    consumer_cursor: RenderWorldConsumerCursor,
+    prepared_workload: Option<RenderWorldBenchWorkload>,
+    pending_sync_stats: Option<RenderWorldSyncStats>,
+}
+
+impl RenderWorldBenchHarness {
+    /// Build and warm a retained RenderWorld with `item_count` visible meshes.
+    #[must_use]
+    pub fn new(item_count: usize) -> Self {
+        Self::new_internal(item_count, false)
+    }
+
+    /// Build two warm retained Scene domains for the alternation benchmark.
+    #[must_use]
+    pub fn new_with_scene_alternation(item_count: usize) -> Self {
+        Self::new_internal(item_count, true)
+    }
+
+    fn new_internal(item_count: usize, with_alternate_scene: bool) -> Self {
+        assert!(item_count != 0, "RenderWorld benchmark needs one source");
+        assert!(
+            u32::try_from(item_count).is_ok(),
+            "RenderWorld benchmark source count exceeds diagnostics range"
+        );
+
+        let assets = AssetServer::new();
+        let geometry = assets.geometries.add(Geometry::new());
+        let material = assets
+            .materials
+            .add(Material::from(PhysicalMaterial::new(glam::Vec4::ONE)));
+
+        let (mut scene, render_nodes) =
+            build_render_world_bench_scene(item_count, geometry, material);
+        let mut alternate_scene = with_alternate_scene
+            .then(|| build_render_world_bench_scene(item_count, geometry, material).0);
+
+        let mut camera = Camera::new_perspective(60.0, 16.0 / 9.0, 0.1);
+        camera.update_view_projection(&glam::Affine3A::IDENTITY);
+        let camera = camera.extract_render_camera();
+        let mut extracted_scene = ExtractedScene::with_capacity(item_count);
+
+        let cold = extracted_scene.extract_into(&mut scene, &camera, &assets, 0.0, 0, false);
+        assert_eq!(cold.item_count as usize, item_count);
+        assert_eq!(cold.items_rebuilt as usize, item_count);
+        let cold_cursor = RenderWorldConsumerCursor {
+            scene_id: cold.scene_id,
+            revision: cold.revision,
+        };
+        assert!(extracted_scene.acknowledge_render_world_delta(cold_cursor));
+
+        // Exercise the actual O(1) reuse path once before Criterion samples;
+        // this also establishes retained scratch capacities and proves that
+        // fixture setup left no unacknowledged Scene mutations.
+        let warm = extracted_scene.extract_into(&mut scene, &camera, &assets, 0.0, 0, false);
+        assert_eq!(warm.mutation_count, 0);
+        assert_eq!(warm.item_count as usize, item_count);
+        assert_eq!(warm.items_reused as usize, item_count);
+        assert_eq!(warm.full_rebuild_reason, RenderWorldFullRebuildReason::None);
+        let mut consumer_cursor = RenderWorldConsumerCursor {
+            scene_id: warm.scene_id,
+            revision: warm.revision,
+        };
+        assert!(
+            extracted_scene.acknowledge_render_world_delta(consumer_cursor),
+            "warm benchmark RenderWorld delta was not acknowledged"
+        );
+
+        if let Some(alternate) = alternate_scene.as_mut() {
+            // Materialize the second domain once, then return the first Scene
+            // to the active slot. Timed alternation therefore measures only
+            // the production retained-domain swap/reuse boundary.
+            std::mem::swap(&mut scene, alternate);
+            let alternate_cold =
+                extracted_scene.extract_into(&mut scene, &camera, &assets, 0.0, 0, false);
+            assert_eq!(alternate_cold.item_count as usize, item_count);
+            assert_eq!(alternate_cold.items_rebuilt as usize, item_count);
+            let alternate_cursor = RenderWorldConsumerCursor {
+                scene_id: alternate_cold.scene_id,
+                revision: alternate_cold.revision,
+            };
+            assert!(
+                extracted_scene.acknowledge_render_world_delta(alternate_cursor),
+                "alternate benchmark RenderWorld delta was not acknowledged"
+            );
+
+            std::mem::swap(&mut scene, alternate);
+            let primary_reactivated =
+                extracted_scene.extract_into(&mut scene, &camera, &assets, 0.0, 0, false);
+            assert_eq!(primary_reactivated.items_reused as usize, item_count);
+            assert_eq!(primary_reactivated.resident_domain_count, 2);
+            consumer_cursor = RenderWorldConsumerCursor {
+                scene_id: primary_reactivated.scene_id,
+                revision: primary_reactivated.revision,
+            };
+            assert!(
+                extracted_scene.acknowledge_render_world_delta(consumer_cursor),
+                "reactivated benchmark RenderWorld delta was not acknowledged"
+            );
+        }
+
+        Self {
+            scene,
+            alternate_scene,
+            assets,
+            geometry,
+            material,
+            camera,
+            extracted_scene,
+            render_nodes,
+            topology_extra_node: None,
+            consumer_cursor,
+            prepared_workload: None,
+            pending_sync_stats: None,
+        }
+    }
+
+    /// Number of retained dense render sources.
+    #[must_use]
+    pub fn item_count(&self) -> usize {
+        self.render_nodes.len() + usize::from(self.topology_extra_node.is_some())
+    }
+
+    /// Author the selected Scene mutation set outside the timed scope.
+    ///
+    /// Changed nodes form a centered dense range. This avoids accidentally
+    /// benchmarking hash-order selection or a first/last-source special case.
+    pub fn prepare_iteration(&mut self, workload: RenderWorldBenchWorkload) {
+        assert!(
+            self.prepared_workload.is_none(),
+            "previous RenderWorld benchmark iteration was not finished"
+        );
+        assert!(
+            self.pending_sync_stats.is_none(),
+            "previous RenderWorld benchmark synchronization was not finished"
+        );
+        match workload {
+            RenderWorldBenchWorkload::StaticWarm => {}
+            RenderWorldBenchWorkload::SingleTransform
+            | RenderWorldBenchWorkload::OnePercentTransforms
+            | RenderWorldBenchWorkload::AllTransforms => {
+                let mutation_count = workload.mutation_count(self.render_nodes.len());
+                let start = self.render_nodes.len().saturating_sub(mutation_count) / 2;
+                let end = start + mutation_count;
+                for &node in &self.render_nodes[start..end] {
+                    let y = if self
+                        .scene
+                        .node(node)
+                        .is_some_and(|node| node.transform.position.y == 0.0)
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    let edited = self
+                        .scene
+                        .edit_node_transform(node, |transform| transform.position.y = y);
+                    assert!(edited.is_some(), "benchmark Scene node disappeared");
+                }
+            }
+            RenderWorldBenchWorkload::TopologyRebuild => {
+                assert!(
+                    self.alternate_scene.is_none(),
+                    "topology and Scene-alternation arms require separate fixtures"
+                );
+                if let Some(node) = self.topology_extra_node.take() {
+                    self.scene.remove_node(node);
+                } else {
+                    let node = self.scene.add_node(Node::new());
+                    self.scene
+                        .set_mesh(node, render_world_bench_mesh(self.geometry, self.material));
+                    self.topology_extra_node = Some(node);
+                }
+            }
+            RenderWorldBenchWorkload::SceneAlternation => {
+                assert!(
+                    self.topology_extra_node.is_none(),
+                    "topology and Scene-alternation arms require separate fixtures"
+                );
+                let alternate = self
+                    .alternate_scene
+                    .as_mut()
+                    .expect("Scene alternation needs new_with_scene_alternation");
+                std::mem::swap(&mut self.scene, alternate);
+            }
+        }
+        self.prepared_workload = Some(workload);
+    }
+
+    /// Synchronize through the real extraction-boundary production path.
+    ///
+    /// Callers should time only this method. Mutation authoring, exact delta
+    /// validation, and consumer acknowledgement belong to
+    /// [`Self::prepare_iteration`] and [`Self::finish_iteration`].
+    pub fn sync(&mut self) {
+        assert!(
+            self.prepared_workload.is_some(),
+            "RenderWorld benchmark iteration was not prepared"
+        );
+        let stats = self.extracted_scene.extract_into(
+            &mut self.scene,
+            &self.camera,
+            &self.assets,
+            0.0,
+            0,
+            false,
+        );
+        assert!(
+            self.pending_sync_stats.replace(stats).is_none(),
+            "RenderWorld benchmark synchronization was already pending"
+        );
+    }
+
+    /// Validate and acknowledge the exact retained delta outside timing.
+    ///
+    /// Returning the token gives Criterion a convenient value to pass through
+    /// `black_box` after the timer has stopped.
+    #[must_use]
+    pub fn finish_iteration(&mut self) -> RenderWorldBenchRunToken {
+        let stats = self
+            .pending_sync_stats
+            .take()
+            .expect("RenderWorld benchmark iteration was not synchronized");
+        let token =
+            RenderWorldBenchRunToken::from_stats(stats, self.scene.last_transform_update_stats());
+        let workload = self
+            .prepared_workload
+            .take()
+            .expect("RenderWorld benchmark iteration was not prepared");
+        let expected = workload.mutation_count(self.render_nodes.len());
+        let expected_u32 = u32::try_from(expected).expect("mutation count exceeds u32");
+        let item_count_u32 = u32::try_from(self.item_count()).expect("item count exceeds u32");
+
+        assert_eq!(token.scene_id, self.scene.id());
+        assert_eq!(token.mutation_count, expected_u32);
+        assert_eq!(token.item_count, item_count_u32);
+        let (expected_full_delta, expected_changed_sources) = match workload {
+            RenderWorldBenchWorkload::StaticWarm
+            | RenderWorldBenchWorkload::SingleTransform
+            | RenderWorldBenchWorkload::OnePercentTransforms
+            | RenderWorldBenchWorkload::AllTransforms => {
+                assert_eq!(token.items_examined, expected_u32);
+                assert_eq!(token.items_updated, expected_u32);
+                assert_eq!(token.items_rebuilt, 0);
+                assert_eq!(token.items_added, 0);
+                assert_eq!(token.items_removed, 0);
+                assert_eq!(token.items_reused, item_count_u32 - expected_u32);
+                assert_eq!(token.rebuild_reason, RenderWorldBenchRebuildReason::None);
+                assert_eq!(token.transform_dirty_roots_examined, expected);
+                assert_eq!(token.transform_parent_links_examined, 0);
+                assert_eq!(token.transform_nodes_visited, expected);
+                assert_eq!(token.transform_nodes_updated, expected);
+                assert!(!token.transform_full_traversal);
+                (false, expected)
+            }
+            RenderWorldBenchWorkload::TopologyRebuild => {
+                assert_eq!(token.items_examined, item_count_u32);
+                assert_eq!(token.items_updated, 0);
+                assert_eq!(token.items_rebuilt, item_count_u32);
+                assert_eq!(token.items_reused, 0);
+                assert_eq!(
+                    (token.items_added, token.items_removed),
+                    if self.topology_extra_node.is_some() {
+                        (1, 0)
+                    } else {
+                        (0, 1)
+                    }
+                );
+                assert_eq!(
+                    token.rebuild_reason,
+                    RenderWorldBenchRebuildReason::TopologyChanged
+                );
+                (true, 0)
+            }
+            RenderWorldBenchWorkload::SceneAlternation => {
+                assert_eq!(token.items_examined, 0);
+                assert_eq!(token.items_updated, 0);
+                assert_eq!(token.items_rebuilt, 0);
+                assert_eq!(token.items_added, 0);
+                assert_eq!(token.items_removed, 0);
+                assert_eq!(token.items_reused, item_count_u32);
+                assert_eq!(token.resident_domain_count, 2);
+                assert_eq!(token.rebuild_reason, RenderWorldBenchRebuildReason::None);
+                assert_eq!(token.transform_dirty_roots_examined, 0);
+                assert_eq!(token.transform_nodes_visited, 0);
+                assert_eq!(token.transform_nodes_updated, 0);
+                assert!(!token.transform_full_traversal);
+                (true, 0)
+            }
+        };
+
+        assert!(
+            token.retained_bytes != 0,
+            "warm RenderWorld retained no authority"
+        );
+
+        let (target_cursor, requires_full_rebuild, changed_source_count) = {
+            let delta = self
+                .extracted_scene
+                .render_world_delta(self.consumer_cursor);
+            (
+                RenderWorldConsumerCursor {
+                    scene_id: delta.scene_id,
+                    revision: delta.revision,
+                },
+                delta.requires_full_rebuild,
+                delta.changes.len(),
+            )
+        };
+        assert_eq!(requires_full_rebuild, expected_full_delta);
+        assert_eq!(changed_source_count, expected_changed_sources);
+        assert_eq!(target_cursor.scene_id, token.scene_id);
+        assert_eq!(target_cursor.revision, token.revision);
+        assert!(
+            self.extracted_scene
+                .acknowledge_render_world_delta(target_cursor),
+            "benchmark consumer rejected its exact RenderWorld frontier"
+        );
+        self.consumer_cursor = target_cursor;
+        token
+    }
+}
+
+fn build_render_world_bench_scene(
+    item_count: usize,
+    geometry: GeometryHandle,
+    material: MaterialHandle,
+) -> (Scene, Vec<NodeHandle>) {
+    let mut scene = Scene::new();
+    let mut render_nodes = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let handle = scene.add_node(Node::new());
+        scene.set_mesh(handle, render_world_bench_mesh(geometry, material));
+        render_nodes.push(handle);
+    }
+    (scene, render_nodes)
+}
+
+fn render_world_bench_mesh(geometry: GeometryHandle, material: MaterialHandle) -> Mesh {
+    let mut mesh = Mesh::new(geometry, material);
+    // Keep the benchmark focused on RenderWorld synchronization. The shadow
+    // aggregate has its own workload-dependent rebuild policy.
+    mesh.cast_shadows = false;
+    mesh.receive_shadows = false;
+    mesh
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2200,7 +2747,8 @@ mod tests {
         GpuDrivenMatrixBenchHarness, GpuDrivenMatrixBenchSpec, GpuDrivenMatrixMode,
         HighFanOutBenchHarness, HighFanOutBenchSpec, HighFanOutRoot, MaterialSceneCpuBenchHarness,
         MaterialSceneCpuBenchStage, RdgBenchDiagnosticsMode, RdgRecorderLifecycleBenchHarness,
-        RenderPath, project_plan_key, shadow_plan_key,
+        RenderPath, RenderWorldBenchHarness, RenderWorldBenchWorkload, project_plan_key,
+        shadow_plan_key,
     };
 
     fn spec(
@@ -2274,6 +2822,38 @@ mod tests {
         (0..plan_count)
             .map(|index| project_plan_key(shadow_plan_key(index, d2_plan_count)))
             .collect()
+    }
+
+    #[test]
+    fn render_world_benchmark_fixture_preserves_all_steady_workload_contracts() {
+        let mut harness = RenderWorldBenchHarness::new(200);
+        for workload in [
+            RenderWorldBenchWorkload::StaticWarm,
+            RenderWorldBenchWorkload::SingleTransform,
+            RenderWorldBenchWorkload::OnePercentTransforms,
+            RenderWorldBenchWorkload::AllTransforms,
+            RenderWorldBenchWorkload::TopologyRebuild,
+        ] {
+            harness.prepare_iteration(workload);
+            harness.sync();
+            let token = harness.finish_iteration();
+            assert_eq!(
+                usize::try_from(token.mutation_count).expect("mutation count exceeds usize"),
+                workload.mutation_count(harness.item_count())
+            );
+            assert_ne!(token.checksum, 0);
+        }
+
+        let mut alternating = RenderWorldBenchHarness::new_with_scene_alternation(200);
+        for _ in 0..2 {
+            alternating.prepare_iteration(RenderWorldBenchWorkload::SceneAlternation);
+            alternating.sync();
+            let token = alternating.finish_iteration();
+            assert_eq!(token.mutation_count, 0);
+            assert_eq!(token.items_reused, 200);
+            assert_eq!(token.resident_domain_count, 2);
+            assert_ne!(token.checksum, 0);
+        }
     }
 
     #[test]

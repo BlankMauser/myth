@@ -59,6 +59,78 @@ struct ProbeResult {
     gpu_driven: GpuDrivenMode,
 }
 
+/// Fixed-width sums of facts already emitted by the persistent Render World.
+///
+/// This deliberately stores only integers in the measured hot loop. Means and
+/// rates are derived once, after measurement, so benchmark support adds no
+/// allocation, lock, hash lookup, or extra scene traversal per frame.
+#[cfg(feature = "rdg_bench_support")]
+#[derive(Default)]
+struct RenderWorldTotals {
+    samples: usize,
+    mutation_count: u128,
+    transform_dirty_roots_examined: u128,
+    transform_parent_links_examined: u128,
+    transform_nodes_visited: u128,
+    transform_nodes_updated: u128,
+    transform_full_traversal_frames: usize,
+    render_items_reused: u128,
+    render_items_examined: u128,
+    render_items_updated: u128,
+    render_items_rebuilt: u128,
+    retained_bytes_total: u128,
+    retained_bytes_max: u64,
+    retained_bytes_last: u64,
+    full_rebuild_frames: usize,
+}
+
+#[cfg(feature = "rdg_bench_support")]
+impl RenderWorldTotals {
+    fn record(&mut self, diagnostics: &RdgFrameDiagnostics) {
+        let world = diagnostics.render_world();
+        self.samples = self.samples.saturating_add(1);
+        self.mutation_count = self
+            .mutation_count
+            .saturating_add(u128::from(world.mutation_count()));
+        self.transform_dirty_roots_examined = self
+            .transform_dirty_roots_examined
+            .saturating_add(u128::from(world.hierarchy_dirty_roots_examined()));
+        self.transform_parent_links_examined = self
+            .transform_parent_links_examined
+            .saturating_add(u128::from(world.hierarchy_dirty_parent_links_examined()));
+        self.transform_nodes_visited = self
+            .transform_nodes_visited
+            .saturating_add(u128::from(world.hierarchy_nodes_visited()));
+        self.transform_nodes_updated = self
+            .transform_nodes_updated
+            .saturating_add(u128::from(world.hierarchy_nodes_updated()));
+        self.transform_full_traversal_frames = self
+            .transform_full_traversal_frames
+            .saturating_add(usize::from(world.hierarchy_full_traversal()));
+        self.render_items_reused = self
+            .render_items_reused
+            .saturating_add(u128::from(world.render_items_reused()));
+        self.render_items_examined = self
+            .render_items_examined
+            .saturating_add(u128::from(world.render_items_examined()));
+        self.render_items_updated = self
+            .render_items_updated
+            .saturating_add(u128::from(world.render_items_updated()));
+        self.render_items_rebuilt = self
+            .render_items_rebuilt
+            .saturating_add(u128::from(world.render_items_rebuilt()));
+        let retained_bytes = world.retained_bytes();
+        self.retained_bytes_total = self
+            .retained_bytes_total
+            .saturating_add(u128::from(retained_bytes));
+        self.retained_bytes_max = self.retained_bytes_max.max(retained_bytes);
+        self.retained_bytes_last = retained_bytes;
+        self.full_rebuild_frames = self
+            .full_rebuild_frames
+            .saturating_add(usize::from(world.rebuild_reason().is_some()));
+    }
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent probe axes and one-shot lifecycle flags are clearer as named booleans"
@@ -84,6 +156,8 @@ struct HelmetGltfFixedProbe {
     detail_elapsed_ns: [u128; RdgDetailPhase::COUNT],
     #[cfg(feature = "rdg_bench_support")]
     phase_timing_samples: usize,
+    #[cfg(feature = "rdg_bench_support")]
+    render_world_totals: RenderWorldTotals,
     result: Option<ProbeResult>,
     exit_requested: bool,
 }
@@ -130,6 +204,7 @@ impl HelmetGltfFixedProbe {
             *slot = slot.saturating_add(u128::from(diagnostics.detail_elapsed_ns(phase)));
         }
         self.phase_timing_samples = self.phase_timing_samples.saturating_add(1);
+        self.render_world_totals.record(diagnostics);
     }
 }
 
@@ -191,6 +266,8 @@ impl AppHandler for HelmetGltfFixedProbe {
             detail_elapsed_ns: [0; RdgDetailPhase::COUNT],
             #[cfg(feature = "rdg_bench_support")]
             phase_timing_samples: 0,
+            #[cfg(feature = "rdg_bench_support")]
+            render_world_totals: RenderWorldTotals::default(),
             result: None,
             exit_requested: false,
         }
@@ -218,10 +295,13 @@ impl AppHandler for HelmetGltfFixedProbe {
                         mesh.material = material;
                     }
                 }
+                let (surface_width, surface_height) = engine.size();
                 println!(
-                    "Helmet ready: root={root:?}, warmup={}, measure={}, environment={}, textured={}, draw_model={}, gpu_driven={:?}",
+                    "Helmet ready: root={root:?}, warmup={}, measure={}, surface={}x{}, environment={}, textured={}, draw_model={}, gpu_driven={:?}",
                     self.warmup_frames,
                     self.measure_frames,
+                    surface_width,
+                    surface_height,
                     self.environment_enabled,
                     self.replacement_material.is_none(),
                     self.draw_model,
@@ -282,6 +362,8 @@ impl AppHandler for HelmetGltfFixedProbe {
                 &self.detail_elapsed_ns,
                 self.phase_timing_samples,
             );
+            #[cfg(feature = "rdg_bench_support")]
+            print_render_world_totals(&self.render_world_totals);
             self.exit_requested = true;
 
             if !request_graceful_exit(window) {
@@ -479,6 +561,62 @@ fn print_phase_timings(
         .expect("failed to flush helmet probe phase timings");
 }
 
+#[cfg(feature = "rdg_bench_support")]
+fn print_render_world_totals(totals: &RenderWorldTotals) {
+    let samples = totals.samples as f64;
+    let mean = |total: u128| {
+        if totals.samples == 0 {
+            0.0
+        } else {
+            total as f64 / samples
+        }
+    };
+    let rate = |count: usize| {
+        if totals.samples == 0 {
+            0.0
+        } else {
+            count as f64 / samples
+        }
+    };
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(
+        output,
+        "HELMET_FIXED_PROBE_RENDER_WORLD samples={} mutations_total={} mutations_mean={:.3} transform_dirty_roots_examined_total={} transform_dirty_roots_examined_mean={:.3} transform_parent_links_examined_total={} transform_parent_links_examined_mean={:.3} transform_nodes_visited_total={} transform_nodes_visited_mean={:.3} transform_nodes_updated_total={} transform_nodes_updated_mean={:.3} transform_full_traversal_frames={} transform_full_traversal_rate={:.6} render_items_reused_total={} render_items_reused_mean={:.3} render_items_examined_total={} render_items_examined_mean={:.3} render_items_updated_total={} render_items_updated_mean={:.3} render_items_rebuilt_total={} render_items_rebuilt_mean={:.3} retained_bytes_mean={:.3} retained_bytes_max={} retained_bytes_last={} full_rebuild_frames={} full_rebuild_rate={:.6}",
+        totals.samples,
+        totals.mutation_count,
+        mean(totals.mutation_count),
+        totals.transform_dirty_roots_examined,
+        mean(totals.transform_dirty_roots_examined),
+        totals.transform_parent_links_examined,
+        mean(totals.transform_parent_links_examined),
+        totals.transform_nodes_visited,
+        mean(totals.transform_nodes_visited),
+        totals.transform_nodes_updated,
+        mean(totals.transform_nodes_updated),
+        totals.transform_full_traversal_frames,
+        rate(totals.transform_full_traversal_frames),
+        totals.render_items_reused,
+        mean(totals.render_items_reused),
+        totals.render_items_examined,
+        mean(totals.render_items_examined),
+        totals.render_items_updated,
+        mean(totals.render_items_updated),
+        totals.render_items_rebuilt,
+        mean(totals.render_items_rebuilt),
+        mean(totals.retained_bytes_total),
+        totals.retained_bytes_max,
+        totals.retained_bytes_last,
+        totals.full_rebuild_frames,
+        rate(totals.full_rebuild_frames),
+    )
+    .expect("failed to write helmet probe Render World diagnostics");
+    output
+        .flush()
+        .expect("failed to flush helmet probe Render World diagnostics");
+}
+
 fn terminate_with_error(message: &str) -> ! {
     let stderr = io::stderr();
     let mut output = stderr.lock();
@@ -528,13 +666,14 @@ fn request_graceful_exit(_window: &dyn Window) -> bool {
 #[myth::main]
 fn main() -> myth::Result<()> {
     let gpu_driven = read_gpu_driven_mode();
-    App::new()
-        .with_title("Myth Helmet Fixed Probe")
-        .with_settings(RendererSettings {
-            path: RenderPath::BasicForward,
-            vsync: false,
-            gpu_driven,
-            ..Default::default()
-        })
-        .run::<HelmetGltfFixedProbe>()
+    let app = App::new().with_title("Myth Helmet Fixed Probe");
+    #[cfg(not(target_arch = "wasm32"))]
+    let app = app.with_inner_size(1280, 720);
+    app.with_settings(RendererSettings {
+        path: RenderPath::BasicForward,
+        vsync: false,
+        gpu_driven,
+        ..Default::default()
+    })
+    .run::<HelmetGltfFixedProbe>()
 }

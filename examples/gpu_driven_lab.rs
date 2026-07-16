@@ -14,10 +14,31 @@
 //! fails before it can render the UI:
 //! - `1`..`6`: workload presets
 //! - `F1`: Off, `F2`: Auto, `F3`: Required when the GPU baseline is available
+//!
+//! A non-interactive performance-gate matrix is also available. It runs the
+//! five high-pressure workloads through fixed Off and Required windows, emits
+//! machine-readable stdout records, and exits after the final arm:
+//!
+//! ```powershell
+//! cargo run --release --features rdg_bench_support --example gpu_driven_lab -- --autorun
+//! ```
+//!
+//! `--warmup-frames <N>` / `--measure-frames <N>` (or the corresponding
+//! `MYTH_GPU_DRIVEN_LAB_WARMUP_FRAMES` / `MYTH_GPU_DRIVEN_LAB_MEASURE_FRAMES`
+//! environment variables) override the default fixed window sizes.
 
-use std::{any::Any, time::Instant};
+use std::{
+    any::Any,
+    io::{self, Write},
+    sync::{
+        OnceLock,
+        atomic::{AtomicI32, Ordering},
+    },
+    time::Instant,
+};
 
 use myth::prelude::*;
+use myth::renderer::graph::core::{GraphBlackboard, HookStage};
 use myth::renderer::graph::{
     RdgAttemptOutcome, RdgFrameDiagnostics, RdgGpuDrivenFailure, RdgSceneSubmissionFamily,
 };
@@ -36,11 +57,19 @@ const SHADOW_OBJECTS: usize = 8_192;
 const HYBRID_SHARED_OBJECTS: usize = 8_192;
 const HYBRID_SINGLETON_OBJECTS: usize = 512;
 const HYBRID_OBJECTS: usize = HYBRID_SHARED_OBJECTS + HYBRID_SINGLETON_OBJECTS;
-const WARMUP_FRAMES: u32 = 120;
-const SAMPLE_FRAMES: u32 = 600;
+const DEFAULT_WARMUP_FRAMES: u32 = 120;
+const DEFAULT_MEASURE_FRAMES: u32 = 600;
+#[cfg(not(target_arch = "wasm32"))]
+const AUTORUN_ENV: &str = "MYTH_GPU_DRIVEN_LAB_AUTORUN";
+#[cfg(not(target_arch = "wasm32"))]
+const WARMUP_FRAMES_ENV: &str = "MYTH_GPU_DRIVEN_LAB_WARMUP_FRAMES";
+#[cfg(not(target_arch = "wasm32"))]
+const MEASURE_FRAMES_ENV: &str = "MYTH_GPU_DRIVEN_LAB_MEASURE_FRAMES";
+static AUTORUN_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 #[cfg(feature = "rdg_bench_support")]
-const MATRIX_PHASES: [RdgFramePhase; 7] = [
+const MATRIX_PHASES: [RdgFramePhase; 8] = [
+    RdgFramePhase::Extract,
     RdgFramePhase::Cull,
     RdgFramePhase::BuildGraph,
     RdgFramePhase::CompileGraph,
@@ -67,6 +96,31 @@ enum LabPreset {
     HybridCohorts,
 }
 
+const AUTORUN_PRESETS: [LabPreset; 5] = [
+    LabPreset::MassiveReuse,
+    LabPreset::Fragmented,
+    LabPreset::DynamicStorm,
+    LabPreset::ShadowAmplification,
+    LabPreset::HybridCohorts,
+];
+
+#[derive(Debug, Clone, Copy)]
+struct LabRunConfig {
+    autorun: bool,
+    warmup_frames: u32,
+    measure_frames: u32,
+}
+
+impl Default for LabRunConfig {
+    fn default() -> Self {
+        Self {
+            autorun: false,
+            warmup_frames: DEFAULT_WARMUP_FRAMES,
+            measure_frames: DEFAULT_MEASURE_FRAMES,
+        }
+    }
+}
+
 impl LabPreset {
     const ALL: [Self; 6] = [
         Self::Tiny,
@@ -85,6 +139,13 @@ impl LabPreset {
             Self::DynamicStorm => "DynamicStorm",
             Self::ShadowAmplification => "ShadowAmplification",
             Self::HybridCohorts => "HybridCohorts",
+        }
+    }
+
+    const fn autorun_label(self) -> &'static str {
+        match self {
+            Self::HybridCohorts => "Hybrid",
+            _ => self.label(),
         }
     }
 
@@ -147,6 +208,8 @@ struct DynamicObject {
 
 #[derive(Debug, Clone, Copy)]
 struct MeasurementResult {
+    sample_frames: u32,
+    total_ns: u128,
     mean_fps: f64,
     mean_frame_ms: f64,
     p50_frame_ms: f64,
@@ -154,14 +217,16 @@ struct MeasurementResult {
     p99_frame_ms: f64,
     max_frame_ms: f64,
     #[cfg(feature = "rdg_bench_support")]
-    phase_mean_us: [f64; MATRIX_PHASES.len()],
+    phase_total_ns: [u128; MATRIX_PHASES.len()],
     #[cfg(feature = "rdg_bench_support")]
-    detail_mean_us: [f64; MATRIX_DETAIL_PHASES.len()],
+    detail_total_ns: [u128; MATRIX_DETAIL_PHASES.len()],
     #[cfg(feature = "rdg_bench_support")]
     timing_samples: u32,
 }
 
 struct MeasurementWindow {
+    warmup_frames: u32,
+    sample_frames: u32,
     warmup_remaining: u32,
     last_update: Option<Instant>,
     samples_ns: Vec<u64>,
@@ -175,11 +240,14 @@ struct MeasurementWindow {
 }
 
 impl MeasurementWindow {
-    fn new() -> Self {
+    fn new(warmup_frames: u32, sample_frames: u32) -> Self {
+        assert!(sample_frames > 0, "measurement requires at least one frame");
         let mut window = Self {
+            warmup_frames,
+            sample_frames,
             warmup_remaining: 0,
             last_update: None,
-            samples_ns: Vec::with_capacity(SAMPLE_FRAMES as usize),
+            samples_ns: Vec::with_capacity(sample_frames as usize),
             result: None,
             #[cfg(feature = "rdg_bench_support")]
             phase_elapsed_ns: [0; MATRIX_PHASES.len()],
@@ -193,7 +261,7 @@ impl MeasurementWindow {
     }
 
     fn reset(&mut self) {
-        self.warmup_remaining = WARMUP_FRAMES;
+        self.warmup_remaining = self.warmup_frames;
         self.last_update = None;
         self.samples_ns.clear();
         self.result = None;
@@ -244,13 +312,13 @@ impl MeasurementWindow {
             u64::try_from(interval_ns)
                 .expect("one GPU-driven lab frame interval must fit in u64 nanoseconds"),
         );
-        if self.samples_ns.len() == SAMPLE_FRAMES as usize {
+        if self.samples_ns.len() == self.sample_frames as usize {
             let total_ns: u128 = self.samples_ns.iter().map(|&ns| u128::from(ns)).sum();
             let mean_ns = total_ns as f64 / self.samples_ns.len() as f64;
             self.samples_ns.sort_unstable();
-            #[cfg(feature = "rdg_bench_support")]
-            let timing_divisor = f64::from(self.timing_samples.max(1)) * 1_000.0;
             self.result = Some(MeasurementResult {
+                sample_frames: self.sample_frames,
+                total_ns,
                 mean_fps: 1_000_000_000.0 / mean_ns,
                 mean_frame_ms: mean_ns / 1_000_000.0,
                 p50_frame_ms: percentile_ns(&self.samples_ns, 50) as f64 / 1_000_000.0,
@@ -258,9 +326,9 @@ impl MeasurementWindow {
                 p99_frame_ms: percentile_ns(&self.samples_ns, 99) as f64 / 1_000_000.0,
                 max_frame_ms: self.samples_ns[self.samples_ns.len() - 1] as f64 / 1_000_000.0,
                 #[cfg(feature = "rdg_bench_support")]
-                phase_mean_us: self.phase_elapsed_ns.map(|ns| ns as f64 / timing_divisor),
+                phase_total_ns: self.phase_elapsed_ns,
                 #[cfg(feature = "rdg_bench_support")]
-                detail_mean_us: self.detail_elapsed_ns.map(|ns| ns as f64 / timing_divisor),
+                detail_total_ns: self.detail_elapsed_ns,
                 #[cfg(feature = "rdg_bench_support")]
                 timing_samples: self.timing_samples,
             });
@@ -320,6 +388,34 @@ enum MatrixPhase {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixRun {
+    Interactive,
+    Autorun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutorunState {
+    Disabled,
+    Running,
+    ExitRequested,
+}
+
+impl AutorunState {
+    const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+impl MatrixRun {
+    const fn presets(self) -> &'static [LabPreset] {
+        match self {
+            Self::Interactive => &LabPreset::ALL,
+            Self::Autorun => &AUTORUN_PRESETS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MatrixResult {
     preset: LabPreset,
@@ -329,6 +425,7 @@ struct MatrixResult {
 
 struct MatrixExperiment {
     phase: MatrixPhase,
+    run: MatrixRun,
     original_preset: LabPreset,
     original_mode: GpuDrivenMode,
     preset_index: usize,
@@ -336,18 +433,23 @@ struct MatrixExperiment {
 }
 
 impl MatrixExperiment {
-    fn new(preset: LabPreset, mode: GpuDrivenMode) -> Self {
+    fn new(preset: LabPreset, mode: GpuDrivenMode, run: MatrixRun) -> Self {
         Self {
             phase: MatrixPhase::Idle,
+            run,
             original_preset: preset,
             original_mode: mode,
             preset_index: 0,
-            results: Vec::with_capacity(LabPreset::ALL.len()),
+            results: Vec::with_capacity(run.presets().len()),
         }
     }
 
     const fn is_active(&self) -> bool {
         matches!(self.phase, MatrixPhase::Running)
+    }
+
+    fn presets(&self) -> &'static [LabPreset] {
+        self.run.presets()
     }
 }
 
@@ -368,7 +470,7 @@ enum ExperimentAction {
 }
 
 struct GpuDrivenLab {
-    ui_pass: UiPass,
+    ui_pass: Option<UiPass>,
     controls: OrbitControls,
     fps_counter: FpsCounter,
     preset: LabPreset,
@@ -387,6 +489,7 @@ struct GpuDrivenLab {
     gpu_timing_enabled: bool,
     ab: AbExperiment,
     matrix: MatrixExperiment,
+    autorun_state: AutorunState,
 }
 
 impl GpuDrivenLab {
@@ -596,16 +699,16 @@ impl GpuDrivenLab {
         }
     }
 
-    fn start_matrix(&mut self, engine: &mut Engine) {
+    fn start_matrix(&mut self, engine: &mut Engine, run: MatrixRun) {
         if !self.gpu_baseline_available || self.ab.is_active() || self.matrix.is_active() {
             return;
         }
 
-        self.matrix = MatrixExperiment::new(self.preset, self.mode);
+        self.matrix = MatrixExperiment::new(self.preset, self.mode, run);
         self.matrix.phase = MatrixPhase::Running;
         println!(
             "GPU_DRIVEN_LAB_MATRIX start presets={} original_preset={} original_mode={:?}",
-            LabPreset::ALL.len(),
+            self.matrix.presets().len(),
             self.matrix.original_preset.label(),
             self.matrix.original_mode,
         );
@@ -614,7 +717,7 @@ impl GpuDrivenLab {
 
     fn start_current_matrix_preset(&mut self, engine: &mut Engine) {
         assert!(self.matrix.is_active());
-        let preset = LabPreset::ALL[self.matrix.preset_index];
+        let preset = self.matrix.presets()[self.matrix.preset_index];
         self.mode = self.matrix.original_mode;
         engine.renderer.set_gpu_driven_mode(self.mode);
         self.preset = preset;
@@ -622,7 +725,7 @@ impl GpuDrivenLab {
         println!(
             "GPU_DRIVEN_LAB_MATRIX preset_start index={}/{} preset={}",
             self.matrix.preset_index + 1,
-            LabPreset::ALL.len(),
+            self.matrix.presets().len(),
             preset.label(),
         );
         self.start_ab(engine);
@@ -648,7 +751,7 @@ impl GpuDrivenLab {
         println!(
             "GPU_DRIVEN_LAB_MATRIX cancelled completed={}/{} restored_preset={} restored_mode={restored_mode:?}",
             self.matrix.results.len(),
-            LabPreset::ALL.len(),
+            self.matrix.presets().len(),
             restored_preset.label(),
         );
     }
@@ -673,7 +776,7 @@ impl GpuDrivenLab {
             .ab
             .off
             .expect("terminal matrix A/B lost its Off result");
-        let preset = LabPreset::ALL[self.matrix.preset_index];
+        let preset = self.matrix.presets()[self.matrix.preset_index];
         debug_assert_eq!(self.preset, preset);
         self.matrix.results.push(MatrixResult {
             preset,
@@ -696,22 +799,53 @@ impl GpuDrivenLab {
                 off.mean_frame_ms,
             ),
         }
+        if self.matrix.run == MatrixRun::Autorun {
+            print_autorun_arm_result(preset, self.measurement.warmup_frames, &off, &required);
+        }
         #[cfg(feature = "rdg_bench_support")]
         {
-            print_matrix_cpu_timings(preset, "Off", off);
-            if let Ok(required) = required {
-                print_matrix_cpu_timings(preset, "Required", required);
+            if self.matrix.run == MatrixRun::Autorun {
+                print_autorun_cpu_timings(preset, "Off", &off);
+                if let Ok(required) = required {
+                    print_autorun_cpu_timings(preset, "Required", &required);
+                }
+            } else {
+                print_matrix_cpu_timings(preset, "Off", &off);
+                if let Ok(required) = required {
+                    print_matrix_cpu_timings(preset, "Required", &required);
+                }
             }
         }
 
         self.matrix.preset_index += 1;
-        if self.matrix.preset_index < LabPreset::ALL.len() {
+        if self.matrix.preset_index < self.matrix.presets().len() {
             self.start_current_matrix_preset(engine);
             return;
         }
 
         self.matrix.phase = MatrixPhase::Complete;
         self.print_matrix_table();
+        if self.matrix.run == MatrixRun::Autorun {
+            let successful_required = self
+                .matrix
+                .results
+                .iter()
+                .filter(|result| result.required.is_ok())
+                .count();
+            let completed_windows = self.matrix.results.len() + successful_required;
+            let succeeded = successful_required == self.matrix.results.len();
+            println!(
+                "GPU_DRIVEN_LAB_AUTORUN_COMPLETE version=1 arms={} completed_windows={} planned_windows={} status={}",
+                self.matrix.results.len(),
+                completed_windows,
+                self.matrix.presets().len() * 2,
+                if succeeded { "ok" } else { "required_failed" },
+            );
+            io::stdout()
+                .flush()
+                .expect("failed to flush GPU-driven autorun results");
+            return;
+        }
         let restored_preset = self.matrix.original_preset;
         let restored_mode = self.matrix.original_mode;
         self.mode = restored_mode;
@@ -907,17 +1041,18 @@ impl GpuDrivenLab {
 
     fn draw_measurement(&self, ui: &mut egui::Ui) {
         if self.measurement.warmup_remaining != 0 {
-            let completed = WARMUP_FRAMES - self.measurement.warmup_remaining;
+            let completed = self.measurement.warmup_frames - self.measurement.warmup_remaining;
             ui.label(format!(
-                "Warmup: {completed}/{WARMUP_FRAMES} frames (scene rebuild excluded)"
+                "Warmup: {completed}/{} frames (scene rebuild excluded)",
+                self.measurement.warmup_frames,
             ));
             ui.add(egui::ProgressBar::new(
-                completed as f32 / WARMUP_FRAMES as f32,
+                completed as f32 / self.measurement.warmup_frames as f32,
             ));
         } else if let Some(result) = self.measurement.result {
             ui.label(format!(
-                "{SAMPLE_FRAMES} frames: {:.1} FPS | mean {:.3} ms",
-                result.mean_fps, result.mean_frame_ms
+                "{} frames: {:.1} FPS | mean {:.3} ms",
+                self.measurement.sample_frames, result.mean_fps, result.mean_frame_ms
             ));
             ui.label(format!(
                 "p50/p95/p99/max: {:.3} / {:.3} / {:.3} / {:.3} ms",
@@ -925,11 +1060,12 @@ impl GpuDrivenLab {
             ));
         } else {
             ui.label(format!(
-                "Sampling: {}/{SAMPLE_FRAMES} frames",
-                self.measurement.samples_ns.len()
+                "Sampling: {}/{} frames",
+                self.measurement.samples_ns.len(),
+                self.measurement.sample_frames,
             ));
             ui.add(egui::ProgressBar::new(
-                self.measurement.samples_ns.len() as f32 / SAMPLE_FRAMES as f32,
+                self.measurement.samples_ns.len() as f32 / self.measurement.sample_frames as f32,
             ));
         }
     }
@@ -937,7 +1073,10 @@ impl GpuDrivenLab {
     fn draw_ab(&self, ui: &mut egui::Ui) {
         match self.ab.phase {
             AbPhase::Idle => {
-                ui.label("Runs two independent 120-warmup + 600-sample windows.");
+                ui.label(format!(
+                    "Runs two independent {}-warmup + {}-sample windows.",
+                    self.measurement.warmup_frames, self.measurement.sample_frames,
+                ));
             }
             AbPhase::MeasuringOff => {
                 ui.label("Phase 1/2: measuring Off (CPU-direct baseline)");
@@ -996,18 +1135,19 @@ impl GpuDrivenLab {
                 let current_window_progress = if self.measurement.result.is_some() {
                     1.0
                 } else if self.measurement.warmup_remaining != 0 {
-                    f64::from(WARMUP_FRAMES - self.measurement.warmup_remaining)
-                        / f64::from(WARMUP_FRAMES + SAMPLE_FRAMES)
+                    f64::from(self.measurement.warmup_frames - self.measurement.warmup_remaining)
+                        / f64::from(self.measurement.warmup_frames + self.measurement.sample_frames)
                 } else {
-                    f64::from(WARMUP_FRAMES).mul_add(1.0, self.measurement.samples_ns.len() as f64)
-                        / f64::from(WARMUP_FRAMES + SAMPLE_FRAMES)
+                    f64::from(self.measurement.warmup_frames)
+                        .mul_add(1.0, self.measurement.samples_ns.len() as f64)
+                        / f64::from(self.measurement.warmup_frames + self.measurement.sample_frames)
                 };
-                let total_windows = LabPreset::ALL.len() * 2;
+                let total_windows = self.matrix.presets().len() * 2;
                 let overall =
                     (completed_windows as f64 + current_window_progress) / total_windows as f64;
                 ui.label(format!(
                     "Preset {preset_number}/{}: {} | {:?}",
-                    LabPreset::ALL.len(),
+                    self.matrix.presets().len(),
                     self.preset.label(),
                     self.ab.phase,
                 ));
@@ -1031,7 +1171,7 @@ impl GpuDrivenLab {
                     format!(
                         "Matrix cancelled after {}/{} presets; partial results were retained.",
                         self.matrix.results.len(),
-                        LabPreset::ALL.len()
+                        self.matrix.presets().len()
                     ),
                 );
             }
@@ -1080,7 +1220,8 @@ impl GpuDrivenLab {
 
 impl AppHandler for GpuDrivenLab {
     fn init(engine: &mut Engine, window: &dyn Window) -> Self {
-        let ui_pass = {
+        let run_config = lab_run_config();
+        let ui_pass = (!run_config.autorun).then(|| {
             let wgpu_ctx = engine
                 .renderer
                 .wgpu_ctx()
@@ -1090,7 +1231,7 @@ impl AppHandler for GpuDrivenLab {
                 .downcast_ref::<winit::window::Window>()
                 .expect("GPU-driven lab requires the winit window backend");
             UiPass::new(&wgpu_ctx.device, wgpu_ctx.surface_view_format, winit_window)
-        };
+        });
 
         let geometry = engine
             .assets
@@ -1149,16 +1290,46 @@ impl AppHandler for GpuDrivenLab {
             workload_lights: Vec::new(),
             dynamic_objects: Vec::with_capacity(DYNAMIC_OBJECTS),
             time: 0.0,
-            measurement: MeasurementWindow::new(),
+            measurement: MeasurementWindow::new(
+                run_config.warmup_frames,
+                run_config.measure_frames,
+            ),
             gpu_baseline_available,
             #[cfg(feature = "rdg_bench_support")]
             gpu_timing_supported,
             #[cfg(feature = "rdg_bench_support")]
             gpu_timing_enabled: false,
             ab: AbExperiment::new(mode),
-            matrix: MatrixExperiment::new(LabPreset::Tiny, mode),
+            matrix: MatrixExperiment::new(LabPreset::Tiny, mode, MatrixRun::Interactive),
+            autorun_state: if run_config.autorun {
+                AutorunState::Running
+            } else {
+                AutorunState::Disabled
+            },
         };
-        lab.rebuild_workload(engine);
+
+        if run_config.autorun {
+            if !gpu_baseline_available {
+                terminate_autorun_with_error(
+                    "Required GPU-driven submissions are unavailable on this adapter",
+                );
+            }
+            println!(
+                "GPU_DRIVEN_LAB_AUTORUN_BEGIN version=1 warmup={} frames={} arms={} planned_windows={} order=OffThenRequired phase_attribution={}",
+                run_config.warmup_frames,
+                run_config.measure_frames,
+                AUTORUN_PRESETS.len(),
+                AUTORUN_PRESETS.len() * 2,
+                cfg!(feature = "rdg_bench_support"),
+            );
+            #[cfg(not(feature = "rdg_bench_support"))]
+            println!(
+                "GPU_DRIVEN_LAB_AUTORUN_WARNING phase_attribution=disabled required_feature=rdg_bench_support"
+            );
+            lab.start_matrix(engine, MatrixRun::Autorun);
+        } else {
+            lab.rebuild_workload(engine);
+        }
 
         println!("GPU-Driven M7.5 Lab: 1-6 presets, F1=Off, F2=Auto, F3=Required");
         if let Some(capabilities) = engine.renderer.gpu_driven_capabilities() {
@@ -1168,6 +1339,9 @@ impl AppHandler for GpuDrivenLab {
     }
 
     fn on_event(&mut self, _engine: &mut Engine, window: &dyn Window, event: &dyn Any) -> bool {
+        if self.autorun_state.is_enabled() {
+            return false;
+        }
         let Some(event) = event.downcast_ref::<WindowEvent>() else {
             return false;
         };
@@ -1175,12 +1349,15 @@ impl AppHandler for GpuDrivenLab {
             .as_any()
             .downcast_ref::<winit::window::Window>()
             .expect("GPU-driven lab requires the winit window backend");
-        if self.ui_pass.handle_input(winit_window, event) {
+        let ui_pass = self
+            .ui_pass
+            .as_mut()
+            .expect("interactive GPU-driven lab lost its UI pass");
+        if ui_pass.handle_input(winit_window, event) {
             return true;
         }
         if let WindowEvent::Resized(size) = event {
-            self.ui_pass
-                .resize(size.width, size.height, window.scale_factor());
+            ui_pass.resize(size.width, size.height, window.scale_factor());
         }
         false
     }
@@ -1193,69 +1370,82 @@ impl AppHandler for GpuDrivenLab {
         {
             self.fail_ab(engine, failure);
         }
-        #[cfg(feature = "rdg_bench_support")]
-        let gpu_timings = engine.renderer.latest_rdg_gpu_timings();
-        let keyboard_preset = keyboard_preset(&engine.input);
-        let keyboard_mode = keyboard_mode(&engine.input);
-
-        let winit_window = window
-            .as_any()
-            .downcast_ref::<winit::window::Window>()
-            .expect("GPU-driven lab requires the winit window backend");
-        self.ui_pass.begin_frame(winit_window);
-        let egui_ctx = self.ui_pass.context().clone();
-        let (ui_preset, ui_mode, actions) = self.draw_ui(
-            &egui_ctx,
-            diagnostics.as_ref(),
+        if !self.autorun_state.is_enabled() {
             #[cfg(feature = "rdg_bench_support")]
-            gpu_timings,
-        );
-        self.ui_pass.end_frame(winit_window);
+            let gpu_timings = engine.renderer.latest_rdg_gpu_timings();
+            let keyboard_preset = keyboard_preset(&engine.input);
+            let keyboard_mode = keyboard_mode(&engine.input);
 
-        #[cfg(feature = "rdg_bench_support")]
-        if let Some(enabled) = actions.gpu_timing_enabled {
-            self.gpu_timing_enabled = enabled;
-            let interval = if enabled { 8 } else { 0 };
-            assert!(
-                engine.renderer.set_rdg_gpu_timing_sample_interval(interval),
-                "initialized renderer rejected GPU timing cadence"
+            let winit_window = window
+                .as_any()
+                .downcast_ref::<winit::window::Window>()
+                .expect("GPU-driven lab requires the winit window backend");
+            self.ui_pass
+                .as_mut()
+                .expect("interactive GPU-driven lab lost its UI pass")
+                .begin_frame(winit_window);
+            let egui_ctx = self
+                .ui_pass
+                .as_ref()
+                .expect("interactive GPU-driven lab lost its UI pass")
+                .context()
+                .clone();
+            let (ui_preset, ui_mode, actions) = self.draw_ui(
+                &egui_ctx,
+                diagnostics.as_ref(),
+                #[cfg(feature = "rdg_bench_support")]
+                gpu_timings,
             );
-        }
+            self.ui_pass
+                .as_mut()
+                .expect("interactive GPU-driven lab lost its UI pass")
+                .end_frame(winit_window);
 
-        if actions.experiment == Some(ExperimentAction::CancelMatrix) {
-            self.cancel_matrix(engine, None);
-        } else if self.matrix.is_active() && keyboard_mode == Some(GpuDrivenMode::Off) {
-            // F1 remains a hard recovery path for the complete unattended
-            // matrix, including a Required attempt which cannot draw the UI.
-            self.cancel_matrix(engine, Some(GpuDrivenMode::Off));
-        } else if actions.experiment == Some(ExperimentAction::CancelAb) {
-            self.cancel_ab(engine, None);
-        } else if self.ab.is_active() && keyboard_mode == Some(GpuDrivenMode::Off) {
-            // F1 is a recovery path even while the automated experiment owns
-            // the normal mode UI.
-            self.cancel_ab(engine, Some(GpuDrivenMode::Off));
-        } else if !self.ab.is_active() && !self.matrix.is_active() {
-            if actions.experiment == Some(ExperimentAction::StartMatrix) {
-                self.start_matrix(engine);
-            } else if actions.experiment == Some(ExperimentAction::StartAb) {
-                self.start_ab(engine);
-            } else {
-                let requested_mode = keyboard_mode.unwrap_or(ui_mode);
-                if (requested_mode != GpuDrivenMode::Required || self.gpu_baseline_available)
-                    && requested_mode != self.mode
-                {
-                    self.mode = requested_mode;
-                    engine.renderer.set_gpu_driven_mode(self.mode);
-                    self.measurement.reset();
-                    println!("GPU_DRIVEN_LAB mode={:?}", self.mode);
-                }
+            #[cfg(feature = "rdg_bench_support")]
+            if let Some(enabled) = actions.gpu_timing_enabled {
+                self.gpu_timing_enabled = enabled;
+                let interval = if enabled { 8 } else { 0 };
+                assert!(
+                    engine.renderer.set_rdg_gpu_timing_sample_interval(interval),
+                    "initialized renderer rejected GPU timing cadence"
+                );
+            }
 
-                let requested_preset = keyboard_preset.unwrap_or(ui_preset);
-                if requested_preset != self.preset {
-                    self.preset = requested_preset;
-                    self.rebuild_workload(engine);
-                } else if actions.restart_measurement {
-                    self.measurement.reset();
+            if actions.experiment == Some(ExperimentAction::CancelMatrix) {
+                self.cancel_matrix(engine, None);
+            } else if self.matrix.is_active() && keyboard_mode == Some(GpuDrivenMode::Off) {
+                // F1 remains a hard recovery path for the complete unattended
+                // matrix, including a Required attempt which cannot draw the UI.
+                self.cancel_matrix(engine, Some(GpuDrivenMode::Off));
+            } else if actions.experiment == Some(ExperimentAction::CancelAb) {
+                self.cancel_ab(engine, None);
+            } else if self.ab.is_active() && keyboard_mode == Some(GpuDrivenMode::Off) {
+                // F1 is a recovery path even while the automated experiment owns
+                // the normal mode UI.
+                self.cancel_ab(engine, Some(GpuDrivenMode::Off));
+            } else if !self.ab.is_active() && !self.matrix.is_active() {
+                if actions.experiment == Some(ExperimentAction::StartMatrix) {
+                    self.start_matrix(engine, MatrixRun::Interactive);
+                } else if actions.experiment == Some(ExperimentAction::StartAb) {
+                    self.start_ab(engine);
+                } else {
+                    let requested_mode = keyboard_mode.unwrap_or(ui_mode);
+                    if (requested_mode != GpuDrivenMode::Required || self.gpu_baseline_available)
+                        && requested_mode != self.mode
+                    {
+                        self.mode = requested_mode;
+                        engine.renderer.set_gpu_driven_mode(self.mode);
+                        self.measurement.reset();
+                        println!("GPU_DRIVEN_LAB mode={:?}", self.mode);
+                    }
+
+                    let requested_preset = keyboard_preset.unwrap_or(ui_preset);
+                    if requested_preset != self.preset {
+                        self.preset = requested_preset;
+                        self.rebuild_workload(engine);
+                    } else if actions.restart_measurement {
+                        self.measurement.reset();
+                    }
                 }
             }
         }
@@ -1280,7 +1470,9 @@ impl AppHandler for GpuDrivenLab {
         self.measurement.update(Instant::now());
         self.advance_ab_if_complete(engine);
         self.advance_matrix_if_ready(engine);
-        if let Some(fps) = self.fps_counter.update() {
+        if !self.autorun_state.is_enabled()
+            && let Some(fps) = self.fps_counter.update()
+        {
             window.set_title(&format!(
                 "GPU-Driven Lab | {} | {:?} | {:.1} FPS",
                 self.preset.label(),
@@ -1290,15 +1482,36 @@ impl AppHandler for GpuDrivenLab {
         }
     }
 
-    fn render(&mut self, engine: &mut Engine, _window: &dyn Window) {
-        use myth::renderer::graph::core::{GraphBlackboard, HookStage};
+    fn render(&mut self, engine: &mut Engine, window: &dyn Window) {
+        if self.autorun_state.is_enabled() {
+            if self.matrix.phase == MatrixPhase::Complete {
+                if self.autorun_state != AutorunState::ExitRequested {
+                    self.autorun_state = AutorunState::ExitRequested;
+                    let failed = self
+                        .matrix
+                        .results
+                        .iter()
+                        .any(|result| result.required.is_err());
+                    let exit_code = if failed { 2 } else { 0 };
+                    AUTORUN_EXIT_CODE.store(exit_code, Ordering::Relaxed);
+                    if !request_graceful_exit(window) {
+                        std::process::exit(exit_code);
+                    }
+                }
+                return;
+            }
+            engine.render_active_scene();
+            return;
+        }
 
         let Some(composer) = engine.compose_frame() else {
             return;
         };
-        self.ui_pass
-            .resolve_textures(composer.device(), composer.resource_manager());
-        let ui_pass = &mut self.ui_pass;
+        let ui_pass = self
+            .ui_pass
+            .as_mut()
+            .expect("interactive GPU-driven lab lost its UI pass");
+        ui_pass.resolve_textures(composer.device(), composer.resource_manager());
         composer
             .add_custom_pass(HookStage::AfterPostProcess, move |rdg, blackboard| {
                 let surface_out = rdg.add_pass("GpuDrivenLabUI", |builder| {
@@ -1321,24 +1534,103 @@ impl AppHandler for GpuDrivenLab {
     }
 }
 
+fn print_autorun_arm_result(
+    preset: LabPreset,
+    warmup_frames: u32,
+    off: &MeasurementResult,
+    required: &Result<MeasurementResult, RdgGpuDrivenFailure>,
+) {
+    match required {
+        Ok(required) => println!(
+            "GPU_DRIVEN_LAB_AUTORUN_RESULT version=1 arm={} objects={} intended_bins={} warmup={} frames={} off_total_ns={} off_mean_ms={:.6} off_p50_ms={:.6} off_p95_ms={:.6} off_p99_ms={:.6} off_max_ms={:.6} off_mean_fps={:.3} required_total_ns={} required_mean_ms={:.6} required_p50_ms={:.6} required_p95_ms={:.6} required_p99_ms={:.6} required_max_ms={:.6} required_mean_fps={:.3} speedup={:.6} status=ok",
+            preset.autorun_label(),
+            preset.object_count(),
+            preset.intended_bin_count(),
+            warmup_frames,
+            off.sample_frames,
+            off.total_ns,
+            off.mean_frame_ms,
+            off.p50_frame_ms,
+            off.p95_frame_ms,
+            off.p99_frame_ms,
+            off.max_frame_ms,
+            off.mean_fps,
+            required.total_ns,
+            required.mean_frame_ms,
+            required.p50_frame_ms,
+            required.p95_frame_ms,
+            required.p99_frame_ms,
+            required.max_frame_ms,
+            required.mean_fps,
+            off.mean_frame_ms / required.mean_frame_ms,
+        ),
+        Err(failure) => println!(
+            "GPU_DRIVEN_LAB_AUTORUN_RESULT version=1 arm={} objects={} intended_bins={} warmup={} frames={} off_total_ns={} off_mean_ms={:.6} off_p50_ms={:.6} off_p95_ms={:.6} off_p99_ms={:.6} off_max_ms={:.6} off_mean_fps={:.3} status=required_failed reason={failure:?}",
+            preset.autorun_label(),
+            preset.object_count(),
+            preset.intended_bin_count(),
+            warmup_frames,
+            off.sample_frames,
+            off.total_ns,
+            off.mean_frame_ms,
+            off.p50_frame_ms,
+            off.p95_frame_ms,
+            off.p99_frame_ms,
+            off.max_frame_ms,
+            off.mean_fps,
+        ),
+    }
+}
+
 #[cfg(feature = "rdg_bench_support")]
-fn print_matrix_cpu_timings(preset: LabPreset, mode: &str, result: MeasurementResult) {
+fn print_matrix_cpu_timings(preset: LabPreset, mode: &str, result: &MeasurementResult) {
     for (index, phase) in MATRIX_PHASES.into_iter().enumerate() {
+        let mean_us = mean_timing_us(result.phase_total_ns[index], result.timing_samples);
         println!(
             "GPU_DRIVEN_LAB_MATRIX_CPU preset={} mode={mode} kind=phase phase={phase:?} samples={} mean_us={:.3}",
             preset.label(),
             result.timing_samples,
-            result.phase_mean_us[index],
+            mean_us,
         );
     }
     for (index, phase) in MATRIX_DETAIL_PHASES.into_iter().enumerate() {
+        let mean_us = mean_timing_us(result.detail_total_ns[index], result.timing_samples);
         println!(
             "GPU_DRIVEN_LAB_MATRIX_CPU preset={} mode={mode} kind=detail phase={phase:?} samples={} mean_us={:.3}",
             preset.label(),
             result.timing_samples,
-            result.detail_mean_us[index],
+            mean_us,
         );
     }
+}
+
+#[cfg(feature = "rdg_bench_support")]
+fn print_autorun_cpu_timings(preset: LabPreset, mode: &str, result: &MeasurementResult) {
+    for (index, phase) in MATRIX_PHASES.into_iter().enumerate() {
+        let mean_us = mean_timing_us(result.phase_total_ns[index], result.timing_samples);
+        println!(
+            "GPU_DRIVEN_LAB_AUTORUN_CPU version=1 arm={} mode={mode} kind=phase phase={phase:?} samples={} total_ns={} mean_us={:.3}",
+            preset.autorun_label(),
+            result.timing_samples,
+            result.phase_total_ns[index],
+            mean_us,
+        );
+    }
+    for (index, phase) in MATRIX_DETAIL_PHASES.into_iter().enumerate() {
+        let mean_us = mean_timing_us(result.detail_total_ns[index], result.timing_samples);
+        println!(
+            "GPU_DRIVEN_LAB_AUTORUN_CPU version=1 arm={} mode={mode} kind=detail phase={phase:?} samples={} total_ns={} mean_us={:.3}",
+            preset.autorun_label(),
+            result.timing_samples,
+            result.detail_total_ns[index],
+            mean_us,
+        );
+    }
+}
+
+#[cfg(feature = "rdg_bench_support")]
+fn mean_timing_us(total_ns: u128, samples: u32) -> f64 {
+    total_ns as f64 / f64::from(samples.max(1)) / 1_000.0
 }
 
 #[cfg(feature = "rdg_bench_support")]
@@ -1475,9 +1767,147 @@ fn keyboard_mode(input: &myth_resources::Input) -> Option<GpuDrivenMode> {
     }
 }
 
+fn lab_run_config() -> LabRunConfig {
+    static CONFIG: OnceLock<LabRunConfig> = OnceLock::new();
+    *CONFIG.get_or_init(parse_lab_run_config)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_lab_run_config() -> LabRunConfig {
+    let mut config = LabRunConfig {
+        autorun: read_bool_env(AUTORUN_ENV).unwrap_or(false),
+        warmup_frames: read_frame_count_env(WARMUP_FRAMES_ENV, DEFAULT_WARMUP_FRAMES, true),
+        measure_frames: read_frame_count_env(MEASURE_FRAMES_ENV, DEFAULT_MEASURE_FRAMES, false),
+    };
+
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--autorun" => config.autorun = true,
+            "--warmup-frames" => {
+                let value = args
+                    .next()
+                    .expect("--warmup-frames requires an unsigned integer");
+                config.warmup_frames = parse_frame_count("--warmup-frames", &value, true);
+            }
+            "--measure-frames" => {
+                let value = args
+                    .next()
+                    .expect("--measure-frames requires an unsigned integer");
+                config.measure_frames = parse_frame_count("--measure-frames", &value, false);
+            }
+            "--help" | "-h" => print_autorun_help_and_exit(),
+            _ if argument.starts_with("--warmup-frames=") => {
+                let (_, value) = argument
+                    .split_once('=')
+                    .expect("warmup assignment must contain '='");
+                config.warmup_frames = parse_frame_count("--warmup-frames", value, true);
+            }
+            _ if argument.starts_with("--measure-frames=") => {
+                let (_, value) = argument
+                    .split_once('=')
+                    .expect("measurement assignment must contain '='");
+                config.measure_frames = parse_frame_count("--measure-frames", value, false);
+            }
+            _ => panic!("unknown gpu_driven_lab argument {argument:?}; use --help for options"),
+        }
+    }
+
+    config
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_lab_run_config() -> LabRunConfig {
+    LabRunConfig::default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_bool_env(name: &str) -> Option<bool> {
+    let value = std::env::var(name).ok()?;
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => panic!("{name} must be a boolean, got {value:?}"),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_frame_count_env(name: &str, default: u32, allow_zero: bool) -> u32 {
+    let Ok(value) = std::env::var(name) else {
+        return default;
+    };
+    parse_frame_count(name, &value, allow_zero)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_frame_count(name: &str, value: &str, allow_zero: bool) -> u32 {
+    let parsed = value
+        .parse::<u32>()
+        .unwrap_or_else(|_| panic!("{name} must be an unsigned 32-bit integer, got {value:?}"));
+    assert!(allow_zero || parsed > 0, "{name} must be greater than zero");
+    parsed
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn print_autorun_help_and_exit() -> ! {
+    println!(
+        "GPU-driven lab options:\n  --autorun\n  --warmup-frames <N>\n  --measure-frames <N>\n\nEnvironment equivalents:\n  {AUTORUN_ENV}\n  {WARMUP_FRAMES_ENV}\n  {MEASURE_FRAMES_ENV}"
+    );
+    std::process::exit(0);
+}
+
+fn terminate_autorun_with_error(message: &str) -> ! {
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
+    let _ = writeln!(output, "GPU_DRIVEN_LAB_AUTORUN_ERROR {message}");
+    let _ = output.flush();
+    std::process::exit(2);
+}
+
+#[cfg(target_os = "windows")]
+fn request_graceful_exit(window: &dyn Window) -> bool {
+    use std::ffi::c_void;
+
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    const WM_CLOSE: u32 = 0x0010;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        #[link_name = "PostMessageW"]
+        fn post_message_w(window: *mut c_void, message: u32, w_param: usize, l_param: isize)
+        -> i32;
+    }
+
+    let Some(window) = window
+        .as_any()
+        .downcast_ref::<myth_app::winit::WinitWindow>()
+    else {
+        return false;
+    };
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return false;
+    };
+
+    // SAFETY: the HWND belongs to the live winit window. `PostMessageW` copies
+    // the handle value and does not retain a Rust reference.
+    unsafe { post_message_w(handle.hwnd.get() as *mut c_void, WM_CLOSE, 0, 0) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn request_graceful_exit(_window: &dyn Window) -> bool {
+    false
+}
+
 #[myth::main]
 fn main() -> myth::Result<()> {
-    App::new()
+    // Parse automation arguments before creating a window or initializing the
+    // adapter. `OnceLock` makes the same immutable config available to `init`.
+    let _ = lab_run_config();
+    let result = App::new()
         .with_title("GPU-Driven M7.5 Lab")
         .with_settings(RendererSettings {
             path: RenderPath::BasicForward,
@@ -1485,5 +1915,10 @@ fn main() -> myth::Result<()> {
             gpu_driven: GpuDrivenMode::Auto,
             ..Default::default()
         })
-        .run::<GpuDrivenLab>()
+        .run::<GpuDrivenLab>();
+    let autorun_exit_code = AUTORUN_EXIT_CODE.load(Ordering::Relaxed);
+    if autorun_exit_code != 0 {
+        std::process::exit(autorun_exit_code);
+    }
+    result
 }
