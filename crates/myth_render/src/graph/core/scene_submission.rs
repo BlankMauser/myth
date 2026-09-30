@@ -154,11 +154,7 @@ impl From<DrawPlanKey> for SceneSubmissionKey {
     }
 }
 
-/// Typed logical dependency builder for every scene-submission backend.
-///
-/// Texture and Buffer handles are erased only after their resource class was
-/// checked by the typed method. Registration order and duplicates are
-/// preserved; GraphStorage's one-shot demand finalizer owns deduplication.
+/// Logical dependency fixture for scene-submission behavior tests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg(test)]
 pub(crate) struct SceneSubmissionDependencies {
@@ -172,26 +168,6 @@ impl SceneSubmissionDependencies {
         Self {
             reads: SmallVec::new(),
         }
-    }
-
-    #[must_use]
-    pub(crate) fn with_texture(mut self, texture: TextureNodeId) -> Self {
-        self.read_texture(texture);
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_buffer(mut self, buffer: BufferNodeId) -> Self {
-        self.read_buffer(buffer);
-        self
-    }
-
-    pub(crate) fn read_texture(&mut self, texture: TextureNodeId) {
-        self.reads.push(texture.erase());
-    }
-
-    pub(crate) fn read_buffer(&mut self, buffer: BufferNodeId) {
-        self.reads.push(buffer.erase());
     }
 
     #[must_use]

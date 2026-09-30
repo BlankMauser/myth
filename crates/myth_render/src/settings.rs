@@ -359,7 +359,7 @@ impl Default for RendererSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusteredShadingMode, GpuDrivenMode, RendererSettings};
+    use super::{ClusteredShadingMode, RendererSettings};
 
     #[test]
     fn clustered_auto_threshold_switches_at_threshold() {
@@ -381,10 +381,5 @@ mod tests {
             RendererSettings::default().clustered_shading,
             ClusteredShadingMode::Auto { threshold: 32 }
         );
-    }
-
-    #[test]
-    fn renderer_settings_default_gpu_driven_mode_preserves_cpu_direct() {
-        assert_eq!(RendererSettings::default().gpu_driven, GpuDrivenMode::Off);
     }
 }

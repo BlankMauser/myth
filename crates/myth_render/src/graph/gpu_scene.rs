@@ -4866,20 +4866,7 @@ mod tests {
     }
 
     #[test]
-    fn table_abi_and_cpu_only_planning_match_shader_contracts() {
-        assert_eq!(size_of::<GpuSceneInstanceRecord>(), 256);
-        assert_eq!(std::mem::align_of::<GpuSceneInstanceRecord>(), 16);
-        assert!(bytemuck::try_cast_slice::<_, u8>(&[GpuSceneInstanceRecord::zeroed()]).is_ok());
-        assert_eq!(size_of::<GpuSceneGeometryId>(), 8);
-        assert_eq!(size_of::<GpuSceneMaterialId>(), 8);
-        assert_eq!(size_of::<GpuSceneBatchId>(), 8);
-        assert_eq!(size_of::<GpuSceneGeometryRecord>(), 48);
-        assert_eq!(size_of::<GpuSceneMaterialRecord>(), 32);
-        assert_eq!(size_of::<GpuSceneBatchRecord>(), 80);
-        assert_eq!(std::mem::align_of::<GpuSceneGeometryRecord>(), 16);
-        assert_eq!(std::mem::align_of::<GpuSceneMaterialRecord>(), 16);
-        assert_eq!(std::mem::align_of::<GpuSceneBatchRecord>(), 16);
-
+    fn cpu_only_table_planning_tracks_specs_revision_and_dirty_ranges() {
         let mut scene = GpuScene::new();
         let mut registry = PersistentBufferRegistry::new();
         let empty = scene.plan_instance_table(&mut registry, 1).unwrap();

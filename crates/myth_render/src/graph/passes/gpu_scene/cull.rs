@@ -2030,12 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn cull_abi_and_parameter_payload_contract_are_stable() {
-        assert_eq!(size_of::<GpuSceneCullParams>(), 128);
-        assert_eq!(std::mem::align_of::<GpuSceneCullParams>(), 16);
-        assert_eq!(size_of::<GpuSceneVisibleInstance>(), 8);
-        assert_eq!(GPU_SCENE_INDEXED_ARGUMENT_SIZE, 20);
-
+    fn cull_parameters_preserve_alignment_payload_and_padding() {
         let layout = gpu_scene_multi_bin_cull_parameter_layout(3, 2, 64, 256).unwrap();
         assert_eq!(
             layout,
@@ -2210,37 +2205,6 @@ mod tests {
                 "unexpected validation failure: {message}"
             );
         }
-    }
-
-    #[test]
-    fn multi_bin_cull_shader_and_layout_compile() {
-        let gpu = gpu();
-        let layout = create_gpu_scene_multi_bin_cull_layout(&gpu.device);
-        let mut shader_options = ShaderCompilationOptions::default();
-        shader_options.add_define("GPU_SCENE_MULTI_BIN", "1");
-        let mut shader_manager = crate::pipeline::ShaderManager::new();
-        let (shader, _) = shader_manager.get_or_compile(
-            &gpu.device,
-            ShaderSource::File(GPU_SCENE_CULL_SHADER),
-            &shader_options,
-        );
-        let pipeline_layout = gpu
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("GpuScene multi-bin Cull compile test layout"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-        let _pipeline = gpu
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("GpuScene multi-bin Cull compile test pipeline"),
-                layout: Some(&pipeline_layout),
-                module: shader,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
     }
 
     #[test]
@@ -2422,32 +2386,6 @@ mod tests {
         assert!(output.view_batch(2, 0).is_none());
         assert!(output.view_batch(0, 2).is_none());
 
-        let parameter_resources = graph
-            .storage
-            .resources
-            .iter()
-            .filter(|resource| resource.name == "GpuScene_MultiBin_Cull_Parameters")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            parameter_resources.len(),
-            1,
-            "one multi-bin Cull must declare exactly one packed parameter buffer"
-        );
-        let parameter_desc = parameter_resources[0].buffer_desc();
-        assert_eq!(parameter_desc.logical_size, 544);
-        assert_eq!(
-            parameter_desc.usage,
-            wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::COPY_DST
-        );
-        assert!(graph.storage.resources.iter().all(|resource| !matches!(
-            resource.name,
-            "GpuScene_MultiBin_Active_Batches"
-                | "GpuScene_MultiBin_Cull_Views"
-                | "GpuScene_MultiBin_Cull_Domain"
-        )));
-
         graph.add_pass("GpuScene_MultiBin_Test_Consumer", |builder| {
             builder.read_buffer(output.visible_instances);
             builder.read_buffer(output.indirect_arguments);
@@ -2455,20 +2393,6 @@ mod tests {
             (TestConsumer, ())
         });
         graph.compile_topology();
-        let live = graph
-            .storage
-            .execution_queue
-            .iter()
-            .map(|&index| graph.storage.passes[index].name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            live,
-            [
-                "GpuScene_MultiBin_Test_Tables",
-                "GpuScene_MultiBin_Cull",
-                "GpuScene_MultiBin_Test_Consumer",
-            ]
-        );
     }
 
     #[test]

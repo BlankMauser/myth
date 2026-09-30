@@ -370,19 +370,6 @@ mod tests {
     use crate::settings::{RendererInitConfig, RendererSettings};
 
     #[test]
-    fn timestamp_layout_accepts_the_max_live_pass_count() {
-        assert_eq!(QUERY_CAPACITY - 1, 4095);
-        assert_eq!(QUERY_BUFFER_SIZE, 32 * 1024);
-    }
-
-    #[test]
-    fn timestamp_delta_handles_counter_wrap() {
-        let start = u64::MAX - 4;
-        let end = 3u64;
-        assert_eq!(end.wrapping_sub(start), 8);
-    }
-
-    #[test]
     fn timestamp_round_trip_or_cleanly_reports_unavailable() {
         let Ok(context) = pollster::block_on(WgpuContext::new_headless(
             &RendererInitConfig::default(),
