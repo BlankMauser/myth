@@ -509,7 +509,7 @@ fn bake_shadow_intents(
                 "binding_code",
                 format!(
                     "{}\n{}\n{}",
-                    SHADOW_BINDING_WGSL, &source.material_binding_wgsl, &source.object_binding_wgsl
+                    SHADOW_BINDING_WGSL, source.material_binding_wgsl, source.object_binding_wgsl
                 ),
             );
             options.inject_code(
