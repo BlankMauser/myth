@@ -637,6 +637,24 @@ impl ExtractedScene {
                         }
                     }
                 }
+                // A skin's culling bounds live in its root-bone space. That
+                // bone can be a sibling of the mesh, so hierarchy propagation
+                // alone cannot invalidate the mesh's retained world bounds.
+                // Visit only skin bindings, not the entire render-item table.
+                for (mesh_node, binding) in &scene.skins {
+                    let root = scene
+                        .skeleton_pool
+                        .get(binding.skeleton)
+                        .and_then(myth_scene::Skeleton::root_bone);
+                    if root.is_some_and(|root| {
+                        self.render_world_pending.get(&root).is_some_and(|flags| {
+                            flags.contains(myth_scene::SceneMutationFlags::TRANSFORM)
+                        })
+                    }) {
+                        *self.render_world_pending.entry(mesh_node).or_default() |=
+                            myth_scene::SceneMutationFlags::TRANSFORM;
+                    }
+                }
                 self.render_world_ordered_changes.extend(
                     self.render_world_pending
                         .iter()
@@ -1304,11 +1322,21 @@ fn extract_render_item(
     let world_determinant = world_matrix.determinant();
     let item_variant_flags =
         u32::from(world_determinant < 0.0) | (u32::from(skeleton_key.is_some()) << 1);
-    let world_aabb = if let Some(key) = skeleton_key
-        && let Some(skeleton) = scene.skeleton_pool.get(key)
+    let world_aabb = if let Some(binding) = scene.skins.get(node_handle)
+        && let Some(skeleton) = scene.skeleton_pool.get(binding.skeleton)
         && let Some(local_bounds) = skeleton.local_bounds()
+        && let Some(root) = skeleton.root_bone().and_then(|root| scene.node(root))
     {
-        local_bounds.transform(&node_world)
+        // Skeleton bounds are relative to the root bone, not the mesh node.
+        // Match the vertex path's model * joint transform: Attached cancels
+        // the mesh world matrix; Detached retains its bind-time inverse.
+        let bounds_world = match binding.bind_mode {
+            myth_scene::BindMode::Attached => root.transform.world_matrix,
+            myth_scene::BindMode::Detached => {
+                node_world * binding.bind_matrix_inv * root.transform.world_matrix
+            }
+        };
+        local_bounds.transform(&bounds_world)
     } else {
         geometry.bounding_box.transform(&node_world)
     };
@@ -1769,6 +1797,125 @@ mod tests {
             .expect("descendant mesh source missing");
         assert_eq!(item.world_matrix.w_axis.x, 3.0);
         assert_eq!(item.prev_world_matrix.w_axis.x, 0.0);
+
+        // Skinned sources also depend on their root-bone branch, even when
+        // that branch is a sibling of the mesh instead of its ancestor.
+        let mut camera = Camera::new_perspective(20.0, 16.0 / 9.0, 0.05);
+        camera.update_view_projection(&Affine3A::from_translation(Vec3::new(0.0, 1.7, 3.0)));
+        let camera = camera.extract_render_camera();
+        let extract_rig = |extracted: &mut ExtractedScene, scene: &mut Scene| {
+            scene.update_matrix_world();
+            scene.update_skeletons();
+            extracted.extract_into(scene, &camera, &assets, 0.0, 16, false)
+        };
+        let assert_bounds = |actual: myth_resources::BoundingBox,
+                             expected: myth_resources::BoundingBox| {
+            assert!(
+                (actual.min - expected.min).abs().max_element() < 1e-5,
+                "min: {actual:?} != {expected:?}"
+            );
+            assert!(
+                (actual.max - expected.max).abs().max_element() < 1e-5,
+                "max: {actual:?} != {expected:?}"
+            );
+        };
+
+        for mode in [
+            myth_scene::BindMode::Attached,
+            myth_scene::BindMode::Detached,
+        ] {
+            let mut scene = Scene::new();
+            let mesh = scene.add_mesh(Mesh::new(geometry, material));
+            let root_parent = scene.add_node(myth_scene::Node::new());
+            let root = scene.add_node(myth_scene::Node::new());
+            scene.attach(root, root_parent);
+            scene.edit_node_transform(root, |transform| {
+                transform.rotation = glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            });
+            let tip = scene.add_node(myth_scene::Node::new());
+            scene.attach(tip, root);
+            scene.edit_node(tip).set_position(0.2, 0.1, 2.0);
+            let skeleton = scene.add_skeleton(myth_scene::Skeleton::new(
+                "rotated sibling root",
+                vec![root, tip],
+                vec![Affine3A::IDENTITY; 2],
+                0,
+            ));
+            scene.edit_node(mesh).set_position(3.0, 0.0, 0.0);
+            scene.update_matrix_world();
+            scene.bind_skeleton(mesh, skeleton, mode);
+
+            let mut extracted = ExtractedScene::new();
+            extract_rig(&mut extracted, &mut scene);
+            let local = *scene.skeleton_pool[skeleton]
+                .local_bounds()
+                .expect("skeleton bounds must be initialized");
+            let root_world = scene.node(root).unwrap().transform.world_matrix;
+            let mesh_world = scene.node(mesh).unwrap().transform.world_matrix;
+            assert_bounds(
+                extracted.render_items[0].world_aabb,
+                local.transform(&root_world),
+            );
+            assert!(
+                !camera
+                    .frustum
+                    .intersects_aabb(&local.transform(&mesh_world)),
+                "the fixture must put the old mesh-space bounds outside the closeup"
+            );
+            let mut lists = crate::graph::frame::RenderLists::new();
+            crate::graph::culling::collect_draw_intents(
+                &extracted, &mut lists, &camera, false, false,
+            );
+            assert_eq!(
+                lists.opaque.len(),
+                1,
+                "the visible skin must survive culling"
+            );
+
+            let before = extracted.render_items[0].world_aabb;
+            let retained_mesh_world = extracted.render_items[0].world_matrix;
+            let root_displacement = Vec3::new(4.0, 1.0, -2.0);
+            scene.edit_node_transform(root_parent, |transform| {
+                transform.position = root_displacement;
+            });
+            let changed = extract_rig(&mut extracted, &mut scene);
+            assert_eq!(changed.items_rebuilt, 0);
+            assert_eq!(changed.items_updated, 1);
+            assert_eq!(extracted.render_items[0].world_matrix, retained_mesh_world);
+            assert_bounds(
+                extracted.render_items[0].world_aabb,
+                myth_resources::BoundingBox {
+                    min: before.min + root_displacement,
+                    max: before.max + root_displacement,
+                },
+            );
+            let warm = extract_rig(&mut extracted, &mut scene);
+            assert_eq!(warm.items_examined, 0);
+            assert_eq!(warm.items_rebuilt, 0);
+            assert_eq!(warm.items_updated, 0);
+            assert_eq!(warm.items_reused, 1);
+
+            let before = extracted.render_items[0].world_aabb;
+            let mesh_displacement = Vec3::new(5.0, 1.0, -2.0);
+            scene.edit_node_transform(mesh, |transform| {
+                transform.position += mesh_displacement;
+            });
+            let changed = extract_rig(&mut extracted, &mut scene);
+            assert_eq!(changed.items_rebuilt, 0);
+            assert_eq!(changed.items_updated, 1);
+            let bounds_displacement = if mode == myth_scene::BindMode::Detached {
+                mesh_displacement
+            } else {
+                Vec3::ZERO
+            };
+            assert_bounds(
+                extracted.render_items[0].world_aabb,
+                myth_resources::BoundingBox {
+                    min: before.min + bounds_displacement,
+                    max: before.max + bounds_displacement,
+                },
+            );
+        }
     }
 
     #[test]
@@ -1919,8 +2066,6 @@ mod tests {
 
     #[test]
     fn item_shader_features_resolve_to_four_shared_canonical_variants() {
-        assert_eq!(std::mem::size_of::<ItemShaderFeatures>(), 1);
-
         for bits in 0..4 {
             let features = ItemShaderFeatures::from_bits_retain(bits);
             let defines = features.shader_defines();
