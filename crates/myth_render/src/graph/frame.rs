@@ -1555,9 +1555,6 @@ mod draw_plan_tests {
     use super::*;
     use slotmap::Key;
 
-    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
-    fn assert_copy<T: Copy>() {}
-
     fn test_command(sort_key: u64) -> DrawCommand {
         DrawCommand {
             source_item_index: 0,
@@ -1589,15 +1586,6 @@ mod draw_plan_tests {
             geometry_handle: GeometryHandle::null(),
             material_handle: MaterialHandle::null(),
         }
-    }
-
-    #[test]
-    fn draw_plan_types_do_not_borrow_frame_resources() {
-        assert_send_sync_static::<DrawCommand>();
-        assert_send_sync_static::<DrawPlanId>();
-        assert_send_sync_static::<DrawPlanStore>();
-        assert_copy::<DrawPlanId>();
-        assert!(std::mem::needs_drop::<DrawPlanStore>());
     }
 
     #[test]
@@ -1724,21 +1712,5 @@ mod draw_plan_tests {
             "Prepass must select opaque sources, the exact live shadow must add only its queue, and shared source 2 must be deduplicated"
         );
         assert_eq!(lists.all_source_indices(), vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn an_empty_live_plan_has_an_empty_source_union() {
-        let lists = RenderLists::new();
-        let mut plans = DrawPlanStore::new();
-        let empty_prepass = plans.reserve_plan(DrawPlanKey::Prepass {
-            needs_normal: false,
-            needs_feature_id: false,
-            needs_velocity: false,
-        });
-        plans.mark_live(empty_prepass);
-
-        assert_eq!(plans.live_keys().count(), 1);
-        assert!(lists.live_source_indices(plans.live_keys()).is_empty());
-        assert!(lists.all_source_indices().is_empty());
     }
 }

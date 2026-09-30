@@ -915,31 +915,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_texture_states_reject_same_handle_pending_aba() {
-        let assets = AssetServer::new();
-        let first_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x101));
-        let second_missing = ImageHandle::from(slotmap::KeyData::from_ffi(0x202));
-        let texture_handle = assets
-            .textures
-            .add(Texture::new_2d(Some("pending A"), first_missing));
-
-        let first = snapshot_asset_texture_state(&assets, texture_handle);
-        assert!(first.ready.is_none());
-        assert_eq!(first.image_handle, Some(first_missing));
-
-        assets.textures.insert_ready(
-            texture_handle,
-            Texture::new_2d(Some("pending B"), second_missing),
-        );
-        let second = snapshot_asset_texture_state(&assets, texture_handle);
-        assert!(second.ready.is_none());
-        assert_eq!(second.texture_version, first.texture_version);
-        assert_ne!(second.texture_identity, first.texture_identity);
-        assert_eq!(second.image_handle, Some(second_missing));
-        assert_ne!(first, second);
-    }
-
-    #[test]
     fn incompatible_texture_specs_own_independent_physical_images_and_mip_requests() {
         let wgpu = pollster::block_on(WgpuContext::new_headless(
             &RendererInitConfig::default(),

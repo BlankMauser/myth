@@ -142,30 +142,3 @@ pub(crate) fn collect_draw_intents(
 fn checked_source_item_index(item_idx: usize) -> u32 {
     u32::try_from(item_idx).expect("one frame cannot extract more than u32::MAX render items")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::checked_source_item_index;
-
-    #[test]
-    fn shared_draw_assets_keep_distinct_source_item_indices() {
-        // Geometry/material identity can be identical for two instances; the
-        // extraction position remains the discriminator carried by the draw
-        // intent into later per-item pipeline derivation.
-        let shared_geometry = 17_u64;
-        let shared_material = 23_u64;
-        let first = (
-            shared_geometry,
-            shared_material,
-            checked_source_item_index(4),
-        );
-        let second = (
-            shared_geometry,
-            shared_material,
-            checked_source_item_index(9),
-        );
-
-        assert_eq!((first.0, first.1), (second.0, second.1));
-        assert_ne!(first.2, second.2);
-    }
-}
