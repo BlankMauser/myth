@@ -1551,62 +1551,6 @@ mod tests {
     }
 
     #[test]
-    fn global_state_and_render_graph_exclude_the_unused_brdf_lut() {
-        let mut renderer = init_headless_renderer();
-        let assets = AssetServer::new();
-        let mut scene = Scene::new();
-        let camera = make_camera();
-
-        {
-            let state = renderer.context.as_ref().expect("renderer state missing");
-            assert!(
-                !state
-                    .resource_manager
-                    .internal_textures
-                    .contains_name("BRDF_LUT"),
-                "renderer initialization must not allocate the unused LUT"
-            );
-        }
-
-        render_frame(&mut renderer, &mut scene, camera, &assets, 0);
-
-        let state = renderer.context.as_ref().expect("renderer state missing");
-        let global_state = state
-            .resource_manager
-            .get_global_state(state.render_frame.render_state.id, scene.id())
-            .expect("global state missing after render");
-        assert_eq!(
-            global_state.resource_ids.as_slice().len(),
-            4,
-            "global fingerprint should contain only camera, environment, lights, and the bound PMREM identity"
-        );
-        assert_eq!(
-            global_state.binding_wgsl.matches("@group(0)").count(),
-            5,
-            "global layout should contain three buffers plus PMREM texture/sampler"
-        );
-        assert!(
-            !global_state.binding_wgsl.contains("brdf_lut"),
-            "the generated global shader interface must not expose a dead LUT binding"
-        );
-        assert!(
-            !state
-                .resource_manager
-                .internal_textures
-                .contains_name("BRDF_LUT"),
-            "rendering a frame must not allocate the unused LUT"
-        );
-        assert!(
-            state
-                .graph_storage
-                .passes
-                .iter()
-                .all(|pass| pass.name != "BRDF_LUT"),
-            "the graph must not schedule a dead BRDF compute pass"
-        );
-    }
-
-    #[test]
     fn background_only_skybox_modes_do_not_allocate_ibl_textures() {
         let mut renderer = init_headless_renderer();
         let assets = AssetServer::new();

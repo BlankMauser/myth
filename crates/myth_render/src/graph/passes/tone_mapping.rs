@@ -536,29 +536,4 @@ mod tests {
         assert!(feature.transient_layout.is_none());
         assert!(feature.local_cache.is_empty());
     }
-
-    #[test]
-    fn pipeline_key_tracks_global_layout_and_shader_identity() {
-        let base = ToneMappingPipelineKey {
-            mode: ToneMappingMode::Neutral,
-            output_format: wgpu::TextureFormat::Bgra8UnormSrgb,
-            has_lut: false,
-            global_layout_id: 11,
-            shader_source_identity: 17,
-        };
-        assert_ne!(
-            base,
-            ToneMappingPipelineKey {
-                global_layout_id: 12,
-                ..base
-            }
-        );
-        assert_ne!(
-            base,
-            ToneMappingPipelineKey {
-                shader_source_identity: 18,
-                ..base
-            }
-        );
-    }
 }

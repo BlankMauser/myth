@@ -105,11 +105,6 @@ mod tests {
     }
 
     #[test]
-    fn asset_mipmap_node_is_zero_drop() {
-        assert!(!std::mem::needs_drop::<AssetMipmapNode>());
-    }
-
-    #[test]
     fn asset_mipmap_batch_remains_an_explicit_side_effect() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();

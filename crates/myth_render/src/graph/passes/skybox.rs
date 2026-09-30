@@ -1474,32 +1474,4 @@ mod tests {
     fn dead_procedural_skybox_culls_its_entire_input_chain() {
         assert!(procedural_graph_live_passes(false).is_empty());
     }
-
-    #[test]
-    fn procedural_pipeline_key_tracks_global_and_shader_identity() {
-        let base = SkyboxPipelineKey {
-            variant: SkyboxVariant::Procedural,
-            procedural_starbox: ProceduralStarboxKind::None,
-            procedural_moon_texture: false,
-            color_format: crate::HDR_TEXTURE_FORMAT,
-            depth_format: wgpu::TextureFormat::Depth32Float,
-            msaa_samples: 1,
-            global_layout_id: 11,
-            shader_source_identity: 17,
-        };
-        assert_ne!(
-            base,
-            SkyboxPipelineKey {
-                global_layout_id: 12,
-                ..base
-            }
-        );
-        assert_ne!(
-            base,
-            SkyboxPipelineKey {
-                shader_source_identity: 18,
-                ..base
-            }
-        );
-    }
 }

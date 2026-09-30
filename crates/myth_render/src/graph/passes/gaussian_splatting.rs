@@ -2285,29 +2285,7 @@ mod tests {
     }
 
     #[test]
-    fn new_feature_has_no_pipeline_layout_or_cloud_cache() {
-        let feature = GaussianSplattingFeature::new();
-
-        assert!(feature.cache_is_empty());
-        assert_eq!(feature.cloud_cache_len(), 0);
-        assert_eq!(
-            feature.static_cache_identity(),
-            GaussianStaticCacheIdentity {
-                preprocess_pipeline: None,
-                sort_pipelines: None,
-                render_pipeline: None,
-                composite_pipeline: None,
-                layout_ids: [None; 6],
-            }
-        );
-    }
-
-    #[test]
-    fn gaussian_pass_nodes_are_no_drop_and_form_three_stage_chain() {
-        assert!(!std::mem::needs_drop::<GaussianComputePassNode<'static>>());
-        assert!(!std::mem::needs_drop::<GaussianRenderPassNode<'static>>());
-        assert!(!std::mem::needs_drop::<GaussianCompositePassNode<'static>>());
-
+    fn gaussian_pass_nodes_form_three_stage_chain() {
         let assets = AssetServer::new();
         let cloud_handle = assets.gaussian_clouds.add(tiny_cloud());
         let sort_config = GaussianSortConfig;

@@ -81,10 +81,4 @@ impl InternalTextureRegistry {
     pub(super) fn remove(&mut self, id: u64) {
         self.resources.remove(&id);
     }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn contains_name(&self, name: &str) -> bool {
-        self.name_lookup.contains_key(name)
-    }
 }

@@ -974,6 +974,9 @@ mod tests {
 
         assert_eq!(first.base_key, second.base_key);
         assert_ne!(first.pmrem_key, second.pmrem_key);
+        assert!(first.params_stride >= PMREM_PARAMS_SIZE);
+        assert_eq!(first.params_stride % 256, 0);
+        assert_eq!(second.params_stride, first.params_stride);
     }
 
     #[test]
@@ -1234,11 +1237,5 @@ mod tests {
         assert_eq!(fallback.pmrem_texture(), published.pmrem_texture());
         assert!(fallback.base_plan.is_some_and(|plan| plan.valid));
         assert!(fallback.pmrem_plan.is_some_and(|plan| plan.valid));
-    }
-
-    #[test]
-    fn packed_params_stride_respects_device_alignment() {
-        assert_eq!(align_up(PMREM_PARAMS_SIZE, 256), 256);
-        assert_eq!(align_up(PMREM_PARAMS_SIZE, PMREM_PARAMS_SIZE), 16);
     }
 }
