@@ -150,7 +150,7 @@ impl SsgiFeature {
         renderer_frame: u64,
         source_uniforms: &CpuBuffer<SsgiUniforms>,
         size: (u32, u32),
-        frame_index: u32,
+        _frame_index: u32,
         taa_history: Option<HistoryTextureRef>,
         global_state_key: GlobalStateKey,
     ) -> SsgiSnapshot {
@@ -231,7 +231,8 @@ impl SsgiFeature {
             1.0 / half_resolution.0 as f32,
             1.0 / half_resolution.1 as f32,
         );
-        uniforms.frame_params.x = frame_index;
+        // Sampling advances with this history domain, even when cameras alternate.
+        uniforms.frame_params.x = temporal_serial as u32;
         uniforms.temporal_params.z = camera.near.max(0.0001);
         uniforms.frame_params.w &= !HISTORY_RUNTIME_MASK;
         if indirect_history.valid {

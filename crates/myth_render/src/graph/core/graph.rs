@@ -752,7 +752,8 @@ impl<'a> RenderGraph<'a> {
     }
 
     /// Publish history banks after the frame's command buffer was submitted.
-    pub fn commit_submitted_histories(&self, registry: &mut HistoryRegistry) {
+    /// Only the renderer's submission path may authorize this publication.
+    pub(crate) fn commit_submitted_histories(&self, registry: &mut HistoryRegistry) {
         for request in &self.storage.history_commit_requests {
             let live_writers = request
                 .required_writes

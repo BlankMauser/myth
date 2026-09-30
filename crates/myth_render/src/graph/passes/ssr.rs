@@ -142,7 +142,7 @@ impl SsrFeature {
         source_uniforms: &CpuBuffer<SsrUniforms>,
         size: (u32, u32),
         renderer_frame: u64,
-        frame_index: u32,
+        _frame_index: u32,
         trace_diagnostics: bool,
         global_state_key: GlobalStateKey,
     ) -> SsrSnapshot {
@@ -184,7 +184,8 @@ impl SsrFeature {
             1.0 / size.0.max(1) as f32,
             1.0 / size.1.max(1) as f32,
         );
-        uniforms.frame_params.x = frame_index;
+        // Sampling advances with this history domain, even when cameras alternate.
+        uniforms.frame_params.x = temporal_serial as u32;
         uniforms.temporal_params.z = camera.near.max(0.0001);
 
         let history_desc = TextureDesc::new_2d(

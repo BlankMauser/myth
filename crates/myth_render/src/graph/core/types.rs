@@ -383,8 +383,7 @@ impl ResourceKind {
                 backing: TextureBacking::External(ptr),
                 ..
             } => Some(*ptr),
-            Self::Texture { .. } => None,
-            Self::Buffer { .. } => None,
+            Self::Texture { .. } | Self::Buffer { .. } => None,
         }
     }
 
