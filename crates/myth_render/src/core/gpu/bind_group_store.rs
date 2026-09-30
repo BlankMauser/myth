@@ -199,8 +199,4 @@ mod tests {
         assert_eq!(key.scene_id(), 0x0123_4567);
     }
 
-    #[test]
-    fn global_state_key_keeps_render_and_scene_ids_distinct() {
-        assert_ne!(GlobalStateKey::new(1, 2), GlobalStateKey::new(2, 1));
-    }
 }

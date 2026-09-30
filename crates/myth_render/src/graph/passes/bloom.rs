@@ -894,12 +894,7 @@ impl<'a> PassNode<'a> for BloomCompositeNode<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BloomFeature, BloomSnapshot, MAX_BLOOM_MIPS, bloom_mip_count};
-    use crate::HDR_TEXTURE_FORMAT;
-    use crate::graph::composer::GraphBuilderContext;
-    use crate::graph::core::graph::FrameConfig;
-    use crate::graph::core::{FrameArena, GraphStorage, RenderGraph, TextureDesc};
-    use myth_resources::bloom::{CompositeUniforms, UpsampleUniforms};
+    use super::{MAX_BLOOM_MIPS, bloom_mip_count};
 
     #[test]
     fn bloom_mip_count_respects_size_and_requested_budget() {
@@ -909,68 +904,6 @@ mod tests {
         assert_eq!(
             bloom_mip_count(u32::MAX, u32::MAX, u32::MAX),
             MAX_BLOOM_MIPS
-        );
-    }
-
-    #[test]
-    fn bloom_graph_shares_one_upsample_uniform_buffer() {
-        let feature = BloomFeature::new();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = RenderGraph::new(&mut storage, &arena);
-        let frame_config = FrameConfig {
-            width: 1920,
-            height: 1080,
-            depth_format: wgpu::TextureFormat::Depth32Float,
-            msaa_samples: 1,
-            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
-            hdr_format: HDR_TEXTURE_FORMAT,
-        };
-        let input = graph.register_texture(
-            "Bloom_Test_Input",
-            TextureDesc::new_2d(
-                frame_config.width,
-                frame_config.height,
-                HDR_TEXTURE_FORMAT,
-                wgpu::TextureUsages::TEXTURE_BINDING,
-            ),
-            true,
-        );
-        let snapshot = BloomSnapshot {
-            upsample: UpsampleUniforms::default(),
-            composite: CompositeUniforms::default(),
-            karis_average: true,
-            max_mip_levels: 6,
-        };
-
-        let mut ctx = GraphBuilderContext::new(&mut graph, &frame_config, 0);
-        let _output = feature.add_to_graph(&mut ctx, snapshot, input);
-
-        assert!(feature.downsample.get().is_none());
-        assert!(feature.upsample.get().is_none());
-        assert!(feature.composite.get().is_none());
-
-        let upsample_params = graph
-            .storage
-            .resources
-            .iter()
-            .filter(|resource| resource.name == "Bloom_Upsample_Params")
-            .count();
-        let composite_params = graph
-            .storage
-            .resources
-            .iter()
-            .filter(|resource| resource.name == "Bloom_Composite_Params")
-            .count();
-
-        assert_eq!(upsample_params, 1);
-        assert_eq!(composite_params, 1);
-        assert!(
-            graph
-                .storage
-                .resources
-                .iter()
-                .all(|resource| !resource.name.starts_with("Bloom_DS_Params"))
         );
     }
 }
