@@ -1315,7 +1315,6 @@ mod tests {
     use myth_resources::texture::{Texture, TextureSource};
     use myth_scene::background::BackgroundMode;
     use myth_scene::camera::Camera;
-    use myth_scene::light::Light;
     use myth_scene::skeleton::Skeleton;
     use myth_scene::{BindMode, Light, Scene};
 

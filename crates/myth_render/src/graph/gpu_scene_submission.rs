@@ -1077,7 +1077,7 @@ fn prepare_gpu_scene_prepass_pipeline(
         format!(
             "{}\n{}\n{}",
             gpu_world.binding_wgsl.as_str(),
-            &material_interface.binding_wgsl,
+            material_interface.binding_wgsl,
             GPU_SCENE_OBJECT_BINDING_WGSL,
         ),
     );
@@ -1209,7 +1209,7 @@ fn prepare_gpu_scene_shadow_pipeline(
         "binding_code",
         format!(
             "{}\n{}\n{}",
-            SHADOW_BINDING_WGSL, &material_interface.binding_wgsl, GPU_SCENE_OBJECT_BINDING_WGSL,
+            SHADOW_BINDING_WGSL, material_interface.binding_wgsl, GPU_SCENE_OBJECT_BINDING_WGSL,
         ),
     );
     options.inject_code(
