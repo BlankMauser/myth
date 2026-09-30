@@ -781,8 +781,8 @@ fn coordinate_prepass_requests(
             format!(
                 "{}\n{}\n{}",
                 gpu_world.binding_wgsl.as_str(),
-                &resolved.material.interface().binding_wgsl,
-                &resolved.object_interface.binding_wgsl
+                resolved.material.interface().binding_wgsl,
+                resolved.object_interface.binding_wgsl
             ),
         );
         options.inject_code(
@@ -931,8 +931,8 @@ fn coordinate_shadow_requests(
             format!(
                 "{}\n{}\n{}",
                 SHADOW_BINDING_WGSL,
-                &resolved.material.interface().binding_wgsl,
-                &resolved.object_interface.binding_wgsl
+                resolved.material.interface().binding_wgsl,
+                resolved.object_interface.binding_wgsl
             ),
         );
         options.inject_code(
