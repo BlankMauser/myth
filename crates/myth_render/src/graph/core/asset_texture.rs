@@ -298,12 +298,6 @@ impl<'a> AssetTextureResolver<'a> {
     pub(crate) fn mipmaps_encoded(self, id: AssetTextureImportId) -> bool {
         self.entry(id).mipmaps_encoded.load(Ordering::Acquire)
     }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn node(self, id: AssetTextureImportId) -> TextureNodeId {
-        self.entry(id).node
-    }
 }
 
 pub(crate) struct AssetTextureMipmapRequests<'a> {

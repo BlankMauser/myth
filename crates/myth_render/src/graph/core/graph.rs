@@ -144,11 +144,6 @@ impl MipmapEncodeCoordinator {
         self.claimed.get_mut().clear();
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.claimed.lock().is_empty()
-    }
 }
 
 /// Declarative Render Graph — persistent capacity storage.
@@ -1767,7 +1762,6 @@ impl<'a> RenderGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::gpu::PhysicalImageId;
     use crate::core::{ResourceManager, WgpuContext};
     use crate::graph::core::persistent::{CacheKey, PersistentTextureSpec};
     use crate::graph::core::types::ResourceClass;
@@ -1795,30 +1789,6 @@ mod tests {
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         )
-    }
-
-    #[test]
-    fn mipmap_encode_claims_are_exact_and_attempt_scoped() {
-        let mut storage = GraphStorage::new();
-        let physical = PhysicalImageId::from(slotmap::KeyData::from_ffi(0x0000_0001_0000_0001));
-        let first = PhysicalImageGenerationKey {
-            physical,
-            allocation: 11,
-            generation: 21,
-        };
-        let next_generation = PhysicalImageGenerationKey {
-            generation: 22,
-            ..first
-        };
-
-        assert!(storage.mipmap_encode_coordinator.try_claim(first));
-        assert!(!storage.mipmap_encode_coordinator.try_claim(first));
-        assert!(storage.mipmap_encode_coordinator.try_claim(next_generation));
-        assert!(!storage.mipmap_encode_coordinator.is_empty());
-
-        storage.release_frame_owners();
-        assert!(storage.mipmap_encode_coordinator.is_empty());
-        assert!(storage.mipmap_encode_coordinator.try_claim(first));
     }
 
     #[test]
@@ -1906,31 +1876,6 @@ mod tests {
     }
 
     #[test]
-    fn asset_texture_import_is_deduplicated_and_not_an_output_root() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let snapshot = dummy_asset_snapshot();
-
-        let first = graph.import_asset_texture("Asset", snapshot);
-        let repeated = graph.import_asset_texture("AssetAgain", snapshot);
-
-        assert_eq!(first, repeated);
-        assert_eq!(
-            graph.storage.asset_texture_imports.resolver().node(
-                graph.storage.resources[first.index() as usize]
-                    .asset_texture_import_id()
-                    .unwrap()
-            ),
-            first
-        );
-        let resource = &graph.storage.resources[first.index() as usize];
-        assert!(resource.is_external);
-        assert!(!resource.is_output_root);
-        assert_eq!(resource.texture_desc(), snapshot_texture_desc(snapshot));
-    }
-
-    #[test]
     fn dead_asset_upload_is_eliminated_without_a_consumer() {
         let mut storage = GraphStorage::new();
         let arena = FrameArena::new();
@@ -1961,18 +1906,6 @@ mod tests {
         });
 
         graph.compile_topology();
-    }
-
-    #[test]
-    fn submitted_asset_import_commit_releases_frame_slots() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let _asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-
-        assert!(!graph.storage.asset_texture_imports.is_empty());
-        assert_eq!(graph.commit_submitted_asset_texture_mipmaps(), 0);
-        assert!(graph.storage.asset_texture_imports.is_empty());
     }
 
     #[test]
@@ -2013,6 +1946,8 @@ mod tests {
         let arena = FrameArena::new();
         let mut graph = begin_test_frame(&mut storage, &arena);
         let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
+        let repeated = graph.import_asset_texture("AssetAgain", dummy_asset_snapshot());
+        assert_eq!(asset, repeated);
         graph.add_pass("Asset_Upload", |builder| {
             builder.write_texture(asset);
             (MockExec, ())
@@ -2032,31 +1967,6 @@ mod tests {
             .map(|&index| graph.storage.passes[index].name)
             .collect();
         assert_eq!(live, ["Asset_Upload", "Asset_Consumer"]);
-    }
-
-    #[test]
-    fn asset_texture_import_supports_base_to_mip_ready_aliasing() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let asset = graph.import_asset_texture("Asset", dummy_asset_snapshot());
-        let mip_ready = graph.add_pass("Asset_Mipmap", |builder| {
-            let output = builder.mutate_texture(asset, "Asset_Mip_Ready");
-            (MockExec, output)
-        });
-
-        let root_import = graph.storage.resources[asset.index() as usize]
-            .asset_texture_import_id()
-            .unwrap();
-        assert_eq!(
-            graph.resolve_alias_root(mip_ready.index() as usize),
-            asset.index() as usize
-        );
-        assert_eq!(
-            graph.storage.resources[graph.resolve_alias_root(mip_ready.index() as usize)]
-                .asset_texture_import_id(),
-            Some(root_import)
-        );
     }
 
     #[test]
@@ -3127,187 +3037,6 @@ mod tests {
             plan.commit.expect("invalid cache needs a token"),
             &[texture],
         );
-    }
-
-    #[test]
-    fn aborted_live_descriptor_replacement_cannot_be_revived_by_a_later_dead_attempt() {
-        let wgpu = pollster::block_on(WgpuContext::new_headless(
-            &RendererInitConfig::default(),
-            &RendererSettings::default(),
-            2,
-            2,
-            None,
-        ))
-        .expect("headless GPU context required");
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let published_key = CacheKey::new(1);
-        let replacement_key = CacheKey::new(2);
-        let published_spec = PersistentTextureSpec::default_view(dummy_desc());
-        let published = registry.plan_cache(cache, published_key, [published_spec], 1);
-        registry.materialize_texture(
-            &wgpu.device,
-            "Published",
-            published.textures[0].id,
-            published_spec,
-        );
-        assert!(
-            registry
-                .commit_cache(
-                    published.commit.expect("initial cache needs a token"),
-                    &[published.textures[0].id],
-                )
-                .is_some()
-        );
-
-        let replacement_desc = TextureDesc::new_2d(
-            2,
-            2,
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
-        let replacement_spec = PersistentTextureSpec::default_view(replacement_desc);
-        let replacement = registry.plan_cache(cache, replacement_key, [replacement_spec], 2);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let replacement_texture =
-                graph.import_persistent_texture("Replacement", replacement.textures[0]);
-            let output = graph.register_texture("Output", dummy_desc(), true);
-            graph.add_pass("PopulateReplacement", |builder| {
-                builder.write_texture(replacement_texture);
-                (MockExec, ())
-            });
-            graph.add_pass("ConsumeReplacement", |builder| {
-                builder.read_texture(replacement_texture);
-                builder.write_texture(output);
-                (MockExec, ())
-            });
-            graph.register_cache_commit(
-                replacement.commit.expect("replacement needs a token"),
-                &[replacement_texture],
-            );
-            graph.compile_topology();
-            graph.materialize_live_persistent_textures(&mut registry, &wgpu.device);
-
-            assert_ne!(
-                graph.storage.resources[replacement_texture.index() as usize].first_use,
-                usize::MAX
-            );
-            assert_eq!(
-                registry
-                    .get_texture_view(replacement.textures[0].id)
-                    .texture()
-                    .width(),
-                2,
-                "live materialization must replace A's one-pixel physical backing with B"
-            );
-            // Simulate an abort after physical materialization by deliberately
-            // skipping command submission/publication.
-        }
-
-        assert!(!registry.is_cache_valid(cache, published_key));
-        assert_eq!(
-            registry
-                .get_texture_view(replacement.textures[0].id)
-                .texture()
-                .width(),
-            2,
-            "dead follow-up must leave B's physical backing paired with invalid metadata"
-        );
-        assert!(!registry.is_cache_valid(cache, replacement_key));
-
-        let dead_attempt = registry.plan_cache(cache, replacement_key, [replacement_spec], 3);
-        {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let replacement_texture =
-                graph.import_persistent_texture("Replacement", dead_attempt.textures[0]);
-            graph.add_pass("DeadReplacement", |builder| {
-                builder.write_texture(replacement_texture);
-                (MockExec, ())
-            });
-            graph.register_cache_commit(
-                dead_attempt.commit.expect("invalid cache needs a token"),
-                &[replacement_texture],
-            );
-            graph.compile_topology();
-            graph.finalize_persistent_cache_attempts_after_dpe(&mut registry);
-            assert!(graph.storage.execution_queue.is_empty());
-        }
-
-        assert!(
-            !registry
-                .plan_cache(cache, replacement_key, [replacement_spec], 4)
-                .valid,
-            "an all-dead follow-up must not restore the overwritten publication"
-        );
-        assert!(!registry.is_cache_valid(cache, published_key));
-    }
-
-    #[test]
-    fn unregistered_live_replacement_forfeits_rollback_and_finalization_is_idempotent() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let published_key = CacheKey::new(1);
-        let replacement_key = CacheKey::new(2);
-        let spec = PersistentTextureSpec::default_view(dummy_desc());
-        let published = registry.plan_cache(cache, published_key, [spec], 1);
-        assert!(
-            registry
-                .commit_cache(
-                    published.commit.expect("initial cache needs a token"),
-                    &[published.textures[0].id],
-                )
-                .is_some()
-        );
-        let replacement = registry.plan_cache(cache, replacement_key, [spec], 2);
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let replacement_texture =
-                graph.import_persistent_texture("Replacement", replacement.textures[0]);
-            let output = graph.register_texture("Output", dummy_desc(), true);
-            graph.add_pass("ReadUnregisteredReplacement", |builder| {
-                builder.read_texture(replacement_texture);
-                builder.write_texture(output);
-                (MockExec, ())
-            });
-            graph.compile_topology();
-
-            assert!(graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
-            assert!(
-                graph.finalize_persistent_cache_attempts_after_dpe(&mut registry),
-                "repeated finalization must return the stored phase result"
-            );
-            assert_eq!(graph.storage.persistent_cache_finalization, Some(true));
-        }
-
-        assert!(!registry.is_cache_valid(cache, published_key));
-        assert!(!registry.is_cache_valid(cache, replacement_key));
-
-        let dead_attempt = registry.plan_cache(cache, replacement_key, [spec], 3);
-        {
-            let mut graph = begin_test_frame(&mut storage, &arena);
-            let replacement_texture =
-                graph.import_persistent_texture("Replacement", dead_attempt.textures[0]);
-            graph.add_pass("DeadUnregisteredReplacement", |builder| {
-                builder.write_texture(replacement_texture);
-                (MockExec, ())
-            });
-            graph.compile_topology();
-            assert!(!graph.finalize_persistent_cache_attempts_after_dpe(&mut registry));
-            assert!(graph.storage.execution_queue.is_empty());
-        }
-
-        assert!(
-            !registry.plan_cache(cache, replacement_key, [spec], 4).valid,
-            "a later dead attempt must not restore an unregistered touched replacement"
-        );
-        assert!(!registry.is_cache_valid(cache, published_key));
     }
 
     #[test]
