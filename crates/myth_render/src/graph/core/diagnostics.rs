@@ -376,15 +376,12 @@ impl RdgDiagnosticsRecorder {
         self.set_flag(FLAG_SURFACE_SUBOPTIMAL, surface_suboptimal);
     }
 
-    /// Records a surface failure and returns whether this is the first surface
-    /// failure after a different terminal outcome. Callers use the return
-    /// value to avoid per-frame logging during timeout/occlusion streaks.
+    /// Records a surface failure and suppresses only consecutive failures with
+    /// the same reason. A changed reason must be reported so a timeout streak
+    /// cannot hide a later lost surface or validation error.
     pub(crate) fn mark_surface_acquisition_failed(&self, reason: RdgSurfaceAcquireFailure) -> bool {
         let should_report = !self.latest.get().is_some_and(|latest| {
-            matches!(
-                latest.outcome(),
-                RdgAttemptOutcome::SurfaceAcquisitionFailed(_)
-            )
+            latest.outcome() == RdgAttemptOutcome::SurfaceAcquisitionFailed(reason)
         });
         self.request_outcome(RdgAttemptOutcome::SurfaceAcquisitionFailed(reason));
         should_report
@@ -878,22 +875,30 @@ mod tests {
     fn repeated_target_failures_request_only_one_log_report() {
         let recorder = RdgDiagnosticsRecorder::default();
 
-        recorder.start_renderer_attempt(20);
-        let first = RdgComposerAttemptGuard::new(&recorder);
-        assert!(recorder.mark_surface_acquisition_failed(RdgSurfaceAcquireFailure::Timeout));
-        drop(first);
+        let reasons = [
+            (RdgSurfaceAcquireFailure::Timeout, true),
+            (RdgSurfaceAcquireFailure::Timeout, false),
+            (RdgSurfaceAcquireFailure::Lost, true),
+            (RdgSurfaceAcquireFailure::Lost, false),
+            (RdgSurfaceAcquireFailure::Validation, true),
+            (RdgSurfaceAcquireFailure::Validation, false),
+        ];
+        for (index, (reason, should_report)) in reasons.into_iter().enumerate() {
+            recorder.start_renderer_attempt(20 + index as u64);
+            let guard = RdgComposerAttemptGuard::new(&recorder);
+            assert_eq!(
+                recorder.mark_surface_acquisition_failed(reason),
+                should_report
+            );
+            drop(guard);
+        }
 
-        recorder.start_renderer_attempt(21);
-        let second = RdgComposerAttemptGuard::new(&recorder);
-        assert!(!recorder.mark_surface_acquisition_failed(RdgSurfaceAcquireFailure::Occluded));
-        drop(second);
-
-        recorder.start_renderer_attempt(22);
+        recorder.start_renderer_attempt(26);
         let third = RdgComposerAttemptGuard::new(&recorder);
         assert!(recorder.mark_no_render_target());
         drop(third);
 
-        recorder.start_renderer_attempt(23);
+        recorder.start_renderer_attempt(27);
         let fourth = RdgComposerAttemptGuard::new(&recorder);
         assert!(!recorder.mark_no_render_target());
         drop(fourth);
