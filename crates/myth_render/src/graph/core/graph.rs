@@ -582,6 +582,7 @@ impl<T> AssertNoDrop for T {
 pub struct RenderGraph<'a> {
     pub(crate) storage: &'a mut GraphStorage,
     arena: &'a FrameArena,
+    topology_compiled: bool,
 }
 
 impl Drop for RenderGraph<'_> {
@@ -607,7 +608,11 @@ impl<'a> RenderGraph<'a> {
     /// for pass-level access via [`PassBuilder::frame_config`].
     pub fn new(storage: &'a mut GraphStorage, arena: &'a FrameArena) -> Self {
         storage.clear();
-        Self { storage, arena }
+        Self {
+            storage,
+            arena,
+            topology_compiled: false,
+        }
     }
 
     /// Explicitly ends this graph attempt and releases its arena-backed nodes
@@ -619,11 +624,13 @@ impl<'a> RenderGraph<'a> {
     pub fn finish(self) {}
 
     #[inline]
-    fn assert_topology_mutable(&self) {
+    fn assert_topology_mutable(&mut self) {
         assert!(
             self.storage.persistent_cache_finalization.is_none(),
             "render graph topology is frozen after persistent cache finalization"
         );
+        // Any edit after compilation invalidates the DPE/lifetime results.
+        self.topology_compiled = false;
     }
 
     /// Allocates a copy of `src` on the per-frame arena.
@@ -917,6 +924,10 @@ impl<'a> RenderGraph<'a> {
         &mut self,
         registry: &mut HistoryRegistry,
     ) -> bool {
+        assert!(
+            self.topology_compiled,
+            "persistent texture materialization requires a compiled graph"
+        );
         if let Some(any_cache_member_touched) = self.storage.persistent_cache_finalization {
             return any_cache_member_touched;
         }
@@ -974,6 +985,11 @@ impl<'a> RenderGraph<'a> {
     /// Call this after [`Self::compile`] (or [`Self::compile_topology`]) and
     /// before prepare/execute/submission. The first call freezes graph topology;
     /// repeated calls in the same attempt are idempotent.
+    ///
+    /// # Panics
+    ///
+    /// Panics before modifying graph or registry state when topology has not
+    /// been compiled, or has changed since its last compilation.
     pub fn materialize_live_persistent_textures(
         &mut self,
         registry: &mut HistoryRegistry,
@@ -1192,6 +1208,7 @@ impl<'a> RenderGraph<'a> {
         self.topological_sort();
 
         self.compute_resource_lifetimes();
+        self.topology_compiled = true;
     }
 
     pub fn compile(&mut self, pool: &mut TransientPool, device: &Device) {
@@ -2964,6 +2981,11 @@ mod tests {
                 let texture =
                     graph.import_persistent_texture("Replacement", replacement.textures[0]);
                 let output = graph.register_texture("Output", dummy_desc(), true);
+                if register_publication {
+                    // Compiling an incomplete graph must not authorize later
+                    // materialization after a new reader changes its topology.
+                    graph.compile_topology();
+                }
                 graph.add_pass("ReadInvalidReplacement", |builder| {
                     builder.read_texture(texture);
                     builder.write_texture(output);
@@ -2975,8 +2997,21 @@ mod tests {
                         &[texture],
                     );
                 }
+                let premature_materialization =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        graph.materialize_live_persistent_textures(&mut registry, &context.device);
+                    }));
+                assert!(
+                    premature_materialization.is_err(),
+                    "uncompiled materialization must reject before restoring cache metadata or freezing topology"
+                );
+                assert!(!registry.is_cache_valid(cache, published_key));
+                assert!(!registry.is_cache_valid(cache, replacement_key));
                 graph.compile_topology();
                 graph.materialize_live_persistent_textures(&mut registry, &context.device);
+                graph.materialize_live_persistent_textures(&mut registry, &context.device);
+                assert!(!registry.is_cache_valid(cache, published_key));
+                assert!(!registry.is_cache_valid(cache, replacement_key));
                 assert_ne!(
                     published_view,
                     registry.get_texture_view(replacement.textures[0].id).id(),
