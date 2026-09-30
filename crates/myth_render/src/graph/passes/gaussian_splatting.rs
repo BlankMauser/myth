@@ -197,11 +197,11 @@ impl GaussianSortConfig {
         Self
     }
 
-    const fn keys_per_wg_u32(self) -> u32 {
+    const fn keys_per_wg_u32() -> u32 {
         SORT_KEYS_PER_WG as u32
     }
 
-    fn buffer_layout(self, key_count: usize) -> SortBufferLayout {
+    fn buffer_layout(key_count: usize) -> SortBufferLayout {
         SortBufferLayout::for_key_count(key_count)
     }
 }
@@ -578,7 +578,7 @@ impl GaussianSplattingFeature {
                 u32::try_from(cloud.num_points).expect("Gaussian cloud exceeds u32 capacity");
             let num_sh_coefficients = u32::try_from(cloud.sh_coefficients.len())
                 .expect("Gaussian SH coefficient table exceeds u32 capacity");
-            let sort_layout = sort_config.buffer_layout(cloud.num_points);
+            let sort_layout = GaussianSortConfig::buffer_layout(cloud.num_points);
             let preprocess_workgroups = num_points.div_ceil(PREPROCESS_WG_SIZE);
             assert!(
                 preprocess_workgroups <= limits.max_compute_workgroups_per_dimension,
@@ -873,7 +873,7 @@ impl GaussianComputeResources {
         let mut preprocess_options = ShaderCompilationOptions::default();
         preprocess_options.add_define(
             "GS_SORT_KEYS_PER_WG",
-            &sort_config.keys_per_wg_u32().to_string(),
+            &GaussianSortConfig::keys_per_wg_u32().to_string(),
         );
         preprocess_options.inject_code("binding_code", &global_binding_wgsl);
         preprocess_options.inject_code(
@@ -1311,7 +1311,7 @@ impl GaussianSplattingFeature {
                     "GS_Sort_Depths_A",
                     BufferDesc::new(sort_key_buffer_size, wgpu::BufferUsages::STORAGE),
                 );
-                let sort_depths_b_buf = builder.create_buffer(
+                let alternate_depths = builder.create_buffer(
                     "GS_Sort_Depths_B",
                     BufferDesc::new(sort_key_buffer_size, wgpu::BufferUsages::STORAGE),
                 );
@@ -1319,7 +1319,7 @@ impl GaussianSplattingFeature {
                     "GS_Sort_Indices_A",
                     BufferDesc::new(sort_key_buffer_size, wgpu::BufferUsages::STORAGE),
                 );
-                let sort_indices_b_buf = builder.create_buffer(
+                let alternate_indices = builder.create_buffer(
                     "GS_Sort_Indices_B",
                     BufferDesc::new(sort_key_buffer_size, wgpu::BufferUsages::STORAGE),
                 );
@@ -1346,9 +1346,9 @@ impl GaussianSplattingFeature {
                     sort_dispatch_buf,
                     sort_internal_buf,
                     sort_depths_a_buf,
-                    sort_depths_b_buf,
+                    sort_depths_b_buf: alternate_depths,
                     sort_indices_a_buf,
-                    sort_indices_b_buf,
+                    sort_indices_b_buf: alternate_indices,
                     draw_indirect_buf,
                     render_settings_buf,
                     num_points: plan.num_points,
@@ -2317,7 +2317,7 @@ mod tests {
             version: 1,
             num_points: 1,
             num_sh_coefficients: 1,
-            sort_layout: sort_config.buffer_layout(1),
+            sort_layout: GaussianSortConfig::buffer_layout(1),
             sh_degree: 0,
             mip_splatting: false,
             kernel_size: 0.3,

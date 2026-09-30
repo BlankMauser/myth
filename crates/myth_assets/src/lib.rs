@@ -190,7 +190,7 @@ async fn read_gaussian_source_bytes(
     let uri = source.uri().into_owned();
     let filename = source
         .filename()
-        .unwrap_or_else(|| Cow::Borrowed("unknown"))
+        .unwrap_or(Cow::Borrowed("unknown"))
         .into_owned();
     let reader = AssetReaderVariant::new(&source)?;
     let bytes = reader.read_bytes(&filename).await.map_err(|e| {

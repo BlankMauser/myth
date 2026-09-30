@@ -324,6 +324,16 @@ impl GraphStorage {
 
                 fn write_mermaid(&self, out: &mut String, storage: &GraphStorage, depth: usize) {
                     use std::fmt::Write;
+                    const STYLES: &[(&str, &str)] = &[
+                        ("#3b82f614", "#3b82f6"),
+                        ("#10b98114", "#10b981"),
+                        ("#8b5cf614", "#8b5cf6"),
+                        ("#f59e0b14", "#f59e0b"),
+                        ("#ef444414", "#ef4444"),
+                        ("#ec489914", "#ec4899"),
+                        ("#06b6d414", "#06b6d4"),
+                    ];
+
                     let indent = "    ".repeat(depth);
 
                     if !self.name.is_empty() {
@@ -366,16 +376,6 @@ impl GraphStorage {
                             .name
                             .bytes()
                             .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
-
-                        const STYLES: &[(&str, &str)] = &[
-                            ("#3b82f614", "#3b82f6"),
-                            ("#10b98114", "#10b981"),
-                            ("#8b5cf614", "#8b5cf6"),
-                            ("#f59e0b14", "#f59e0b"),
-                            ("#ef444414", "#ef4444"),
-                            ("#ec489914", "#ec4899"),
-                            ("#06b6d414", "#06b6d4"),
-                        ];
 
                         let (bg, stroke) = STYLES[hash % STYLES.len()];
 

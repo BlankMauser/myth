@@ -15,7 +15,7 @@ use myth_scene::{LightKind, ProceduralSkyParams, ProjectionType, Scene};
 const OCEAN_SHADER_NAME: &str = "myth_dev_utils/ocean_surface";
 const OCEAN_RESOLVE_SHADER_NAME: &str = "myth_dev_utils/ocean_resolve";
 
-const OCEAN_SHADER_TEMPLATE: &str = r#"
+const OCEAN_SHADER_TEMPLATE: &str = r"
 {$ include 'core/full_screen_vertex' $}
 {$ include 'entry/utility/atmosphere/transmittance_math' $}
 
@@ -554,9 +554,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     return vec4<f32>(ocean, 1.0);
 }
-"#;
+";
 
-const OCEAN_RESOLVE_SHADER_TEMPLATE: &str = r#"
+const OCEAN_RESOLVE_SHADER_TEMPLATE: &str = r"
 {$ include 'core/full_screen_vertex' $}
 
 @group(0) @binding(0) var t_ocean: texture_2d<f32>;
@@ -583,7 +583,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     return vec4<f32>(ocean, 1.0);
 }
-"#;
+";
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1205,16 +1205,14 @@ impl OceanRenderer {
 
         match self.light_source {
             OceanLightSource::Manual => manual,
-            OceanLightSource::ProceduralSky => self
-                .procedural_sky_lighting_state(scene)
-                .or_else(|| self.scene_directional_lighting_state(scene))
+            OceanLightSource::ProceduralSky => Self::procedural_sky_lighting_state(scene)
+                .or_else(|| Self::scene_directional_lighting_state(scene))
                 .unwrap_or(manual),
-            OceanLightSource::SceneDirectional => self
-                .scene_directional_lighting_state(scene)
-                .unwrap_or(manual),
-            OceanLightSource::SceneAuto => self
-                .procedural_sky_lighting_state(scene)
-                .or_else(|| self.scene_directional_lighting_state(scene))
+            OceanLightSource::SceneDirectional => {
+                Self::scene_directional_lighting_state(scene).unwrap_or(manual)
+            }
+            OceanLightSource::SceneAuto => Self::procedural_sky_lighting_state(scene)
+                .or_else(|| Self::scene_directional_lighting_state(scene))
                 .unwrap_or(manual),
         }
     }
@@ -1222,13 +1220,12 @@ impl OceanRenderer {
     fn resolve_camera_state(&self, scene: &mut Scene) -> OceanCameraState {
         match self.camera_source {
             OceanCameraSource::Reference => OceanCameraState::reference(self.time),
-            OceanCameraSource::SceneMainCamera => self
-                .scene_camera_state(scene)
+            OceanCameraSource::SceneMainCamera => Self::scene_camera_state(scene)
                 .unwrap_or_else(|| OceanCameraState::reference(self.time)),
         }
     }
 
-    fn scene_camera_state(&self, scene: &mut Scene) -> Option<OceanCameraState> {
+    fn scene_camera_state(scene: &mut Scene) -> Option<OceanCameraState> {
         let (transform, camera) = scene.query_main_camera_bundle()?;
         let (right, up, basis_forward) = transform.rotation_basis();
         let forward = (-basis_forward).normalize_or_zero();
@@ -1254,7 +1251,7 @@ impl OceanRenderer {
         })
     }
 
-    fn procedural_sky_lighting_state(&self, scene: &Scene) -> Option<OceanLightingState> {
+    fn procedural_sky_lighting_state(scene: &Scene) -> Option<OceanLightingState> {
         let params = scene.background.procedural_sky_params()?;
         let (direction, color, energy) = Self::dominant_procedural_sky_light(params);
         Some(OceanLightingState {
@@ -1265,7 +1262,7 @@ impl OceanRenderer {
         })
     }
 
-    fn scene_directional_lighting_state(&self, scene: &Scene) -> Option<OceanLightingState> {
+    fn scene_directional_lighting_state(scene: &Scene) -> Option<OceanLightingState> {
         let ambient = Self::scene_ambient_color(scene);
         let mut best_state = None;
         let mut best_energy = -1.0_f32;

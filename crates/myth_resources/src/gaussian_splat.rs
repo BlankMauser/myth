@@ -70,7 +70,8 @@ pub struct Splat2D {
     /// RGBA colour channels 2–3 (2 × f16 packed).
     pub color_ba: u32,
 
-    pub _pad: u32,
+    /// Padding to match the 32-byte GPU storage layout.
+    pub padding: u32,
 }
 
 // ─── High-Level Asset ──────────────────────────────────────────────────────

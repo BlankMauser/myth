@@ -1380,14 +1380,15 @@ impl<'a> FrameComposer<'a> {
                         DebugViewTarget::SceneNormal => dbg_normals,
                         DebugViewTarget::Velocity => dbg_velocity,
                         DebugViewTarget::SsaoRaw => dbg_ssao,
-                        DebugViewTarget::SceneDepth => Some(scene_depth),
-                        DebugViewTarget::ClusterHeatmap => Some(scene_depth),
+                        DebugViewTarget::SceneDepth | DebugViewTarget::ClusterHeatmap => {
+                            Some(scene_depth)
+                        }
                         DebugViewTarget::SsgiRaw => dbg_ssgi_raw,
                         DebugViewTarget::SsgiDenoised => dbg_ssgi_denoised,
                         DebugViewTarget::SsrRaw => dbg_ssr_raw,
                         DebugViewTarget::SsrResolved => dbg_ssr_resolved,
                         DebugViewTarget::SsrTraceDebug => dbg_ssr_trace_diagnostic,
-                        _ => None,
+                        DebugViewTarget::None => None,
                     };
 
                     if let Some(src) = source

@@ -44,11 +44,14 @@ struct SlicedBuffer {
 }
 
 /// Texture record owned by the Myth egui renderer.
-pub struct Texture {
+pub struct TextureRecord {
     pub texture: Option<wgpu::Texture>,
     pub bind_group: wgpu::BindGroup,
     pub options: Option<epaint::textures::TextureOptions>,
 }
+
+/// Compatibility name for an egui texture record.
+pub type Texture = TextureRecord;
 
 /// Renderer configuration.
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +96,11 @@ impl Renderer {
         output_color_format: wgpu::TextureFormat,
         options: RendererOptions,
     ) -> Self {
+        const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
+            (std::mem::size_of::<Vertex>() * 1024) as _;
+        const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
+            (std::mem::size_of::<u32>() * 1024 * 3) as _;
+
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("myth_egui_shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("egui.wgsl"))),
@@ -242,11 +250,6 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-
-        const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
-            (std::mem::size_of::<Vertex>() * 1024) as _;
-        const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
-            (std::mem::size_of::<u32>() * 1024 * 3) as _;
 
         let placeholder_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("myth_egui_placeholder_texture"),
@@ -759,17 +762,15 @@ struct ScissorRect {
 
 impl ScissorRect {
     fn new(clip_rect: &epaint::Rect, pixels_per_point: f32, target_size: [u32; 2]) -> Self {
-        let clip_min_x = (pixels_per_point * clip_rect.min.x).round() as i32;
-        let clip_min_y = (pixels_per_point * clip_rect.min.y).round() as i32;
-        let clip_max_x = (pixels_per_point * clip_rect.max.x).round() as i32;
-        let clip_max_y = (pixels_per_point * clip_rect.max.y).round() as i32;
+        let clip_min_x = (pixels_per_point * clip_rect.min.x).round() as u32;
+        let clip_min_y = (pixels_per_point * clip_rect.min.y).round() as u32;
+        let clip_max_x = (pixels_per_point * clip_rect.max.x).round() as u32;
+        let clip_max_y = (pixels_per_point * clip_rect.max.y).round() as u32;
 
-        let max_x = target_size[0] as i32;
-        let max_y = target_size[1] as i32;
-        let clip_min_x = clip_min_x.clamp(0, max_x) as u32;
-        let clip_min_y = clip_min_y.clamp(0, max_y) as u32;
-        let clip_max_x = clip_max_x.clamp(clip_min_x as i32, max_x) as u32;
-        let clip_max_y = clip_max_y.clamp(clip_min_y as i32, max_y) as u32;
+        let clip_min_x = clip_min_x.min(target_size[0]);
+        let clip_min_y = clip_min_y.min(target_size[1]);
+        let clip_max_x = clip_max_x.clamp(clip_min_x, target_size[0]);
+        let clip_max_y = clip_max_y.clamp(clip_min_y, target_size[1]);
 
         Self {
             x: clip_min_x,

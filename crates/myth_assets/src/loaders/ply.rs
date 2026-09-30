@@ -111,14 +111,10 @@ fn parse_header<R: BufRead>(reader: &mut R) -> Result<PlyHeader> {
                 let type_name = parts.get(1).unwrap_or(&"");
                 let prop_name = parts.get(2).unwrap_or(&"").to_string();
                 let byte_size = match *type_name {
-                    "float" | "float32" => 4,
                     "double" | "float64" => 8,
                     "uchar" | "uint8" => 1,
-                    "short" | "int16" => 2,
-                    "ushort" | "uint16" => 2,
-                    "int" | "int32" => 4,
-                    "uint" | "uint32" => 4,
-                    _ => 4, // default assumption
+                    "short" | "int16" | "ushort" | "uint16" => 2,
+                    _ => 4, // float/int/uint and the default assumption
                 };
                 properties.push((prop_name, current_offset));
                 current_offset += byte_size;
@@ -158,8 +154,7 @@ fn parse_header<R: BufRead>(reader: &mut R) -> Result<PlyHeader> {
         properties
             .iter()
             .find(|(n, _)| n == "f_rest_0")
-            .map(|(_, off)| *off)
-            .unwrap_or(f_dc_0 + 12) // 3 floats after f_dc
+            .map_or(f_dc_0 + 12, |(_, off)| *off) // 3 floats after f_dc
     } else {
         f_dc_0 + 12
     };
@@ -194,12 +189,12 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
 }
 
 /// Builds the upper triangle of the 3×3 covariance matrix from a normalised
-/// quaternion `q` and log-space scale `s`.
+/// quaternion and linear scale.
 ///
 /// Returns `[c00, c01, c02, c11, c12, c22]`.
-pub(crate) fn build_covariance(q: [f32; 4], s: [f32; 3]) -> [f32; 6] {
+pub(crate) fn build_covariance(rotation: [f32; 4], scale: [f32; 3]) -> [f32; 6] {
     // Rotation matrix from quaternion (w, x, y, z)
-    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
+    let (w, x, y, z) = (rotation[0], rotation[1], rotation[2], rotation[3]);
     let r00 = 1.0 - 2.0 * (y * y + z * z);
     let r01 = 2.0 * (x * y - w * z);
     let r02 = 2.0 * (x * z + w * y);
@@ -211,15 +206,15 @@ pub(crate) fn build_covariance(q: [f32; 4], s: [f32; 3]) -> [f32; 6] {
     let r22 = 1.0 - 2.0 * (x * x + y * y);
 
     // L = R * S  (S is diagonal)
-    let l00 = r00 * s[0];
-    let l01 = r01 * s[1];
-    let l02 = r02 * s[2];
-    let l10 = r10 * s[0];
-    let l11 = r11 * s[1];
-    let l12 = r12 * s[2];
-    let l20 = r20 * s[0];
-    let l21 = r21 * s[1];
-    let l22 = r22 * s[2];
+    let l00 = r00 * scale[0];
+    let l01 = r01 * scale[1];
+    let l02 = r02 * scale[2];
+    let l10 = r10 * scale[0];
+    let l11 = r11 * scale[1];
+    let l12 = r12 * scale[2];
+    let l20 = r20 * scale[0];
+    let l21 = r21 * scale[1];
+    let l22 = r22 * scale[2];
 
     // M = L * L^T  (symmetric)
     let m00 = l00 * l00 + l01 * l01 + l02 * l02;
@@ -237,7 +232,7 @@ pub(crate) fn build_covariance(q: [f32; 4], s: [f32; 3]) -> [f32; 6] {
 pub(crate) fn pack2x16float(a: f32, b: f32) -> u32 {
     let lo = f16::from_f32(a).to_bits();
     let hi = f16::from_f32(b).to_bits();
-    (lo as u32) | ((hi as u32) << 16)
+    u32::from(lo) | (u32::from(hi) << 16)
 }
 
 // ─── PLY Loader ────────────────────────────────────────────────────────────
@@ -258,12 +253,12 @@ pub fn load_gaussian_ply<R: Read + Seek>(reader: R) -> Result<GaussianCloud> {
         )));
     }
 
-    let n = header.vertex_count;
+    let vertex_count = header.vertex_count;
     let offsets = &header.property_offsets;
     let stride = header.vertex_byte_size;
 
-    let mut gaussians = Vec::with_capacity(n);
-    let mut sh_coefficients = Vec::with_capacity(n);
+    let mut gaussians = Vec::with_capacity(vertex_count);
+    let mut sh_coefficients = Vec::with_capacity(vertex_count);
 
     let mut aabb_min = Vec3::splat(f32::INFINITY);
     let mut aabb_max = Vec3::splat(f32::NEG_INFINITY);
@@ -272,12 +267,12 @@ pub fn load_gaussian_ply<R: Read + Seek>(reader: R) -> Result<GaussianCloud> {
     let num_sh_coeffs = header.num_sh_coeffs;
 
     // Read all vertex data into a flat buffer for efficient parsing
-    let total_bytes = n * stride;
+    let total_bytes = vertex_count * stride;
     let mut raw = vec![0u8; total_bytes];
     buf.read_exact(&mut raw)
         .map_err(|e| Error::Asset(AssetError::Io(e)))?;
 
-    for i in 0..n {
+    for i in 0..vertex_count {
         let base = i * stride;
         let vertex = &raw[base..base + stride];
 
@@ -337,10 +332,10 @@ pub fn load_gaussian_ply<R: Read + Seek>(reader: R) -> Result<GaussianCloud> {
         );
         let len = (r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3).sqrt();
         let inv_len = if len > 1e-12 { 1.0 / len } else { 0.0 };
-        let q = [r0 * inv_len, r1 * inv_len, r2 * inv_len, r3 * inv_len];
+        let rotation = [r0 * inv_len, r1 * inv_len, r2 * inv_len, r3 * inv_len];
 
         // Build covariance and pack to f16
-        let cov = build_covariance(q, [s0, s1, s2]);
+        let cov = build_covariance(rotation, [s0, s1, s2]);
         let packed_cov = [
             pack2x16float(cov[0], cov[1]),
             pack2x16float(cov[2], cov[3]),
@@ -387,12 +382,12 @@ pub fn load_gaussian_ply<R: Read + Seek>(reader: R) -> Result<GaussianCloud> {
         if num_rest > 0 {
             let rest_base = offsets.f_rest_start;
             let coeffs_per_channel = num_sh_coeffs - 1;
-            for c_idx in 0..coeffs_per_channel.min(15) {
-                for ch in 0..3 {
+            for (c_idx, coefficient) in sh_flat[1..].iter_mut().take(coeffs_per_channel).enumerate()
+            {
+                for (ch, channel) in coefficient.iter_mut().enumerate() {
                     let off = rest_base + (ch * coeffs_per_channel + c_idx) * 4;
                     if off + 4 <= vertex.len() {
-                        sh_flat[c_idx + 1][ch] =
-                            f32::from_le_bytes(vertex[off..off + 4].try_into().unwrap());
+                        *channel = f32::from_le_bytes(vertex[off..off + 4].try_into().unwrap());
                     }
                 }
             }
@@ -403,12 +398,12 @@ pub fn load_gaussian_ply<R: Read + Seek>(reader: R) -> Result<GaussianCloud> {
             // channel_idx -> which u32 and which half
             // half_idx = c_idx * 3 + ch  (0..48)
             // u32_idx = half_idx / 2, sub_idx = half_idx % 2
-            for ch in 0..3 {
+            for (ch, channel) in coeff.iter().enumerate() {
                 let half_idx = c_idx * 3 + ch;
                 let u32_idx = half_idx / 2;
                 let sub_idx = half_idx % 2;
-                let h = f16::from_f32(coeff[ch]).to_bits();
-                sh_data[u32_idx] |= (h as u32) << (sub_idx * 16);
+                let half = f16::from_f32(*channel).to_bits();
+                sh_data[u32_idx] |= u32::from(half) << (sub_idx * 16);
             }
         }
 
@@ -421,7 +416,7 @@ pub fn load_gaussian_ply<R: Read + Seek>(reader: R) -> Result<GaussianCloud> {
         gaussians,
         sh_coefficients,
         sh_degree: sh_degree_from_coeffs(num_sh_coeffs as u32),
-        num_points: n,
+        num_points: vertex_count,
         aabb_min,
         aabb_max,
         center,
