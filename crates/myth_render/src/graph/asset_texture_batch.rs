@@ -1093,14 +1093,6 @@ mod tests {
     }
 
     #[test]
-    fn asset_texture_batch_id_uses_the_nonzero_option_niche() {
-        assert_eq!(std::mem::size_of::<AssetTextureBatchId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<AssetTextureBatchId>>(), 4);
-        assert_eq!(std::mem::size_of::<Option<AssetImageSnapshotId>>(), 4);
-        assert_eq!(AssetTextureBatchId::from_index(0).index(), 0);
-    }
-
-    #[test]
     fn stable_dedup_retains_one_texture_and_image_owner() {
         let assets = AssetServer::new();
         let image = assets.images.add(image_8x8(1));

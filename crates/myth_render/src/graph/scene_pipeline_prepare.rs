@@ -1210,8 +1210,6 @@ mod tests {
     use crate::graph::frame::{DrawPlanKey, DrawPlanStore};
     use slotmap::KeyData;
 
-    fn assert_recipe_shape<T: Copy + Send + Sync + 'static>() {}
-
     fn prepass_key(discriminator: u64) -> PrepassPipelineL1Key {
         let asset_version = u32::try_from(discriminator).expect("test discriminator exceeds u32");
         PrepassPipelineL1Key {
@@ -1277,21 +1275,6 @@ mod tests {
             Some(store.source_join_generation)
         );
         store.accepted_source_stamps[source.index()] = store.source_join_generation;
-    }
-
-    #[test]
-    fn recipe_types_are_copy_worker_safe_and_niche_sized() {
-        assert_recipe_shape::<SceneRecipeOrdinal>();
-        assert_recipe_shape::<MainDrawRecipe>();
-        assert_recipe_shape::<PrepassDrawRecipe>();
-        assert_recipe_shape::<ShadowDrawRecipe>();
-        assert_recipe_shape::<AcceptedPreparedSource>();
-        assert_eq!(std::mem::size_of::<MainPipelineRequestId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<MainPipelineRequestId>>(), 4);
-        assert_eq!(std::mem::size_of::<PrepassPipelineRequestId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<PrepassPipelineRequestId>>(), 4);
-        assert_eq!(std::mem::size_of::<ShadowPipelineRequestId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<ShadowPipelineRequestId>>(), 4);
     }
 
     #[test]

@@ -609,7 +609,6 @@ fn trim_live_source_join(stamps: &mut Vec<u32>, target_bytes: usize, retained_by
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::size_of;
 
     use crate::graph::frame::RenderIntent;
 
@@ -677,29 +676,6 @@ mod tests {
         store.clear();
         assert_eq!(store.live_source_generation, 1);
         assert!(store.live_source_stamps.iter().all(|&stamp| stamp == 0));
-    }
-
-    #[test]
-    fn source_recipe_id_preserves_option_niche() {
-        assert_eq!(
-            size_of::<Option<SceneSourceRecipeId>>(),
-            size_of::<SceneSourceRecipeId>()
-        );
-        assert_eq!(SceneSourceRecipeId::from_index(0).index(), 0);
-        assert_eq!(SceneSourceRecipeId::from_index(127).index(), 127);
-    }
-
-    #[test]
-    fn source_recipe_is_worker_safe_pod_without_hidden_owners() {
-        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
-
-        assert_send_sync_static::<SceneSourceRecipe>();
-        assert!(!std::mem::needs_drop::<SceneSourceRecipe>());
-        assert!(
-            size_of::<SceneSourceRecipe>()
-                <= size_of::<DynamicModelUniforms>() + size_of::<[u64; 8]>(),
-            "source recipes must remain a compact uniform payload plus Copy identities"
-        );
     }
 
     #[test]

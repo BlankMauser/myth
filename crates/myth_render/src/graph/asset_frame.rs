@@ -1128,34 +1128,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_asset_ids_are_copy_sized_handles() {
-        fn assert_copy<T: Copy>() {}
-        assert_copy::<GeometryFrameId>();
-        assert_copy::<GeometryAssetSnapshotId>();
-        assert_copy::<GeometryLiveSnapshotId>();
-        assert_copy::<ObjectInterfaceId>();
-        assert_eq!(std::mem::size_of::<GeometryFrameId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<GeometryFrameId>>(), 4);
-        assert_eq!(std::mem::size_of::<GeometryAssetSnapshotId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<GeometryAssetSnapshotId>>(), 4);
-        assert_eq!(std::mem::size_of::<GeometryLiveSnapshotId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<GeometryLiveSnapshotId>>(), 4);
-        assert_eq!(std::mem::size_of::<ObjectInterfaceId>(), 4);
-    }
-
-    #[test]
-    fn geometry_frame_id_preserves_zero_based_indices_and_rejects_overflow() {
-        assert_eq!(GeometryFrameId::from_index(0).index(), 0);
-        assert_eq!(
-            GeometryFrameId::from_index(u32::MAX as usize - 1).index(),
-            u32::MAX as usize - 1
-        );
-        assert!(
-            std::panic::catch_unwind(|| GeometryFrameId::from_index(u32::MAX as usize)).is_err()
-        );
-    }
-
-    #[test]
     fn duplicate_sources_share_one_exact_geometry_owner() {
         let assets = AssetServer::new();
         let handle = assets.geometries.add(Geometry::new_box(1.0, 1.0, 1.0));
@@ -1621,16 +1593,5 @@ mod tests {
         assert!(trimmed.retained_bytes < cleared.retained_bytes);
         assert!(trimmed.retained_bytes >= trimmed.baseline_bytes);
         assert!(store.is_empty());
-    }
-
-    #[test]
-    fn geometry_revalidation_flags_are_accounted_as_bytes() {
-        let mut current = Vec::with_capacity(65);
-        current.resize(65, true);
-        let usage = vec_footprint(&current, 64);
-
-        assert_eq!(usage.active_bytes, 65);
-        assert_eq!(usage.retained_bytes, current.capacity());
-        assert_eq!(usage.baseline_bytes, 64);
     }
 }

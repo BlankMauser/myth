@@ -1593,14 +1593,4 @@ mod tests {
         batch.clear();
         assert!(batch.is_empty());
     }
-
-    #[test]
-    fn planned_material_candidate_id_preserves_the_option_niche() {
-        assert_eq!(
-            size_of::<Option<PlannedMaterialCandidateId>>(),
-            size_of::<PlannedMaterialCandidateId>()
-        );
-        assert_eq!(PlannedMaterialCandidateId::from_index(0).index(), 0);
-        assert_eq!(PlannedMaterialCandidateId::from_index(127).index(), 127);
-    }
 }

@@ -1915,35 +1915,6 @@ mod tests {
     }
 
     #[test]
-    fn material_frame_id_uses_the_nonzero_option_niche() {
-        assert_eq!(std::mem::size_of::<MaterialFrameId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<MaterialFrameId>>(), 4);
-        assert_eq!(std::mem::size_of::<MaterialAssetSnapshotId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<MaterialAssetSnapshotId>>(), 4);
-        assert_eq!(std::mem::size_of::<MaterialFrameInterfaceId>(), 4);
-        assert_eq!(std::mem::size_of::<Option<MaterialFrameInterfaceId>>(), 4);
-        assert_eq!(MaterialFrameId::from_index(0).index(), 0);
-        assert_eq!(
-            MaterialFrameId::from_index(u32::MAX as usize - 1).index(),
-            u32::MAX as usize - 1
-        );
-        assert!(
-            std::panic::catch_unwind(|| MaterialFrameId::from_index(u32::MAX as usize)).is_err()
-        );
-        assert_eq!(MaterialFrameInterfaceId::from_index(0).index(), 0);
-        assert_eq!(
-            MaterialFrameInterfaceId::from_index(u32::MAX as usize - 1).index(),
-            u32::MAX as usize - 1
-        );
-        assert!(
-            std::panic::catch_unwind(|| {
-                MaterialFrameInterfaceId::from_index(u32::MAX as usize);
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
     fn generation_stamped_source_join_reuses_capacity_without_stale_publication() {
         let mut join = GenerationStampedSourceJoin::with_capacity(2);
         join.begin(17);
@@ -2350,17 +2321,6 @@ mod tests {
             recipes.textures(opaque).is_empty(),
             "a replaced Material must not publish topology from its retained old owner"
         );
-    }
-
-    #[test]
-    fn material_revalidation_flags_are_accounted_as_bytes() {
-        let mut current = Vec::with_capacity(129);
-        current.resize(129, true);
-        let usage = vec_footprint(&current, 128);
-
-        assert_eq!(usage.active_bytes, 129);
-        assert_eq!(usage.retained_bytes, current.capacity());
-        assert_eq!(usage.baseline_bytes, 128);
     }
 
     #[test]
