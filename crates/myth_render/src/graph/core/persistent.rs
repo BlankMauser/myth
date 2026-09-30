@@ -737,6 +737,15 @@ impl HistoryRegistry {
         spec: PersistentTextureSpec,
     ) {
         self.assert_texture_spec_is_current(id, spec);
+        // A live import can replace or overwrite this backing before submission.
+        // Forfeit rollback now, including unregistered readers and attempts that
+        // abort during prepare/execute, so a later dead attempt cannot revive
+        // metadata for physical contents that may already have changed.
+        for cache in self.caches.values_mut() {
+            if !cache.valid && cache.members.contains(&id) {
+                cache.rollback = None;
+            }
+        }
         let needs_recreate = self
             .textures
             .get(&id)

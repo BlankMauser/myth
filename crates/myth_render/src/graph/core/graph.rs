@@ -994,7 +994,7 @@ impl<'a> RenderGraph<'a> {
     /// requests return typed receipts instead of storing callbacks or feature
     /// pointers in graph storage; callers may use those receipts to update
     /// feature-local bookkeeping after submission.
-    pub fn commit_submitted_persistent_resources(
+    pub(crate) fn commit_submitted_persistent_resources(
         &self,
         registry: &mut HistoryRegistry,
     ) -> SmallVec<[CachePublicationReceipt; 4]> {
@@ -2340,61 +2340,93 @@ mod tests {
 
     #[test]
     fn live_reader_of_an_invalid_replacement_forfeits_rollback() {
-        let mut registry = HistoryRegistry::new();
-        let cache = registry.create_cache();
-        let published_key = CacheKey::new(1);
-        let replacement_key = CacheKey::new(2);
-        let published_spec = PersistentTextureSpec::default_view(dummy_desc());
-        let published = registry.plan_cache(cache, published_key, [published_spec], 1);
-        assert!(
-            registry
-                .commit_cache(
-                    published.commit.expect("initial cache needs a token"),
-                    &[published.textures[0].id],
-                )
-                .is_some()
-        );
-
-        let replacement_desc = TextureDesc::new_2d(
+        let context = pollster::block_on(crate::core::WgpuContext::new_headless(
+            &crate::settings::RendererInitConfig::default(),
+            &crate::settings::RendererSettings::default(),
             2,
             2,
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
-        let replacement_spec = PersistentTextureSpec::default_view(replacement_desc);
-        let replacement = registry.plan_cache(cache, replacement_key, [replacement_spec], 2);
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let replacement_texture =
-            graph.import_persistent_texture("Replacement", replacement.textures[0]);
-        let output = graph.register_texture("Output", dummy_desc(), true);
-        graph.add_pass("ReadInvalidReplacement", |builder| {
-            builder.read_texture(replacement_texture);
-            builder.write_texture(output);
-            (MockExec, ())
-        });
-        graph.register_cache_commit(
-            replacement.commit.expect("replacement needs a token"),
-            &[replacement_texture],
-        );
-        graph.compile_topology();
+            None,
+        ))
+        .expect("headless context init failed");
 
-        assert_ne!(
-            graph.storage.resources[replacement_texture.index() as usize].first_use,
-            usize::MAX
-        );
-        assert!(
-            graph
-                .commit_submitted_persistent_resources(&mut registry)
-                .is_empty()
-        );
-        assert!(!registry.is_cache_valid(cache, published_key));
-        assert!(
-            !registry
-                .plan_cache(cache, replacement_key, [replacement_spec], 3)
-                .valid
-        );
+        for register_publication in [false, true] {
+            let mut registry = HistoryRegistry::new();
+            let cache = registry.create_cache();
+            let published_key = CacheKey::new(1);
+            let replacement_key = CacheKey::new(2);
+            let published_spec = PersistentTextureSpec::default_view(dummy_desc());
+            let published = registry.plan_cache(cache, published_key, [published_spec], 1);
+            registry.materialize_texture(
+                &context.device,
+                "Published",
+                published.textures[0].id,
+                published_spec,
+            );
+            let published_view = registry.get_texture_view(published.textures[0].id).id();
+            assert!(
+                registry
+                    .commit_cache(
+                        published.commit.expect("initial cache needs a token"),
+                        &[published.textures[0].id],
+                    )
+                    .is_some()
+            );
+
+            let replacement_spec = PersistentTextureSpec::default_view(TextureDesc::new_2d(
+                2,
+                2,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            ));
+            let replacement = registry.plan_cache(cache, replacement_key, [replacement_spec], 2);
+            let mut storage = GraphStorage::new();
+            let arena = FrameArena::new();
+            {
+                let mut graph = begin_test_frame(&mut storage, &arena);
+                let texture =
+                    graph.import_persistent_texture("Replacement", replacement.textures[0]);
+                let output = graph.register_texture("Output", dummy_desc(), true);
+                graph.add_pass("ReadInvalidReplacement", |builder| {
+                    builder.read_texture(texture);
+                    builder.write_texture(output);
+                    (MockExec, ())
+                });
+                if register_publication {
+                    graph.register_cache_commit(
+                        replacement.commit.expect("replacement needs a token"),
+                        &[texture],
+                    );
+                }
+                graph.compile_topology();
+                graph.materialize_live_persistent_textures(&mut registry, &context.device);
+                assert_ne!(
+                    published_view,
+                    registry.get_texture_view(replacement.textures[0].id).id(),
+                    "the live reader replaced the original physical texture"
+                );
+                // Abandon this attempt before submit, with or without a registered
+                // publication. Physical materialization has already happened.
+            }
+
+            let dead_attempt = registry.plan_cache(cache, replacement_key, [replacement_spec], 3);
+            let mut graph = begin_test_frame(&mut storage, &arena);
+            let texture =
+                graph.import_persistent_texture("DeadReplacement", dead_attempt.textures[0]);
+            graph.register_cache_commit(
+                dead_attempt.commit.expect("replacement is still invalid"),
+                &[texture],
+            );
+            graph.compile_topology();
+            assert!(
+                graph
+                    .commit_submitted_persistent_resources(&mut registry)
+                    .is_empty()
+            );
+            assert!(
+                !registry.is_cache_valid(cache, published_key),
+                "an abandoned live reader must not revive metadata for the destroyed texture (registered: {register_publication})"
+            );
+        }
     }
 
     #[test]
