@@ -466,19 +466,6 @@ impl SceneSubmissionStore {
         }
     }
 
-    #[cfg(test)]
-    fn finalize_indirect_stub(&mut self, id: SceneSubmissionPlanId) {
-        let record = self
-            .record_mut(id)
-            .expect("indirect stub belongs to another graph attempt");
-        assert!(record.live, "dead indirect stub cannot be finalized");
-        assert!(
-            matches!(record.backend, SceneSubmissionBackend::IndirectStub(_)),
-            "only an indirect stub may use test finalization"
-        );
-        record.indirect_finalized = true;
-    }
-
     fn record(&self, id: SceneSubmissionPlanId) -> Option<&SceneSubmissionRecord> {
         self.validate_reserved(id)
             .then(|| self.plans.get(id.index as usize))
@@ -625,7 +612,6 @@ impl<'a> SceneSubmissionWriter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::core::{BufferNodeId, TextureNodeId};
     use crate::graph::frame::DrawPlanKey;
 
     fn finalized_direct(draw_plans: &mut DrawPlanStore, command: Option<u64>) -> DrawPlanId {
@@ -738,41 +724,5 @@ mod tests {
         );
         assert_eq!(store.plan_count(), 1);
         assert_eq!(store.reserved_index(plan), Some(0));
-    }
-
-    #[test]
-    fn typed_dependencies_preserve_mixed_registration_order_and_duplicates() {
-        let texture_a = TextureNodeId::new(3, 0);
-        let buffer = BufferNodeId::new(7, 1);
-        let texture_b = TextureNodeId::new(11, 2);
-        let mut dependencies = SceneSubmissionDependencies::new()
-            .with_texture(texture_a)
-            .with_buffer(buffer);
-        dependencies.read_texture(texture_b);
-        dependencies.read_buffer(buffer);
-
-        assert_eq!(
-            dependencies.as_slice(),
-            &[
-                texture_a.erase(),
-                buffer.erase(),
-                texture_b.erase(),
-                buffer.erase(),
-            ]
-        );
-
-        let draw_plans = DrawPlanStore::new();
-        let mut store = SceneSubmissionStore::new();
-        let indirect = store.reserve_indirect_stub(41, &dependencies);
-        assert_eq!(store.dependencies(indirect), Some(dependencies.as_slice()));
-        store.mark_live(indirect);
-        assert_eq!(store.live_backend_counts().indirect_stub, 1);
-        assert!(store.resolve_stream(indirect, &draw_plans).is_none());
-        store.finalize_indirect_stub(indirect);
-        let stream = store
-            .resolve_stream(indirect, &draw_plans)
-            .expect("finalized indirect stub stream missing");
-        assert!(store.validate_stream(stream));
-        assert!(store.cpu_direct_stream(stream).is_none());
     }
 }

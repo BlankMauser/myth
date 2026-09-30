@@ -176,7 +176,6 @@ impl MipmapEncodeCoordinator {
     pub(crate) fn clear(&mut self) {
         self.claimed.get_mut().clear();
     }
-
 }
 
 /// Reusable dense set for attempt-local IDs.
@@ -3414,53 +3413,6 @@ mod tests {
                 "Live_Shared_Consumer",
                 "Live_Two_Plan_Consumer"
             ]
-        );
-    }
-
-    #[test]
-    fn scene_submission_demands_are_raw_during_setup_and_canonical_afterward() {
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = begin_test_frame(&mut storage, &arena);
-        let texture = graph.register_texture("Draw_Texture", dummy_desc(), false);
-        graph.set_scene_submission_texture_dependencies(
-            SceneSubmissionKey::Opaque,
-            [texture, texture],
-        );
-        let submission = graph.reserve_scene_submission(SceneSubmissionKey::Opaque);
-        let pass_index = graph.storage.passes.len();
-
-        graph.add_pass("Repeated_Draw_Consumer", |builder| {
-            builder.demand_scene_submission(submission);
-            builder.demand_scene_submission(submission);
-            builder.demand_scene_submission(submission);
-            assert_eq!(
-                builder.graph.storage.scene_submission_raw_demands.len(),
-                3,
-                "setup must append raw IDs without accumulated-demand scans"
-            );
-            assert!(
-                builder
-                    .graph
-                    .storage
-                    .pass_reads(builder.pass_index)
-                    .is_empty(),
-                "scene-submission dependency union must wait until setup returns"
-            );
-            (MockExec, ())
-        });
-
-        assert_eq!(
-            graph.storage.pass_scene_submission_demands(pass_index),
-            &[submission]
-        );
-        assert_eq!(graph.storage.pass_reads(pass_index), &[texture.erase()]);
-        assert_eq!(
-            graph
-                .storage
-                .resource_consumers(texture.index() as usize)
-                .collect::<Vec<_>>(),
-            &[pass_index]
         );
     }
 

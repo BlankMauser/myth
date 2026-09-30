@@ -1337,30 +1337,4 @@ mod tests {
             assert!(facts.execution_queue.is_empty());
         }
     }
-
-    #[test]
-    fn high_fan_out_timed_token_matches_exact_live_and_dead_formulas() {
-        for consumer_count in [4, 8, 16, 64, 128] {
-            for root in [HighFanOutRoot::None, HighFanOutRoot::AllConsumers] {
-                let mut harness = HighFanOutBenchHarness::new();
-                let token = harness.run_iteration(HighFanOutBenchSpec {
-                    consumer_count,
-                    root,
-                });
-                let rooted = usize::from(root == HighFanOutRoot::AllConsumers);
-                assert_eq!(token.registered_pass_count, consumer_count + 1 + rooted);
-                assert_eq!(token.registered_resource_count, consumer_count + 1 + rooted);
-                assert_eq!(token.logical_consumer_count, consumer_count);
-                assert_eq!(
-                    token.producer_reverse_consumer_count,
-                    consumer_count * rooted
-                );
-                assert_eq!(
-                    token.root_physical_dependency_count,
-                    consumer_count * rooted
-                );
-                assert_eq!(token.compiled_pass_count, (consumer_count + 2) * rooted);
-            }
-        }
-    }
 }

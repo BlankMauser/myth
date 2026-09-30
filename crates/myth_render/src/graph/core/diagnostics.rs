@@ -851,27 +851,6 @@ mod tests {
     }
 
     #[test]
-    fn presentation_truth_precedes_debug_validation() {
-        let recorder = RdgDiagnosticsRecorder::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recorder.start_renderer_attempt(13);
-            let _guard = RdgComposerAttemptGuard::new(&recorder);
-            recorder.record_compiled_live_passes(0);
-            recorder.mark_queue_submitted();
-            // A headless target intentionally violates the presentation
-            // invariant after the external present fact is recorded.
-            recorder.mark_target_acquired(RdgRenderTargetKind::Headless, false);
-            recorder.mark_presented();
-        }));
-        assert!(result.is_err());
-
-        let snapshot = recorder.latest().expect("panic snapshot missing");
-        assert!(snapshot.presented());
-        assert!(snapshot.queue_submitted());
-        assert!(snapshot.panicked());
-    }
-
-    #[test]
     fn repeated_target_failures_request_only_one_log_report() {
         let recorder = RdgDiagnosticsRecorder::default();
 

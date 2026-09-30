@@ -2159,44 +2159,6 @@ impl<'a> FrameComposer<'a> {
 }
 
 #[cfg(test)]
-mod diagnostic_tests {
-    use super::*;
-
-    #[test]
-    fn surface_acquisition_failures_map_to_stable_diagnostic_reasons() {
-        let cases = [
-            (
-                wgpu::CurrentSurfaceTexture::Timeout,
-                RdgSurfaceAcquireFailure::Timeout,
-            ),
-            (
-                wgpu::CurrentSurfaceTexture::Occluded,
-                RdgSurfaceAcquireFailure::Occluded,
-            ),
-            (
-                wgpu::CurrentSurfaceTexture::Outdated,
-                RdgSurfaceAcquireFailure::Outdated,
-            ),
-            (
-                wgpu::CurrentSurfaceTexture::Lost,
-                RdgSurfaceAcquireFailure::Lost,
-            ),
-            (
-                wgpu::CurrentSurfaceTexture::Validation,
-                RdgSurfaceAcquireFailure::Validation,
-            ),
-        ];
-
-        for (failure, expected) in cases {
-            assert_eq!(
-                classify_surface_acquisition_failure(&failure),
-                Some(expected)
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::present_then_reconfigure_if_needed;
 

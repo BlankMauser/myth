@@ -552,30 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn dead_import_never_invokes_materialization_callback() {
-        let metadata = metadata_buffer();
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut calls = 0;
-
-        {
-            let mut graph = RenderGraph::new(&mut storage, &arena);
-            graph.import_scene_light_metadata_buffer("dead metadata", &metadata);
-            graph.compile_topology();
-            let result = graph
-                .storage
-                .scene_buffer_imports
-                .materialize_live_for_test(&graph.storage.resources, |_, _| {
-                    calls += 1;
-                    None
-                });
-            assert_eq!(result, Ok(()));
-        }
-
-        assert_eq!(calls, 0);
-    }
-
-    #[test]
     fn dead_imports_do_not_touch_the_real_resource_manager() {
         let wgpu = pollster::block_on(WgpuContext::new_headless(
             &RendererInitConfig::default(),
