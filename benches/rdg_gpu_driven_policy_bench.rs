@@ -68,14 +68,13 @@ fn bench_gpu_driven_shadow_and_dirty_matrix(c: &mut Criterion) {
 
     let cases = [
         (
-            "basic_720p_tier1_span1_shadow0_dirty0",
+            "high_1080p_n32_indirect_loop_span1_shadow0_dirty0",
             GpuDrivenMatrixBenchSpec {
-                item_count: 10_000,
-                bin_count: 64,
-                render_path: RenderPath::BasicForward,
-                viewport_width: 1280,
-                viewport_height: 720,
-                device_tier: 1,
+                item_count: 32,
+                bin_count: 1,
+                render_path: RenderPath::HighFidelity,
+                viewport_width: 1920,
+                viewport_height: 1080,
                 slot_span_multiplier: 1,
                 shadow_2d_view_count: 0,
                 shadow_cube_view_count: 0,
@@ -83,14 +82,27 @@ fn bench_gpu_driven_shadow_and_dirty_matrix(c: &mut Criterion) {
             },
         ),
         (
-            "high_1440p_tier2_span1_shadow1_dirty1",
+            "basic_720p_indirect_loop_span1_shadow0_dirty0",
+            GpuDrivenMatrixBenchSpec {
+                item_count: 10_000,
+                bin_count: 64,
+                render_path: RenderPath::BasicForward,
+                viewport_width: 1280,
+                viewport_height: 720,
+                slot_span_multiplier: 1,
+                shadow_2d_view_count: 0,
+                shadow_cube_view_count: 0,
+                dirty_percent: 0,
+            },
+        ),
+        (
+            "high_1440p_indirect_loop_span1_shadow1_dirty1",
             GpuDrivenMatrixBenchSpec {
                 item_count: 10_000,
                 bin_count: 64,
                 render_path: RenderPath::HighFidelity,
                 viewport_width: 2560,
                 viewport_height: 1440,
-                device_tier: 2,
                 slot_span_multiplier: 1,
                 shadow_2d_view_count: 1,
                 shadow_cube_view_count: 0,
@@ -98,14 +110,13 @@ fn bench_gpu_driven_shadow_and_dirty_matrix(c: &mut Criterion) {
             },
         ),
         (
-            "high_4k_tier2_span4_shadow4_dirty10",
+            "high_4k_indirect_loop_span4_shadow4_dirty10",
             GpuDrivenMatrixBenchSpec {
                 item_count: 100_000,
                 bin_count: 64,
                 render_path: RenderPath::HighFidelity,
                 viewport_width: 3840,
                 viewport_height: 2160,
-                device_tier: 2,
                 slot_span_multiplier: 4,
                 shadow_2d_view_count: 0,
                 shadow_cube_view_count: 4,
@@ -113,14 +124,13 @@ fn bench_gpu_driven_shadow_and_dirty_matrix(c: &mut Criterion) {
             },
         ),
         (
-            "high_4k_tier1_span16_shadow16_dirty100",
+            "high_4k_indirect_loop_span16_shadow16_dirty100",
             GpuDrivenMatrixBenchSpec {
                 item_count: 100_000,
                 bin_count: 64,
                 render_path: RenderPath::HighFidelity,
                 viewport_width: 3840,
                 viewport_height: 2160,
-                device_tier: 1,
                 slot_span_multiplier: 16,
                 shadow_2d_view_count: 4,
                 shadow_cube_view_count: 12,
@@ -128,14 +138,13 @@ fn bench_gpu_driven_shadow_and_dirty_matrix(c: &mut Criterion) {
             },
         ),
         (
-            "basic_1440p_tier2_span1_shadow64_dirty0",
+            "basic_1440p_indirect_loop_span1_shadow64_dirty0",
             GpuDrivenMatrixBenchSpec {
                 item_count: 100_000,
                 bin_count: 64,
                 render_path: RenderPath::BasicForward,
                 viewport_width: 2560,
                 viewport_height: 1440,
-                device_tier: 2,
                 slot_span_multiplier: 1,
                 shadow_2d_view_count: 16,
                 shadow_cube_view_count: 48,

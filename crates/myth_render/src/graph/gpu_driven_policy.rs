@@ -14,6 +14,10 @@ const EXIT_CONFIRMATIONS: u8 = 5;
 const MINIMUM_DWELL_SUBMISSIONS: u64 = 30;
 const CPU_RECHECK_INTERVAL: u64 = 30;
 const MINIMUM_AUTO_CANDIDATES: u32 = 32;
+// `passes::draw` currently records one `draw_indexed_indirect` command per
+// live batch. Do not discount this cost from a device capability alone; add a
+// new calibrated execution cost only together with a real consuming endpoint.
+const INDIRECT_LOOP_FIXED_COST: u64 = 7_000;
 
 bitflags! {
     /// Independently selectable semantic scene-submission families. Main and
@@ -113,10 +117,6 @@ pub(crate) struct GpuDrivenExactWorkload {
     pub(crate) shadow_2d_view_count: u32,
     pub(crate) shadow_cube_view_count: u32,
     pub(crate) viewport_pixels: u64,
-    /// 0 = conservative/unknown, 1 = portable indirect, 2 = enabled
-    /// indirect-count capability. This is a capability prior, not an attempt
-    /// to infer integrated versus discrete hardware from feature bits.
-    pub(crate) device_tier: u8,
     /// Families whose projected buffers/bindings fit the active device.
     pub(crate) capability_families: GpuDrivenFamilyMask,
 }
@@ -462,14 +462,23 @@ fn select_cost_optimum(
 
     let available = available_families(exact);
     let cpu_only = score_mask(GpuDrivenFamilyMask::empty(), available, exact);
+    let current = current & available;
     let mut best_mask = GpuDrivenFamilyMask::empty();
     let mut best_score = cpu_only;
+    let mut current_score = if current.is_empty() {
+        cpu_only
+    } else {
+        u64::MAX
+    };
     for raw in 1..=GpuDrivenFamilyMask::ALL.bits() {
         let mask = GpuDrivenFamilyMask::from_bits_retain(raw) & available;
         if mask.bits() != raw || mask.is_empty() {
             continue;
         }
         let score = score_mask(mask, available, exact);
+        if mask == current {
+            current_score = score;
+        }
         if score < best_score || (score == best_score && mask == current) {
             best_score = score;
             best_mask = mask;
@@ -479,13 +488,11 @@ fn select_cost_optimum(
     // Estimates within ten percent are deliberately treated as low
     // confidence. Retaining the current backend avoids oscillation and gives
     // benchmark calibration an explicit, observable region.
-    let difference = cpu_only.abs_diff(best_score);
-    let low_confidence = difference.saturating_mul(10) <= cpu_only.max(best_score);
+    debug_assert_ne!(current_score, u64::MAX);
+    let difference = current_score.abs_diff(best_score);
+    let low_confidence = difference.saturating_mul(10) <= current_score.max(best_score);
     if low_confidence {
-        return (
-            current & available,
-            GpuDrivenAutoDecisionReason::LowConfidence,
-        );
+        return (current, GpuDrivenAutoDecisionReason::LowConfidence);
     }
     (best_mask, GpuDrivenAutoDecisionReason::CostModel)
 }
@@ -514,15 +521,10 @@ fn score_mask(
             .instance_slot_span
             .saturating_sub(exact.candidate_count),
     );
-    let device_fixed = match exact.device_tier {
-        2 => 4_000,
-        1 => 7_000,
-        _ => 10_000,
-    };
     let mut score = if gpu.is_empty() {
         0
     } else {
-        device_fixed
+        INDIRECT_LOOP_FIXED_COST
             + u64::from(exact.dirty_candidate_count).saturating_mul(20)
             + bins.saturating_mul(180)
             + slot_waste.saturating_mul(3)
@@ -648,7 +650,6 @@ mod tests {
             shadow_2d_view_count: 4,
             shadow_cube_view_count: 0,
             viewport_pixels: 1920 * 1080,
-            device_tier: 2,
             capability_families: GpuDrivenFamilyMask::ALL,
         }
     }
@@ -667,19 +668,21 @@ mod tests {
     #[test]
     fn shared_workload_enters_only_after_submitted_confirmations() {
         let mut policy = GpuDrivenAutoPolicy::new();
+        let domain = key(1);
+        let mut gpu_synopsis = synopsis(1_024, 2);
+        gpu_synopsis.shadow_2d_view_count = 0;
+        let mut gpu_exact = shared_exact(1_024);
+        gpu_exact.shadow_candidate_count = 0;
+        gpu_exact.shadow_2d_view_count = 0;
         for frame in 0..ENTER_CONFIRMATIONS {
             let GpuDrivenCoarseGate::EvaluateExact {
                 minimum_cohort_members,
-            } = policy.coarse_gate(key(1), synopsis(1_024, 2))
+            } = policy.coarse_gate(domain, gpu_synopsis)
             else {
                 panic!("shared workload unexpectedly skipped exact evaluation");
             };
-            let decision = policy.evaluate_exact(
-                key(1),
-                synopsis(1_024, 2),
-                shared_exact(1_024),
-                minimum_cohort_members,
-            );
+            let decision =
+                policy.evaluate_exact(domain, gpu_synopsis, gpu_exact, minimum_cohort_members);
             assert_eq!(
                 decision
                     .families
@@ -688,6 +691,34 @@ mod tests {
             );
             assert!(policy.commit_submitted(decision.token));
         }
+
+        for _ in 0..MINIMUM_DWELL_SUBMISSIONS {
+            let decision = policy.evaluate_exact(domain, gpu_synopsis, gpu_exact, 1);
+            assert!(
+                decision
+                    .families
+                    .contains(GpuDrivenFamilyMask::MAIN_PREPASS)
+            );
+            assert!(policy.commit_submitted(decision.token));
+        }
+
+        let mut cpu_synopsis = synopsis(49, 56);
+        cpu_synopsis.shadow_2d_view_count = 0;
+        let mut cpu_exact = shared_exact(49);
+        cpu_exact.shadow_candidate_count = 0;
+        cpu_exact.shadow_2d_view_count = 0;
+        for confirmation in 1..=EXIT_CONFIRMATIONS {
+            let decision = policy.evaluate_exact(domain, cpu_synopsis, cpu_exact, 1);
+            assert_eq!(
+                decision
+                    .families
+                    .contains(GpuDrivenFamilyMask::MAIN_PREPASS),
+                confirmation < EXIT_CONFIRMATIONS,
+                "a confident CPU optimum must exit after submitted confirmations"
+            );
+            assert!(policy.commit_submitted(decision.token));
+        }
+        assert!(policy.state_for(domain).selected.is_empty());
     }
 
     #[test]
@@ -811,7 +842,7 @@ mod tests {
 
     #[test]
     fn shared_visibility_makes_high_fidelity_cross_over_before_basic_forward() {
-        let mut basic = shared_exact(32);
+        let mut basic = shared_exact(48);
         basic.shadow_2d_view_count = 0;
         basic.shadow_candidate_count = 0;
         basic.main_submission_count = 1;
@@ -823,6 +854,16 @@ mod tests {
         let (high_fidelity_proposal, _) =
             select_cost_optimum(GpuDrivenFamilyMask::empty(), high_fidelity);
         assert!(high_fidelity_proposal.contains(GpuDrivenFamilyMask::MAIN_PREPASS));
+
+        let mut minimum = shared_exact(MINIMUM_AUTO_CANDIDATES);
+        minimum.shadow_candidate_count = 0;
+        minimum.shadow_2d_view_count = 0;
+        minimum.main_submission_count = 2;
+        let (minimum_proposal, _) = select_cost_optimum(GpuDrivenFamilyMask::empty(), minimum);
+        assert!(
+            minimum_proposal.is_empty(),
+            "the per-bin indirect loop cannot receive an unrealized multi-draw discount"
+        );
     }
 
     #[test]

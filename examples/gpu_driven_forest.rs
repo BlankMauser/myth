@@ -248,7 +248,7 @@ impl AppHandler for GpuDrivenForestDemo {
                     "Window throughput: {:.1} FPS",
                     self.fps_counter.current_fps
                 ));
-                ui.label(format!("GPU-driven tier: {tier:?}"));
+                ui.label(format!("GPU-driven capability tier: {tier:?}"));
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.mode, GpuDrivenMode::Off, "CPU Off");

@@ -1237,13 +1237,6 @@ impl<'a> FrameComposer<'a> {
                                     .unwrap_or(u32::MAX),
                                     viewport_pixels: u64::from(self.frame_config.width)
                                         .saturating_mul(u64::from(self.frame_config.height)),
-                                    device_tier: if capabilities
-                                        .supports_multi_draw_indirect_count()
-                                    {
-                                        2
-                                    } else {
-                                        1
-                                    },
                                     capability_families,
                                 }
                             } else {

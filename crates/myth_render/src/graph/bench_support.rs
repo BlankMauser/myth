@@ -1780,9 +1780,6 @@ pub struct GpuDrivenMatrixBenchSpec {
     pub render_path: RenderPath,
     pub viewport_width: u32,
     pub viewport_height: u32,
-    /// Production capability prior: 1 = portable indirect, 2 = enabled
-    /// indirect-count. Adapter-specific throughput belongs to hardware runs.
-    pub device_tier: u8,
     /// Retained slot-span pressure relative to the compact live domain.
     pub slot_span_multiplier: u32,
     pub shadow_2d_view_count: u32,
@@ -1800,7 +1797,6 @@ impl GpuDrivenMatrixBenchSpec {
             render_path: RenderPath::BasicForward,
             viewport_width: 1920,
             viewport_height: 1080,
-            device_tier: 2,
             slot_span_multiplier: 1,
             shadow_2d_view_count: 0,
             shadow_cube_view_count: 0,
@@ -1887,10 +1883,6 @@ impl GpuDrivenMatrixBenchHarness {
         assert!(
             spec.viewport_width > 0 && spec.viewport_height > 0,
             "GPU-driven matrix viewport must be nonzero"
-        );
-        assert!(
-            spec.device_tier <= 2,
-            "GPU-driven matrix device tier must be 0, 1, or 2"
         );
         assert!(
             spec.slot_span_multiplier > 0,
@@ -2098,7 +2090,6 @@ impl GpuDrivenMatrixBenchHarness {
             shadow_cube_view_count: self.spec.shadow_cube_view_count,
             viewport_pixels: u64::from(self.spec.viewport_width)
                 .saturating_mul(u64::from(self.spec.viewport_height)),
-            device_tier: self.spec.device_tier,
             capability_families: GpuDrivenFamilyMask::ALL,
         }
     }
@@ -2727,7 +2718,6 @@ mod tests {
             render_path: RenderPath::HighFidelity,
             viewport_width: 2560,
             viewport_height: 1440,
-            device_tier: 2,
             slot_span_multiplier: 1,
             shadow_2d_view_count: 4,
             shadow_cube_view_count: 6,
