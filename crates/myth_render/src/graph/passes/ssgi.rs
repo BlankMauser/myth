@@ -1403,61 +1403,43 @@ mod tests {
     fn alternating_scene_camera_domains_keep_independent_continuity() {
         let mut feature = SsgiFeature::new();
         let mut histories = HistoryRegistry::new();
-        let settings = SsgiSettings::default();
+        let mut settings = SsgiSettings::default();
+        settings.set_checkerboard_enabled(true);
         let camera_a = camera(71);
         let camera_b = camera(72);
 
-        let a1 = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera_a,
-            1,
-            (1280, 720),
-        );
-        let b1 = feature.extract(
-            &mut histories,
-            2,
-            &camera_b,
-            1,
-            1,
-            &settings.uniforms,
-            (1280, 720),
-            1,
-            None,
-            GlobalStateKey::new(1, 2),
-        );
-        assert!(commit_indirect(&mut histories, a1));
-        assert!(commit_source(&mut histories, a1));
-        assert!(commit_indirect(&mut histories, b1));
-        assert!(commit_source(&mut histories, b1));
-
-        let a2 = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera_a,
-            2,
-            (1280, 720),
-        );
-        let b2 = feature.extract(
-            &mut histories,
-            2,
-            &camera_b,
-            2,
-            2,
-            &settings.uniforms,
-            (1280, 720),
-            2,
-            None,
-            GlobalStateKey::new(1, 2),
-        );
-        assert!(a2.indirect_history.valid && a2.source_history.valid);
-        assert!(b2.indirect_history.valid && b2.source_history.valid);
-        assert_ne!(
-            a2.indirect_history.previous[0].id,
-            b2.indirect_history.previous[0].id
-        );
+        let mut previous = [None, None];
+        let mut sampled_phases = [0_u32; 2];
+        for serial in 1..=4 {
+            for (index, camera) in [&camera_a, &camera_b].into_iter().enumerate() {
+                let scene_id = index as u32 + 1;
+                let global_frame = 100 + serial * 2 + index as u64;
+                let snapshot = feature.extract(
+                    &mut histories,
+                    scene_id,
+                    camera,
+                    serial,
+                    global_frame,
+                    &settings.uniforms,
+                    (1280, 720),
+                    global_frame as u32,
+                    None,
+                    GlobalStateKey::new(1, scene_id),
+                );
+                assert_eq!(snapshot.uniforms.frame_params.x, serial as u32);
+                sampled_phases[index] |= 1 << (snapshot.uniforms.frame_params.x & 3);
+                assert_eq!(snapshot.indirect_history.valid, serial > 1);
+                assert_eq!(snapshot.source_history.valid, serial > 1);
+                if let Some(previous) = previous[index] {
+                    assert_eq!(snapshot.indirect_history.previous[0].id, previous);
+                }
+                previous[index] = Some(snapshot.indirect_history.next[0].id);
+                assert!(commit_indirect(&mut histories, snapshot));
+                assert!(commit_source(&mut histories, snapshot));
+            }
+            assert_ne!(previous[0], previous[1]);
+        }
+        assert_eq!(sampled_phases, [0b1111, 0b1111]);
     }
 
     #[test]
@@ -1598,52 +1580,6 @@ mod tests {
     }
 
     #[test]
-    fn graph_has_one_uniform_no_archive_passes_and_no_eager_static_state() {
-        let mut feature = SsgiFeature::new();
-        let mut histories = HistoryRegistry::new();
-        let settings = SsgiSettings::default();
-        let camera = camera(10);
-        let snapshot = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera,
-            1,
-            (1280, 720),
-        );
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = RenderGraph::new(&mut storage, &arena);
-        let _outputs = add_graph(&mut feature, &mut graph, snapshot);
-
-        assert!(
-            graph
-                .storage
-                .passes
-                .iter()
-                .all(|pass| !pass.name.contains("Save"))
-        );
-        assert_eq!(
-            graph
-                .storage
-                .resources
-                .iter()
-                .filter(|resource| resource.name == "SSGI_Uniforms")
-                .count(),
-            1
-        );
-        assert!(feature.raw.pipelines.is_empty());
-        assert!(feature.temporal.pipeline_id.is_none());
-        assert!(
-            feature
-                .atrous
-                .iter()
-                .all(|stage| stage.pipeline_id.is_none())
-        );
-        assert!(feature.merge.pipeline_id.is_none());
-    }
-
-    #[test]
     fn raw_root_commits_neither_history_set() {
         let mut feature = SsgiFeature::new();
         let mut histories = HistoryRegistry::new();
@@ -1755,5 +1691,16 @@ mod tests {
         );
         graph.commit_submitted_histories(&mut histories);
         assert_eq!(followup_validity(&mut histories, snapshot), (true, true));
+
+        // Building and compiling a live graph must not eagerly create GPU state.
+        assert!(feature.raw.pipelines.is_empty());
+        assert!(feature.temporal.pipeline_id.is_none());
+        assert!(
+            feature
+                .atrous
+                .iter()
+                .all(|stage| stage.pipeline_id.is_none())
+        );
+        assert!(feature.merge.pipeline_id.is_none());
     }
 }

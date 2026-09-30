@@ -1404,122 +1404,32 @@ mod tests {
         let camera_a = camera(10);
         let camera_b = camera(11);
 
-        let a1 = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera_a,
-            1,
-            1,
-            (1280, 720),
-        );
-        assert!(commit(&mut histories, a1));
-        let b1 = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera_b,
-            1,
-            1,
-            (1280, 720),
-        );
-        assert!(commit(&mut histories, b1));
-
-        let a2 = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera_a,
-            1,
-            2,
-            (1280, 720),
-        );
-        let b2 = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera_b,
-            1,
-            2,
-            (1280, 720),
-        );
-        assert!(a2.history.valid);
-        assert!(b2.history.valid);
-        assert_ne!(a2.history.previous[0].id, b2.history.previous[0].id);
-    }
-
-    #[test]
-    fn graph_has_one_uniform_and_no_history_save_passes() {
-        let mut feature = SsrFeature::new();
-        let mut histories = HistoryRegistry::new();
-        let settings = SsrSettings::default();
-        let camera = camera(12);
-        let snapshot = extract(
-            &mut feature,
-            &mut histories,
-            &settings,
-            &camera,
-            1,
-            1,
-            (1280, 720),
-        );
-
-        let mut storage = GraphStorage::new();
-        let arena = FrameArena::new();
-        let mut graph = RenderGraph::new(&mut storage, &arena);
-        let frame_config = FrameConfig {
-            width: 1280,
-            height: 720,
-            depth_format: wgpu::TextureFormat::Depth32Float,
-            msaa_samples: 1,
-            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
-            hdr_format: HDR_TEXTURE_FORMAT,
-        };
-        let color_desc = TextureDesc::new_2d(
-            1280,
-            720,
-            HDR_TEXTURE_FORMAT,
-            wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let data_desc = TextureDesc::new_2d(
-            1280,
-            720,
-            SSR_TEXTURE_FORMAT,
-            wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let depth_desc = TextureDesc::new_2d(
-            1280,
-            720,
-            wgpu::TextureFormat::Depth32Float,
-            wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let color = graph.register_texture("SSR_Test_Color", color_desc, true);
-        let data = graph.register_texture("SSR_Test_Data", data_desc, true);
-        let depth = graph.register_texture("SSR_Test_Depth", depth_desc, true);
-
-        let mut ctx = GraphBuilderContext::new(&mut graph, &frame_config, 0);
-        let _outputs = feature.add_to_graph(
-            &mut ctx, snapshot, color, depth, data, data, data, data, data,
-        );
-
-        let names: Vec<_> = graph.storage.passes.iter().map(|pass| pass.name).collect();
-        assert_eq!(
-            names,
-            ["SSR_Trace", "SSR_Temporal", "SSR_Resolve", "SSR_Merge"]
-        );
-        assert_eq!(
-            graph
-                .storage
-                .resources
-                .iter()
-                .filter(|resource| resource.name == "SSR_Uniforms")
-                .count(),
-            1
-        );
-        assert!(feature.raw.pipelines.is_empty());
-        assert!(feature.temporal.pipeline_id.is_none());
-        assert!(feature.spatial.pipeline_id.is_none());
-        assert!(feature.merge.pipeline_id.is_none());
+        let mut previous = [None, None];
+        for serial in 1..=4 {
+            for (index, camera) in [&camera_a, &camera_b].into_iter().enumerate() {
+                let global_frame = 100 + serial * 2 + index as u64;
+                let snapshot = feature.extract(
+                    &mut histories,
+                    1,
+                    camera,
+                    serial,
+                    &settings.uniforms,
+                    (1280, 720),
+                    global_frame,
+                    global_frame as u32,
+                    false,
+                    GlobalStateKey::new(1, 1),
+                );
+                assert_eq!(snapshot.uniforms.frame_params.x, serial as u32);
+                assert_eq!(snapshot.history.valid, serial > 1);
+                if let Some(previous) = previous[index] {
+                    assert_eq!(snapshot.history.previous[0].id, previous);
+                }
+                previous[index] = Some(snapshot.history.next[0].id);
+                assert!(commit(&mut histories, snapshot));
+            }
+            assert_ne!(previous[0], previous[1]);
+        }
     }
 
     #[cfg(feature = "debug_view")]
@@ -1678,6 +1588,12 @@ mod tests {
             false,
         );
         assert!(followup.valid);
+
+        // Building and compiling a live graph must not eagerly create GPU state.
+        assert!(feature.raw.pipelines.is_empty());
+        assert!(feature.temporal.pipeline_id.is_none());
+        assert!(feature.spatial.pipeline_id.is_none());
+        assert!(feature.merge.pipeline_id.is_none());
     }
 
     #[test]

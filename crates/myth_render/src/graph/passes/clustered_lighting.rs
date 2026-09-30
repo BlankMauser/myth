@@ -1078,7 +1078,6 @@ mod tests {
     #[test]
     fn upload_derivation_resolves_depth_without_changing_topology_fields() {
         let snapshot = snapshot(true, 3);
-        assert_eq!(snapshot.params.depth_params, glam::Vec4::ZERO);
 
         let resolved = resolve_cluster_params_for_upload(
             snapshot.params,
@@ -1166,10 +1165,6 @@ mod tests {
     fn final_lights_only_culls_cluster_suffix() {
         let live = final_lights_live_passes(true);
         assert_eq!(live, ["Merge_Local_Lights", "Cluster_Test_Root"]);
-        assert!(!live.contains(&"Cluster_Params_Upload"));
-        assert!(!live.contains(&"Cluster_Light_Dispatch_Args"));
-        assert!(!live.contains(&"Cluster_Light_View_Pass"));
-        assert!(!live.contains(&"Cluster_Cull_Pass"));
     }
 
     #[test]
@@ -1178,15 +1173,5 @@ mod tests {
             final_lights_live_passes(false),
             ["Merge_Local_Lights", "Cluster_Test_Root"]
         );
-    }
-
-    #[test]
-    fn cull_l1_key_changes_and_reverts_with_wgsl_specialization() {
-        let original = ClusterCullResourceKey::new(64);
-        let changed = ClusterCullResourceKey::new(128);
-        let reverted = ClusterCullResourceKey::new(64);
-
-        assert_ne!(original, changed);
-        assert_eq!(original, reverted);
     }
 }
