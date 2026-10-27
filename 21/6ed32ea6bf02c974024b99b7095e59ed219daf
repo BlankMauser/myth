@@ -1,0 +1,14 @@
+crates/myth_render/src/pipeline/shader_manager.rs
+  h_03360edcd9e88f 339-346
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "216ed32ea6bf02c974024b99b7095e59ed219daf",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
