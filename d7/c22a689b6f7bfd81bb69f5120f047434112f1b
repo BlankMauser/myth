@@ -1,0 +1,36 @@
+Cargo.lock
+  h_03360edcd9e88f 2145-2158
+Cargo.toml
+  h_03360edcd9e88f 22
+crates/myth_render/Cargo.toml
+  h_03360edcd9e88f 61
+crates/myth_render/src/graph/composer.rs
+  h_03360edcd9e88f 2406-2447,2811-2814,2834-2837,2855-2862
+crates/myth_render/src/graph/passes/bloom.rs
+  h_03360edcd9e88f 277-279
+crates/myth_render/src/graph/passes/fxaa.rs
+  h_03360edcd9e88f 164-166
+crates/myth_render/src/graph/passes/mod.rs
+  h_03360edcd9e88f 28-29,66-80
+crates/myth_render/src/graph/passes/study.rs
+  h_03360edcd9e88f 1-378
+crates/myth_render/src/graph/passes/study_gen_input.wgsl
+  h_03360edcd9e88f 1-153
+crates/myth_render/src/graph/passes/tone_mapping.rs
+  h_03360edcd9e88f 302-304
+study/myth_post_chain/Cargo.toml
+  h_03360edcd9e88f 1-21
+study/myth_post_chain/src/main.rs
+  h_03360edcd9e88f 1-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d7c22a689b6f7bfd81bb69f5120f047434112f1b",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
