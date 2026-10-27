@@ -161,7 +161,9 @@ impl FxaaFeature {
 
             let out_desc = ctx
                 .frame_config
-                .create_surface_desc(wgpu::TextureUsages::TEXTURE_BINDING);
+                .create_surface_desc(
+                    wgpu::TextureUsages::TEXTURE_BINDING | super::study_capture_usage(),
+                );
             let output = builder.create_texture("LDR_Antialiased", out_desc);
 
             let node = FxaaPassNode {

@@ -2143,6 +2143,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "myth_post_chain"
+version = "0.1.0"
+dependencies = [
+ "myth_app",
+ "myth_render",
+ "myth_resources",
+ "myth_scene",
+ "pollster",
+ "serde_json",
+ "sha2",
+ "wgpu",
+]
+
+[[package]]
 name = "myth_render"
 version = "0.3.0"
 dependencies = [

@@ -274,7 +274,9 @@ impl BloomFeature {
                     fc.width,
                     fc.height,
                     hdr_format,
-                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | super::study_capture_usage(),
                 );
 
                 let out = builder.create_texture("Scene_Color_Bloom", out_desc);

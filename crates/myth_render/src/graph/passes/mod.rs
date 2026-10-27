@@ -25,6 +25,8 @@ pub mod ssao;
 pub mod ssgi;
 pub mod ssr;
 pub mod ssss;
+#[cfg(feature = "study_post_chain")]
+pub mod study;
 pub mod taa;
 pub mod tone_mapping;
 pub mod transmission_copy;
@@ -61,3 +63,18 @@ pub use taa::TaaFeature;
 pub use tone_mapping::ToneMappingFeature;
 pub use transmission_copy::TransmissionCopyFeature;
 pub use transparent::TransparentFeature;
+
+/// Extra texture usage for study captures (empty unless `study_post_chain`
+/// capture mode is on).
+#[inline]
+#[must_use]
+pub fn study_capture_usage() -> wgpu::TextureUsages {
+    #[cfg(feature = "study_post_chain")]
+    {
+        study::capture_usage()
+    }
+    #[cfg(not(feature = "study_post_chain"))]
+    {
+        wgpu::TextureUsages::empty()
+    }
+}

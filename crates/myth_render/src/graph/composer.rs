@@ -2403,6 +2403,48 @@ impl<'a> FrameComposer<'a> {
 
                 let fxaa_enabled = self.ctx.camera.aa_mode.is_fxaa();
 
+                // Study harness: the scene group is replaced by the protocol's
+                // deterministic input pass feeding Myth's own TAA and CAS.
+                #[cfg(feature = "study_post_chain")]
+                let mut study_ids = crate::graph::passes::study::StudyStageIds::default();
+                #[cfg(feature = "study_post_chain")]
+                let (mut active_color, mut scene_depth, mut scene_hiz) =
+                    graph_ctx.with_group("Scene", |c| {
+                        let input = crate::graph::passes::study::add_input_gen(c);
+                        study_ids.in_color = Some(input.color);
+                        study_ids.in_velocity = Some(input.velocity);
+                        study_ids.in_depth = Some(input.depth);
+                        let mut active_color = input.color;
+                        // Same calls as section 6 (TAA Resolve) below.
+                        c.with_group("TAA_System", |c| {
+                            active_color = self.ctx.taa_pass.add_to_graph(
+                                c,
+                                taa_snapshot.expect("TAA snapshot missing"),
+                                active_color,
+                                input.velocity,
+                                input.depth,
+                            );
+                            study_ids.taa = Some(active_color);
+                            if cas_enabled {
+                                let taa_settings = self
+                                    .ctx
+                                    .camera
+                                    .aa_mode
+                                    .taa_settings()
+                                    .expect("CAS requires TAA settings");
+                                let snapshot = self.ctx.cas_pass.extract(
+                                    taa_settings.sharpen_intensity,
+                                    self.frame_config.hdr_format,
+                                );
+                                active_color =
+                                    self.ctx.cas_pass.add_to_graph(c, snapshot, active_color);
+                                study_ids.cas = Some(active_color);
+                            }
+                        });
+                        let scene_hiz: Option<crate::graph::core::TextureNodeId> = None;
+                        (active_color, input.depth, scene_hiz)
+                    });
+                #[cfg(not(feature = "study_post_chain"))]
                 let (mut active_color, mut scene_depth, mut scene_hiz) =
                     graph_ctx.with_group("Scene", |c| {
                         let scene_lights = c.with_group("Scene_Lighting", |c| {
@@ -2766,6 +2808,10 @@ impl<'a> FrameComposer<'a> {
                             self.ctx
                                 .bloom_pass
                                 .add_to_graph(ctx, snapshot, active_color);
+                        #[cfg(feature = "study_post_chain")]
+                        {
+                            study_ids.bloom = Some(active_color);
+                        }
                     }
 
                     // ToneMapping: HDR → LDR, into a transient target.
@@ -2785,6 +2831,10 @@ impl<'a> FrameComposer<'a> {
                         .ctx
                         .tone_map_pass
                         .add_to_graph(ctx, snapshot, active_color);
+                    #[cfg(feature = "study_post_chain")]
+                    {
+                        study_ids.tonemap = Some(active_color);
+                    }
 
                     // FXAA: anti-alias the LDR result into a second transient
                     // target.
@@ -2800,6 +2850,14 @@ impl<'a> FrameComposer<'a> {
                             .fxaa_pass
                             .extract(fxaa_settings.quality(), self.frame_config.surface_format);
                         active_color = self.ctx.fxaa_pass.add_to_graph(ctx, snapshot, active_color);
+                    }
+
+                    #[cfg(feature = "study_post_chain")]
+                    {
+                        if fxaa_enabled {
+                            study_ids.fxaa = Some(active_color);
+                        }
+                        crate::graph::passes::study::add_capture(ctx, &study_ids);
                     }
 
                     bb_scene_color = Some(active_color);

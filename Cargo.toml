@@ -19,6 +19,7 @@ members = [
     "demo_apps/gltf_viewer",
     "demo_apps/gltf_shower",
     "xtask",
+    "study/myth_post_chain",
 ]
 
 # =============================================================================

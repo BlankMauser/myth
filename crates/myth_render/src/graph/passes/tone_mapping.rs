@@ -299,7 +299,9 @@ impl ToneMappingFeature {
             ctx.frame_config.width,
             ctx.frame_config.height,
             snapshot.output_format,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | super::study_capture_usage(),
         );
 
         ctx.graph.add_pass("ToneMap_Pass", |builder| {
