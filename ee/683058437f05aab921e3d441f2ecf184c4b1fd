@@ -1,0 +1,19 @@
+study/myth_post_chain/src/main.rs
+  s_ee56707a139ec4::t_5cb645c7310c30 192-208,260,264-268,333-347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ee683058437f05aab921e3d441f2ecf184c4b1fd",
+  "prompts": {},
+  "sessions": {
+    "s_ee56707a139ec4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a17aa3-f9ab-71b2-81ea-fc2b1b39b5b5",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
