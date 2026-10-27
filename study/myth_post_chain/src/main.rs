@@ -189,6 +189,23 @@ fn latest_timings(_engine: &Engine) -> Option<(u64, f64, Vec<(&'static str, f64)
     None
 }
 
+/// Myth's own per-phase CPU split of the last frame (rdg_bench_support only).
+#[cfg(feature = "gpu_timing")]
+fn phase_split(engine: &Engine) -> Option<Vec<(String, f64)>> {
+    use myth_render::graph::RdgFramePhase;
+    engine.renderer.latest_rdg_diagnostics().map(|d| {
+        RdgFramePhase::ALL
+            .iter()
+            .map(|p| (format!("{p:?}"), d.phase_elapsed_ns(*p) as f64 / 1.0e6))
+            .collect()
+    })
+}
+
+#[cfg(not(feature = "gpu_timing"))]
+fn phase_split(_engine: &Engine) -> Option<Vec<(String, f64)>> {
+    None
+}
+
 fn enable_timings(engine: &mut Engine) -> bool {
     #[cfg(feature = "gpu_timing")]
     {
@@ -240,9 +257,15 @@ fn main() {
             let mut gpu: BTreeMap<u64, (f64, Vec<(&'static str, f64)>)> = BTreeMap::new();
             let mut renderer_frame_of = Vec::with_capacity(total as usize);
             let mut first_frame_ms = 0.0;
+            let mut phases: Vec<Vec<(String, f64)>> = Vec::new();
             for f in 0..total {
                 renderer_frame_of.push(engine.frame_count() + 1);
                 let (c, s) = frame(&mut engine, f);
+                if f >= args.warmup {
+                    if let Some(p) = phase_split(&engine) {
+                        phases.push(p);
+                    }
+                }
                 if f == 0 {
                     first_frame_ms = c + s;
                 }
@@ -307,6 +330,21 @@ fn main() {
                 csv.push('\n');
             }
             std::fs::write(args.out.join("frames.csv"), csv).expect("write csv");
+            if let Some(first) = phases.first() {
+                let mut pcsv = String::from("frame");
+                for (n, _) in first {
+                    write!(pcsv, ",{n}_ms").unwrap();
+                }
+                pcsv.push('\n');
+                for (k, p) in phases.iter().enumerate() {
+                    write!(pcsv, "{}", args.warmup as usize + k).unwrap();
+                    for (_, v) in p {
+                        write!(pcsv, ",{v:.6}").unwrap();
+                    }
+                    pcsv.push('\n');
+                }
+                std::fs::write(args.out.join("phases.csv"), pcsv).expect("write phases");
+            }
             write_json(
                 &args.out.join("harness.json"),
                 &serde_json::json!({
