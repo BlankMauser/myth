@@ -1,0 +1,14 @@
+study/myth_post_chain/src/main.rs
+  h_03360edcd9e88f 33-35,108-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "526bdfbf20bbf6c6f20d09e26ba4fed71eef2c2f",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
