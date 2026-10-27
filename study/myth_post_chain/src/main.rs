@@ -30,6 +30,9 @@ use myth_resources::{AntiAliasingMode, FxaaSettings, TaaSettings};
 use myth_scene::camera::Camera;
 use sha2::{Digest, Sha256};
 
+/// CAS sharpness (Myth default 0.5). Build trial B2 edits this line.
+const CAS_SHARPNESS: f32 = 0.5;
+
 struct Args {
     mode: String,
     width: u32,
@@ -102,7 +105,11 @@ fn setup(args: &Args) -> Engine {
         0.1,
     );
     camera.set_aa_mode(AntiAliasingMode::TAA_FXAA(
-        TaaSettings::default(),
+        TaaSettings {
+            // Myth's default (0.5), explicit so build-time trial B2 can edit it.
+            sharpen_intensity: CAS_SHARPNESS,
+            ..TaaSettings::default()
+        },
         FxaaSettings::default(),
     ));
     let cam = scene.add_camera(camera);
