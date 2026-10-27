@@ -336,6 +336,14 @@ impl ShaderManager {
             ShaderSource::Inline { name, .. } => name,
         };
 
+        // Study harness: dump every final WGSL Myth compiles (exact source the
+        // port must match) when MYTH_STUDY_DUMP_WGSL names a directory.
+        #[cfg(feature = "study_post_chain")]
+        if let Ok(dir) = std::env::var("MYTH_STUDY_DUMP_WGSL") {
+            let file = format!("{}_{:08x}.wgsl", label.replace('/', "__"), hash as u32);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(file), &final_wgsl);
+        }
+
         let module = self.module_cache.entry(hash).or_insert_with(|| {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(&format!("Shader Module {label}")),
